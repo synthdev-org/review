@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy --strict
+        run: uv run mypy --strict .
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # No `-m integration` here on purpose: integration tests (Phase 2
+      # onward, tagged @pytest.mark.integration) run on every PR, not every
+      # push, per docs/rules/testing.md's CI-gating section. Plain `pytest`
+      # already excludes them via pyproject.toml's `addopts`.
+      - name: pytest (unit only)
+        run: uv run pytest
+
+  integration-test:
+    name: Integration tests (Postgres)
+    # Gated on pull requests, not every push, per docs/rules/testing.md's
+    # CI-gating section ("Integration: every PR") and the plan's Phase 2
+    # section. `testcontainers-python` (adapter/storage's migration,
+    # SKIP LOCKED, and pgvector-presence tests) manages its own real
+    # Postgres/pgvector container against the runner's Docker daemon, which
+    # ubuntu-latest GitHub-hosted runners provide out of the box — no
+    # `services:` container needed here.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: pytest -m integration
+        run: uv run pytest -m integration
+
+  helm-lint:
+    name: Helm chart lint & template
+    # No real cluster involved — the Helm-equivalent of the pyramid's unit
+    # tier, per the plan's Phase 6 ("Helm chart skeleton") Tests section.
+    # Runs on every push, same as the plain lint/unit-test jobs above,
+    # since it's just as cheap and has no external dependency.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.4"
+
+      # charts/review/test-render.sh runs helm lint + helm template against
+      # the default values.yaml, values-production.yaml layered on top
+      # (asserting postgresql.enabled: false takes effect), and
+      # postgresql.enabled: false plus an existingSecret reference for
+      # every credential field (asserting no literal credential value
+      # renders anywhere) — see the plan's Phase 6 Tests/Acceptance
+      # sections.
+      - name: helm lint + helm template checks
+        run: ./charts/review/test-render.sh

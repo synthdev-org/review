@@ -1,0 +1,24 @@
+# Default values for the bundled postgresql subchart. Overridden from the
+# parent chart via the top-level `postgresql:` values key (see
+# charts/review/values.yaml) — standard Helm subchart values passthrough.
+enabled: true
+
+image:
+  repository: pgvector/pgvector
+  tag: pg16
+  pullPolicy: IfNotPresent
+
+auth:
+  username: review
+  password: review
+  database: review
+
+service:
+  port: 5432
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClassName: ""
+
+resources: {}

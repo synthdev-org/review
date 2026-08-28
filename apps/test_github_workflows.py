@@ -1,0 +1,100 @@
+"""Structural sanity checks for the CI/E2E GitHub Actions workflow files.
+
+Neither .github/workflows/ci.yml nor e2e.yml has any other automated test
+guarding its own correctness — a hand-edit that silently dropped a gating
+job, a trigger, or a step's `run:` command would only be caught by actually
+observing CI misbehave. These tests parse the real YAML and assert the
+structure docs/rules/testing.md's CI-gating rule and the plan's Phase 1/2/5
+sections require, so a regression here fails locally instead of on the next
+push.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+WORKFLOWS_DIR = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+
+
+def _load(name: str) -> dict[Any, Any]:
+    return yaml.safe_load((WORKFLOWS_DIR / name).read_text())  # type: ignore[no-any-return]
+
+
+def _triggers(workflow: dict[Any, Any]) -> dict[str, Any]:
+    # PyYAML's default (YAML 1.1) loader reads the unquoted `on:` key as the
+    # boolean True, not the string "on" — GitHub Actions workflow YAML hits
+    # this every time, so both spellings must be checked.
+    return workflow.get("on") or workflow.get(True) or {}
+
+
+def _job_step_runs(job: dict[str, Any]) -> list[str]:
+    return [step["run"] for step in job.get("steps", []) if "run" in step]
+
+
+def test_ci_workflow_triggers_on_every_push_and_pull_request() -> None:
+    triggers = _triggers(_load("ci.yml"))
+
+    assert "push" in triggers, "ci.yml must run on every push (unit tests + lint gate)"
+    assert "pull_request" in triggers, "ci.yml must run on every pull_request (integration gate)"
+
+
+def test_ci_lint_and_typecheck_job_runs_all_three_gates() -> None:
+    job = _load("ci.yml")["jobs"]["lint-and-typecheck"]
+    runs = _job_step_runs(job)
+
+    assert any("ruff check" in run for run in runs), "missing ruff check step"
+    assert any("ruff format --check" in run for run in runs), "missing ruff format --check step"
+    assert any("mypy --strict" in run for run in runs), "missing mypy --strict step"
+
+
+def test_ci_unit_test_job_excludes_integration_tests() -> None:
+    job = _load("ci.yml")["jobs"]["test"]
+    runs = _job_step_runs(job)
+
+    pytest_runs = [run for run in runs if "pytest" in run]
+    assert pytest_runs, "missing a pytest step in the unit-test job"
+    # No `-m integration` here on purpose (see ci.yml's own comment) —
+    # pyproject.toml's addopts already excludes integration-marked tests
+    # from a bare `pytest` invocation.
+    assert not any("-m integration" in run for run in pytest_runs), (
+        "unit-test job should run plain pytest (integration exclusion comes from "
+        "pyproject.toml's addopts), not pass -m integration itself"
+    )
+
+
+def test_ci_integration_test_job_is_gated_on_pull_requests_only() -> None:
+    job = _load("ci.yml")["jobs"]["integration-test"]
+    runs = _job_step_runs(job)
+
+    assert job.get("if") == "github.event_name == 'pull_request'", (
+        "integration-test job must be gated to pull_request events, not every push"
+    )
+    assert any("pytest -m integration" in run for run in runs), (
+        "integration-test job must actually run the integration-marked tests"
+    )
+
+
+def test_ci_helm_lint_job_runs_the_render_test_script() -> None:
+    job = _load("ci.yml")["jobs"]["helm-lint"]
+    runs = _job_step_runs(job)
+
+    assert any("charts/review/test-render.sh" in run for run in runs)
+
+
+def test_e2e_workflow_triggers_on_merge_to_main() -> None:
+    triggers = _triggers(_load("e2e.yml"))
+
+    push_trigger = triggers.get("push") or {}
+    assert "main" in push_trigger.get("branches", []), (
+        "e2e.yml must trigger on merge to main, per testing.md's E2E CI-gating rule"
+    )
+
+
+def test_e2e_workflow_runs_the_compose_e2e_suite() -> None:
+    job = _load("e2e.yml")["jobs"]["e2e"]
+    runs = _job_step_runs(job)
+
+    assert any("pytest tests/e2e" in run for run in runs)

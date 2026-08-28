@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "review.fullname" . }}-webhook-api
+  labels:
+    {{- include "review.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook-api
+spec:
+  type: {{ .Values.webhookApi.service.type }}
+  ports:
+    - port: {{ .Values.webhookApi.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "review.selectorLabels" (dict "root" . "component" "webhook-api") | nindent 4 }}

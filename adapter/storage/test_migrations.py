@@ -1,0 +1,137 @@
+"""Integration test: `alembic upgrade head` / `downgrade base` against a
+real Postgres/pgvector instance (testcontainers), per the plan's Phase 2
+Tests and Acceptance sections.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from alembic import command
+from sqlalchemy import inspect, text
+
+from adapter.storage.conftest import alembic_config_for
+from adapter.storage.engine import create_storage_engine
+
+pytestmark = pytest.mark.integration
+
+_EXPECTED_TABLES = {
+    "org",
+    "repo",
+    "team",
+    "job_queue",
+    "model_routing_config",
+    "org_repo_team_setting",
+    "alembic_version",
+}
+
+# Per-table expected columns, keyed to the SQLAlchemy models in models.py —
+# proves the migration actually creates the schema the ORM expects, not just
+# a table with the right name.
+_EXPECTED_COLUMNS = {
+    "org": {"id", "name", "slug", "created_at", "updated_at"},
+    "repo": {"id", "org_id", "name", "full_name", "created_at", "updated_at"},
+    "team": {"id", "org_id", "name", "created_at", "updated_at"},
+    "job_queue": {
+        "id",
+        "job_type",
+        "status",
+        "payload",
+        "org_id",
+        "repo_id",
+        "attempts",
+        "claimed_by",
+        "claimed_at",
+        "created_at",
+        "updated_at",
+    },
+    "model_routing_config": {
+        "id",
+        "org_id",
+        "stage",
+        "model_name",
+        "created_at",
+        "updated_at",
+    },
+    "org_repo_team_setting": {
+        "id",
+        "org_id",
+        "repo_id",
+        "team_id",
+        "key",
+        "value",
+        "created_at",
+        "updated_at",
+    },
+}
+
+
+async def _table_names(dsn: str) -> set[str]:
+    engine = create_storage_engine(dsn)
+    try:
+        async with engine.connect() as connection:
+            return set(
+                await connection.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names())
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _column_names(dsn: str, table_name: str) -> set[str]:
+    engine = create_storage_engine(dsn)
+    try:
+        async with engine.connect() as connection:
+            columns = await connection.run_sync(
+                lambda sync_conn: inspect(sync_conn).get_columns(table_name)
+            )
+            return {column["name"] for column in columns}
+    finally:
+        await engine.dispose()
+
+
+async def _pgvector_extension_present(dsn: str) -> bool:
+    engine = create_storage_engine(dsn)
+    try:
+        async with engine.connect() as connection:
+            result = await connection.execute(
+                text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+            )
+            return result.first() is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_head_creates_expected_schema(pgvector_container) -> None:  # type: ignore[no-untyped-def]
+    dsn = pgvector_container.get_connection_url()
+    config = alembic_config_for(dsn)
+
+    # See conftest.py's migrated_engine fixture for why this runs in a
+    # thread: Alembic's async env.py calls `asyncio.run(...)` internally,
+    # which cannot nest inside this test's own running event loop.
+    await asyncio.to_thread(command.upgrade, config, "head")
+    try:
+        tables = await _table_names(dsn)
+        assert tables >= _EXPECTED_TABLES
+        for table_name, expected_columns in _EXPECTED_COLUMNS.items():
+            actual_columns = await _column_names(dsn, table_name)
+            assert actual_columns >= expected_columns, (
+                f"{table_name}: missing columns {expected_columns - actual_columns}"
+            )
+        assert await _pgvector_extension_present(dsn)
+    finally:
+        await asyncio.to_thread(command.downgrade, config, "base")
+
+
+@pytest.mark.asyncio
+async def test_downgrade_base_reverses_the_baseline_migration(pgvector_container) -> None:  # type: ignore[no-untyped-def]
+    dsn = pgvector_container.get_connection_url()
+    config = alembic_config_for(dsn)
+
+    await asyncio.to_thread(command.upgrade, config, "head")
+    await asyncio.to_thread(command.downgrade, config, "base")
+
+    tables = await _table_names(dsn)
+    assert not (_EXPECTED_TABLES - {"alembic_version"}) & tables
+    assert not await _pgvector_extension_present(dsn)

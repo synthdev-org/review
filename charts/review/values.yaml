@@ -1,0 +1,128 @@
+# charts/review/values.yaml — DEFAULT profile: postgresql.enabled: true,
+# the fast-eval/trial path (per the C4 doc and this plan's Phase 6
+# section). Production installs layer values-production.yaml on top of
+# this file (`helm install -f values.yaml -f values-production.yaml`),
+# which flips postgresql.enabled to false and expects externally-managed
+# connection details.
+#
+# PRE-1.0 / UNSTABLE — see the note at the top of Chart.yaml. This shape
+# may still change before Phase 8 ("Production hardening").
+#
+# Credential fields (github.webhookSecret, github.setupStateSecret,
+# llm.apiKey, database.url) all share one shape:
+#
+#   <field>:
+#     value: "<literal, used when existingSecret.name is empty>"
+#     existingSecret:
+#       name: ""   # name of a Secret the operator/secret-backend already
+#                  # populated (Vault, External Secrets Operator, Sealed
+#                  # Secrets, a cloud Secrets Manager, ...) — see the C4
+#                  # doc's "Configuration & Secrets" / secret-backend-
+#                  # agnostic design goal.
+#       key: ""    # key within that Secret holding the value.
+#
+# When existingSecret.name is set, this chart's own Secret omits that
+# field entirely (no literal value rendered anywhere) and every Deployment
+# that needs it reads straight from the referenced Secret/key instead —
+# `value` is then ignored.
+
+webhookApi:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/mystery-digital/review
+    # Empty string defaults to .Chart.AppVersion (see _helpers.tpl).
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8000
+  # Mirrors apps/webhook_api/settings.py's WebhookAPISettings fields
+  # one-for-one (REVIEW_WEBHOOK_API_* env prefix).
+  environment: development
+  logLevel: INFO
+  webhook:
+    # Quoted as a string, not a bare int: Helm decodes values.yaml numbers
+    # as float64, and Go's default float64->string formatting renders
+    # values >= 1e6 in scientific notation (e.g. "1e+06") — a real, easy-to-
+    # miss bug caught while rendering this chart. Every other numeric field
+    # below stays under that threshold and is safe as a bare int.
+    maxBodyBytes: "1000000"
+    rateLimit:
+      maxRequests: 30
+      windowSeconds: 60
+  # Off by default per the plan's Security review ("Manifest-flow
+  # gating") — only enable for the duration of a one-time GitHub App
+  # creation flow, same as docker-compose.yml's default.
+  setupMode: false
+  setupStateTtlSeconds: 600
+  githubApi:
+    baseUrl: https://api.github.com
+    timeoutSeconds: 10
+  resources: {}
+
+worker:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/mystery-digital/review
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Mirrors apps/worker/settings.py's WorkerSettings fields one-for-one
+  # (REVIEW_WORKER_* env prefix).
+  environment: development
+  logLevel: INFO
+  llm:
+    endpoint: http://host.docker.internal:1234/v1
+    model: local-model
+    timeoutSeconds: 30
+  resources: {}
+
+# --- Credential fields (see the file header for the shared shape) ---
+
+github:
+  webhookSecret:
+    value: "replace-with-a-real-webhook-secret"
+    existingSecret:
+      name: ""
+      key: ""
+  # Only required when webhookApi.setupMode is true (see Chart.yaml's
+  # helper validation) — mirrors WebhookAPISettings' own
+  # model_validator that requires it exactly when setup_mode is enabled.
+  setupStateSecret:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+
+llm:
+  apiKey:
+    value: "not-needed"
+    existingSecret:
+      name: ""
+      key: ""
+
+database:
+  # Full REVIEW_DATABASE_URL DSN (postgresql+asyncpg://user:pass@host:port/db).
+  # Left blank here: when postgresql.enabled is true, the chart derives it
+  # automatically from the bundled subchart's postgresql.auth.* values
+  # (see templates/_helpers.tpl's "review.databaseUrl" helper) so the
+  # fast-eval path works with zero extra configuration. When
+  # postgresql.enabled is false, either set this value explicitly or use
+  # existingSecret — templates fail closed with a clear error if neither
+  # is provided (see the same helper).
+  url:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+
+# `true` bundles the Postgres+pgvector subchart (charts/postgresql/) for a
+# fast-eval/trial path — no external database needed. `false` takes
+# externally-managed connection details via `database.url` above. See
+# docs/reference/c4-architecture.md's "Postgres is bring-your-own-or-
+# bundled" note. values-production.yaml sets this to false.
+postgresql:
+  enabled: true
+  auth:
+    username: review
+    password: review
+    database: review

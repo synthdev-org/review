@@ -1,0 +1,41 @@
+{{- if and .Values.webhookApi.setupMode (not .Values.github.setupStateSecret.value) (not .Values.github.setupStateSecret.existingSecret.name) }}
+{{- fail "github.setupStateSecret.value (or existingSecret) must be set when webhookApi.setupMode is true — mirrors WebhookAPISettings' own validator" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "review.fullname" . }}-webhook-api
+  labels:
+    {{- include "review.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook-api
+spec:
+  replicas: {{ .Values.webhookApi.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "review.selectorLabels" (dict "root" . "component" "webhook-api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "review.labels" . | nindent 8 }}
+        {{- include "review.selectorLabels" (dict "root" . "component" "webhook-api") | nindent 8 }}
+    spec:
+      containers:
+        - name: webhook-api
+          image: "{{ .Values.webhookApi.image.repository }}:{{ .Values.webhookApi.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.webhookApi.image.pullPolicy }}
+          # Runs the Webhook API entrypoint — the runtime image's default
+          # CMD (see Dockerfile) already does this, so no override needed.
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: {{ include "review.fullname" . }}-config
+          env:
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET" "field" .Values.github.webhookSecret "secretName" (include "review.secretName" .) "secretKey" "github-webhook-secret") | nindent 12 }}
+            {{- if .Values.webhookApi.setupMode }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WEBHOOK_API_SETUP_STATE_SECRET" "field" .Values.github.setupStateSecret "secretName" (include "review.secretName" .) "secretKey" "github-setup-state-secret") | nindent 12 }}
+            {{- end }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_DATABASE_URL" "field" .Values.database.url "secretName" (include "review.secretName" .) "secretKey" "database-url") | nindent 12 }}
+          resources:
+            {{- toYaml .Values.webhookApi.resources | nindent 12 }}

@@ -1,0 +1,155 @@
+# docker-compose.yml — local dev / CI E2E stack, per the plan's Phase 5
+# ("Docker Compose stack") section. Wires Phases 1-4 together into the
+# roadmap's Phase 0 exit criteria: "a Webhook API + Worker + Postgres that
+# boots cleanly with no review capability yet." See
+# docs/reference/c4-architecture.md's Level 3 diagram for the shape this
+# mirrors, and ADR-0001 for why Compose locally / Helm (Phase 6) in
+# production, over the same container images.
+#
+# Config: every environment variable referenced below is documented with a
+# placeholder value in .env.example, per the C4 doc's "Compose reads local
+# config from a plain .env file" note. Copy it to `.env` (gitignored — see
+# .gitignore) and fill in real values before running `docker compose up`.
+#
+# Boot ordering / health, per the plan's Phase 5 requirement that `docker
+# compose up` genuinely blocks until the stack is actually ready, not just
+# "containers started":
+#   1. `postgres` must report healthy (`pg_isready`) before anything else
+#      starts.
+#   2. `migrate` then runs `alembic upgrade head` followed by Phase 2's
+#      pgvector-presence check (adapter/storage/startup_check_cli.py) and
+#      exits. A failure in either step exits this service non-zero with the
+#      error visible in `docker compose logs migrate` — Compose refuses to
+#      start `webhook_api`/`worker` at all when a `depends_on:
+#      condition: service_completed_successfully` dependency fails, so a
+#      migration failure surfaces as a loud, immediate `docker compose up`
+#      error, never a silent hang or a partially-booted stack.
+#   3. `webhook_api` and `worker` both wait on `migrate` succeeding, then
+#      start. `webhook_api`'s own healthcheck polls `/healthz`.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-review}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-review}
+      POSTGRES_DB: ${POSTGRES_DB:-review}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-review} -d ${POSTGRES_DB:-review}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    # No named volume, on purpose: per the plan's Phase 5 "Observability &
+    # rollback" section, this dev stack keeps no persistent volume by
+    # default, so `docker compose down` + `up` is a genuine "start clean"
+    # rather than a partial rollback that needs a bespoke procedure.
+
+  migrate:
+    build:
+      context: .
+      target: runtime
+    image: review-app:compose-local
+    environment:
+      REVIEW_DATABASE_URL: >-
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
+    # `alembic upgrade head` (Phase 2's baseline migration, which also runs
+    # `CREATE EXTENSION IF NOT EXISTS vector`) followed by the standalone
+    # pgvector-presence check CLI (adapter/storage/startup_check_cli.py).
+    # Either step failing exits this container non-zero with the error on
+    # stdout/stderr, visible via `docker compose logs migrate`.
+    command: ["sh", "-c", "alembic upgrade head && python -m adapter.storage.startup_check_cli"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  webhook_api:
+    build:
+      context: .
+      target: runtime
+    image: review-app:compose-local
+    ports:
+      - "${WEBHOOK_API_PORT:-8000}:8000"
+    environment:
+      REVIEW_WEBHOOK_API_ENVIRONMENT: ${REVIEW_WEBHOOK_API_ENVIRONMENT:-development}
+      REVIEW_WEBHOOK_API_LOG_LEVEL: ${REVIEW_WEBHOOK_API_LOG_LEVEL:-INFO}
+      # Required, no default — the webhook receiver's HMAC trust boundary
+      # (docs/plans's Security review) cannot function without one.
+      REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET: >-
+        ${REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET:?set REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET in .env, see .env.example}
+      REVIEW_WEBHOOK_API_WEBHOOK_MAX_BODY_BYTES: ${REVIEW_WEBHOOK_API_WEBHOOK_MAX_BODY_BYTES:-1000000}
+      REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_MAX_REQUESTS: >-
+        ${REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_MAX_REQUESTS:-30}
+      REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_WINDOW_SECONDS: >-
+        ${REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_WINDOW_SECONDS:-60}
+      # SETUP_MODE off by default, per the plan's Security review
+      # ("Manifest-flow gating") — only enable for the duration of a
+      # one-time GitHub App creation flow.
+      REVIEW_WEBHOOK_API_SETUP_MODE: ${REVIEW_WEBHOOK_API_SETUP_MODE:-false}
+      REVIEW_WEBHOOK_API_SETUP_STATE_SECRET: ${REVIEW_WEBHOOK_API_SETUP_STATE_SECRET:-}
+      REVIEW_WEBHOOK_API_SETUP_STATE_TTL_SECONDS: >-
+        ${REVIEW_WEBHOOK_API_SETUP_STATE_TTL_SECONDS:-600}
+      REVIEW_WEBHOOK_API_GITHUB_API_BASE_URL: >-
+        ${REVIEW_WEBHOOK_API_GITHUB_API_BASE_URL:-https://api.github.com}
+      REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS: >-
+        ${REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS:-10}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # No curl in the runtime image (Dockerfile, Phase 1) — the app's own
+      # venv `python` (already on PATH) is always available, so this needs
+      # no extra image dependency.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; u.urlopen('http://localhost:8000/healthz', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    image: review-app:compose-local
+    command: ["python", "-m", "apps.worker.main"]
+    environment:
+      REVIEW_WORKER_ENVIRONMENT: ${REVIEW_WORKER_ENVIRONMENT:-development}
+      REVIEW_WORKER_LOG_LEVEL: ${REVIEW_WORKER_LOG_LEVEL:-INFO}
+      # LM Studio's OpenAI-compatible endpoint on the Docker host, per the
+      # plan's Phase 5 instruction and the C4 doc's Level 3 diagram.
+      REVIEW_WORKER_LLM_ENDPOINT: >-
+        ${REVIEW_WORKER_LLM_ENDPOINT:-http://host.docker.internal:1234/v1}
+      REVIEW_WORKER_LLM_API_KEY: ${REVIEW_WORKER_LLM_API_KEY:-not-needed}
+      REVIEW_WORKER_LLM_MODEL: ${REVIEW_WORKER_LLM_MODEL:-local-model}
+      REVIEW_WORKER_LLM_TIMEOUT_SECONDS: ${REVIEW_WORKER_LLM_TIMEOUT_SECONDS:-30}
+    # `host.docker.internal` is provided for free on Docker Desktop, but
+    # plain Docker Engine on Linux needs this mapping to resolve it — this
+    # is what actually makes the C4 doc's "worker calls LM Studio on the
+    # Docker host" arrangement work on a Linux dev machine or a Linux CI
+    # runner, not just macOS/Windows.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # No compose-level healthcheck: the Worker has no HTTP surface yet — no
+    # job-dispatch loop exists until a later roadmap phase (see
+    # apps/worker/main.py's module docstring, "Replaced by a real
+    # claim/dispatch loop once a later phase's job-queue dispatch logic
+    # exists"). Its startup connectivity check against the LLM endpoint
+    # *is* the health signal for this phase: `main()` logs "llm endpoint
+    # reachable" then "worker idle: no job dispatch wired yet" and returns,
+    # so the container exits 0 on success — a clean, intentional exit per
+    # the roadmap's "no review capability yet" scope, not a crash. `restart:
+    # "no"` (Compose's default, made explicit here) means a genuine
+    # LLM-unreachable failure exits non-zero exactly once rather than
+    # crash-looping — see tests/e2e/test_compose_stack.py for the assertion
+    # that this exit is clean (code 0, zero restarts), not a crash loop.
+    restart: "no"

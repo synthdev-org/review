@@ -1,0 +1,30 @@
+# Non-secret bootstrap values for both entrypoints, per the plan's Phase 6
+# section ("ConfigMap ... for non-secret bootstrap values"). Keys mirror
+# apps/webhook_api/settings.py's WebhookAPISettings and
+# apps/worker/settings.py's WorkerSettings fields one-for-one — each
+# entrypoint's own env_prefix (REVIEW_WEBHOOK_API_ / REVIEW_WORKER_) keeps
+# the two sets of keys from colliding in one shared ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "review.fullname" . }}-config
+  labels:
+    {{- include "review.labels" . | nindent 4 }}
+data:
+  # --- Webhook API (apps/webhook_api/settings.py) ---
+  REVIEW_WEBHOOK_API_ENVIRONMENT: {{ .Values.webhookApi.environment | quote }}
+  REVIEW_WEBHOOK_API_LOG_LEVEL: {{ .Values.webhookApi.logLevel | quote }}
+  REVIEW_WEBHOOK_API_WEBHOOK_MAX_BODY_BYTES: {{ .Values.webhookApi.webhook.maxBodyBytes | quote }}
+  REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_MAX_REQUESTS: {{ .Values.webhookApi.webhook.rateLimit.maxRequests | quote }}
+  REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_WINDOW_SECONDS: {{ .Values.webhookApi.webhook.rateLimit.windowSeconds | quote }}
+  REVIEW_WEBHOOK_API_SETUP_MODE: {{ .Values.webhookApi.setupMode | quote }}
+  REVIEW_WEBHOOK_API_SETUP_STATE_TTL_SECONDS: {{ .Values.webhookApi.setupStateTtlSeconds | quote }}
+  REVIEW_WEBHOOK_API_GITHUB_API_BASE_URL: {{ .Values.webhookApi.githubApi.baseUrl | quote }}
+  REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS: {{ .Values.webhookApi.githubApi.timeoutSeconds | quote }}
+
+  # --- Worker (apps/worker/settings.py) ---
+  REVIEW_WORKER_ENVIRONMENT: {{ .Values.worker.environment | quote }}
+  REVIEW_WORKER_LOG_LEVEL: {{ .Values.worker.logLevel | quote }}
+  REVIEW_WORKER_LLM_ENDPOINT: {{ .Values.worker.llm.endpoint | quote }}
+  REVIEW_WORKER_LLM_MODEL: {{ .Values.worker.llm.model | quote }}
+  REVIEW_WORKER_LLM_TIMEOUT_SECONDS: {{ .Values.worker.llm.timeoutSeconds | quote }}
