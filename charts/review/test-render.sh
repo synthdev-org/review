@@ -57,6 +57,8 @@ assert_contains "$DEFAULT_OUT" '# Source: review/charts/postgresql/templates/sta
     "postgresql.enabled: true (default) bundles the pgvector subchart"
 assert_contains "$DEFAULT_OUT" 'kind: Deployment' \
     "default render includes Deployment manifests"
+assert_contains "$DEFAULT_OUT" $'resources:\n            limits:\n              cpu: "2"\n              memory: 2Gi\n            requests:\n              cpu: 500m\n              memory: 512Mi' \
+    "default render includes the Worker Deployment's non-empty resources.requests/limits (Phase 5)"
 
 echo
 echo "=== 2. helm lint (values-production.yaml layered on top) ==="
@@ -101,6 +103,8 @@ EXISTING_SECRET_OVERRIDES=(
     --set webhookApi.setupMode=true
     --set github.setupStateSecret.existingSecret.name=review-github-credentials
     --set github.setupStateSecret.existingSecret.key=setup-state-secret
+    --set github.appPrivateKey.existingSecret.name=review-github-credentials
+    --set github.appPrivateKey.existingSecret.key=app-private-key
     --set llm.apiKey.existingSecret.name=review-llm-credentials
     --set llm.apiKey.existingSecret.key=api-key
 )
@@ -112,6 +116,8 @@ assert_not_contains "$EXISTING_OUT" 'github-webhook-secret:' \
     "github-webhook-secret key is absent from this chart's own Secret when existingSecret is used"
 assert_not_contains "$EXISTING_OUT" 'github-setup-state-secret:' \
     "github-setup-state-secret key is absent from this chart's own Secret when existingSecret is used"
+assert_not_contains "$EXISTING_OUT" 'github-app-private-key:' \
+    "github-app-private-key key is absent from this chart's own Secret when existingSecret is used"
 assert_not_contains "$EXISTING_OUT" 'llm-api-key:' \
     "llm-api-key key is absent from this chart's own Secret when existingSecret is used"
 assert_not_contains "$EXISTING_OUT" 'replace-with-a-real-webhook-secret' \
@@ -124,6 +130,8 @@ assert_contains "$EXISTING_OUT" $'name: review-github-credentials\n             
     "REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET env references the given existingSecret name/key"
 assert_contains "$EXISTING_OUT" $'name: review-github-credentials\n                  key: setup-state-secret' \
     "REVIEW_WEBHOOK_API_SETUP_STATE_SECRET env references the given existingSecret name/key"
+assert_contains "$EXISTING_OUT" $'name: review-github-credentials\n                  key: app-private-key' \
+    "REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY env references the given existingSecret name/key"
 assert_contains "$EXISTING_OUT" $'name: review-llm-credentials\n                  key: api-key' \
     "REVIEW_WORKER_LLM_API_KEY env references the given existingSecret name/key"
 

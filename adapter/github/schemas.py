@@ -16,21 +16,76 @@ class Installation(BaseModel):
     id: int
 
 
+class Repository(BaseModel):
+    """The ``repository`` object GitHub embeds in every webhook event
+    payload scoped to a repo (every event type Phase 1 subscribes to —
+    ``pull_request`` and ``push`` — always carries one)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    full_name: str
+
+
+class PullRequestHead(BaseModel):
+    """The ``pull_request.head`` object — only ``sha`` is needed here."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Optional per the plan's Phase 1 section: a malformed/adversarial
+    # delivery missing this field must be accepted-but-not-enqueued, never
+    # rejected with a 4xx at the schema layer — see
+    # apps/webhook_api/webhook_routes.py's point-of-use validation.
+    sha: str | None = None
+
+
+class PullRequest(BaseModel):
+    """The ``pull_request`` object present on every real ``pull_request``
+    event payload — absent entirely on other event types (e.g. ``push``)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Both optional for the same reason as PullRequestHead.sha above.
+    number: int | None = None
+    head: PullRequestHead | None = None
+
+
 class GitHubWebhookEnvelope(BaseModel):
-    """Minimal envelope used to resolve the installation ID a webhook event
-    belongs to.
+    """Minimal envelope used to resolve a webhook event's installation,
+    repository, and (for ``pull_request`` events) PR identity.
 
     Per the plan's Phase 4 section: "Installation-ID resolution at this
     phase is payload parsing only — no DB lookup, no persisted mapping."
-    This model validates just enough of GitHub's webhook payload shape to
-    extract that ID; every other event-specific field (there are dozens,
-    varying per event type) is ignored via ``extra="ignore"`` rather than
-    modeled here, since nothing downstream in this phase consumes them yet.
+    Phase 1 extends this with ``repository.full_name`` (present on every
+    event type this App subscribes to) and the optional ``action``/
+    ``pull_request.number``/``pull_request.head.sha`` fields Phase 1's
+    enqueue payload needs — every other event-specific field (there are
+    dozens more, varying per event type) is still ignored via
+    ``extra="ignore"`` rather than modeled here, since nothing downstream
+    consumes them yet.
+
+    ``action``/``pull_request`` are optional because a real GitHub ``push``
+    delivery has no top-level ``action`` key and no ``pull_request`` object
+    at all — a required field here would reject every real ``push``
+    delivery with a 422 before ``adapter/github/triggers.py``'s lookup ever
+    runs, contradicting this phase's "every non-enqueuing outcome is still
+    accepted (200)" design.
     """
 
     model_config = ConfigDict(extra="ignore")
 
     installation: Installation
+    # Optional: GitHub always delivers `ping` (on webhook creation) and the
+    # `installation`/`installation_repositories`/`github_app_authorization`
+    # family (App lifecycle changes) to this endpoint regardless of which
+    # events the App subscribes to, and none of those payloads carries a
+    # top-level `repository` key — a required field here would reject every
+    # one of those well-formed, correctly-signed deliveries with a 422,
+    # contradicting this module's own "every non-enqueuing outcome is still
+    # accepted (200)" design. See apps/webhook_api/webhook_routes.py's
+    # early return for events with no `repository`.
+    repository: Repository | None = None
+    action: str | None = None
+    pull_request: PullRequest | None = None
 
 
 class GitHubAppCredentials(BaseModel):

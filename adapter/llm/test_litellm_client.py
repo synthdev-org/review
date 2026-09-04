@@ -25,6 +25,20 @@ from llmgateway.models import CompletionRequest, Message
 pytestmark = pytest.mark.integration
 
 
+@pytest.fixture(autouse=True)
+def _reenable_litellm_client_logger() -> None:
+    """Alembic's `env.py` (triggered by any `migrated_engine`-using test
+    elsewhere in the same `pytest -m integration` process) disables every
+    already-created logger not listed in `alembic.ini`, including this
+    module's own `adapter.llm.litellm_client` logger. Re-enabled here,
+    autouse, so every `caplog`-asserting case below stays deterministic
+    regardless of test order — mirroring
+    `apps/webhook_api/test_webhook_routes.py`'s own per-test version of
+    this same fix.
+    """
+    logging.getLogger("adapter.llm.litellm_client").disabled = False
+
+
 def _request(model: str = "local-model") -> CompletionRequest:
     return CompletionRequest(model=model, messages=[Message(role="user", content="ping")])
 

@@ -4,20 +4,22 @@ Per docs/rules/architecture.md's Decoupling section: config is parsed once at
 each entrypoint's composition root and passed down explicitly — domain and
 adapter code never read env vars, Kubernetes Secrets, or files directly.
 
-Phase 1 kept this model intentionally near-empty, anticipating that "later
+Phase 0 kept this model intentionally near-empty, anticipating that "later
 phases add GitHub App / webhook-secret credentials here as
-``pydantic.SecretStr`` fields." Phase 4 is that phase: it adds the webhook
-signature secret (required — the webhook route cannot function without
-one), the body-size/rate-limit knobs for that route, and the
-``SETUP_MODE``-gated manifest/callback flow's configuration, per the plan's
-Phase 4 and Security review sections.
+``pydantic.SecretStr`` fields." Phase 4 added the webhook signature secret
+(required — the webhook route cannot function without one), the
+body-size/rate-limit knobs for that route, and the ``SETUP_MODE``-gated
+manifest/callback flow's configuration, per the plan's Phase 4 and Security
+review sections. Phase 1 (this phase) adds ``database_url`` (installation/
+org/repo resolution and delivery-idempotency need a database) and the
+per-repo review-enqueue rate limit, per that phase's own section.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +41,14 @@ class WebhookAPISettings(BaseSettings):
     environment: Literal["development", "staging", "production"]
     log_level: str = "INFO"
 
+    # --- Storage (Phase 1, adapter/storage) ---
+    # Sourced from the bare REVIEW_DATABASE_URL env var, not this class's
+    # own REVIEW_WEBHOOK_API_ prefix — the same variable name Phase 0's
+    # `migrate` Compose service and both Helm Deployments already inject.
+    # Required: installation/org/repo resolution and delivery-idempotency
+    # (tenancy/resolution.py) cannot function without a database.
+    database_url: SecretStr = Field(validation_alias="REVIEW_DATABASE_URL")
+
     # --- Webhook receiver (apps/webhook_api/webhook_routes.py) ---
     # Required: the webhook route's signature verification (this phase's
     # first trust boundary, per the plan's Security review) cannot run
@@ -49,6 +59,21 @@ class WebhookAPISettings(BaseSettings):
     webhook_max_body_bytes: int = 1_000_000
     webhook_rate_limit_max_requests: int = 30
     webhook_rate_limit_window_seconds: float = 60.0
+
+    # Per-repo review-enqueue rate limit (Phase 1), keyed by repo_id rather
+    # than client IP — mitigates unbounded LLM-cost/queue-starvation risk
+    # from repeated `synchronize` pushes on one PR. Reverses a stated NFR
+    # decision in phase-1-review-pipeline.md ("no additional cross-review
+    # rate-limiting is specified for Phase 1"), so it ships **disabled by
+    # default** (`0`) per this plan's pre-activation-gate policy for
+    # genuine product/cost-policy tradeoffs — Phase 1's own shipped
+    # configuration matches that PRD text exactly until a PRD owner
+    # explicitly opts in by setting this above `0`. `0` is a documented
+    # sentinel handled at the call site (apps/webhook_api/main.py): no
+    # `InMemoryRateLimiter` instance is constructed and the enqueue path
+    # skips the rate-check call entirely, rather than constructing a
+    # limiter and relying on its own `max_requests >= 1` `ValueError` guard.
+    review_enqueue_rate_limit_per_minute: int = 0
 
     # --- App manifest/callback setup flow (apps/webhook_api/manifest_routes.py) ---
     # Off by default, per the plan's Phase 4 section ("both ... routes are

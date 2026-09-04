@@ -7,7 +7,15 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from adapter.github.auth import validate_private_key
+from adapter.github.exceptions import GitHubPrivateKeyInvalidError
+from apps.worker.conftest import TEST_RSA_PRIVATE_KEY_PEM
 from apps.worker.settings import WorkerSettings
+from review.config import (
+    NoViableStepConfigurationError,
+    StepEnablement,
+    check_step_configuration_viable,
+)
 
 
 def test_missing_required_environment_field_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,3 +91,205 @@ def test_accepts_custom_llm_endpoint_from_env(monkeypatch: pytest.MonkeyPatch) -
     assert str(settings.llm_endpoint) == "https://api.example.com/v1"
     assert settings.llm_model == "gpt-4o-mini"
     assert settings.llm_timeout_seconds == 15.0
+
+
+def test_step_enablement_and_timeout_fields_default_per_the_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.prefilter_enabled is True
+    assert settings.static_analysis_enabled is True
+    assert settings.llm_review_enabled is True
+    assert settings.output_enabled is True
+    assert settings.prefilter_step_timeout_seconds == 30
+    assert settings.static_analysis_step_timeout_seconds == 240
+    assert settings.static_analysis_analyzer_timeout_seconds == 60
+    assert settings.llm_review_step_timeout_seconds == 90
+    assert settings.output_step_timeout_seconds == 30
+
+
+def test_individual_step_flags_are_overridable_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_STEP_TIMEOUT_SECONDS", "45")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.static_analysis_enabled is False
+    assert settings.llm_review_step_timeout_seconds == 45
+
+
+# --- US-F7: an all-disabled step configuration is caught at startup --------
+#
+# Per the plan's Phase 2 section, this predicate operates at the
+# granularity Phase 2 actually has: static-analysis and llm-review are the
+# only two finding-producing macro steps (pre-filter and output produce no
+# findings of their own). "Zero analyzers enabled" is expressed here as
+# "static-analysis disabled" — Phase 5 refines this once the
+# static-analysis step's own two per-analyzer sub-flags exist.
+
+
+def _step_enablement_from(settings: WorkerSettings) -> StepEnablement:
+    """Mirrors `apps/worker/main.py`'s own `_build_step_enablement` — kept
+    as a small local helper here (not imported) so this test proves the
+    predicate against a `StepEnablement` built the same way the real
+    composition root builds one, without coupling this test file to
+    `apps/worker/main.py`'s internals."""
+    return StepEnablement(
+        prefilter_enabled=settings.prefilter_enabled,
+        static_analysis_enabled=settings.static_analysis_enabled,
+        llm_review_enabled=settings.llm_review_enabled,
+        output_enabled=settings.output_enabled,
+    )
+
+
+def test_all_finding_producing_steps_disabled_fails_the_viability_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "false")
+
+    settings = WorkerSettings(_env_file=None)
+
+    with pytest.raises(NoViableStepConfigurationError):
+        check_step_configuration_viable(_step_enablement_from(settings))
+
+
+def test_one_analyzer_enabled_and_llm_review_disabled_passes_the_viability_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "false")
+
+    settings = WorkerSettings(_env_file=None)
+
+    # Must not raise: static-analysis alone is enough to produce a review.
+    check_step_configuration_viable(_step_enablement_from(settings))
+
+
+def test_static_analysis_enabled_with_prefilter_disabled_fails_the_viability_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_PREFILTER_ENABLED", "false")
+
+    settings = WorkerSettings(_env_file=None)
+
+    # static_analysis has a fixed dependency on prefilter's output — this
+    # combination would fail every review job at runtime, not just be
+    # sub-optimal.
+    with pytest.raises(NoViableStepConfigurationError):
+        check_step_configuration_viable(_step_enablement_from(settings))
+
+
+def test_llm_review_falling_back_to_disabled_prefilter_fails_the_viability_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_PREFILTER_ENABLED", "false")
+
+    settings = WorkerSettings(_env_file=None)
+
+    # static-analysis can't produce findings here, so apps/worker/main.py
+    # wires llm_review to depend directly on prefilter's output — a
+    # disabled prefilter would fail every review job at runtime.
+    with pytest.raises(NoViableStepConfigurationError):
+        check_step_configuration_viable(_step_enablement_from(settings))
+
+
+def test_llm_review_depending_on_static_analysis_tolerates_disabled_prefilter_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_PREFILTER_ENABLED", "false")
+
+    settings = WorkerSettings(_env_file=None)
+
+    # static-analysis is enabled (and can produce findings) but declares a
+    # fixed dependency on prefilter, so the static-analysis check above
+    # (not this one) is the check that must catch this combination.
+    with pytest.raises(NoViableStepConfigurationError):
+        check_step_configuration_viable(_step_enablement_from(settings))
+
+
+def test_output_disabled_fails_the_viability_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_OUTPUT_ENABLED", "false")
+
+    settings = WorkerSettings(_env_file=None)
+
+    # output is the only step that ever posts a review/check-run — a
+    # disabled output step would silently produce no visible result for
+    # every job, with no failure signal at all.
+    with pytest.raises(NoViableStepConfigurationError):
+        check_step_configuration_viable(_step_enablement_from(settings))
+
+
+# --- Phase 4: GitHub App auth / diff-fetch bootstrap config -----------------
+
+
+def test_github_app_fields_are_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.delenv("REVIEW_WORKER_GITHUB_APP_ID", raising=False)
+    monkeypatch.delenv("REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY", raising=False)
+
+    with pytest.raises(ValidationError):
+        WorkerSettings(_env_file=None)
+
+
+def test_github_fields_default_per_the_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.github_api_base_url == "https://api.github.com"
+    assert settings.github_api_timeout_seconds == 10.0
+    assert settings.github_retry_max_attempts == 3
+
+
+def test_github_app_private_key_never_appears_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert TEST_RSA_PRIVATE_KEY_PEM not in repr(settings)
+    assert TEST_RSA_PRIVATE_KEY_PEM not in str(settings.github_app_private_key)
+
+
+# --- Phase 4: adapter.github.auth.validate_private_key startup check -------
+#
+# Per the plan's Phase 4 Tests section: "a valid test RSA key passes; a
+# malformed/truncated key fails startup with SystemExit(1), the same shape
+# as the existing pgvector/LLM startup-check tests" — mirroring
+# `test_all_finding_producing_steps_disabled_fails_the_viability_check`'s
+# own precedent above of testing the pure check function directly, not
+# only through `main()`'s own SystemExit wrapping (covered separately in
+# `apps/worker/test_main.py`).
+
+
+def test_validate_private_key_accepts_a_valid_rsa_key() -> None:
+    # Must not raise.
+    validate_private_key(app_id=123456, private_key_pem=TEST_RSA_PRIVATE_KEY_PEM)
+
+
+def test_validate_private_key_rejects_a_malformed_key() -> None:
+    with pytest.raises(GitHubPrivateKeyInvalidError):
+        validate_private_key(app_id=123456, private_key_pem="not-a-real-private-key")
+
+
+def test_validate_private_key_rejects_a_truncated_key() -> None:
+    truncated = TEST_RSA_PRIVATE_KEY_PEM[: len(TEST_RSA_PRIVATE_KEY_PEM) // 2]
+    with pytest.raises(GitHubPrivateKeyInvalidError):
+        validate_private_key(app_id=123456, private_key_pem=truncated)

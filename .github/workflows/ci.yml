@@ -74,6 +74,32 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # Semgrep is already covered by uv sync --locked above (a
+      # pyproject.toml dependency, Phase 5). Gitleaks is not (a Go binary
+      # with no first-party Python packaging, per the plan's Assumptions
+      # section) — this job runs `pytest -m integration` directly on the
+      # runner, not inside the built Docker image (which vendors Gitleaks
+      # itself, per the Dockerfile), so the binary needs installing here
+      # too. Pinned to the same explicit tag as the Dockerfile
+      # (v8.21.2, never `:latest`), verified against a checksum published
+      # alongside that pinned GitHub release before use — a mismatch fails
+      # the build, the same fatal-not-warn action every other pinning check
+      # in this plan takes.
+      - name: Install Gitleaks (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION=8.21.2
+          ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL -o "$ARCHIVE" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${ARCHIVE}"
+          curl -sSL -o checksums.txt \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${ARCHIVE}\$" checksums.txt | sha256sum -c -
+          tar xzf "$ARCHIVE" gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          chmod +x /usr/local/bin/gitleaks
+          gitleaks version
+
       - name: pytest -m integration
         run: uv run pytest -m integration
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 import adapter.storage.startup_check_cli as cli
-from adapter.storage.exceptions import PgVectorNotInstalledError
+from adapter.storage.exceptions import PgVectorNotInstalledError, StorageConnectionError
 
 
 def test_main_exits_non_zero_when_database_url_missing(
@@ -33,6 +33,22 @@ def test_main_exits_non_zero_when_pgvector_missing(
 
     async def _fake_check(dsn: str) -> None:
         raise PgVectorNotInstalledError(dsn_summary="host/db")
+
+    monkeypatch.setattr(cli, "_check", _fake_check)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    assert excinfo.value.code == 1
+
+
+def test_main_exits_non_zero_when_postgres_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_DATABASE_URL", "postgresql+asyncpg://user:pass@host/db")
+
+    async def _fake_check(dsn: str) -> None:
+        raise StorageConnectionError(dsn_summary="host/db")
 
     monkeypatch.setattr(cli, "_check", _fake_check)
 

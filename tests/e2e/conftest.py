@@ -25,11 +25,31 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 PROJECT_NAME = "review_e2e"
 STUB_LLM_PORT = 1234
+
+
+def _generate_test_rsa_private_key_pem() -> str:
+    """A real (test-generated, never committed) RSA private key — Phase 4's
+    `REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY` is required, with no default, and
+    the Worker's own fail-fast startup check attempts a real RS256 signing
+    call with it, so a placeholder string would crash-loop the `worker`
+    service here the same way a real misconfiguration would."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem_bytes = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return pem_bytes.decode("utf-8")
+
+
+_TEST_RSA_PRIVATE_KEY_PEM = _generate_test_rsa_private_key_pem()
 
 # Generous but bounded: image builds on this host can be slow the first time
 # (cold `uv sync` dependency download, and this host's Docker containers can
@@ -107,6 +127,10 @@ def base_compose_env(**overrides: str) -> dict[str, str]:
             "REVIEW_WORKER_ENVIRONMENT": "development",
             "REVIEW_WORKER_LLM_ENDPOINT": f"http://host.docker.internal:{STUB_LLM_PORT}/v1",
             "REVIEW_WORKER_LLM_TIMEOUT_SECONDS": "10",
+            # Required, no default (Phase 4) — see this module's own
+            # docstring on _generate_test_rsa_private_key_pem.
+            "REVIEW_WORKER_GITHUB_APP_ID": "123456",
+            "REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY": _TEST_RSA_PRIVATE_KEY_PEM,
         }
     )
     env.update(overrides)
@@ -191,3 +215,52 @@ def restart_count(service: str, env: dict[str, str]) -> int:
     if not cid:
         raise AssertionError(f"no container found for service {service!r}")
     return int(docker_inspect(cid, "{{.RestartCount}}"))
+
+
+def wait_for_log_line(
+    service: str, env: dict[str, str], text: str, timeout: float = _HEALTHY_TIMEOUT_SECONDS
+) -> None:
+    """Poll `docker compose logs <service>` until `text` appears — used for
+    services (the Worker, since Phase 3) with no compose-level healthcheck
+    to poll instead."""
+    deadline = time.monotonic() + timeout
+    last_logs = ""
+    while time.monotonic() < deadline:
+        last_logs = compose("logs", "--no-color", service, env=env).stdout
+        if text in last_logs:
+            return
+        time.sleep(1)
+    raise AssertionError(f"{service} logs did not contain {text!r} within {timeout}s:\n{last_logs}")
+
+
+def wait_for_running_stable(
+    service: str,
+    env: dict[str, str],
+    *,
+    observation_seconds: float = 10.0,
+    poll: float = 1.0,
+) -> None:
+    """Poll `service`'s container state for `observation_seconds`, asserting
+    it stays `running` (never `exited`/`restarting`) and its restart count
+    never changes — the "no crash-looping" proof for a service with no
+    compose-level healthcheck to poll instead (per Phase 3's
+    `docker-compose.yml` `worker` service comment: its dispatch loop, once
+    started, runs forever by design, so "still running" — not "exited
+    cleanly" — is the correct healthy signal from this phase onward).
+    """
+    baseline_restarts = restart_count(service, env)
+    deadline = time.monotonic() + observation_seconds
+    while time.monotonic() < deadline:
+        cid = container_id(service, env, all_states=True)
+        if not cid:
+            raise AssertionError(f"no container found for service {service!r}")
+        status = docker_inspect(cid, "{{.State.Status}}")
+        if status != "running":
+            raise AssertionError(f"{service} left the running state: now {status!r}")
+        current_restarts = restart_count(service, env)
+        if current_restarts != baseline_restarts:
+            raise AssertionError(
+                f"{service} restarted during the observation window "
+                f"(restart count {baseline_restarts} -> {current_restarts})"
+            )
+        time.sleep(poll)

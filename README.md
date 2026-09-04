@@ -26,3 +26,7 @@ Compose, using the same images Kubernetes runs in production.
 hardening" phase. Don't build automation against it expecting a stable
 contract yet; see the header comments in `charts/review/Chart.yaml` and
 `charts/review/values.yaml` for details.
+
+See [`docs/reference/operations.md`](docs/reference/operations.md) for
+operator-facing gotchas (restart-looping after an upgrade, rate-limiting
+defaults, running migrations before a Helm upgrade).

@@ -28,3 +28,11 @@ data:
   REVIEW_WORKER_LLM_ENDPOINT: {{ .Values.worker.llm.endpoint | quote }}
   REVIEW_WORKER_LLM_MODEL: {{ .Values.worker.llm.model | quote }}
   REVIEW_WORKER_LLM_TIMEOUT_SECONDS: {{ .Values.worker.llm.timeoutSeconds | quote }}
+  # GitHub App auth / diff fetch (Phase 4). github_app_id is public-ish,
+  # not sensitive (see the Security review) — github_app_private_key below
+  # is the sensitive counterpart, rendered via templates/secret.yaml
+  # instead.
+  REVIEW_WORKER_GITHUB_APP_ID: {{ .Values.worker.github.appId | quote }}
+  REVIEW_WORKER_GITHUB_API_BASE_URL: {{ .Values.worker.github.apiBaseUrl | quote }}
+  REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: {{ .Values.worker.github.apiTimeoutSeconds | quote }}
+  REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: {{ .Values.worker.github.retryMaxAttempts | quote }}

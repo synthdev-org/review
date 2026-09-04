@@ -12,7 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.community.postgres import PostgresContainer
 
 from adapter.storage.engine import create_storage_engine
-from adapter.storage.exceptions import PgVectorNotInstalledError, StorageError
+from adapter.storage.exceptions import (
+    PgVectorNotInstalledError,
+    StorageConnectionError,
+    StorageError,
+)
 from adapter.storage.pgvector_check import check_pgvector_installed
 
 pytestmark = pytest.mark.integration
@@ -23,6 +27,26 @@ async def test_check_passes_once_extension_is_enabled(migrated_engine: AsyncEngi
     """The baseline migration runs `CREATE EXTENSION vector`, so a freshly
     migrated database passes the check without raising."""
     await check_pgvector_installed(migrated_engine)
+
+
+@pytest.mark.asyncio
+async def test_check_raises_typed_connection_error_when_postgres_unreachable() -> None:
+    """Per the plan's Phase 1 section: the check is genuinely extended to
+    catch a connection failure at `engine.connect()` too — not just the
+    "extension missing" case, which requires a connection to have already
+    succeeded. Nothing is listening on this port, a genuine
+    connection-refused."""
+    engine = create_storage_engine("postgresql+asyncpg://postgres:postgres@localhost:1/nonexistent")
+    try:
+        with pytest.raises(StorageConnectionError) as excinfo:
+            await check_pgvector_installed(engine)
+
+        assert isinstance(excinfo.value, StorageError)
+        # Credentials/DSN never leak into the error message.
+        assert "postgres:postgres" not in str(excinfo.value)
+        assert "@" not in str(excinfo.value)
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

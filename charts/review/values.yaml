@@ -74,7 +74,31 @@ worker:
     endpoint: http://host.docker.internal:1234/v1
     model: local-model
     timeoutSeconds: 30
-  resources: {}
+  # GitHub App server-to-server auth / diff fetch (Phase 4). `appId` is
+  # public-ish, not sensitive (see the Security review — "github_app_id is
+  # a public-ish identifier, not sensitive, so it belongs in the
+  # ConfigMap, not the Secret"), unlike `github.appPrivateKey` below, which
+  # follows the shared credential-field shape (see this file's own header
+  # comment).
+  github:
+    appId: ""
+    apiBaseUrl: https://api.github.com
+    apiTimeoutSeconds: 10
+    retryMaxAttempts: 3
+  # Phase 5: non-empty defaults, closing the gap between the pipeline's own
+  # per-step timeout (Phase 2) and actual container enforcement — a
+  # pathological diff or a misbehaving analyzer subprocess (Gitleaks,
+  # Semgrep) is bounded by both, not the timeout alone. Mirrors
+  # docker-compose.yml's own worker service `mem_limit`/`cpus` figures;
+  # tunable per-deployment via a values override, not hardcoded by the
+  # chart itself.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
 
 # --- Credential fields (see the file header for the shared shape) ---
 
@@ -88,6 +112,17 @@ github:
   # helper validation) — mirrors WebhookAPISettings' own
   # model_validator that requires it exactly when setup_mode is enabled.
   setupStateSecret:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+  # Required (Phase 4) — adapter/github/auth.py's JWT signing cannot
+  # function without the App's own private key. Left blank here (no safe
+  # default, like database.url.value below): the Worker's own fail-fast
+  # startup check (validate_private_key) refuses to boot with an unset or
+  # unusable value rather than posting nothing and failing silently
+  # mid-review.
+  appPrivateKey:
     value: ""
     existingSecret:
       name: ""

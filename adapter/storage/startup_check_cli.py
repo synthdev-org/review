@@ -24,7 +24,7 @@ import os
 import sys
 
 from adapter.storage.engine import create_storage_engine
-from adapter.storage.exceptions import PgVectorNotInstalledError
+from adapter.storage.exceptions import PgVectorNotInstalledError, StorageConnectionError
 from adapter.storage.pgvector_check import check_pgvector_installed
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ def main() -> None:
 
     try:
         asyncio.run(_check(dsn))
-    except PgVectorNotInstalledError as exc:
+    except (PgVectorNotInstalledError, StorageConnectionError) as exc:
         logger.error("pgvector startup check failed: %s", exc)
         sys.exit(1)
 

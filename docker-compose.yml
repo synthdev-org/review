@@ -74,6 +74,12 @@ services:
     environment:
       REVIEW_WEBHOOK_API_ENVIRONMENT: ${REVIEW_WEBHOOK_API_ENVIRONMENT:-development}
       REVIEW_WEBHOOK_API_LOG_LEVEL: ${REVIEW_WEBHOOK_API_LOG_LEVEL:-INFO}
+      # Required, no default (Phase 1) — installation/org/repo resolution
+      # and delivery-idempotency (tenancy/resolution.py) cannot function
+      # without a database. Same variable name migrate's block already
+      # injects (adapter/storage/migrations/env.py reads it directly).
+      REVIEW_DATABASE_URL: >-
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
       # Required, no default — the webhook receiver's HMAC trust boundary
       # (docs/plans's Security review) cannot function without one.
       REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET: >-
@@ -83,6 +89,10 @@ services:
         ${REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_MAX_REQUESTS:-30}
       REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_WINDOW_SECONDS: >-
         ${REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_WINDOW_SECONDS:-60}
+      # Disabled (0) by default, per the plan's Phase 1 pre-activation-gate
+      # policy — see .env.example's own comment on this variable.
+      REVIEW_WEBHOOK_API_REVIEW_ENQUEUE_RATE_LIMIT_PER_MINUTE: >-
+        ${REVIEW_WEBHOOK_API_REVIEW_ENQUEUE_RATE_LIMIT_PER_MINUTE:-0}
       # SETUP_MODE off by default, per the plan's Security review
       # ("Manifest-flow gating") — only enable for the duration of a
       # one-time GitHub App creation flow.
@@ -122,6 +132,12 @@ services:
     environment:
       REVIEW_WORKER_ENVIRONMENT: ${REVIEW_WORKER_ENVIRONMENT:-development}
       REVIEW_WORKER_LOG_LEVEL: ${REVIEW_WORKER_LOG_LEVEL:-INFO}
+      # Required, no default (Phase 3) — the claim/dispatch loop below
+      # (apps/worker/dispatch.py) cannot claim or mark jobs without a
+      # database. Same variable name migrate's/webhook_api's blocks already
+      # inject.
+      REVIEW_DATABASE_URL: >-
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
       # LM Studio's OpenAI-compatible endpoint on the Docker host, per the
       # plan's Phase 5 instruction and the C4 doc's Level 3 diagram.
       REVIEW_WORKER_LLM_ENDPOINT: >-
@@ -129,6 +145,21 @@ services:
       REVIEW_WORKER_LLM_API_KEY: ${REVIEW_WORKER_LLM_API_KEY:-not-needed}
       REVIEW_WORKER_LLM_MODEL: ${REVIEW_WORKER_LLM_MODEL:-local-model}
       REVIEW_WORKER_LLM_TIMEOUT_SECONDS: ${REVIEW_WORKER_LLM_TIMEOUT_SECONDS:-30}
+      REVIEW_WORKER_POLL_INTERVAL_SECONDS: ${REVIEW_WORKER_POLL_INTERVAL_SECONDS:-2}
+      REVIEW_WORKER_STUCK_JOB_WARNING_THRESHOLD_SECONDS: >-
+        ${REVIEW_WORKER_STUCK_JOB_WARNING_THRESHOLD_SECONDS:-450}
+      # Required, no default (Phase 4) — adapter/github/auth.py's JWT
+      # signing (the GitHub App server-to-server auth flow) cannot function
+      # without the App's own identity/private key. Without these, the
+      # Worker crash-loops under `restart: unless-stopped` above — see
+      # docs/reference/operations.md's dedicated entry for this case.
+      REVIEW_WORKER_GITHUB_APP_ID: >-
+        ${REVIEW_WORKER_GITHUB_APP_ID:?set REVIEW_WORKER_GITHUB_APP_ID in .env, see .env.example}
+      REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY: >-
+        ${REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY:?set REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY in .env, see .env.example}
+      REVIEW_WORKER_GITHUB_API_BASE_URL: ${REVIEW_WORKER_GITHUB_API_BASE_URL:-https://api.github.com}
+      REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: ${REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS:-10}
+      REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: ${REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS:-3}
     # `host.docker.internal` is provided for free on Docker Desktop, but
     # plain Docker Engine on Linux needs this mapping to resolve it — this
     # is what actually makes the C4 doc's "worker calls LM Studio on the
@@ -139,17 +170,35 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    # No compose-level healthcheck: the Worker has no HTTP surface yet — no
-    # job-dispatch loop exists until a later roadmap phase (see
-    # apps/worker/main.py's module docstring, "Replaced by a real
-    # claim/dispatch loop once a later phase's job-queue dispatch logic
-    # exists"). Its startup connectivity check against the LLM endpoint
-    # *is* the health signal for this phase: `main()` logs "llm endpoint
-    # reachable" then "worker idle: no job dispatch wired yet" and returns,
-    # so the container exits 0 on success — a clean, intentional exit per
-    # the roadmap's "no review capability yet" scope, not a crash. `restart:
-    # "no"` (Compose's default, made explicit here) means a genuine
-    # LLM-unreachable failure exits non-zero exactly once rather than
-    # crash-looping — see tests/e2e/test_compose_stack.py for the assertion
-    # that this exit is clean (code 0, zero restarts), not a crash loop.
-    restart: "no"
+    # Resource limits (Phase 5) — closes the gap between this pipeline's
+    # per-step timeout (Phase 2) and actual container enforcement: a
+    # pathological diff or a misbehaving analyzer subprocess (Gitleaks,
+    # Semgrep) is bounded by both, not the timeout alone. Concrete starting
+    # figures sized to run Gitleaks/Semgrep plus the Worker process
+    # comfortably on a typical single-node Compose deployment (including
+    # both analyzer sub-steps each materializing their own copy of the same
+    # pre-filtered diff concurrently — see review/static_analysis.py's own
+    # docstring), tunable per-deployment, not a value the platform
+    # hardcodes.
+    mem_limit: 2g
+    cpus: "2"
+    # No compose-level healthcheck: the Worker has no HTTP surface to probe
+    # (apps/worker/dispatch.py's claim/dispatch loop, Phase 3, has no HTTP
+    # surface either) — real liveness probing (a heartbeat file or a
+    # minimal local health endpoint) is Phase 8 (production hardening)
+    # scope, not built here. `main()`'s own startup checks (LLM
+    # reachability, step configuration) are the fail-fast signal instead:
+    # a genuine misconfiguration still exits non-zero at startup, logged
+    # clearly, before this service ever reaches its dispatch loop. Once
+    # past startup, `main()` runs the dispatch loop forever (Phase 3) — a
+    # clean, intentional non-return, not a crash — so `restart:
+    # unless-stopped` (not Compose's `"no"` default, unlike Phase 0/1/2's
+    # "no dispatch loop wired yet" state that this replaces) keeps the
+    # container up across the process's own long lifetime. A genuine
+    # startup-check failure now restart-loops indefinitely rather than
+    # exiting once — see docs/reference/operations.md's first entry for the
+    # operator-facing diagnosis this trade-off requires — and
+    # tests/e2e/test_compose_stack.py asserts the container stays
+    # `running` (not `exited`) and never restarts during its observation
+    # window, not the old "exits 0 once" claim.
+    restart: unless-stopped
