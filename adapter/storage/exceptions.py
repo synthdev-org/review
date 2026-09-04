@@ -32,3 +32,25 @@ class PgVectorNotInstalledError(StorageError):
             "before starting this service."
         )
         self.dsn_summary = dsn_summary
+
+
+class StorageConnectionError(StorageError):
+    """Raised when Postgres itself could not be reached at all (as opposed
+    to being reachable but missing the ``pgvector`` extension).
+
+    Per the plan's Phase 1 section: ``adapter/storage/pgvector_check.py``'s
+    ``check_pgvector_installed`` is genuinely extended to catch a
+    connection failure at ``engine.connect()`` and re-raise it as this
+    error — the same ``dsn_summary``-redacted shape as
+    ``PgVectorNotInstalledError``, never a raw driver exception, per
+    architecture.md's "specific exception types per domain concern" rule.
+    """
+
+    def __init__(self, *, dsn_summary: str, detail: str | None = None) -> None:
+        message = (
+            f"Could not connect to the configured Postgres database ({dsn_summary})."
+            if detail is None
+            else f"Postgres database error ({dsn_summary}): {detail}."
+        )
+        super().__init__(message)
+        self.dsn_summary = dsn_summary

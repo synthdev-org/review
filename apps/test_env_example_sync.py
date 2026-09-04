@@ -7,11 +7,15 @@ edit — this test catches drift in both directions: a Settings field with no
 documented env var, and a documented env var that no longer maps to any
 field.
 
-REVIEW_DATABASE_URL is deliberately excluded from the field-derived checks:
-it's read directly via `os.environ` by adapter/storage's Alembic env.py and
-pgvector startup check (see their module docstrings), not parsed through
-either Settings model — but it must still appear in .env.example, so it's
-checked explicitly.
+Most fields derive their env var name from the class's own prefix
+(``REVIEW_WEBHOOK_API_``/``REVIEW_WORKER_``) plus the field name. One field
+(``WebhookAPISettings.database_url``, Phase 1) deliberately overrides that
+via ``pydantic.Field(validation_alias=...)`` to reuse the bare
+``REVIEW_DATABASE_URL`` variable Alembic/the pgvector startup check already
+read directly via ``os.environ`` (see their own module docstrings) — the
+same variable name, not a second, prefixed one — so ``_expected_env_vars``
+below honors an explicit ``validation_alias`` when a field declares one,
+rather than assuming the class prefix always applies.
 """
 
 from __future__ import annotations
@@ -33,7 +37,11 @@ def _env_example_keys() -> set[str]:
 
 
 def _expected_env_vars(settings_cls: type[BaseSettings], prefix: str) -> set[str]:
-    return {f"{prefix}{field_name.upper()}" for field_name in settings_cls.model_fields}
+    expected: set[str] = set()
+    for field_name, field_info in settings_cls.model_fields.items():
+        alias = field_info.validation_alias
+        expected.add(alias if isinstance(alias, str) else f"{prefix}{field_name.upper()}")
+    return expected
 
 
 def test_every_webhook_api_settings_field_is_documented() -> None:

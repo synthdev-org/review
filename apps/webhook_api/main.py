@@ -18,6 +18,14 @@ so tests can build an app from arbitrary settings — e.g. a low rate limit
 or a small body-size cap — without mutating process environment variables;
 the module-level ``app`` below is what uvicorn actually serves
 (``apps.webhook_api.main:app``).
+
+Phase 1 wires this entrypoint's first storage adapters: a
+``PostgresTenancyStore`` and a ``JobQueueRepository`` (both
+``adapter/storage``), built from one ``AsyncEngine``/session factory
+constructed here — the composition root, per architecture.md's "wire
+concrete implementations only at the composition root" rule — and passed
+into the webhook router alongside the (optionally ``None``) per-repo
+enqueue rate limiter.
 """
 
 from __future__ import annotations
@@ -26,6 +34,9 @@ import logging
 
 from fastapi import FastAPI
 
+from adapter.storage.engine import create_session_factory, create_storage_engine
+from adapter.storage.queue import JobQueueRepository
+from adapter.storage.tenancy import PostgresTenancyStore
 from apps.webhook_api.logging_config import configure_logging
 from apps.webhook_api.manifest_routes import create_manifest_router
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
@@ -33,6 +44,40 @@ from apps.webhook_api.settings import WebhookAPISettings
 from apps.webhook_api.webhook_routes import create_webhook_router
 
 logger = logging.getLogger(__name__)
+
+
+def _build_enqueue_rate_limiter(settings: WebhookAPISettings) -> InMemoryRateLimiter | None:
+    """``review_enqueue_rate_limit_per_minute=0`` (this phase's shipped
+    default) is a documented sentinel meaning "skip the rate-check call
+    entirely" — handled here at the call site, not by loosening
+    ``InMemoryRateLimiter``'s own ``max_requests >= 1`` guard, which stays
+    exactly as strict for its existing per-IP use. Logs at ``warning`` when
+    inactive (this phase's own shipped default leaves a known
+    cost-exhaustion vector open — see the plan's Phase 1 "Assumptions"
+    section) or ``info`` when an operator has actively raised it above
+    ``0``, so an operator or PRD owner can confirm the deployment's actual
+    state without reading config files either way.
+    """
+    if settings.review_enqueue_rate_limit_per_minute == 0:
+        logger.warning(
+            "per-repo review-enqueue rate limiting is disabled "
+            "(review_enqueue_rate_limit_per_minute=0); this is Phase 1's own "
+            "shipped default, matching phase-1-review-pipeline.md's current "
+            "NFR text, but leaves a known cost-exhaustion vector open — see "
+            "the plan's Phase 1 Assumptions section"
+        )
+        return None
+
+    logger.info(
+        "per-repo review-enqueue rate limiting is active",
+        extra={
+            "review_enqueue_rate_limit_per_minute": settings.review_enqueue_rate_limit_per_minute
+        },
+    )
+    return InMemoryRateLimiter(
+        max_requests=settings.review_enqueue_rate_limit_per_minute,
+        window_seconds=60.0,
+    )
 
 
 def create_app(settings: WebhookAPISettings) -> FastAPI:
@@ -44,6 +89,12 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
         """Liveness/readiness probe target."""
         return {"status": "ok"}
 
+    engine = create_storage_engine(settings.database_url.get_secret_value())
+    session_factory = create_session_factory(engine)
+    tenancy_store = PostgresTenancyStore(session_factory)
+    job_queue = JobQueueRepository(session_factory)
+    enqueue_rate_limiter = _build_enqueue_rate_limiter(settings)
+
     rate_limiter = InMemoryRateLimiter(
         max_requests=settings.webhook_rate_limit_max_requests,
         window_seconds=settings.webhook_rate_limit_window_seconds,
@@ -53,6 +104,10 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
             webhook_secret=settings.github_webhook_secret,
             rate_limiter=rate_limiter,
             max_body_bytes=settings.webhook_max_body_bytes,
+            tenancy_store=tenancy_store,
+            job_queue=job_queue,
+            session_factory=session_factory,
+            enqueue_rate_limiter=enqueue_rate_limiter,
         )
     )
 

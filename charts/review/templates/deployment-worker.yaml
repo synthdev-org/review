@@ -26,6 +26,7 @@ spec:
                 name: {{ include "review.fullname" . }}-config
           env:
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WORKER_LLM_API_KEY" "field" .Values.llm.apiKey "secretName" (include "review.secretName" .) "secretKey" "llm-api-key") | nindent 12 }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY" "field" .Values.github.appPrivateKey "secretName" (include "review.secretName" .) "secretKey" "github-app-private-key") | nindent 12 }}
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_DATABASE_URL" "field" .Values.database.url "secretName" (include "review.secretName" .) "secretKey" "database-url") | nindent 12 }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

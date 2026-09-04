@@ -23,6 +23,7 @@ _EXPECTED_TABLES = {
     "job_queue",
     "model_routing_config",
     "org_repo_team_setting",
+    "webhook_delivery",
     "alembic_version",
 }
 
@@ -31,8 +32,17 @@ _EXPECTED_TABLES = {
 # a table with the right name.
 _EXPECTED_COLUMNS = {
     "org": {"id", "name", "slug", "created_at", "updated_at"},
-    "repo": {"id", "org_id", "name", "full_name", "created_at", "updated_at"},
+    "repo": {
+        "id",
+        "org_id",
+        "name",
+        "full_name",
+        "installation_id",
+        "created_at",
+        "updated_at",
+    },
     "team": {"id", "org_id", "name", "created_at", "updated_at"},
+    "webhook_delivery": {"id", "created_at"},
     "job_queue": {
         "id",
         "job_type",

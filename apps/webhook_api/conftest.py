@@ -3,18 +3,35 @@
 `apps/webhook_api/main.py` parses `WebhookAPISettings()` at import time (it
 needs a module-level `app` object for uvicorn to discover as
 `apps.webhook_api.main:app`), so any test module that imports it needs
-`REVIEW_WEBHOOK_API_ENVIRONMENT` and (as of Phase 4)
-`REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET` set before that import happens —
-the latter is a required field with no default (see settings.py). pytest
-imports `conftest.py` before collecting sibling test modules in this
+`REVIEW_WEBHOOK_API_ENVIRONMENT`, `REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET`
+(Phase 4), and (Phase 1) the bare `REVIEW_DATABASE_URL` set before that
+import happens — all required fields with no default (see settings.py).
+pytest imports `conftest.py` before collecting sibling test modules in this
 directory, so setting defaults here (only if not already set) covers every
 test file in this package without each one repeating it. Tests that need a
 *specific* secret/settings value (e.g. to compute a matching webhook
-signature) construct their own `WebhookAPISettings(...)` directly instead
-of relying on these process-wide defaults.
+signature, or a real testcontainers Postgres DSN) construct their own
+`WebhookAPISettings(...)` directly instead of relying on these process-wide
+defaults. The `REVIEW_DATABASE_URL` default below is a syntactically valid
+but unreachable DSN — safe at import time only because
+`adapter.storage.engine.create_storage_engine`/`create_session_factory` are
+non-connecting, synchronous factory calls (see their own docstrings); any
+test that actually exercises a DB-touching route builds its own settings
+with a real testcontainers DSN instead.
+
+Per docs/rules/testing.md's middle tier: every DB-touching integration test
+in this package runs against a real Postgres via `testcontainers-python` —
+`migrated_engine`/`pgvector_container` are imported from
+`adapter/storage/conftest.py` (not redefined here) so this package reuses
+that same fixture machinery rather than a second, near-duplicate copy.
 """
 
 import os
 
+from adapter.storage.conftest import migrated_engine, pgvector_container  # noqa: F401
+
 os.environ.setdefault("REVIEW_WEBHOOK_API_ENVIRONMENT", "development")
 os.environ.setdefault("REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET", "conftest-default-webhook-secret")
+os.environ.setdefault(
+    "REVIEW_DATABASE_URL", "postgresql+asyncpg://unused:unused@localhost:5432/unused"
+)

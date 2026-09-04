@@ -13,6 +13,27 @@ dependencies = [
     "asyncpg>=0.29,<1",
     "alembic>=1.13,<2",
     "litellm>=1.98.0,<2",
+    # Phase 4: adapter/github/manifest.py's exchange_temporary_code (Phase 0)
+    # already imports httpx, but it was only ever listed under the dev
+    # dependency group — a latent gap this phase's own dependency check
+    # surfaced (the built runtime image, which runs `uv sync --no-dev`, was
+    # already broken for that route). Moved to main dependencies here, the
+    # first phase to add a production GitHub-calling code path
+    # (adapter/github/auth.py, diff.py) that would ship the same way if left
+    # uncorrected. See the plan's Phase 4 section.
+    "httpx>=0.27,<1",
+    # Phase 4: RS256 JWT signing for the GitHub App server-to-server
+    # auth flow (adapter/github/auth.py) — no existing dependency or stdlib
+    # module covers this (manifest.py's HMAC-based setup-state signing is a
+    # different, symmetric primitive). Pulls in `cryptography` as its RS256
+    # backend.
+    "pyjwt[crypto]>=2.9,<3",
+    # Phase 5: Semgrep (adapter/analyzers/semgrep.py) ships a proper PyPI
+    # wheel — added like any other library, per the plan's Assumptions
+    # section ("Analyzer binary packaging"). Gitleaks does not (a Go binary
+    # with no first-party Python packaging) — it's vendored into the
+    # Dockerfile's runtime/dev stages instead, per that same section.
+    "semgrep>=1.85,<2",
 ]
 
 [dependency-groups]
@@ -21,7 +42,6 @@ dev = [
     "mypy>=1.13,<2",
     "pytest>=8.3,<9",
     "pytest-asyncio>=0.24,<1",
-    "httpx>=0.27,<1",
     "testcontainers[postgres]>=4.8,<5",
     "respx>=0.21,<1",
     "pyyaml>=6.0,<7",

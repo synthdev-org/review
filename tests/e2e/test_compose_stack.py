@@ -12,10 +12,14 @@ Webhook API's actual entrypoint" E2E rule):
     against the compose Postgres instance — verified two ways: the
     `migrate` service itself exited 0, and the expected baseline schema
     (the `org` table Phase 2's migration creates) is actually queryable.
-  * `apps/worker` is running without crash-looping: it exits 0 (a clean,
-    intentional exit — see docker-compose.yml's `worker` service comment
-    for why that, not "still Up", is the correct signal at this phase) and
-    was never restarted.
+  * `apps/worker` is running without crash-looping: since Phase 3 wires its
+    claim/dispatch loop (which runs forever by design — see
+    `apps/worker/dispatch.py`'s own docstring), a clean, intentional
+    *non-return* is now the healthy signal, not the Phase 0-2 "exits 0"
+    signal this test previously asserted (see docker-compose.yml's
+    `worker` service comment for the full before/after). The container
+    logs "worker started" and then stays in the `running` state, never
+    restarting, for the test's observation window.
 """
 
 from __future__ import annotations
@@ -30,9 +34,10 @@ from tests.e2e.conftest import (
     compose,
     compose_down,
     container_id,
-    restart_count,
     wait_for_exit,
     wait_for_healthy,
+    wait_for_log_line,
+    wait_for_running_stable,
 )
 
 
@@ -100,19 +105,34 @@ def test_migrations_and_pgvector_check_applied(running_stack: dict[str, str]) ->
 def test_worker_boots_cleanly_without_crash_looping(running_stack: dict[str, str]) -> None:
     env = running_stack
 
-    exit_code = wait_for_exit("worker", env)
-
-    # Per docker-compose.yml's `worker` service comment: main() runs its
-    # LLM-reachability startup check, logs "worker idle: no job dispatch
-    # wired yet", and returns — a clean, intentional exit is *success* at
-    # this phase, not a crash. `restart: "no"` plus RestartCount == 0
-    # together are the actual "no crash-looping" proof: a real failure
-    # would exit 1 (see apps/worker/main.py's `SystemExit(1)` on LLM
-    # unreachable) and, under a restart policy, keep restarting — neither
-    # happened here.
-    assert exit_code == 0
-    assert restart_count("worker", env) == 0
+    # Per docker-compose.yml's `worker` service comment: Phase 3's
+    # claim/dispatch loop runs forever by design once main()'s startup
+    # checks pass — "still running", not "exited 0", is the healthy signal
+    # from this phase onward. `restart: unless-stopped` plus a stable
+    # RestartCount over the observation window together are the actual
+    # "no crash-looping" proof: a real startup-check failure would exit 1
+    # (see apps/worker/main.py's `SystemExit(1)` on LLM unreachable) and,
+    # under this restart policy, keep restarting — neither happens here.
+    wait_for_log_line("worker", env, "worker started")
 
     logs = compose("logs", "--no-color", "worker", env=env).stdout
     assert "llm endpoint reachable" in logs
-    assert "worker idle: no job dispatch wired yet" in logs
+    assert "worker started" in logs
+
+    wait_for_running_stable("worker", env)
+
+
+def test_worker_runs_as_non_root(running_stack: dict[str, str]) -> None:
+    """Phase 5: proves the built image actually runs as non-root, not only
+    that the Dockerfile source says so — a regression here (e.g. a future
+    edit accidentally dropping the ``USER`` line) would otherwise go
+    undetected until an actual incident. See the Security review's "No
+    process-level privilege separation" section.
+    """
+    env = running_stack
+    wait_for_log_line("worker", env, "worker started")
+
+    result = compose("exec", "-T", "worker", "id", "-u", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() != "0", "worker container is running as root (uid 0)"

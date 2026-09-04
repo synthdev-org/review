@@ -32,7 +32,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -92,6 +92,14 @@ class Repo(Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(511), nullable=False)
+    # Which GitHub App installation this repo belongs to. Nullable, no
+    # default, per the plan's Phase 1 section: existing Phase-0-era rows
+    # predate any installation mapping and have no value to backfill; Phase
+    # 1's own resolution logic (tenancy/resolution.py via
+    # adapter/storage/tenancy.py) only ever reads/writes it for rows it
+    # itself provisions or updates, treating NULL as "not yet resolved"
+    # rather than an invariant violation.
+    installation_id: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -196,6 +204,36 @@ class ModelRoutingConfig(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+
+class WebhookDeliveryRow(Base):
+    """Anti-replay record of a uniquely-delivered GitHub webhook, per the
+    plan's Phase 1 section (closing the gap Phase 0's own plan flagged
+    forward: "Phase 1 ... should dedupe on GitHub's ``X-GitHub-Delivery``
+    header before this becomes a real vector").
+
+    ``id`` *is* the delivery id (GitHub's own ``X-GitHub-Delivery`` header
+    value) rather than a separate surrogate key — its own uniqueness is
+    exactly the anti-replay invariant this table exists to enforce, so a
+    second primary-key column would add nothing.
+    ``adapter/storage/tenancy.py``'s ``record_delivery_if_new`` inserts via
+    Postgres's native ``INSERT ... ON CONFLICT DO NOTHING`` against this
+    primary key rather than a raw ``IntegrityError`` catch, per that
+    module's own docstring.
+
+    No retention/pruning policy yet — every uniquely-delivered webhook
+    inserts a permanent row here, including ones later rejected by the
+    per-repo rate limiter. Unbounded Postgres growth over time is a named,
+    accepted gap for this phase; a scheduled pruning job is Phase 8
+    operational hardening, not built here.
+    """
+
+    __tablename__ = "webhook_delivery"
+
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 
