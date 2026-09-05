@@ -62,6 +62,28 @@ own" docstring note. This phase also reads `WorkerSettings.dry_run` once
 here and threads it into `apps/worker/dispatch.py`'s `run_dispatch_loop`,
 which sets it on every claimed job's shared `StepContext`.
 
+Phase 4 of the indexing delivery plan (docs/plans/plan-indexing-delivery.md
+— a separate plan from the "Phase N" numbering used by every docstring
+paragraph above this one, disambiguated explicitly here) adds a fourth
+fail-fast startup check: the bundled local embedding model
+(`adapter.embedding.local_onnx.LocalONNXEmbeddingClient`) is verified to
+load and produce a real inference result once at startup
+(`adapter.embedding.startup_check.check_embedding_model_loaded`), the same
+fail-fast pattern as the LLM-reachability, step-configuration, and GitHub
+private-key checks above.
+
+Phase 7 of the indexing delivery plan wires the `LocalONNXEmbeddingClient`
+built for that startup check (no second client) into the indexing job
+dispatch path: `adapter.github.tree.GitHubTreeFetcher` (sharing the same
+`GitHubInstallationTokenProvider`/`httpx.AsyncClient` every other GitHub
+adapter here already shares — no second token cache) and
+`adapter.storage.indexing_repository.IndexingRepository` (sharing the same
+`session_factory` `JobQueueRepository` already uses) are constructed here
+and bundled into `indexing.pipeline.IndexingJobDependencies`, threaded into
+`apps/worker/dispatch.py`'s `run_dispatch_loop` — replacing that module's
+prior `INDEX`-job stub with a real call into
+`indexing.pipeline.run_indexing_job`.
+
 Settings are parsed and logging configured inside `main()`, not at module
 import time, so importing this module (mypy, pytest collection) never
 requires environment variables or performs process-level side effects.
@@ -77,17 +99,23 @@ import httpx
 
 from adapter.analyzers.gitleaks import GitleaksAnalyzer, GitleaksTextRedactor
 from adapter.analyzers.semgrep import SemgrepAnalyzer
+from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
+from adapter.embedding.startup_check import check_embedding_model_loaded
 from adapter.github.auth import GitHubInstallationTokenProvider, validate_private_key
 from adapter.github.diff import GitHubDiffFetcher
 from adapter.github.exceptions import GitHubPrivateKeyInvalidError
 from adapter.github.posting import GitHubFindingsPublisher
+from adapter.github.tree import GitHubTreeFetcher
 from adapter.llm.litellm_client import LiteLLMClient
 from adapter.storage.engine import create_session_factory, create_storage_engine
+from adapter.storage.indexing_repository import IndexingRepository
 from adapter.storage.queue import JobQueueRepository
 from apps.worker.dispatch import run_dispatch_loop
 from apps.worker.logging_config import configure_logging
 from apps.worker.settings import WorkerSettings
 from findings.redact import NoOpTextRedactor, TextRedactor
+from indexing.embedding import EmbeddingError
+from indexing.pipeline import IndexingJobDependencies
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMError
 from llmgateway.startup_check import check_llm_reachable
@@ -179,6 +207,50 @@ def _log_github_retry_configuration(settings: WorkerSettings, logger: logging.Lo
         )
 
 
+def _build_embedding_client(settings: WorkerSettings) -> LocalONNXEmbeddingClient:
+    """Wire the indexing domain's `EmbeddingClient` Protocol to its local
+    ONNX-backed implementation, per architecture.md's "wire concrete
+    implementations only at the composition root" rule — the indexing
+    delivery plan's Phase 4 counterpart to `_build_llm_client` above.
+    `settings.embedding_model_path` points at the Dockerfile's
+    checksum-verified, baked-in model directory (see that file's own
+    `embedding-model` stage) — never a network location.
+    """
+    return LocalONNXEmbeddingClient(model_path=settings.embedding_model_path)
+
+
+def _check_embedding_model_startup(
+    client: LocalONNXEmbeddingClient, settings: WorkerSettings, logger: logging.Logger
+) -> None:
+    """Run the local embedding model's startup load/inference check and
+    raise `SystemExit(1)` if it fails — the same fail-fast pattern as
+    `_check_llm_startup` and `adapter/storage/pgvector_check.py` before it
+    (indexing delivery plan's Phase 4 "Non-Functional Requirements"
+    section). A missing/corrupted baked model artifact fails loudly here,
+    at Worker boot, rather than silently on the first real `INDEX` job's
+    `embed` stage.
+
+    Deliberately called synchronously, not via `asyncio.to_thread` (unlike
+    Phase 7's per-file `embed` calls once the real dispatch loop exists) —
+    this runs exactly once, before the dispatch loop starts, the same way
+    `_check_github_private_key_startup`'s own synchronous
+    `validate_private_key` call already blocks startup briefly by design.
+    """
+    try:
+        check_embedding_model_loaded(client)
+    except EmbeddingError as exc:
+        logger.error(
+            "local embedding model is not usable at startup; exiting",
+            extra={"embedding_model_path": settings.embedding_model_path, "error": str(exc)},
+        )
+        raise SystemExit(1) from exc
+
+    logger.info(
+        "local embedding model loaded",
+        extra={"embedding_model_path": settings.embedding_model_path},
+    )
+
+
 def _build_token_provider(
     settings: WorkerSettings, http_client: httpx.AsyncClient
 ) -> GitHubInstallationTokenProvider:
@@ -243,6 +315,46 @@ def _build_findings_publisher(
         timeout=settings.github_api_timeout_seconds,
         max_retry_attempts=settings.github_retry_max_attempts,
         client=http_client,
+    )
+
+
+def _build_tree_fetcher(
+    settings: WorkerSettings,
+    token_provider: GitHubInstallationTokenProvider,
+    http_client: httpx.AsyncClient,
+) -> GitHubTreeFetcher:
+    """Wire the indexing domain's `RepoTreeFetcher` Protocol to its
+    GitHub-backed implementation (indexing delivery plan's Phase 7),
+    sharing `token_provider`/`http_client` with `_build_diff_fetcher`/
+    `_build_findings_publisher` rather than constructing a second token
+    cache or a second long-lived client — same reasoning as
+    `_build_token_provider`'s own docstring.
+    """
+    return GitHubTreeFetcher(
+        token_provider=token_provider,
+        github_api_base_url=settings.github_api_base_url,
+        timeout=settings.github_api_timeout_seconds,
+        max_retry_attempts=settings.github_retry_max_attempts,
+        client=http_client,
+    )
+
+
+def _build_indexing_deps(
+    tree_fetcher: GitHubTreeFetcher,
+    embedding_client: LocalONNXEmbeddingClient,
+    index_repository: IndexingRepository,
+) -> IndexingJobDependencies:
+    """Bundle the indexing domain's four Protocol-typed dependencies
+    (indexing delivery plan's Phase 7) — `IndexingRepository` implements
+    both `IndexRepository` and `IndexCommitTracker` (Assumption 13's
+    split), so the same instance is passed for both roles here, the one
+    place this composition root's own concrete class is named.
+    """
+    return IndexingJobDependencies(
+        tree_fetcher=tree_fetcher,
+        embedding_client=embedding_client,
+        index_repository=index_repository,
+        commit_tracker=index_repository,
     )
 
 
@@ -422,6 +534,7 @@ def _build_worker_id() -> str:
 async def _run_dispatch_loop_forever(
     job_queue: JobQueueRepository,
     registry: StepRegistry,
+    indexing_deps: IndexingJobDependencies,
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
@@ -444,6 +557,7 @@ async def _run_dispatch_loop_forever(
         await run_dispatch_loop(
             job_queue=job_queue,
             review_registry=registry,
+            indexing_deps=indexing_deps,
             worker_id=worker_id,
             poll_interval_seconds=settings.poll_interval_seconds,
             stuck_job_warning_threshold_seconds=settings.stuck_job_warning_threshold_seconds,
@@ -476,6 +590,9 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
     _check_github_private_key_startup(settings, logger)
     _log_github_retry_configuration(settings, logger)
 
+    embedding_client = _build_embedding_client(settings)
+    _check_embedding_model_startup(embedding_client, settings, logger)
+
     engine = create_storage_engine(settings.database_url.get_secret_value())
     session_factory = create_session_factory(engine)
     job_queue = JobQueueRepository(session_factory)
@@ -492,10 +609,15 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
     registry = _build_review_registry(
         enablement, timeouts, diff_fetcher, redactor, client, publisher, settings
     )
+    tree_fetcher = _build_tree_fetcher(settings, token_provider, github_http_client)
+    index_repository = IndexingRepository(session_factory)
+    indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)
     worker_id = _build_worker_id()
 
     logger.info("worker started", extra={"worker_id": worker_id})
-    await _run_dispatch_loop_forever(job_queue, registry, settings, worker_id, github_http_client)
+    await _run_dispatch_loop_forever(
+        job_queue, registry, indexing_deps, settings, worker_id, github_http_client
+    )
 
 
 def main() -> None:

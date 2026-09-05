@@ -3,13 +3,22 @@
 Per the plan's Phase 4 section: "apps/webhook_api gains its first real
 route: a webhook receiver that verifies the signature and returns 401/200
 accordingly, with a request body size limit and basic rate limiting in
-front of it." Phase 1 (this module's current state) adds the rest of Unit
-A on top of that trust boundary: installation/org/repo resolution
-(auto-provisioning on first sight), delivery-id idempotency, a declarative
-trigger-set lookup, a per-repo enqueue rate limit, and the actual
-`JobQueueRepository.enqueue()` call — see the plan's Phase 1 section for
-the full design (particularly "Transaction boundary", which this module's
-`_handle_matched_trigger` implements).
+front of it." Phase 1 of `plan-phase-1-walking-skeleton.md` (this module's
+prior state) added the rest of that Unit A on top of that trust boundary:
+installation/org/repo resolution (auto-provisioning on first sight),
+delivery-id idempotency, a declarative trigger-set lookup, a per-repo
+enqueue rate limit, and the actual `JobQueueRepository.enqueue()` call.
+
+Phase 1 of `plan-indexing-delivery.md` (this module's current state)
+generalizes that single-job-type machinery to serve a second, independent
+trigger kind (`INDEX`, alongside the existing `REVIEW`) without duplicating
+it: `_JobCandidate`/`_handle_matched_triggers` replace the old
+`REVIEW`-only `_handle_matched_trigger`, resolving installation/org/repo
+and recording delivery idempotency exactly once per request (see
+"Transaction boundary" below), then attempting an enqueue for every trigger
+kind that matched this event — a `pull_request opened`/`synchronize`
+delivery can therefore enqueue both a `REVIEW` and an `INDEX` job from the
+same request, sharing one transaction.
 
 Rejection order matches the plan and Security review precisely: rate limit
 (cheapest — no body read needed) -> body size limit (enforced while
@@ -19,10 +28,10 @@ at ``warning`` with the reason only — never the payload body, per the
 plan's Observability & rollback section. Once past that boundary, this
 module never rejects a well-formed, correctly-signed webhook with a 4xx/5xx
 except for the one genuine mid-request-failure case documented on
-`_handle_matched_trigger` below — every other non-enqueuing outcome (no
-trigger match, a duplicate delivery, a rate-limited repo, missing PR
-fields) is still accepted (200) and logged at ``info`` with the reason, per
-the plan's Phase 1 section.
+`_handle_matched_triggers` below — every other non-enqueuing outcome (no
+trigger match, a duplicate delivery, a rate-limited repo, missing required
+fields, indexing disabled) is still accepted (200) and logged at ``info``
+with the reason, per the plan's Phase 1 sections.
 """
 
 from __future__ import annotations
@@ -30,20 +39,27 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from adapter.github.schemas import GitHubWebhookEnvelope
+from adapter.github.schemas import GitHubWebhookEnvelope, PushCommit
 from adapter.github.signature import verify_webhook_signature
-from adapter.github.triggers import is_enqueue_trigger
+from adapter.github.triggers import is_enqueue_trigger, is_index_trigger
 from adapter.storage.models import JobType
 from adapter.storage.queue import JobQueueRepository
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
 from tenancy.resolution import ResolutionResult, TenancyStore, WebhookEvent, resolve_installation
+
+# Skipped-reason values a rate-limited candidate can carry (used by the
+# should-commit rule in `_handle_matched_triggers` below: a request where
+# *nothing* enqueued and *something* was rate-limited rolls its whole
+# transaction back, per that function's own docstring).
+_RATE_LIMITED_REASONS = frozenset({"rate_limited", "index_rate_limited"})
 
 logger = logging.getLogger(__name__)
 
@@ -114,25 +130,138 @@ def _build_webhook_event(envelope: GitHubWebhookEnvelope, *, delivery_id: str) -
     )
 
 
-def _enqueue_payload(event: WebhookEvent, result: ResolutionResult) -> dict[str, object]:
-    # `repo_full_name` (Phase 4 addition): the Worker's diff-fetch step
-    # (`review/prefilter.py`, `adapter/github/diff.py`) needs GitHub's own
-    # "owner/repo" identifier to call the Files/Trees/Blobs APIs and to
-    # request a repo-scoped installation token — it cannot derive that from
-    # `org_id`/`repo_id` alone (this platform's own UUIDs), and the Worker
-    # only ever sees this job's `payload`, never the original webhook
-    # envelope `event` came from. Sourced from `event.repo_full_name`
-    # (`tenancy.resolution.WebhookEvent`, already parsed from
-    # `GitHubWebhookEnvelope` at this route's own boundary) — closing a gap
-    # where this field was resolved here but never threaded into the
-    # payload the Worker actually reads.
+def _base_job_identity_fields(event: WebhookEvent, result: ResolutionResult) -> dict[str, object]:
+    """The `org_id`/`repo_id`/`installation_id`/`repo_full_name` fields
+    every job payload below carries, regardless of job type — shared here
+    rather than independently re-assembled at each of `_review_enqueue_payload`'s
+    and `_index_enqueue_payload`'s own return points.
+
+    `repo_full_name` (Phase 4 addition): the Worker's diff-fetch step
+    (`review/prefilter.py`, `adapter/github/diff.py`) needs GitHub's own
+    "owner/repo" identifier to call the Files/Trees/Blobs APIs and to
+    request a repo-scoped installation token — it cannot derive that from
+    `org_id`/`repo_id` alone (this platform's own UUIDs), and the Worker
+    only ever sees this job's `payload`, never the original webhook
+    envelope `event` came from. Sourced from `event.repo_full_name`
+    (`tenancy.resolution.WebhookEvent`, already parsed from
+    `GitHubWebhookEnvelope` at this route's own boundary) — closing a gap
+    where this field was resolved here but never threaded into the
+    payload the Worker actually reads.
+    """
     return {
         "org_id": str(result.org_id),
         "repo_id": str(result.repo_id),
         "installation_id": event.installation_id,
         "repo_full_name": event.repo_full_name,
+    }
+
+
+def _review_enqueue_payload(
+    event: WebhookEvent, result: ResolutionResult
+) -> dict[str, object] | None:
+    """Build the `REVIEW` job payload, or `None` when `event` is missing a
+    field a review job cannot run without (the caller logs this as
+    `missing_required_fields` and enqueues nothing for this candidate).
+    """
+    if event.pr_number is None or event.head_sha is None:
+        return None
+    return {
+        **_base_job_identity_fields(event, result),
         "pr_number": event.pr_number,
         "head_sha": event.head_sha,
+    }
+
+
+def _merged_push_file_lists(
+    commits: Sequence[PushCommit],
+) -> tuple[list[str], list[str], list[str]]:
+    """Merge a `push` payload's per-commit `added`/`removed`/`modified`
+    lists into one flat, de-duplicated (insertion-order-preserving) triple —
+    the shape `indexing/pipeline.py`'s Phase 7 file-set resolution consumes
+    directly. GitHub's `push` payload only ever gives per-commit lists, not
+    a single already-merged "net change of this push" list, so this merge
+    is this payload builder's own responsibility, not something upstream
+    already did for us.
+
+    Callers must pass `envelope.head_commit` alongside `envelope.commits`
+    (see `_index_enqueue_payload`) — GitHub's `commits` array excludes
+    merge commits, so a push whose only new commit is a merge (e.g. landed
+    via the "Merge pull request" button) has an empty `commits` array with
+    the actual file changes present only on `head_commit`. Re-merging the
+    same paths `head_commit` and the last entry of `commits` already share,
+    in the ordinary non-merge-commit case, is harmless: this dict-keyed
+    merge is idempotent on path.
+    """
+    added: dict[str, None] = {}
+    removed: dict[str, None] = {}
+    modified: dict[str, None] = {}
+    for commit in commits:
+        added.update(dict.fromkeys(commit.added))
+        removed.update(dict.fromkeys(commit.removed))
+        modified.update(dict.fromkeys(commit.modified))
+    return list(added), list(removed), list(modified)
+
+
+def _index_enqueue_payload(
+    *,
+    event_type: str,
+    envelope: GitHubWebhookEnvelope,
+    event: WebhookEvent,
+    result: ResolutionResult,
+) -> dict[str, object] | None:
+    """Build the `INDEX` job payload Phase 7's pipeline consumes, per
+    Assumption 9's `pr_number` contract (`0` for a `push`-triggered job,
+    the real PR number for a `pull_request`-triggered job) — or `None` when
+    the triggering event is missing a field an index job cannot run
+    without.
+    """
+    if event_type == "push":
+        if envelope.after is None or envelope.deleted:
+            # A branch/tag deletion push: `after` is the all-zeros SHA (a
+            # string, not `None`) — GitHub's own `deleted` flag is what
+            # actually distinguishes this from a real push, so `after is
+            # None` alone never catches it. Nothing to index for a commit
+            # that never existed.
+            return None
+        commits_with_head = (
+            (*envelope.commits, envelope.head_commit)
+            if envelope.head_commit is not None
+            else envelope.commits
+        )
+        added, removed, modified = _merged_push_file_lists(commits_with_head)
+        return {
+            **_base_job_identity_fields(event, result),
+            "pr_number": 0,
+            "commit_sha": envelope.after,
+            "added": added,
+            "removed": removed,
+            "modified": modified,
+            # US8's fallback signal: GitHub caps the `commits` array at 20
+            # entries and sets no other "there's more" marker on this
+            # payload shape, so a full commits array is itself the
+            # truncation signal; a non-fast-forward update (`forced`) can
+            # equally invalidate the per-commit lists above as the correct
+            # delta, so either condition forces Phase 7's full-tree-diff
+            # fallback rather than trusting `added`/`removed`/`modified`
+            # above.
+            "force_full_tree_fallback": len(envelope.commits) == 20 or bool(envelope.forced),
+        }
+    # pull_request
+    if event.pr_number is None or event.head_sha is None:
+        return None
+    return {
+        **_base_job_identity_fields(event, result),
+        "pr_number": event.pr_number,
+        "commit_sha": event.head_sha,
+        # A `pull_request` payload never carries per-commit file lists at
+        # all (only `push` events do) — there is no delta data to give
+        # Phase 7's pipeline here, so the fallback signal is unconditional
+        # for a PR-triggered job rather than misrepresenting "no data" as
+        # "no files changed".
+        "added": [],
+        "removed": [],
+        "modified": [],
+        "force_full_tree_fallback": True,
     }
 
 
@@ -145,7 +274,7 @@ async def _run_in_transaction[T](
     """Runs ``work(session)`` inside one shared transaction, committing on
     success unless ``work`` itself signals otherwise (its returned
     ``should_commit`` bool) — the one transaction-wrapper shape both
-    ``_handle_matched_trigger`` and the trigger-not-matched route branch
+    ``_handle_matched_triggers`` and the trigger-not-matched route branch
     need, per the plan's Phase 1 "Transaction boundary" section.
 
     A mid-request failure (Postgres blip, an ``enqueue()`` exception) rolls
@@ -155,13 +284,19 @@ async def _run_in_transaction[T](
     (self-healing via GitHub's own retry, not a confirmed defect) and
     re-raised as an ``HTTPException(500)`` — surfaced, not swallowed.
 
-    ``should_commit=False`` (used by ``_handle_matched_trigger`` for a
-    rate-limited delivery) rolls back without treating it as a failure —
-    rate limiting is not the same as "this delivery was processed";
-    committing the delivery-id record in that case would durably mark it
-    "seen" with no job ever enqueued, permanently losing that trigger even
-    after the rate-limit window passes and a later redelivery of the exact
-    same delivery id arrives.
+    ``should_commit=False`` (used by ``_handle_matched_triggers`` whenever
+    at least one candidate was rate-limited, even if a sibling candidate in
+    the same request enqueued successfully) rolls back without treating it
+    as a failure — rate limiting is not the same as "this delivery was
+    processed"; committing the delivery-id record in that case would
+    durably mark it "seen" (for every candidate, since the guard is
+    per-delivery, not per-candidate) with the rate-limited candidate's own
+    job never enqueued, permanently losing that trigger even after the
+    rate-limit window passes and a later redelivery of the exact same
+    delivery id arrives. A sibling candidate that did enqueue successfully
+    this same pass rolls back too, rather than committing it while
+    discarding the rate-limited one — it re-enqueues cleanly on that same
+    later redelivery instead.
     """
     async with session_factory() as session:
         await session.begin()
@@ -188,69 +323,129 @@ async def _run_in_transaction[T](
             raise HTTPException(status_code=500, detail="failed to process webhook") from exc
 
 
-async def _handle_matched_trigger(
+@dataclass(frozen=True)
+class _JobCandidate:
+    """One job type this request's event matched a trigger for, and
+    everything ``_handle_matched_triggers`` needs to attempt enqueuing it.
+
+    ``payload_builder`` takes the ``ResolutionResult`` (only known once
+    ``resolve_installation`` has actually run inside the shared
+    transaction) and returns the job payload, or ``None`` when this
+    specific candidate is missing a field its job type cannot run without
+    — logged as ``missing_fields_reason`` rather than attempted.
+    """
+
+    job_type: JobType
+    payload_builder: Callable[[ResolutionResult], dict[str, object] | None]
+    missing_fields_reason: str
+    rate_limiter: InMemoryRateLimiter | None
+    rate_limited_reason: str
+
+
+async def _handle_matched_triggers(
     *,
     event: WebhookEvent,
     store: TenancyStore,
     job_queue: JobQueueRepository,
     session_factory: async_sessionmaker[AsyncSession],
-    enqueue_rate_limiter: InMemoryRateLimiter | None,
-) -> tuple[ResolutionResult, uuid.UUID | None, str | None]:
-    """Resolve installation/org/repo, record the delivery, and (if this is
-    a new delivery, under the rate limit, and carries the fields a review
-    job needs) enqueue one — all inside one shared transaction (see
-    ``_run_in_transaction``).
+    candidates: Sequence[_JobCandidate],
+) -> tuple[ResolutionResult, list[tuple[JobType, uuid.UUID | None, str | None]]]:
+    """Resolve installation/org/repo, record the delivery once, then attempt
+    an enqueue for every ``candidate`` this request's event matched a
+    trigger for — all inside one shared transaction (see
+    ``_run_in_transaction``). Replaces the old ``REVIEW``-only
+    ``_handle_matched_trigger``: the delivery-idempotency/org-repo
+    resolution work happens exactly once per request regardless of how many
+    trigger kinds matched, so a ``pull_request opened``/``synchronize``
+    event that matches both ``REVIEW`` and ``INDEX`` never resolves
+    installation twice or records the delivery twice.
+
+    Returns one ``(job_type, job_id, skipped_reason)`` triple per
+    candidate, in the same order as ``candidates`` — every candidate
+    produces exactly one outcome (an enqueued ``job_id`` or a
+    ``skipped_reason``), never both.
     """
 
     async def _work(
         session: AsyncSession,
-    ) -> tuple[tuple[ResolutionResult, uuid.UUID | None, str | None], bool]:
+    ) -> tuple[tuple[ResolutionResult, list[tuple[JobType, uuid.UUID | None, str | None]]], bool]:
         result = await resolve_installation(event, store, unit_of_work=session)
 
-        job_id: uuid.UUID | None = None
-        skipped_reason: str | None = None
-        rate_limit_token: int | None = None
         if not result.is_new_delivery:
-            skipped_reason = "duplicate_delivery"
-        elif event.pr_number is None or event.head_sha is None:
-            skipped_reason = "missing_required_fields"
-        else:
-            rate_limited = False
-            if enqueue_rate_limiter is not None:
-                allowed, rate_limit_token = enqueue_rate_limiter.reserve(
-                    str(result.repo_id)
-                )
-                rate_limited = not allowed
-            if rate_limited:
-                skipped_reason = "rate_limited"
-            else:
-                try:
-                    job_id = await job_queue.enqueue(
-                        JobType.REVIEW,
-                        _enqueue_payload(event, result),
-                        org_id=result.org_id,
-                        repo_id=result.repo_id,
-                        session=session,
-                    )
-                except Exception:
-                    # The rate-limit slot above was already consumed
-                    # in-process before this transaction's outcome was
-                    # known. If enqueue() itself fails, the DB work is
-                    # about to be rolled back by `_run_in_transaction` and
-                    # GitHub will redeliver the same webhook — release
-                    # exactly this reservation (by token, not "whichever
-                    # hit is most recent" — a concurrent request for the
-                    # same repo may have reserved its own hit in the
-                    # meantime) so that redelivery (the same logical
-                    # event, not a new one) isn't spuriously counted twice
-                    # against the small per-repo budget.
-                    if enqueue_rate_limiter is not None:
-                        enqueue_rate_limiter.release(
-                            str(result.repo_id), rate_limit_token
-                        )
-                    raise
+            duplicate_outcomes: list[tuple[JobType, uuid.UUID | None, str | None]] = [
+                (candidate.job_type, None, "duplicate_delivery") for candidate in candidates
+            ]
+            return (result, duplicate_outcomes), True
 
-        return (result, job_id, skipped_reason), skipped_reason != "rate_limited"
+        outcomes: list[tuple[JobType, uuid.UUID | None, str | None]] = []
+        # Reservations made so far this call, released together if a later
+        # candidate's `enqueue()` call fails and the whole transaction is
+        # about to roll back — otherwise an earlier candidate's successful
+        # in-process reservation would durably (if only in-memory) survive
+        # a rollback that undoes the row it was gating, permanently
+        # burning a slot for work that never actually landed.
+        reservations: list[tuple[InMemoryRateLimiter, str, int]] = []
+        for candidate in candidates:
+            payload = candidate.payload_builder(result)
+            if payload is None:
+                outcomes.append((candidate.job_type, None, candidate.missing_fields_reason))
+                continue
+
+            token: int | None = None
+            if candidate.rate_limiter is not None:
+                allowed, token = candidate.rate_limiter.reserve(str(result.repo_id))
+                if not allowed:
+                    outcomes.append((candidate.job_type, None, candidate.rate_limited_reason))
+                    continue
+
+            try:
+                job_id = await job_queue.enqueue(
+                    candidate.job_type,
+                    payload,
+                    org_id=result.org_id,
+                    repo_id=result.repo_id,
+                    session=session,
+                )
+            except Exception:
+                # Same reasoning as the single-candidate design this
+                # replaces: release every reservation made during this
+                # call (this candidate's own, plus any earlier candidate's)
+                # so GitHub's redelivery of this same logical event isn't
+                # spuriously double-charged against the small per-repo
+                # budget once the transaction below rolls everything back.
+                if candidate.rate_limiter is not None and token is not None:
+                    candidate.rate_limiter.release(str(result.repo_id), token)
+                for limiter, key, reserved_token in reservations:
+                    limiter.release(key, reserved_token)
+                raise
+
+            if candidate.rate_limiter is not None and token is not None:
+                reservations.append((candidate.rate_limiter, str(result.repo_id), token))
+            outcomes.append((candidate.job_type, job_id, None))
+
+        any_rate_limited = any(
+            reason in _RATE_LIMITED_REASONS for _job_type, _job_id, reason in outcomes
+        )
+        should_commit = not any_rate_limited
+        if not should_commit:
+            # The whole transaction rolls back together — including any
+            # sibling candidate's own successful enqueue this same pass
+            # (e.g. REVIEW, when INDEX was the one rate-limited) — never
+            # just the rate-limited candidate's own outcome. The
+            # delivery-id guard above is per-*delivery*, not per-candidate:
+            # committing a sibling's successful enqueue here would still
+            # commit (and thus permanently mark "seen") the very delivery
+            # id a later redelivery needs to re-attempt the rate-limited
+            # candidate against, silently losing that candidate forever
+            # once the rate-limit window passes, even though this
+            # function's/`` _run_in_transaction``'s own stated intent is
+            # that a rate-limited outcome always remains retriable. Every
+            # candidate that DID succeed this pass must release its own
+            # rate-limiter reservation too, or its slot is burned for a job
+            # this rollback just discarded.
+            for limiter, key, reserved_token in reservations:
+                limiter.release(key, reserved_token)
+        return (result, outcomes), should_commit
 
     return await _run_in_transaction(session_factory, event=event, work=_work)
 
@@ -264,6 +459,8 @@ def create_webhook_router(
     job_queue: JobQueueRepository,
     session_factory: async_sessionmaker[AsyncSession],
     enqueue_rate_limiter: InMemoryRateLimiter | None,
+    indexing_enabled: bool,
+    index_enqueue_rate_limiter: InMemoryRateLimiter | None,
 ) -> APIRouter:
     """Build the webhook receiver router.
 
@@ -271,10 +468,16 @@ def create_webhook_router(
     settings/globals directly, per docs/rules/architecture.md's "wire
     concrete implementations only at the composition root via constructor
     injection. No module-level singletons or global mutable state." rule —
-    ``apps/webhook_api/main.py`` is the only caller. ``enqueue_rate_limiter``
-    is ``None`` when ``review_enqueue_rate_limit_per_minute`` is configured
-    at its shipped default of ``0`` — the documented sentinel meaning "skip
-    the rate-check call entirely" (see ``apps/webhook_api/settings.py``).
+    ``apps/webhook_api/main.py`` is the only caller. ``enqueue_rate_limiter``/
+    ``index_enqueue_rate_limiter`` are each ``None`` when their respective
+    ``*_enqueue_rate_limit_per_minute`` setting is configured at the
+    documented sentinel value of ``0``, meaning "skip the rate-check call
+    entirely" (see ``apps/webhook_api/settings.py``). ``indexing_enabled``
+    is this route's own copy of the kill switch, passed down explicitly per
+    architecture.md's "parse config once, pass down explicitly" rule —
+    ``is_index_trigger`` itself never reads it (see that function's own
+    docstring); only this route decides whether a syntactic index-trigger
+    match actually gets to attempt an enqueue.
     """
     router = APIRouter()
 
@@ -340,18 +543,60 @@ def create_webhook_router(
 
         event = _build_webhook_event(envelope, delivery_id=delivery_id)
 
-        job_id: uuid.UUID | None
-        skipped_reason: str | None
+        candidates: list[_JobCandidate] = []
         if is_enqueue_trigger(event_type, event.action):
-            result, job_id, skipped_reason = await _handle_matched_trigger(
+            candidates.append(
+                _JobCandidate(
+                    job_type=JobType.REVIEW,
+                    payload_builder=lambda result: _review_enqueue_payload(event, result),
+                    missing_fields_reason="missing_required_fields",
+                    rate_limiter=enqueue_rate_limiter,
+                    rate_limited_reason="rate_limited",
+                )
+            )
+
+        default_branch = envelope.repository.default_branch
+        if is_index_trigger(event_type, event.action, envelope.ref, default_branch):
+            if indexing_enabled:
+                candidates.append(
+                    _JobCandidate(
+                        job_type=JobType.INDEX,
+                        payload_builder=lambda result: _index_enqueue_payload(
+                            event_type=event_type, envelope=envelope, event=event, result=result
+                        ),
+                        missing_fields_reason="missing_required_fields",
+                        rate_limiter=index_enqueue_rate_limiter,
+                        rate_limited_reason="index_rate_limited",
+                    )
+                )
+            else:
+                # Syntactically an index trigger, but the kill switch is
+                # off — logged with its own `indexing_disabled` reason
+                # rather than silently dropped, so an operator scanning
+                # logs can tell "no index job" apart from "wasn't even a
+                # trigger". Never attempts payload building or an enqueue.
+                candidates.append(
+                    _JobCandidate(
+                        job_type=JobType.INDEX,
+                        payload_builder=lambda _result: None,
+                        missing_fields_reason="indexing_disabled",
+                        rate_limiter=None,
+                        rate_limited_reason="index_rate_limited",
+                    )
+                )
+
+        outcomes: list[tuple[JobType | None, uuid.UUID | None, str | None]]
+        if candidates:
+            result, matched_outcomes = await _handle_matched_triggers(
                 event=event,
                 store=tenancy_store,
                 job_queue=job_queue,
                 session_factory=session_factory,
-                enqueue_rate_limiter=enqueue_rate_limiter,
+                candidates=candidates,
             )
+            outcomes = [(job_type, job_id, reason) for job_type, job_id, reason in matched_outcomes]
         else:
-            # Same shared-transaction wrapper as `_handle_matched_trigger`'s
+            # Same shared-transaction wrapper as `_handle_matched_triggers`'s
             # enqueue path, not two independently-committed calls: without
             # `unit_of_work`, `get_or_create_org_repo` and
             # `record_delivery_if_new` each open/commit their own separate
@@ -364,21 +609,22 @@ def create_webhook_router(
                 return result, True
 
             result = await _run_in_transaction(session_factory, event=event, work=_work)
-            job_id = None
-            skipped_reason = "trigger_not_matched"
+            outcomes = [(None, None, "trigger_not_matched")]
 
-        logger.info(
-            "webhook accepted" if job_id is not None else "webhook accepted; not enqueued",
-            extra={
-                "installation_id": event.installation_id,
-                "org_id": str(result.org_id),
-                "repo_id": str(result.repo_id),
-                "pr_number": event.pr_number,
-                "delivery_id": event.delivery_id,
-                "job_id": str(job_id) if job_id is not None else None,
-                "skipped_reason": skipped_reason,
-            },
-        )
+        for job_type, job_id, skipped_reason in outcomes:
+            logger.info(
+                "webhook accepted" if job_id is not None else "webhook accepted; not enqueued",
+                extra={
+                    "installation_id": event.installation_id,
+                    "org_id": str(result.org_id),
+                    "repo_id": str(result.repo_id),
+                    "pr_number": event.pr_number,
+                    "delivery_id": event.delivery_id,
+                    "job_type": job_type.value if job_type is not None else None,
+                    "job_id": str(job_id) if job_id is not None else None,
+                    "skipped_reason": skipped_reason,
+                },
+            )
         return JSONResponse({"status": "accepted"}, status_code=200)
 
     return router

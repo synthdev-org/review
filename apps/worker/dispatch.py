@@ -7,11 +7,18 @@ an actual loop: poll ``JobQueueRepository.claim_next()`` (already
 implemented, ``adapter/storage/queue.py``, unchanged) every
 ``poll_interval_seconds`` when the queue is empty, and for each claimed job,
 dispatch by ``job_type`` — ``REVIEW`` jobs run through Phase 2's pipeline
-registry (``review.pipeline.StepRegistry``); ``INDEX`` jobs are logged and
-left unimplemented (indexing is Phase 2 of the *roadmap*, not this plan) and
-marked ``DONE`` immediately — "logged and left unimplemented" is itself this
-job's complete, correct handling for this phase's scope, not a partial/
-deferred state.
+registry (``review.pipeline.StepRegistry``).
+
+Phase 7 of the indexing delivery plan (``docs/plans/plan-indexing-delivery.md``
+— a separate plan from the "Phase N" numbering used elsewhere in this
+module's own history, disambiguated explicitly here) replaces the prior
+``INDEX``-job stub (log "not implemented", mark ``DONE`` immediately) with a
+real call into ``indexing.pipeline.run_indexing_job``, wired with real
+adapters at the composition root (``apps/worker/main.py``) via
+``indexing.pipeline.IndexingJobDependencies``. ``IndexingJobFailedError``
+(the ``INDEX``-job analog of ``review.pipeline.PipelineFailedError``) is
+caught by ``_run_claimed_job`` the same way — marking the job ``FAILED``
+with a "job failed" log line, never the generic bug-resilience catch-all.
 
 Lives in ``apps/worker`` (an entrypoint package, per
 docs/rules/architecture.md — entrypoints depend on the domain and wire
@@ -61,6 +68,7 @@ import logging
 from adapter.storage.models import JobType
 from adapter.storage.queue import JobQueueRepository
 from adapter.storage.schemas import ClaimedJob
+from indexing.pipeline import IndexingJobDependencies, IndexingJobFailedError, run_indexing_job
 from review.pipeline import PipelineFailedError, StepRegistry
 from review.step import StepContext
 
@@ -68,31 +76,35 @@ logger = logging.getLogger(__name__)
 
 
 async def _dispatch_claimed_job(
-    job: ClaimedJob, *, review_registry: StepRegistry, dry_run: bool
+    job: ClaimedJob,
+    *,
+    review_registry: StepRegistry,
+    indexing_deps: IndexingJobDependencies,
+    dry_run: bool,
 ) -> None:
     """Dispatch one claimed job by its ``job_type``.
 
-    ``INDEX`` jobs have no pipeline to run yet — logged as unimplemented
-    and left at that; there is nothing pending for one, so this is this
-    job's complete, correct handling for Phase 1's scope. ``REVIEW`` jobs
-    run through ``review_registry`` — a fatal macro-step failure propagates
-    as ``PipelineFailedError``, which this function does not catch; the
-    caller (``_run_claimed_job``) is the one place that turns it into a
-    ``FAILED`` status, so this function itself never touches job status.
+    ``INDEX`` jobs run through ``indexing.pipeline.run_indexing_job``
+    (Phase 7 of the indexing delivery plan) — a fatal whole-job failure
+    propagates as ``IndexingJobFailedError``, which this function does not
+    catch; the caller (``_run_claimed_job``) is the one place that turns it
+    into a ``FAILED`` status, mirroring ``REVIEW``'s own
+    ``PipelineFailedError`` handling exactly. ``REVIEW`` jobs run through
+    ``review_registry`` the same way they always have.
 
-    ``dry_run`` (Phase 7, ``WorkerSettings.dry_run``, read once at Worker
-    startup) is set on the shared ``StepContext`` every step receives —
-    never read from settings by any step itself, per
-    ``review/output.py``'s own docstring.
+    ``dry_run`` (Phase 7 of the walking-skeleton plan, ``WorkerSettings.dry_run``,
+    read once at Worker startup) is set on the shared ``StepContext`` every
+    ``REVIEW`` step receives — never read from settings by any step itself,
+    per ``review/output.py``'s own docstring. ``INDEX`` jobs have no
+    equivalent dry-run concept (per ``spec-indexing.md``'s own scope): this
+    phase's pipeline always performs its real writes.
     """
+    logger.info("job dispatched", extra={"job_id": str(job.id), "job_type": job.job_type.value})
+
     if job.job_type == JobType.INDEX:
-        logger.info(
-            "index job dispatch: not implemented",
-            extra={"job_id": str(job.id), "job_type": job.job_type.value},
-        )
+        await run_indexing_job(job.payload, indexing_deps, job_id=str(job.id))
         return
 
-    logger.info("job dispatched", extra={"job_id": str(job.id), "job_type": job.job_type.value})
     context = StepContext(job_id=str(job.id), dry_run=dry_run)
     await review_registry.run(job.payload, context)
 
@@ -102,6 +114,7 @@ async def _run_claimed_job(
     *,
     job_queue: JobQueueRepository,
     review_registry: StepRegistry,
+    indexing_deps: IndexingJobDependencies,
     stuck_job_warning_threshold_seconds: float,
     dry_run: bool,
 ) -> None:
@@ -109,14 +122,16 @@ async def _run_claimed_job(
     ``stuck_job_warning_threshold_seconds`` — and mark it ``DONE``/``FAILED``
     accordingly.
 
-    Any exception other than ``PipelineFailedError`` escaping
-    ``_dispatch_claimed_job`` (a bug in the loop, not a pipeline-reported
-    failure) is deliberately left uncaught here — the caller
-    (``run_dispatch_loop``) is where that distinction is handled, per this
-    module's own docstring.
+    Any exception other than ``PipelineFailedError``/``IndexingJobFailedError``
+    escaping ``_dispatch_claimed_job`` (a bug in the loop, not a
+    pipeline-reported failure) is deliberately left uncaught here — the
+    caller (``run_dispatch_loop``) is where that distinction is handled,
+    per this module's own docstring.
     """
     task: asyncio.Task[None] = asyncio.create_task(
-        _dispatch_claimed_job(job, review_registry=review_registry, dry_run=dry_run)
+        _dispatch_claimed_job(
+            job, review_registry=review_registry, indexing_deps=indexing_deps, dry_run=dry_run
+        )
     )
     done, _pending = await asyncio.wait({task}, timeout=stuck_job_warning_threshold_seconds)
     if task not in done:
@@ -139,7 +154,7 @@ async def _run_claimed_job(
 
     try:
         task.result()
-    except PipelineFailedError as exc:
+    except (PipelineFailedError, IndexingJobFailedError) as exc:
         await job_queue.mark_failed(job.id)
         logger.error(
             "job failed",
@@ -155,6 +170,7 @@ async def run_dispatch_loop(
     *,
     job_queue: JobQueueRepository,
     review_registry: StepRegistry,
+    indexing_deps: IndexingJobDependencies,
     worker_id: str,
     poll_interval_seconds: float,
     stuck_job_warning_threshold_seconds: float,
@@ -164,9 +180,10 @@ async def run_dispatch_loop(
     full design. Runs forever; ``apps/worker/main.py`` is the only caller,
     via ``asyncio.run(...)``.
 
-    ``dry_run`` (Phase 7) defaults to ``False`` so every pre-Phase-7 caller
-    (this module's own test suite's fakes) is unaffected; the real
-    composition root always passes ``WorkerSettings.dry_run`` explicitly.
+    ``dry_run`` (Phase 7 of the walking-skeleton plan) defaults to
+    ``False`` so every pre-Phase-7 caller (this module's own test suite's
+    fakes) is unaffected; the real composition root always passes
+    ``WorkerSettings.dry_run`` explicitly.
     """
     while True:
         try:
@@ -186,6 +203,7 @@ async def run_dispatch_loop(
                 job,
                 job_queue=job_queue,
                 review_registry=review_registry,
+                indexing_deps=indexing_deps,
                 stuck_job_warning_threshold_seconds=stuck_job_warning_threshold_seconds,
                 dry_run=dry_run,
             )

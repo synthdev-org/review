@@ -18,6 +18,7 @@ from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.diff import GitHubDiffFetcher
 from adapter.github.exceptions import (
     GitHubBlobTooLargeError,
+    GitHubDiffFetchMalformedResponseError,
     GitHubDiffFetchUnreachableError,
     GitHubFileCountMismatchError,
     GitHubTreeEntryMissingError,
@@ -43,9 +44,13 @@ def _reenable_diff_logger() -> None:
     `adapter.github.diff` logger. Re-enabled here, autouse, so every
     `caplog`-asserting case below stays deterministic regardless of test
     order — mirroring `apps/webhook_api/test_webhook_routes.py`'s own
-    per-test version of this same fix.
+    per-test version of this same fix. `adapter.github.git_data` is
+    included too (indexing delivery plan Phase 2) — `fetch_content`'s
+    symlink/submodule/size-ceiling logging now lives in that shared module,
+    not here, per the extraction that phase makes.
     """
     logging.getLogger("adapter.github.diff").disabled = False
+    logging.getLogger("adapter.github.git_data").disabled = False
 
 
 def _mock_token_exchange() -> None:
@@ -138,6 +143,15 @@ async def test_fetch_file_count_mismatch_is_fatal_and_logs_error(
         return_value=httpx.Response(
             200, json=[{"filename": "a.py", "status": "modified", "patch": "@@ @@"}]
         )
+    )
+    # `fetch()` issues the PR/files/tree calls concurrently (`asyncio.gather`)
+    # — the count-mismatch check below only runs once all three have
+    # resolved, so the tree call must be mocked too, even though its body is
+    # never consulted on this path (an unmocked call here races
+    # non-deterministically against the other two, per respx's own
+    # `AllMockedAssertionError` on an un-routed request).
+    respx.get(f"{_BASE}/repos/{_OWNER_REPO}/git/trees/{_HEAD_SHA}?recursive=1").mock(
+        return_value=httpx.Response(200, json={"tree": [], "truncated": False})
     )
 
     with (
@@ -322,6 +336,70 @@ async def test_fetch_content_skips_symlink_and_submodule_entries(
 
     assert content == {"regular.py": b"regular"}
     assert blob_route.call_count == 1
+
+
+@respx.mock
+async def test_fetch_content_dedupes_identical_blob_sha_across_paths(
+    test_rsa_private_key_pem: str,
+) -> None:
+    blob_route = respx.get(re.compile(rf"{re.escape(_BASE)}/repos/{_OWNER_REPO}/git/blobs/.+"))
+    blob_route.mock(
+        return_value=httpx.Response(200, json={"content": _b64(b"shared"), "encoding": "base64"})
+    )
+    _mock_token_exchange()
+
+    diff = Diff(
+        files=(
+            DiffFile(
+                path="a.txt", status="added", mode="100644", blob_sha="sha-dup", blob_size_bytes=6
+            ),
+            DiffFile(
+                path="b.txt", status="added", mode="100644", blob_sha="sha-dup", blob_size_bytes=6
+            ),
+        )
+    )
+
+    content = await _fetcher(test_rsa_private_key_pem).fetch_content(
+        installation_id=_INSTALLATION_ID,
+        repo_full_name=_OWNER_REPO,
+        diff=diff,
+        paths=["a.txt", "b.txt"],
+    )
+
+    assert content == {"a.txt": b"shared", "b.txt": b"shared"}
+    # One GitHub API call for the shared blob_sha, not one per path.
+    assert blob_route.call_count == 1
+
+
+@respx.mock
+async def test_fetch_content_blob_with_no_size_is_malformed_and_never_fetched(
+    test_rsa_private_key_pem: str,
+) -> None:
+    _mock_token_exchange()
+    blob_route = respx.get(re.compile(rf"{re.escape(_BASE)}/repos/{_OWNER_REPO}/git/blobs/.+"))
+    blob_route.mock(return_value=httpx.Response(200, json={"content": _b64(b"x")}))
+
+    diff = Diff(
+        files=(
+            DiffFile(
+                path="mystery.bin",
+                status="added",
+                mode="100644",
+                blob_sha="sha-mystery",
+                blob_size_bytes=None,
+            ),
+        )
+    )
+
+    with pytest.raises(GitHubDiffFetchMalformedResponseError):
+        await _fetcher(test_rsa_private_key_pem).fetch_content(
+            installation_id=_INSTALLATION_ID,
+            repo_full_name=_OWNER_REPO,
+            diff=diff,
+            paths=["mystery.bin"],
+        )
+
+    assert blob_route.call_count == 0
 
 
 @respx.mock

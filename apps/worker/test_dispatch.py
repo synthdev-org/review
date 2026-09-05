@@ -26,12 +26,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from adapter.storage.engine import create_session_factory
-from adapter.storage.models import JobQueueRow, JobStatus, JobType
+from adapter.storage.indexing_repository import IndexingRepository
+from adapter.storage.models import JobQueueRow, JobStatus, JobType, Org, Repo
 from adapter.storage.queue import JobQueueRepository
 from apps.worker.dispatch import run_dispatch_loop
+from indexing.conftest import FakeEmbeddingClient, FakeRepoTreeFetcher
+from indexing.pipeline import IndexingJobDependencies
+from indexing.repository import IndexCommitTracker, IndexRepository
 from review.pipeline import FailurePolicy, StepFailureInfo, StepRegistry
 from review.step import StepContext
 
@@ -42,17 +46,77 @@ _POLL_INTERVAL_SECONDS = 0.05
 _WAIT_TIMEOUT_SECONDS = 5.0
 
 
+@dataclass
+class _NullIndexRepository:
+    """A trivial `IndexRepository`/`IndexCommitTracker` stand-in for tests
+    in this file that dispatch no `INDEX` job at all (every `REVIEW`-only
+    test below) — never touches Postgres, just satisfies
+    `IndexingJobDependencies`' own type. Dedicated INDEX-job tests further
+    down build a real `IndexingRepository` against `migrated_engine`
+    instead, so this fake's own (non-)behavior is never itself under test.
+    """
+
+    async def upsert_file(self, **kwargs: object) -> None:
+        raise AssertionError("_NullIndexRepository.upsert_file should never be called")
+
+    async def delete_file(self, **kwargs: object) -> None:
+        raise AssertionError("_NullIndexRepository.delete_file should never be called")
+
+    async def get_last_indexed_commit(self, **kwargs: object) -> str | None:
+        raise AssertionError("_NullIndexRepository.get_last_indexed_commit should never be called")
+
+    async def set_last_indexed_commit(self, **kwargs: object) -> None:
+        raise AssertionError("_NullIndexRepository.set_last_indexed_commit should never be called")
+
+
+_: type[IndexRepository] = _NullIndexRepository
+__: type[IndexCommitTracker] = _NullIndexRepository
+
+
+def _default_indexing_deps() -> IndexingJobDependencies:
+    """The `IndexingJobDependencies` every `REVIEW`-focused test below
+    passes — none of these tests dispatch an `INDEX` job, so this never
+    needs to do real work (see `_NullIndexRepository`'s own docstring)."""
+    null_repo = _NullIndexRepository()
+    return IndexingJobDependencies(
+        tree_fetcher=FakeRepoTreeFetcher(),
+        embedding_client=FakeEmbeddingClient(),
+        index_repository=null_repo,
+        commit_tracker=null_repo,
+    )
+
+
+async def _provision_repo(session_factory: async_sessionmaker[Any]) -> uuid.UUID:
+    """Provisions a real `org`/`repo` row pair, per
+    `adapter/storage/test_indexing_repository.py`'s own identical fixture —
+    an `INDEX` job's `set_last_indexed_commit` call needs a real `repo_id`
+    to update, and `upsert_file` needs one for its own FK-constrained
+    `repo_id` column.
+    """
+    async with session_factory() as session, session.begin():
+        org = Org(name="acme", slug=f"acme-{uuid.uuid4().hex}")
+        session.add(org)
+        await session.flush()
+        repo = Repo(org_id=org.id, name="widgets", full_name=f"acme/widgets-{uuid.uuid4().hex}")
+        session.add(repo)
+        await session.flush()
+        return repo.id
+
+
 def _reenable_dispatch_logger() -> None:
     """`adapter/storage`'s Alembic `env.py` calls
     `logging.config.fileConfig()` on every `migrated_engine` fixture setup
     (default `disable_existing_loggers=True`), which disables every
     already-created logger not explicitly listed in `alembic.ini` —
-    including this module's own `apps.worker.dispatch` logger. Called at
-    the top of every test below that asserts on `caplog`, mirroring
+    including this module's own `apps.worker.dispatch` logger (and, for the
+    dedicated `INDEX`-job dispatch tests further down,
+    `indexing.pipeline`'s own logger too). Called at the top of every test
+    below that asserts on `caplog`, mirroring
     `apps/webhook_api/test_webhook_routes.py`'s own per-test version of
     this same fix.
     """
     logging.getLogger("apps.worker.dispatch").disabled = False
+    logging.getLogger("indexing.pipeline").disabled = False
 
 
 @dataclass
@@ -113,6 +177,7 @@ async def _running_dispatch_loop(
     *,
     job_queue: JobQueueRepository,
     review_registry: StepRegistry,
+    indexing_deps: IndexingJobDependencies | None = None,
     poll_interval_seconds: float = _POLL_INTERVAL_SECONDS,
     stuck_job_warning_threshold_seconds: float = 30.0,
     worker_id: str = _WORKER_ID,
@@ -121,11 +186,16 @@ async def _running_dispatch_loop(
     `async with` block, then cancel it — `run_dispatch_loop` never returns
     on its own (see its own docstring), so every test needs this to observe
     its effects and still let the test process exit cleanly.
+
+    `indexing_deps` defaults to `_default_indexing_deps()` (never touches
+    Postgres) for every `REVIEW`-focused caller below; dedicated INDEX-job
+    tests pass a real one built against `migrated_engine`.
     """
     task: asyncio.Task[None] = asyncio.create_task(
         run_dispatch_loop(
             job_queue=job_queue,
             review_registry=review_registry,
+            indexing_deps=indexing_deps if indexing_deps is not None else _default_indexing_deps(),
             worker_id=worker_id,
             poll_interval_seconds=poll_interval_seconds,
             stuck_job_warning_threshold_seconds=stuck_job_warning_threshold_seconds,
@@ -305,8 +375,7 @@ async def test_stuck_job_that_then_fails_is_marked_failed_via_the_normal_path(
         for record in caplog.records
     )
     assert not any(
-        "unhandled exception in dispatch loop" in record.getMessage()
-        for record in caplog.records
+        "unhandled exception in dispatch loop" in record.getMessage() for record in caplog.records
     )
 
 
@@ -347,32 +416,112 @@ async def test_claim_next_failure_logs_and_loop_recovers_on_a_later_job(
     assert call_count >= 2
 
 
-# --- INDEX job dispatch: logged as unimplemented, marked DONE ---------------
+# --- INDEX job dispatch: a real call into indexing.pipeline.run_indexing_job ---
+# (indexing delivery plan's Phase 7 — replaces the old "log unimplemented,
+# mark DONE" stub the walking-skeleton plan shipped.)
+
+
+def _index_payload(
+    *, repo_id: uuid.UUID, force_full_tree_fallback: bool = False
+) -> dict[str, object]:
+    return {
+        "org_id": str(uuid.uuid4()),
+        "repo_id": str(repo_id),
+        "installation_id": 1,
+        "repo_full_name": "acme/widgets",
+        "pr_number": 0,
+        "commit_sha": "a" * 40,
+        "added": [],
+        "removed": [],
+        "modified": [],
+        "force_full_tree_fallback": force_full_tree_fallback,
+    }
 
 
 @pytest.mark.asyncio
-async def test_index_job_logged_unimplemented_and_marked_done_then_loop_processes_review_job(
+async def test_index_job_runs_real_pipeline_and_marks_done(
     migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A trivial (no added/modified/removed files) `INDEX` job dispatches
+    through `indexing.pipeline.run_indexing_job` for real, against a real
+    `IndexingRepository`/Postgres — proving the stub replacement, not just
+    that dispatch.py compiles against the new signature.
+    """
     _reenable_dispatch_logger()
 
     session_factory = create_session_factory(migrated_engine)
     job_queue = JobQueueRepository(session_factory)
+    repo_id = await _provision_repo(session_factory)
+    indexing_deps = IndexingJobDependencies(
+        tree_fetcher=FakeRepoTreeFetcher(),
+        embedding_client=FakeEmbeddingClient(),
+        index_repository=IndexingRepository(session_factory),
+        commit_tracker=IndexingRepository(session_factory),
+    )
 
-    index_job_id = await job_queue.enqueue(JobType.INDEX, {})
+    index_job_id = await job_queue.enqueue(JobType.INDEX, _index_payload(repo_id=repo_id))
     review_job_id = await job_queue.enqueue(JobType.REVIEW, {"pr_number": 1})
 
     with caplog.at_level("INFO"):
         async with _running_dispatch_loop(
-            job_queue=job_queue, review_registry=_registry(_SucceedingStep())
+            job_queue=job_queue,
+            review_registry=_registry(_SucceedingStep()),
+            indexing_deps=indexing_deps,
         ):
             await _wait_for_status(migrated_engine, index_job_id, JobStatus.DONE)
             await _wait_for_status(migrated_engine, review_job_id, JobStatus.DONE)
 
     assert any(
-        record.getMessage() == "index job dispatch: not implemented"
+        record.getMessage() == "index job completed"
         and getattr(record, "job_id", None) == str(index_job_id)
         for record in caplog.records
+    )
+
+    async with session_factory() as session:
+        row = await session.get(Repo, repo_id)
+        assert row is not None
+        assert row.last_indexed_commit_sha == "a" * 40
+
+
+@pytest.mark.asyncio
+async def test_index_job_fatal_failure_marks_job_failed(
+    migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A truncated Git Trees API response (`RepoTreeTruncatedError`) is a
+    whole-job-fatal failure (`indexing.pipeline.IndexingJobFailedError`) —
+    proving `_run_claimed_job` catches it the same way it already catches
+    `PipelineFailedError` for `REVIEW` jobs, not the generic bug-resilience
+    catch-all.
+    """
+    _reenable_dispatch_logger()
+
+    session_factory = create_session_factory(migrated_engine)
+    job_queue = JobQueueRepository(session_factory)
+    repo_id = await _provision_repo(session_factory)
+    null_repo = _NullIndexRepository()
+    indexing_deps = IndexingJobDependencies(
+        tree_fetcher=FakeRepoTreeFetcher(truncated=True),
+        embedding_client=FakeEmbeddingClient(),
+        index_repository=null_repo,
+        commit_tracker=null_repo,
+    )
+
+    index_job_id = await job_queue.enqueue(JobType.INDEX, _index_payload(repo_id=repo_id))
+
+    with caplog.at_level("ERROR"):
+        async with _running_dispatch_loop(
+            job_queue=job_queue,
+            review_registry=_registry(_SucceedingStep()),
+            indexing_deps=indexing_deps,
+        ):
+            await _wait_for_status(migrated_engine, index_job_id, JobStatus.FAILED)
+
+    assert any(
+        record.getMessage() == "job failed" and getattr(record, "job_id", None) == str(index_job_id)
+        for record in caplog.records
+    )
+    assert not any(
+        "unhandled exception in dispatch loop" in record.getMessage() for record in caplog.records
     )
 
 

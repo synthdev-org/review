@@ -167,6 +167,17 @@ class GitHubDiffFetchError(GitHubAdapterError):
     ``FAILED`` transition), logged at ``error`` — never a silently
     truncated or garbled result, since several of these guard against a
     PR-crafted bypass of this platform's own static-analysis/LLM coverage.
+
+    ``GitHubDiffFetcher``'s own unreachable/malformed-response failures
+    (including ones originating from the shared
+    ``adapter.github.git_data`` blob/tree helpers, Phase 2 of the indexing
+    delivery plan) are translated into subclasses here at ``diff.py``'s own
+    call sites, so this contract is unaffected by that later extraction.
+    ``GitHubBlobTooLargeError`` moved to a ``GitHubGitDataFetchError``
+    subclass instead (see that class) once it became shared with
+    ``adapter.github.tree.GitHubTreeFetcher`` — it is no longer a subclass
+    of this class, though it is still importable from this module
+    unchanged.
     """
 
     def __init__(self, *, detail: str) -> None:
@@ -214,16 +225,68 @@ class GitHubTreeEntryMissingError(GitHubDiffFetchError):
     """
 
 
-class GitHubBlobTooLargeError(GitHubDiffFetchError):
-    """Raised when a Git Blobs API fetch for a surviving file's content
-    returns an error because the blob is at or beyond that API's
-    documented ~100MB size ceiling.
+# ---------------------------------------------------------------------------
+# Phase 2 (indexing): shared Git Data API helpers (adapter.github.git_data)
+# ---------------------------------------------------------------------------
 
-    Per the plan's Phase 4 section: treated the same as any other GitHub
-    API failure — a typed exception that fails the job — never a silently
+
+class GitHubGitDataFetchError(GitHubAdapterError):
+    """Base class for every failure in the shared, low-level Git Data API
+    helpers (``adapter.github.git_data``) — the one ``GET .../git/trees/...``
+    tree-listing call and the semaphore-bounded ``GET .../git/blobs/...``
+    content fetch, used identically by both ``adapter.github.diff``
+    (PR-diff-scoped fetch) and ``adapter.github.tree`` (indexing's
+    arbitrary/full-tree-scoped fetch, Phase 2 of the indexing delivery
+    plan) — genuinely the same GitHub API calls and failure modes,
+    regardless of which higher-level fetcher triggered them, per that
+    plan's Phase 2 section ("extract a shared blob-fetch helper" /
+    "reuses, not reimplements, the tree-listing call itself").
+    """
+
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(f"GitHub Git Data API call failed: {detail}")
+        self.detail = detail
+
+
+class GitHubGitDataUnreachableError(GitHubGitDataFetchError):
+    """Raised when a shared Git Data API call (tree listing or blob
+    content) could not be reached at all, exhausted its retry budget, or
+    returned a permanent error — see ``adapter/github/http.py``'s own
+    exception types, which this wraps.
+
+    ``adapter.github.diff.GitHubDiffFetcher`` translates this into its own
+    ``GitHubDiffFetchUnreachableError`` at its call sites, preserving its
+    pre-extraction exception contract unchanged;
+    ``adapter.github.tree.GitHubTreeFetcher`` (a new Phase 2 adapter, no
+    pre-existing contract to preserve) raises this directly.
+    """
+
+
+class GitHubGitDataMalformedResponseError(GitHubGitDataFetchError):
+    """Raised when a shared Git Data API call responded, but the body did
+    not contain the fields expected — a tree listing missing its own
+    ``tree``/``truncated`` fields, or a blob response missing ``content``.
+
+    Translated by ``adapter.github.diff.GitHubDiffFetcher`` into its own
+    ``GitHubDiffFetchMalformedResponseError``, and raised directly by
+    ``adapter.github.tree.GitHubTreeFetcher`` — same reasoning as
+    ``GitHubGitDataUnreachableError`` above.
+    """
+
+
+class GitHubBlobTooLargeError(GitHubGitDataFetchError):
+    """Raised when a Git Blobs API fetch for a surviving file's content is
+    at or beyond that API's documented ~100MB size ceiling.
+
+    Previously scoped to ``adapter.github.diff`` alone; now raised
+    directly by the shared ``adapter.github.git_data.fetch_blobs`` helper
+    both ``adapter.github.diff.GitHubDiffFetcher`` and
+    ``adapter.github.tree.GitHubTreeFetcher`` (Phase 2) call — the same
+    guard, not a per-caller copy. Treated the same as any other GitHub API
+    failure — a typed exception that fails the job — never a silently
     skipped/empty file, which would let an oversized file hide a secret or
-    vulnerable pattern from this platform's own static-analysis/LLM
-    coverage.
+    vulnerable pattern from this platform's own static-analysis/LLM/
+    indexing coverage.
     """
 
 

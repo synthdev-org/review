@@ -81,4 +81,14 @@ def test_enqueue_rate_limiter_active_logs_info_once(caplog: pytest.LogCaptureFix
     ]
     assert len(matching) == 1
     assert matching[0].levelname == "INFO"
-    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    # Scoped to the review-enqueue rate limiter's own warning, not "no
+    # WARNING record at all" — indexing-delivery plan's Phase 1 adds its
+    # own, independent `indexing_enabled` kill-switch warning (this
+    # settings object's own shipped default leaves it off), which is
+    # correct, expected behavior unrelated to the review-enqueue limiter
+    # this test is about.
+    assert not [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and "review-enqueue rate limiting" in r.getMessage()
+    ]

@@ -21,6 +21,16 @@ connectivity check genuinely, through the real `LiteLLMClient`/`litellm`
 code path against local-only HTTP servers, per docs/rules/testing.md's
 middle tier; both are marked `@pytest.mark.integration` because they cross
 the `adapter.llm` boundary, not merely call a fake.
+
+The indexing delivery plan's Phase 4 adds the local embedding model
+startup check tests below (not marked `@pytest.mark.integration`,
+deliberately): unlike the LLM check, the embedding model needs no network
+and no external service to stand up — its real dependency (the Dockerfile-
+baked model weights at `/app/models/all-MiniLM-L6-v2`) is already present
+in this repo's `dev` image, the same "real, but fully local, baked-in
+dependency exercised without mocking" pattern already established here for
+the GitHub-private-key (real RS256 signing) and Gitleaks-redaction (real
+binary) tests.
 """
 
 from __future__ import annotations
@@ -43,6 +53,7 @@ from adapter.storage.queue import JobQueueRepository
 from apps.worker.main import main
 from apps.worker.settings import WorkerSettings
 from findings.redact import NoOpTextRedactor, TextRedactor
+from indexing.pipeline import IndexingJobDependencies
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
 from review.config import StepEnablement, StepTimeouts
@@ -71,6 +82,7 @@ class _FakeLLMClient:
 async def _noop_dispatch_loop_forever(
     job_queue: JobQueueRepository,
     registry: StepRegistry,
+    indexing_deps: IndexingJobDependencies,
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
@@ -273,6 +285,48 @@ def test_github_retry_disabled_logs_info_once(
     ]
     assert len(matching) == 1
     assert matching[0]["level"] == "INFO"
+
+
+def test_main_succeeds_with_loadable_embedding_model(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The default `embedding_model_path` (the Dockerfile-baked, real
+    bundled model) loads and infers successfully — no mocking, the same
+    "real dependency baked into the dev image, exercised for real" pattern
+    the GitHub-private-key and Gitleaks-redaction tests above already
+    establish for this file."""
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()  # must not raise SystemExit
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    assert any(p["message"] == "local embedding model loaded" for p in payloads)
+    assert any(p["message"] == "worker started" for p in payloads)
+
+
+def test_main_exits_non_zero_with_unloadable_embedding_model(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_EMBEDDING_MODEL_PATH", "/nonexistent/model/path")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 1
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    assert any(
+        p["message"] == "local embedding model is not usable at startup; exiting"
+        and p["level"] == "ERROR"
+        for p in payloads
+    )
 
 
 def test_github_retry_default_does_not_log_disabled_message(

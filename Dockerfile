@@ -38,11 +38,49 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # on the bare runner — see .github/workflows/ci.yml).
 FROM zricethezav/gitleaks:v8.21.2 AS gitleaks
 
+# --- embedding-model: download and checksum-verify the bundled local
+# embedding model weights (US4, adapter/embedding/local_onnx.py) at build
+# time, never at runtime — per the indexing delivery plan's Assumption 4
+# ("model weights are baked into the Worker's container image at build
+# time ... pinned checksum, not a mutable model-name reference alone"). A
+# compromised/tampered model artifact would otherwise run in-process
+# against every customer's proprietary source undetected (found during
+# that plan's own security review); `sha256sum -c` below genuinely fails
+# this stage — and therefore the whole image build — on any mismatch, not
+# just a naming convention.
+#
+# Sourced from the exact Hugging Face repo/commit
+# adapter/embedding/local_onnx.py's own module docstring names (verified
+# directly against `fastembed`'s model registry before implementation, not
+# assumed) — pinned to a commit SHA, not a mutable branch ref, so "the
+# pinned checksum" and "the pinned source" are the same commitment, not two
+# independent ones that could silently drift apart.
+FROM debian:bookworm-slim AS embedding-model
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /model
+COPY adapter/embedding/model.sha256 ./model.sha256
+RUN set -eu; \
+    repo="Qdrant/all-MiniLM-L6-v2-onnx"; \
+    revision="5f1b8cd78bc4fb444dd171e59b18f3a3af89a079"; \
+    for f in config.json model.onnx special_tokens_map.json tokenizer.json tokenizer_config.json vocab.txt; do \
+        curl -fsSL -o "$f" "https://huggingface.co/${repo}/resolve/${revision}/${f}"; \
+    done; \
+    sha256sum -c model.sha256; \
+    rm model.sha256
+
 # --- dev: full source + dev deps, used to run lint/type-check/test locally
 # and in CI — `docker build --target dev` then `docker run <img> uv run ruff
-# check .` etc. Never pushed/deployed.
+# check .` etc. Never pushed/deployed. Gets the same checksum-verified
+# model weights the `runtime` stage does (copied from the same
+# `embedding-model` stage, not re-downloaded) — Phase 4's own integration
+# tests (`adapter/embedding/test_local_onnx.py`,
+# `adapter/embedding/test_startup_check.py`) run the real bundled model,
+# not a mock, per `testing.md`'s adapter convention, and this is what makes
+# that possible without network access from inside the `dev` container.
 FROM dev-deps AS dev
 COPY --from=gitleaks /usr/bin/gitleaks /usr/local/bin/gitleaks
+COPY --from=embedding-model /model /app/models/all-MiniLM-L6-v2
 COPY . .
 ENV PATH="/app/.venv/bin:${PATH}"
 
@@ -50,6 +88,7 @@ ENV PATH="/app/.venv/bin:${PATH}"
 FROM base AS runtime
 COPY --from=deps /app/.venv /app/.venv
 COPY --from=gitleaks /usr/bin/gitleaks /usr/local/bin/gitleaks
+COPY --from=embedding-model /model /app/models/all-MiniLM-L6-v2
 ENV PATH="/app/.venv/bin:${PATH}"
 COPY ingestion ./ingestion
 COPY indexing ./indexing

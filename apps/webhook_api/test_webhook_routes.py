@@ -62,6 +62,8 @@ def _build_client(
     rate_limit_max_requests: int = 1_000,
     rate_limit_window_seconds: float = 60.0,
     review_enqueue_rate_limit_per_minute: int = 0,
+    indexing_enabled: bool = False,
+    index_enqueue_rate_limit_per_minute: int = 5,
 ) -> TestClient:
     settings = WebhookAPISettings(
         environment="development",
@@ -71,6 +73,8 @@ def _build_client(
         webhook_rate_limit_max_requests=rate_limit_max_requests,
         webhook_rate_limit_window_seconds=rate_limit_window_seconds,
         review_enqueue_rate_limit_per_minute=review_enqueue_rate_limit_per_minute,
+        indexing_enabled=indexing_enabled,
+        index_enqueue_rate_limit_per_minute=index_enqueue_rate_limit_per_minute,
         _env_file=None,
     )
     return TestClient(create_app(settings))
@@ -96,6 +100,39 @@ def _payload(
         if head_sha is not None:
             pr["head"] = {"sha": head_sha}
         body["pull_request"] = pr
+    return json.dumps(body).encode("utf-8")
+
+
+def _push_payload(
+    *,
+    repo_full_name: str = "acme/widgets",
+    installation_id: int = 123,
+    default_branch: str = "main",
+    ref: str = "refs/heads/main",
+    after: str | None = "commit-after-sha",
+    before: str | None = "commit-before-sha",
+    commits: list[dict[str, object]] | None = None,
+    head_commit: dict[str, object] | None = None,
+    forced: bool | None = False,
+    deleted: bool | None = None,
+) -> bytes:
+    body: dict[str, object] = {
+        "installation": {"id": installation_id},
+        "repository": {"full_name": repo_full_name, "default_branch": default_branch},
+        "ref": ref,
+    }
+    if before is not None:
+        body["before"] = before
+    if after is not None:
+        body["after"] = after
+    if commits is not None:
+        body["commits"] = commits
+    if head_commit is not None:
+        body["head_commit"] = head_commit
+    if forced is not None:
+        body["forced"] = forced
+    if deleted is not None:
+        body["deleted"] = deleted
     return json.dumps(body).encode("utf-8")
 
 
@@ -523,6 +560,335 @@ async def test_default_configuration_never_rate_limits(migrated_engine: AsyncEng
             assert response.status_code == 200
 
     assert await _job_count(migrated_engine) == burst_size
+
+
+# --- Indexing (INDEX job) enqueue path (plan-indexing-delivery.md US1/US2/US11) ---
+
+
+@pytest.mark.asyncio
+async def test_push_to_default_branch_enqueues_one_index_job(migrated_engine: AsyncEngine) -> None:
+    """US1: a `push` to the repo's default branch, with the kill switch on,
+    enqueues exactly one `INDEX` job carrying the merged file lists and the
+    pushed HEAD commit sha. Before this test, `_push_payload` (defined
+    above) was never called anywhere in this file, so this path was
+    completely untested despite the plan's traceability table naming this
+    file as US1's coverage.
+    """
+    client = _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        indexing_enabled=True,
+    )
+    body = _push_payload(
+        repo_full_name="acme/widgets",
+        installation_id=555,
+        after="commit-after-sha",
+        commits=[{"added": ["a.ts"], "removed": [], "modified": ["b.ts"]}],
+    )
+
+    response = _post(client, body, event_type="push", delivery_id="delivery-push-index")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.job_type == JobType.INDEX
+    assert job.status == JobStatus.PENDING
+    assert job.payload["pr_number"] == 0
+    assert job.payload["commit_sha"] == "commit-after-sha"
+    assert job.payload["added"] == ["a.ts"]
+    assert job.payload["modified"] == ["b.ts"]
+
+
+@pytest.mark.asyncio
+async def test_push_with_merge_commit_still_indexes_head_commit_files(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """A push landed via a merge (e.g. GitHub's "Merge pull request" button)
+    can have an empty `commits` array — GitHub's `push` payload excludes
+    merge commits from it — with the actual file changes present only on
+    `head_commit`. Before the fix, `_merged_push_file_lists` only ever
+    read `envelope.commits`, so this case silently enqueued an `INDEX` job
+    with empty `added`/`removed`/`modified` while still advancing the
+    indexed-commit cursor, permanently skipping the merge's own changes.
+    """
+    client = _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        indexing_enabled=True,
+    )
+    body = _push_payload(
+        repo_full_name="acme/widgets",
+        installation_id=555,
+        after="merge-commit-sha",
+        commits=[],
+        head_commit={"added": ["a.ts"], "removed": [], "modified": ["b.ts"]},
+    )
+
+    response = _post(client, body, event_type="push", delivery_id="delivery-push-merge-commit")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.job_type == JobType.INDEX
+    assert job.payload["added"] == ["a.ts"]
+    assert job.payload["modified"] == ["b.ts"]
+
+
+@pytest.mark.asyncio
+async def test_push_deleting_default_branch_enqueues_no_index_job(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """A branch/tag-deletion push carries `after` as the all-zeros SHA (a
+    string, not absent) and GitHub's own `deleted: true` flag — `after is
+    None` alone never catches this, so without the `deleted` check this
+    would enqueue an `INDEX` job for a commit that never existed.
+    """
+    client = _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        indexing_enabled=True,
+    )
+    body = _push_payload(
+        repo_full_name="acme/widgets",
+        installation_id=555,
+        after="0" * 40,
+        deleted=True,
+    )
+
+    response = _post(client, body, event_type="push", delivery_id="delivery-push-deleted")
+
+    assert response.status_code == 200
+    assert await _fetch_jobs(migrated_engine) == []
+
+
+@pytest.mark.asyncio
+async def test_pull_request_opened_enqueues_review_and_index_jobs(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US2: a `pull_request opened` event, with the kill switch on,
+    enqueues both the pre-existing `REVIEW` job and a new `INDEX` job from
+    the same request/shared transaction. Before this test, no test in this
+    file ever passed `indexing_enabled=True`, so `_index_enqueue_payload`'s
+    `pull_request` branch never executed in any test.
+    """
+    client = _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        indexing_enabled=True,
+    )
+    body = _payload(
+        repo_full_name="acme/widgets", installation_id=555, pr_number=9, head_sha="pr-sha-9"
+    )
+
+    response = _post(client, body, delivery_id="delivery-pr-index")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len(jobs) == 2
+    jobs_by_type = {job.job_type: job for job in jobs}
+    assert set(jobs_by_type) == {JobType.REVIEW, JobType.INDEX}
+    index_job = jobs_by_type[JobType.INDEX]
+    assert index_job.payload["pr_number"] == 9
+    assert index_job.payload["commit_sha"] == "pr-sha-9"
+    assert index_job.payload["force_full_tree_fallback"] is True
+    review_job = jobs_by_type[JobType.REVIEW]
+    assert review_job.payload["pr_number"] == 9
+    assert review_job.payload["head_sha"] == "pr-sha-9"
+
+
+@pytest.mark.asyncio
+async def test_same_delivery_id_processed_twice_yields_exactly_one_index_job(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US11's dedup guarantee, exercised for `INDEX` specifically: a
+    redelivered `push` event with the kill switch on must not double-
+    enqueue an `INDEX` job. Before this test, the only redelivered-
+    delivery-id test in this file
+    (`test_same_delivery_id_processed_twice_yields_exactly_one_job`) always
+    ran with `indexing_enabled=False`, so it only ever exercised the
+    `REVIEW`-job dedup path — `JobType.INDEX` never appeared in this file.
+    """
+    body = _push_payload(repo_full_name="acme/widgets", installation_id=555, after="dup-sha")
+
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        indexing_enabled=True,
+    ) as client:
+        first = _post(client, body, event_type="push", delivery_id="repeated-index-delivery")
+        second = _post(client, body, event_type="push", delivery_id="repeated-index-delivery")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len(jobs) == 1
+    assert jobs[0].job_type == JobType.INDEX
+
+
+@pytest.mark.asyncio
+async def test_index_enqueues_past_rate_limit_are_rejected_at_the_boundary(
+    migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The per-repo index-enqueue rate limit NFR
+    (plan-indexing-delivery.md), the `INDEX` analogue of
+    `test_enqueues_past_rate_limit_are_rejected_at_the_boundary` above for
+    `REVIEW`. Before this test, `index_enqueue_rate_limiter` was only ever
+    wired into a request when `indexing_enabled=True` — which no test set
+    — so the index rate limiter could never actually fire in this suite.
+    """
+    logging.getLogger("apps.webhook_api.webhook_routes").disabled = False
+
+    def _body(after: str) -> bytes:
+        return _push_payload(repo_full_name="acme/widgets", installation_id=555, after=after)
+
+    with (
+        _build_client(
+            dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+            indexing_enabled=True,
+            index_enqueue_rate_limit_per_minute=2,
+        ) as client,
+        caplog.at_level("INFO"),
+    ):
+        first = _post(client, _body("sha-1"), event_type="push", delivery_id="idx-rl-1")
+        second = _post(client, _body("sha-2"), event_type="push", delivery_id="idx-rl-2")
+        third = _post(client, _body("sha-3"), event_type="push", delivery_id="idx-rl-3")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert third.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len([job for job in jobs if job.job_type == JobType.INDEX]) == 2
+    assert any(
+        getattr(record, "skipped_reason", None) == "index_rate_limited" for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_index_rate_limit_is_shared_across_push_and_pull_request_triggers(
+    migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The per-repo `INDEX` rate-limit bucket (plan-indexing-delivery.md's
+    Assumption 10 / Phase 1) is one bucket per repo covering *both*
+    trigger kinds together, not a separate bucket per trigger type. Before
+    this test, the only `INDEX` rate-limit test
+    (`test_index_enqueues_past_rate_limit_are_rejected_at_the_boundary`,
+    above) only ever sent `push` events, so a regression that accidentally
+    keyed the limiter by trigger type as well as repo — defeating the
+    shared-bucket design — would not have been caught.
+    """
+    logging.getLogger("apps.webhook_api.webhook_routes").disabled = False
+
+    with (
+        _build_client(
+            dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+            indexing_enabled=True,
+            index_enqueue_rate_limit_per_minute=2,
+        ) as client,
+        caplog.at_level("INFO"),
+    ):
+        push_response = _post(
+            client,
+            _push_payload(repo_full_name="acme/widgets", installation_id=123, after="sha-shared-1"),
+            event_type="push",
+            delivery_id="idx-shared-rl-push",
+        )
+        pr_response = _post(
+            client,
+            _payload(
+                repo_full_name="acme/widgets",
+                installation_id=123,
+                pr_number=41,
+                head_sha="pr-shared-sha",
+            ),
+            event_type="pull_request",
+            delivery_id="idx-shared-rl-pr",
+        )
+        third_response = _post(
+            client,
+            _push_payload(repo_full_name="acme/widgets", installation_id=123, after="sha-shared-2"),
+            event_type="push",
+            delivery_id="idx-shared-rl-push-2",
+        )
+
+    assert push_response.status_code == 200
+    assert pr_response.status_code == 200
+    assert third_response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    index_jobs = [job for job in jobs if job.job_type == JobType.INDEX]
+    assert len(index_jobs) == 2
+    assert any(
+        getattr(record, "skipped_reason", None) == "index_rate_limited" for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_mixed_enqueue_and_rate_limited_outcomes_roll_back_together(
+    migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression test: a `pull_request opened` event matches both the
+    `REVIEW` and `INDEX` triggers in one request. If `REVIEW` enqueues
+    successfully while `INDEX` is rate-limited in that same request, the
+    whole transaction — including `REVIEW`'s own successful enqueue — must
+    roll back together. Before this fix, `should_commit` was
+    `any_enqueued or not any_rate_limited`: since `REVIEW` did enqueue,
+    the whole delivery committed anyway, durably marking it "seen" with
+    `INDEX`'s own job never enqueued — permanently losing it even after
+    the rate-limit window passes and the exact same delivery is
+    redelivered, since the per-delivery idempotency guard has no way to
+    tell "REVIEW already succeeded" apart from "this whole delivery was
+    already fully handled".
+    """
+    logging.getLogger("apps.webhook_api.webhook_routes").disabled = False
+
+    with (
+        _build_client(
+            dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+            indexing_enabled=True,
+            index_enqueue_rate_limit_per_minute=1,
+        ) as client,
+        caplog.at_level("INFO"),
+    ):
+        # Exhausts the shared per-repo INDEX quota (limit=1) before the
+        # mixed-outcome request below.
+        _post(
+            client,
+            _push_payload(repo_full_name="acme/widgets", installation_id=555, after="sha-warmup"),
+            event_type="push",
+            delivery_id="mixed-warmup",
+        )
+
+        mixed_body = _payload(installation_id=555, pr_number=99, head_sha="mixed-sha")
+        mixed = _post(client, mixed_body, event_type="pull_request", delivery_id="mixed-1")
+
+        assert mixed.status_code == 200
+        jobs = await _fetch_jobs(migrated_engine)
+        # Only the warmup INDEX job exists — the mixed request's own REVIEW
+        # enqueue was rolled back, never durably committed alongside its
+        # sibling's rate-limited INDEX outcome.
+        assert len(jobs) == 1
+        assert jobs[0].job_type == JobType.INDEX
+        assert await _delivery_count(migrated_engine) == 1  # only "mixed-warmup" recorded
+
+        # Redelivering the exact same delivery id (still within the same
+        # rate-limit window, so INDEX is rate-limited again and the whole
+        # thing rolls back again too) is processed fresh, never skipped as
+        # a duplicate — proving the earlier rollback never durably marked
+        # it "seen". Actually clearing the rate limit to let it through
+        # needs real wall-clock time to pass (a sliding window, per
+        # `InMemoryRateLimiter`'s own docstring); what this fix guarantees
+        # — and what's provable without waiting out that window — is that
+        # the delivery stays retriable indefinitely rather than being
+        # permanently resolved as "seen" after just one rate-limited pass.
+        redelivered = _post(client, mixed_body, event_type="pull_request", delivery_id="mixed-1")
+
+    assert redelivered.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    # Still just the one warmup INDEX job — redelivery rolled back again
+    # too (INDEX is still rate-limited), but critically didn't lose
+    # anything new, and REVIEW's own successful outcome rolled back with it
+    # rather than committing while INDEX's was discarded.
+    assert len(jobs) == 1
+    assert await _delivery_count(migrated_engine) == 1
+    assert not any(
+        getattr(record, "skipped_reason", None) == "duplicate_delivery" for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

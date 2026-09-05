@@ -56,9 +56,7 @@ class PostgresTenancyStore:
     ) -> OrgRepoIds:
         return await self._run(
             unit_of_work,
-            lambda session: self._get_or_create_org_repo(
-                session, installation_id, repo_full_name
-            ),
+            lambda session: self._get_or_create_org_repo(session, installation_id, repo_full_name),
         )
 
     async def _get_or_create_org_repo(

@@ -67,12 +67,30 @@ bounded by a stdlib ``asyncio.Semaphore`` — matching the restraint this
 plan shows elsewhere for GitHub API usage, avoiding both unacceptable
 sequential latency and the risk of tripping GitHub's own secondary rate
 limits.
+
+**Shared with ``adapter/github/tree.py`` (indexing delivery plan, Phase 2):**
+the Git Trees API listing call/parse and the mode-guard/size-ceiling/
+concurrency-bounded Git Blobs API fetch described above are no longer
+inlined here alone — both now route through
+``adapter/github/git_data.py``'s ``fetch_tree_listing``/``fetch_blobs``,
+shared with the new ``GitHubTreeFetcher`` (indexing's arbitrary/full-tree
+content fetch) rather than duplicated. The three exceptions this class's
+own call sites raise (``GitHubDiffFetchUnreachableError``,
+``GitHubDiffFetchMalformedResponseError``, translated from the shared
+helper's own failures; ``GitHubBlobTooLargeError``, raised by the shared
+helper directly and never translated) are still exactly these same three
+types — no call site of this class needs to change. Their *class
+hierarchy* did shift, though: ``GitHubBlobTooLargeError`` is now a
+``GitHubGitDataFetchError`` subclass (shared with ``GitHubTreeFetcher``),
+not a ``GitHubDiffFetchError`` one — a hypothetical ``except
+GitHubDiffFetchError`` written to catch every failure this class can
+raise as one family would no longer catch it (nothing in this codebase
+does that today).
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -81,14 +99,16 @@ import httpx
 
 from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.exceptions import (
-    GitHubBlobTooLargeError,
     GitHubDiffFetchMalformedResponseError,
     GitHubDiffFetchUnreachableError,
     GitHubFileCountMismatchError,
+    GitHubGitDataMalformedResponseError,
+    GitHubGitDataUnreachableError,
     GitHubPermanentAPIError,
     GitHubRetryExhaustedError,
     GitHubTreeEntryMissingError,
 )
+from adapter.github.git_data import BlobFetchEntry, fetch_blobs, fetch_tree_listing
 from adapter.github.http import auth_headers, client_context, request_with_retry, split_owner_repo
 from ingestion.diff import Diff, DiffFetcher, DiffFile
 
@@ -96,12 +116,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_GITHUB_API_BASE_URL = "https://api.github.com"
 _DEFAULT_BLOB_FETCH_CONCURRENCY = 10
-# The Git Blobs API's documented ceiling is ~100MB; a blob at or beyond
-# this is treated as fatal (see the module docstring's "Coverage-limit"
-# section) rather than fetched and found to fail.
-_BLOB_SIZE_CEILING_BYTES = 100_000_000
-_SYMLINK_MODE = "120000"
-_SUBMODULE_MODE = "160000"
 _REMOVED_STATUS = "removed"
 
 
@@ -179,6 +193,35 @@ class GitHubDiffFetcher:
         except (GitHubPermanentAPIError, GitHubRetryExhaustedError) as exc:
             raise GitHubDiffFetchUnreachableError(detail=str(exc)) from exc
 
+    async def _fetch_tree_entries(
+        self, client: httpx.AsyncClient, headers: dict[str, str], owner: str, repo: str, sha: str
+    ) -> list[dict[str, Any]]:
+        """Wraps ``adapter/github/git_data.py``'s shared ``fetch_tree_listing``
+        in this class's own pre-existing exception contract
+        (``GitHubDiffFetchUnreachableError``/``GitHubDiffFetchMalformedResponseError``)
+        — the ``truncated`` flag it also returns is not consulted here:
+        unlike ``adapter/github/tree.py``'s full-listing fetch,
+        ``GitHubDiffFetcher`` only ever cross-references specific
+        already-known changed-file paths, so a truncated response is only
+        fatal if one of *those* paths is unresolvable (``GitHubTreeEntryMissingError``
+        below), never merely because the flag itself is set.
+        """
+        try:
+            tree_entries, _truncated = await fetch_tree_listing(
+                client,
+                github_api_base_url=self._github_api_base_url,
+                owner=owner,
+                repo=repo,
+                headers=headers,
+                commit_sha=sha,
+                max_retry_attempts=self._max_retry_attempts,
+            )
+        except GitHubGitDataUnreachableError as exc:
+            raise GitHubDiffFetchUnreachableError(detail=str(exc)) from exc
+        except GitHubGitDataMalformedResponseError as exc:
+            raise GitHubDiffFetchMalformedResponseError(detail=str(exc)) from exc
+        return tree_entries
+
     async def fetch(
         self, *, installation_id: int, repo_full_name: str, pr_number: int, head_sha: str
     ) -> Diff:
@@ -197,7 +240,7 @@ class GitHubDiffFetcher:
             # isn't used until after this line) — so all three run
             # concurrently instead of paying the PR-metadata round-trip's
             # latency serially before the other two even start.
-            pr_response, raw_files, tree_response = await asyncio.gather(
+            pr_response, raw_files, tree_entries = await asyncio.gather(
                 self._request_or_unreachable(
                     client,
                     "GET",
@@ -205,13 +248,7 @@ class GitHubDiffFetcher:
                     headers=headers,
                 ),
                 self._fetch_all_file_pages(client, headers, owner, repo, pr_number),
-                self._request_or_unreachable(
-                    client,
-                    "GET",
-                    f"{self._github_api_base_url}/repos/{owner}/{repo}/git/trees/{head_sha}"
-                    "?recursive=1",
-                    headers=headers,
-                ),
+                self._fetch_tree_entries(client, headers, owner, repo, head_sha),
             )
             pr_data = _parse_json(pr_response)
             try:
@@ -235,11 +272,6 @@ class GitHubDiffFetcher:
                     )
                 )
 
-            tree_data = _parse_json(tree_response)
-            try:
-                tree_entries = tree_data["tree"]
-            except (KeyError, TypeError) as exc:
-                raise GitHubDiffFetchMalformedResponseError(detail=str(exc)) from exc
             tree_by_path: dict[str, dict[str, Any]] = {
                 entry["path"]: entry for entry in tree_entries if "path" in entry
             }
@@ -313,68 +345,47 @@ class GitHubDiffFetcher:
         diff: Diff,
         paths: Sequence[str],
     ) -> dict[str, bytes]:
+        """Delegates the actual mode-guard/size-ceiling/concurrency-bounded
+        fetch to ``adapter/github/git_data.py``'s shared ``fetch_blobs`` —
+        see the module docstring's "Shared with adapter/github/tree.py"
+        section. Any path not present in ``diff.files`` is silently
+        excluded before calling the shared helper (a caller error — same
+        behavior as before this extraction), matching ``BlobFetchEntry``'s
+        precondition that every entry it's given is real.
+        """
         token = await self._token_provider.get_token(
             installation_id=installation_id, repo_full_name=repo_full_name
         )
         headers = auth_headers(token)
         owner, repo = _split_owner_repo(repo_full_name)
         by_path = {file.path: file for file in diff.files}
-        semaphore = asyncio.Semaphore(self._blob_fetch_concurrency)
-        result: dict[str, bytes] = {}
-
-        async def _fetch_one(client: httpx.AsyncClient, path: str) -> None:
-            entry = by_path.get(path)
-            if entry is None or entry.blob_sha is None:
-                # Not present in this diff (caller error) or a removed file
-                # (no blob_sha) — nothing to fetch either way.
-                return
-            if entry.mode in (_SYMLINK_MODE, _SUBMODULE_MODE):
-                logger.info(
-                    "materialization excluded: symlink or submodule entry",
-                    extra={"path": path, "mode": entry.mode},
-                )
-                return
-            if (
-                entry.blob_size_bytes is not None
-                and entry.blob_size_bytes >= _BLOB_SIZE_CEILING_BYTES
-            ):
-                logger.error(
-                    "diff fetch: blob at/over the Git Blobs API size ceiling",
-                    extra={"path": path, "blob_size_bytes": entry.blob_size_bytes},
-                )
-                raise GitHubBlobTooLargeError(
-                    detail=(
-                        f"{path} is {entry.blob_size_bytes} bytes, at/over the ~100MB "
-                        "Git Blobs API ceiling"
-                    )
-                )
-
-            async with semaphore:
-                response = await self._request_or_unreachable(
-                    client,
-                    "GET",
-                    f"{self._github_api_base_url}/repos/{owner}/{repo}/git/blobs/"
-                    f"{entry.blob_sha}",
-                    headers=headers,
-                )
-            data = _parse_json(response)
-            try:
-                content_b64 = data["content"]
-                result[path] = base64.b64decode(content_b64)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise GitHubDiffFetchMalformedResponseError(detail=str(exc)) from exc
+        entries = [
+            BlobFetchEntry(
+                path=path,
+                mode=by_path[path].mode,
+                blob_sha=by_path[path].blob_sha,
+                size=by_path[path].blob_size_bytes,
+            )
+            for path in paths
+            if path in by_path
+        ]
 
         async with client_context(self._client, timeout=self._timeout) as client:
-            tasks = [asyncio.create_task(_fetch_one(client, path)) for path in paths]
             try:
-                await asyncio.gather(*tasks)
-            except Exception:
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
-
-        return result
+                return await fetch_blobs(
+                    client,
+                    github_api_base_url=self._github_api_base_url,
+                    owner=owner,
+                    repo=repo,
+                    headers=headers,
+                    entries=entries,
+                    concurrency=self._blob_fetch_concurrency,
+                    max_retry_attempts=self._max_retry_attempts,
+                )
+            except GitHubGitDataUnreachableError as exc:
+                raise GitHubDiffFetchUnreachableError(detail=str(exc)) from exc
+            except GitHubGitDataMalformedResponseError as exc:
+                raise GitHubDiffFetchMalformedResponseError(detail=str(exc)) from exc
 
 
 # Runtime confirmation (not just a docstring claim) that this class actually

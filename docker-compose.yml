@@ -93,6 +93,15 @@ services:
       # policy — see .env.example's own comment on this variable.
       REVIEW_WEBHOOK_API_REVIEW_ENQUEUE_RATE_LIMIT_PER_MINUTE: >-
         ${REVIEW_WEBHOOK_API_REVIEW_ENQUEUE_RATE_LIMIT_PER_MINUTE:-0}
+      # Indexing kill switch (indexing delivery plan's Phase 1, Assumption
+      # 11) — defaults to `false` so this stack ships inert (no `INDEX`
+      # job ever enqueued) until an operator makes the affirmative choice
+      # to set it `true`. Phase 7 wires the Worker's own INDEX-job
+      # handling, so this is the first phase where enabling it does
+      # anything.
+      REVIEW_WEBHOOK_API_INDEXING_ENABLED: ${REVIEW_WEBHOOK_API_INDEXING_ENABLED:-false}
+      REVIEW_WEBHOOK_API_INDEX_ENQUEUE_RATE_LIMIT_PER_MINUTE: >-
+        ${REVIEW_WEBHOOK_API_INDEX_ENQUEUE_RATE_LIMIT_PER_MINUTE:-5}
       # SETUP_MODE off by default, per the plan's Security review
       # ("Manifest-flow gating") — only enable for the duration of a
       # one-time GitHub App creation flow.

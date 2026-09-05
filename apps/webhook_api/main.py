@@ -26,6 +26,12 @@ constructed here — the composition root, per architecture.md's "wire
 concrete implementations only at the composition root" rule — and passed
 into the webhook router alongside the (optionally ``None``) per-repo
 enqueue rate limiter.
+
+``plan-indexing-delivery.md``'s Phase 1 adds this entrypoint's second
+enqueue rate limiter (``index_enqueue_rate_limiter``, `INDEX`-specific,
+also optionally ``None`` per the same ``0``-disables-it sentinel) and the
+``indexing_enabled`` kill switch, both passed down explicitly into the
+webhook router the same way every other Phase 1 setting already is.
 """
 
 from __future__ import annotations
@@ -80,6 +86,35 @@ def _build_enqueue_rate_limiter(settings: WebhookAPISettings) -> InMemoryRateLim
     )
 
 
+def _build_index_enqueue_rate_limiter(settings: WebhookAPISettings) -> InMemoryRateLimiter | None:
+    """Same ``0``-disables-it sentinel as ``_build_enqueue_rate_limiter``
+    above, for the `INDEX`-specific bucket (indexing-delivery plan's Phase
+    1, Assumption 10) — a single instance shared across both `push`- and
+    `pull_request`-triggered `INDEX` enqueues, keyed by repo id at the call
+    site (``apps/webhook_api/webhook_routes.py``), not per-instance here.
+    Unlike ``review_enqueue_rate_limit_per_minute``, this setting's shipped
+    default is not ``0`` (see ``apps/webhook_api/settings.py`` for why), so
+    reaching the ``0`` branch below means an operator has actively disabled
+    it, not that they're merely running this phase's shipped default.
+    """
+    if settings.index_enqueue_rate_limit_per_minute == 0:
+        logger.warning(
+            "per-repo index-enqueue rate limiting is disabled "
+            "(index_enqueue_rate_limit_per_minute=0); an operator has "
+            "actively overridden this setting's non-zero shipped default"
+        )
+        return None
+
+    logger.info(
+        "per-repo index-enqueue rate limiting is active",
+        extra={"index_enqueue_rate_limit_per_minute": settings.index_enqueue_rate_limit_per_minute},
+    )
+    return InMemoryRateLimiter(
+        max_requests=settings.index_enqueue_rate_limit_per_minute,
+        window_seconds=60.0,
+    )
+
+
 def create_app(settings: WebhookAPISettings) -> FastAPI:
     """Build the Webhook API's FastAPI application from parsed settings."""
     app = FastAPI(title="review webhook_api")
@@ -94,6 +129,14 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
     tenancy_store = PostgresTenancyStore(session_factory)
     job_queue = JobQueueRepository(session_factory)
     enqueue_rate_limiter = _build_enqueue_rate_limiter(settings)
+    index_enqueue_rate_limiter = _build_index_enqueue_rate_limiter(settings)
+
+    if not settings.indexing_enabled:
+        logger.warning(
+            "indexing_enabled is False (this phase's own shipped default); "
+            "no INDEX job will ever be enqueued regardless of trigger match "
+            "until an operator sets REVIEW_WEBHOOK_API_INDEXING_ENABLED=true"
+        )
 
     rate_limiter = InMemoryRateLimiter(
         max_requests=settings.webhook_rate_limit_max_requests,
@@ -108,6 +151,8 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
             job_queue=job_queue,
             session_factory=session_factory,
             enqueue_rate_limiter=enqueue_rate_limiter,
+            indexing_enabled=settings.indexing_enabled,
+            index_enqueue_rate_limiter=index_enqueue_rate_limiter,
         )
     )
 

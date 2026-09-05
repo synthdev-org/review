@@ -132,7 +132,8 @@ class FindingsOutputInput(BaseModel):
     Also, deliberately, the shape ``review.pipeline.StepFailureInfo.seed_input``
     is validated against on the *failure* path (``_run_failure_path``
     below) — the raw job payload (``apps/webhook_api/webhook_routes.py``'s
-    own ``_enqueue_payload``, mirrored exactly by ``review.prefilter.PrefilterInput``)
+    own ``_review_enqueue_payload``, mirrored exactly by
+    ``review.prefilter.PrefilterInput``)
     already carries every field here except ``findings``, which is why that
     one field alone defaults to empty: a fatal failure before this step's
     normal dependency ever produced output has no findings to report, by

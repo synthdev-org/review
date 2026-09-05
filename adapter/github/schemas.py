@@ -24,6 +24,15 @@ class Repository(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     full_name: str
+    # Optional per the same "model only what's consumed, never reject a
+    # well-formed delivery missing it" discipline as every other Phase 1
+    # addition below: `adapter/github/triggers.py`'s `is_index_trigger`
+    # compares a `push` payload's `ref` against this field to decide
+    # default-branch-ness (US1); a `pull_request` delivery still carries a
+    # `repository` object, but this plan's indexing trigger never consults
+    # `default_branch` for that event type, so it stays optional rather than
+    # required.
+    default_branch: str | None = None
 
 
 class PullRequestHead(BaseModel):
@@ -47,6 +56,23 @@ class PullRequest(BaseModel):
     # Both optional for the same reason as PullRequestHead.sha above.
     number: int | None = None
     head: PullRequestHead | None = None
+
+
+class PushCommit(BaseModel):
+    """One entry of a ``push`` event payload's top-level ``commits`` array
+    (and the shape of ``head_commit`` too, which is the same object).
+
+    Per the plan's Phase 1 section, only the three file-path lists are
+    modeled — every other per-commit field (author, message, timestamp,
+    URL, ...) is ignored via ``extra="ignore"`` since nothing downstream
+    consumes it yet.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    added: list[str] = []
+    removed: list[str] = []
+    modified: list[str] = []
 
 
 class GitHubWebhookEnvelope(BaseModel):
@@ -86,6 +112,27 @@ class GitHubWebhookEnvelope(BaseModel):
     repository: Repository | None = None
     action: str | None = None
     pull_request: PullRequest | None = None
+    # Push-only fields (Phase 1's `INDEX` trigger, per the plan's Phase 1
+    # section). Every one of these is optional, deliberately: a
+    # `pull_request`, `ping`, or `installation` delivery carries none of
+    # them, and a required field here would reject those already-working,
+    # correctly-signed deliveries with a 422 — exactly the failure mode
+    # `action`/`pull_request`'s own optionality above already avoids. Same
+    # "model only what's consumed, ignore the rest via extra='ignore'"
+    # discipline the envelope already follows throughout.
+    ref: str | None = None
+    before: str | None = None
+    after: str | None = None
+    commits: list[PushCommit] = []
+    head_commit: PushCommit | None = None
+    forced: bool | None = None
+    # A branch/tag *deletion* push: GitHub sets this `true` and `after` to
+    # the all-zeros SHA (a string, not absent) — `after is None` alone
+    # never catches this case, so callers that must skip a deletion push
+    # (e.g. `apps/webhook_api/webhook_routes.py`'s `INDEX` job enqueue,
+    # which would otherwise try to index a commit that never existed)
+    # check this field explicitly.
+    deleted: bool | None = None
 
 
 class GitHubAppCredentials(BaseModel):

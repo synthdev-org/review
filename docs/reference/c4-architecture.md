@@ -246,6 +246,15 @@ Level 2 and [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).
   embeddings, and a call/import graph — the same shape Greptile and CodeRabbit
   build (§2.1) — kept incrementally up to date by the indexing job on every
   push, queried by the Context Builder during review.
+- **The indexing job makes zero generative LLM calls.** Chunk embeddings use
+  a bi-encoder embedding model call (not generative), and the call/import
+  graph is built by static parsing only — no docstring/summary generation,
+  hierarchical summarization, or LLM-based entity extraction on the default
+  indexing path. This keeps per-push indexing cost and latency low and,
+  since design goal 3 makes every LLM call a customer-billed BYO-key call,
+  keeps indexing free of inference spend the customer never asked for. Richer
+  enrichment techniques are deferred as an optional, explicitly opt-in
+  capability — see [ADR-0007](../adr/0007-llm-free-indexing-deferred-rag-enrichment.md).
 - **Context Builder can optionally call out to knowhow.** After querying
   review's own index, the Context Builder makes an additional MCP client call
   to knowhow (`knowhow_search`/`knowhow_fetch`/`knowhow_related`) when a

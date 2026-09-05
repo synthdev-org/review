@@ -67,6 +67,18 @@ prompt). No new LLM-endpoint fields: ``llm_endpoint``/``llm_api_key``/
 ``llmgateway.client.LLMClient``/``LiteLLMClient``, not a second consumer
 needing its own config surface.
 
+Phase 4 of the indexing delivery plan (docs/plans/plan-indexing-delivery.md
+— a separate plan from the "Phase N" numbering used elsewhere in this
+file's own history, disambiguated explicitly here) adds
+``embedding_model_path`` — the on-disk directory the Dockerfile's
+``embedding-model`` build stage bakes the checksum-verified local
+embedding model weights into (``/app/models/all-MiniLM-L6-v2`` by
+default, matching that stage's own `COPY --from=embedding-model`
+destination in both the ``runtime`` and ``dev`` stages) — read once here
+and passed to ``adapter.embedding.local_onnx.LocalONNXEmbeddingClient``,
+never read from adapter code directly, per architecture.md's "parse
+config once, pass down explicitly" rule.
+
 Phase 7 of the delivery plan adds ``dry_run`` (``REVIEW_WORKER_DRY_RUN``,
 per ``docs/specs/phase-1-review-pipeline.md``'s Rollout & Release Safety
 section's "decided" dry-run design) — a single bootstrap flag, not
@@ -214,6 +226,14 @@ class WorkerSettings(BaseSettings):
     # PR-author-controlled and directly drives LLM token cost, per the
     # plan's Security review.
     llm_max_diff_bytes: int = 200_000
+
+    # --- Local embedding client (indexing delivery plan Phase 4,
+    # adapter/embedding/local_onnx.py) ---
+    # The on-disk path to the Dockerfile-baked, checksum-verified model
+    # directory — see this file's own module docstring. Not a HTTP
+    # endpoint/credential like the LLM fields above: this is a purely
+    # local filesystem path, no network call at inference time.
+    embedding_model_path: str = "/app/models/all-MiniLM-L6-v2"
 
     # --- Findings-merge-and-output step (Phase 7, review/output.py) ---
     # A single bootstrap-config kill-switch: when set, the full pipeline

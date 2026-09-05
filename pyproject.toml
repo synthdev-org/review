@@ -34,6 +34,36 @@ dependencies = [
     # with no first-party Python packaging) — it's vendored into the
     # Dockerfile's runtime/dev stages instead, per that same section.
     "semgrep>=1.85,<2",
+    # Phase 3 (indexing plan): the AST-aware chunker (indexing/chunk.py)
+    # parses TypeScript/PHP/Go source into real syntax trees and splits at
+    # structural boundaries (per rag-techniques.md's cAST rationale) —
+    # added as ordinary PyPI-packaged grammars, the same way Semgrep was in
+    # Phase 1/5. Not covered by the existing Semgrep dependency: Semgrep is
+    # invoked as a subprocess for rule-based finding output only
+    # (adapter/analyzers/semgrep.py), exposing no API for the underlying
+    # chunk/parse-tree boundaries this phase needs. Phase 5's graph
+    # extraction (indexing/graph.py) reuses the same parse tree
+    # ``indexing/chunk.py`` produces rather than re-parsing.
+    "tree-sitter>=0.23,<1",
+    "tree-sitter-typescript>=0.23,<1",
+    "tree-sitter-php>=0.23,<1",
+    "tree-sitter-go>=0.23,<1",
+    # Phase 4 (indexing plan): the local embedding client
+    # (adapter/embedding/local_onnx.py) — a thin ONNX wrapper that ships
+    # its own tokenizer/inference machinery, over a lower-level
+    # onnxruntime+tokenizers pairing or sentence-transformers, per the
+    # plan's Assumption 3 ("smaller dependency footprint, matching this
+    # whole PRD's keep-it-cheap direction"). At runtime this adapter always
+    # points fastembed at the Dockerfile's checksum-verified, baked-in
+    # model directory (`specific_model_path`) rather than letting it
+    # download/cache a model itself — see that module's own docstring.
+    "fastembed>=0.4,<1",
+    # Phase 6 (indexing plan): the Python-side SQLAlchemy ``Vector`` column
+    # type binding for the `index_chunk.embedding` column — the `vector`
+    # Postgres extension itself is already enabled by the baseline
+    # migration (0001), but no Python-side binding was installed until this
+    # phase actually needed to declare a vector-typed column.
+    "pgvector>=0.3,<1",
 ]
 
 [dependency-groups]
@@ -111,6 +141,23 @@ files = [
 # more infra libraries in later phases.
 [[tool.mypy.overrides]]
 module = "uvicorn.*"
+ignore_missing_imports = true
+
+# fastembed ships no inline type hints/py.typed marker and no third-party
+# stub package exists on PyPI as of Phase 4 (indexing plan) — the same
+# "no stubs beyond what's bundled" gap the uvicorn override above already
+# documents, now for this codebase's first ONNX-inference dependency.
+[[tool.mypy.overrides]]
+module = "fastembed.*"
+ignore_missing_imports = true
+
+# asyncpg (already a direct dependency via SQLAlchemy's async engine) ships
+# no inline type hints/py.typed marker either — the same gap as fastembed/
+# uvicorn above, now for tests/e2e/test_indexing_pipeline.py's first direct
+# (not-through-SQLAlchemy) use of it, to query Postgres straight from the
+# host for the indexing E2E scenario's own assertions.
+[[tool.mypy.overrides]]
+module = "asyncpg.*"
 ignore_missing_imports = true
 
 # Alembic version scripts are semi-generated (autogenerate produces the first
