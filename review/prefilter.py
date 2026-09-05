@@ -154,8 +154,8 @@ class PrefilterInput(JobIdentity):
     dict (``apps/worker/dispatch.py``'s ``seed_input``), per
     architecture.md's "validate every boundary ... job payloads ... with
     pydantic models" rule. Mirrors ``apps/webhook_api/webhook_routes.py``'s
-    ``_enqueue_payload`` shape exactly — the one place this payload is
-    built.
+    ``_review_enqueue_payload`` shape exactly — the one place this payload
+    is built.
     """
 
     model_config = ConfigDict(frozen=True)

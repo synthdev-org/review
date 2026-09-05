@@ -24,6 +24,10 @@ _EXPECTED_TABLES = {
     "model_routing_config",
     "org_repo_team_setting",
     "webhook_delivery",
+    # Phase 6 (indexing plan, Unit F):
+    "index_chunk",
+    "index_graph_node",
+    "index_graph_edge",
     "alembic_version",
 }
 
@@ -38,6 +42,7 @@ _EXPECTED_COLUMNS = {
         "name",
         "full_name",
         "installation_id",
+        "last_indexed_commit_sha",
         "created_at",
         "updated_at",
     },
@@ -73,6 +78,37 @@ _EXPECTED_COLUMNS = {
         "value",
         "created_at",
         "updated_at",
+    },
+    "index_chunk": {
+        "id",
+        "repo_id",
+        "pr_number",
+        "file_path",
+        "chunk_index",
+        "language",
+        "symbol_name",
+        "byte_range_start",
+        "byte_range_end",
+        "content",
+        "embedding",
+        "created_at",
+        "updated_at",
+    },
+    "index_graph_node": {
+        "id",
+        "repo_id",
+        "pr_number",
+        "file_path",
+        "symbol_name",
+        "language",
+        "created_at",
+        "updated_at",
+    },
+    "index_graph_edge": {
+        "id",
+        "source_node_id",
+        "target_symbol_name",
+        "created_at",
     },
 }
 

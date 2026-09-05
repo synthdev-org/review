@@ -52,6 +52,8 @@ from adapter.storage.queue import JobQueueRepository
 from apps.worker.dispatch import run_dispatch_loop
 from findings.models import Finding
 from findings.redact import NoOpTextRedactor
+from indexing.conftest import FakeEmbeddingClient, FakeRepoTreeFetcher
+from indexing.pipeline import IndexingJobDependencies
 from ingestion.diff import Diff, DiffFetcher, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMUnreachableError
@@ -231,6 +233,36 @@ def _seed_payload() -> dict[str, object]:
     }
 
 
+class _NullIndexRepository:
+    """A trivial `IndexRepository`/`IndexCommitTracker` stand-in — this
+    file's own tests dispatch only `REVIEW` jobs, never `INDEX`, so
+    `run_dispatch_loop`'s now-required `indexing_deps` argument never needs
+    to do real work here (see `apps/worker/test_dispatch.py`'s identical
+    fake for the dedicated `INDEX`-job dispatch tests)."""
+
+    async def upsert_file(self, **kwargs: object) -> None:
+        raise AssertionError("_NullIndexRepository.upsert_file should never be called")
+
+    async def delete_file(self, **kwargs: object) -> None:
+        raise AssertionError("_NullIndexRepository.delete_file should never be called")
+
+    async def get_last_indexed_commit(self, **kwargs: object) -> str | None:
+        raise AssertionError("_NullIndexRepository.get_last_indexed_commit should never be called")
+
+    async def set_last_indexed_commit(self, **kwargs: object) -> None:
+        raise AssertionError("_NullIndexRepository.set_last_indexed_commit should never be called")
+
+
+def _null_indexing_deps() -> IndexingJobDependencies:
+    null_repo = _NullIndexRepository()
+    return IndexingJobDependencies(
+        tree_fetcher=FakeRepoTreeFetcher(),
+        embedding_client=FakeEmbeddingClient(),
+        index_repository=null_repo,
+        commit_tracker=null_repo,
+    )
+
+
 @contextlib.asynccontextmanager
 async def _running_dispatch_loop(
     *, job_queue: JobQueueRepository, review_registry: StepRegistry
@@ -239,6 +271,7 @@ async def _running_dispatch_loop(
         run_dispatch_loop(
             job_queue=job_queue,
             review_registry=review_registry,
+            indexing_deps=_null_indexing_deps(),
             worker_id="test-worker",
             poll_interval_seconds=_POLL_INTERVAL_SECONDS,
             stuck_job_warning_threshold_seconds=30.0,

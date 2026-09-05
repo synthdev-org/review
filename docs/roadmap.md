@@ -66,7 +66,10 @@ Replace "bare diff" with the structural context every credible competitor
 builds (research §2.1).
 
 - Incremental indexing job: AST-aware chunking, per-node embeddings,
-  call/import graph — kept fresh on every push.
+  call/import graph — kept fresh on every push. LLM-free by design — bi-encoder
+  embeddings and static parsing only, no chunk-level summary generation,
+  hierarchical summarization, or LLM-based entity extraction (see
+  [ADR-0007](adr/0007-llm-free-indexing-deferred-rag-enrichment.md)).
 - Context Builder queries the index during review (blast-radius lookups for
   changed signatures, not just the changed hunk).
 - Review job upgraded to consume built context instead of the bare diff from
@@ -189,6 +192,13 @@ roadmap because nothing above depends on them landing first.
   several separate client companies). [ADR-0004](adr/0004-multi-org-tenancy.md)
   explicitly does not provide this — would need revisiting, not a natural
   extension of Phase 6's model.
+- **Optional, richer RAG enrichment** (docstring/summary embedding,
+  RAPTOR-style hierarchical summarization, LLM-based entity/relationship
+  graph extraction). Per [ADR-0007](adr/0007-llm-free-indexing-deferred-rag-enrichment.md),
+  Phase 2's indexing job stays LLM-free by default to keep per-push indexing
+  cost and latency low; these techniques land later, if ever, as an
+  explicitly opt-in capability a customer configures, not a change to the
+  default indexing path.
 
 ---
 

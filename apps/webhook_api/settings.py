@@ -75,6 +75,30 @@ class WebhookAPISettings(BaseSettings):
     # limiter and relying on its own `max_requests >= 1` `ValueError` guard.
     review_enqueue_rate_limit_per_minute: int = 0
 
+    # Indexing kill switch (indexing-delivery plan's Phase 1, Assumption
+    # 11), defaulting to ``False`` — Phases 1-6 of that plan ship genuinely
+    # inert (no `INDEX` job ever enqueued) until an operator makes the
+    # affirmative choice to set this `True`, once the Worker actually knows
+    # how to run an `INDEX` job (that plan's Phase 7). Scope stated
+    # precisely in `apps/webhook_api/webhook_routes.py`: this stops new
+    # `INDEX` jobs from being *enqueued*; it does not drain jobs already
+    # sitting in `job_queue`.
+    indexing_enabled: bool = False
+
+    # Per-repo index-enqueue rate limit (indexing-delivery plan's Phase 1,
+    # Assumption 10), keyed by repo id, covering both `push`- and
+    # `pull_request`-triggered `INDEX` enqueues together — one bucket per
+    # repo, the same shape `review_enqueue_rate_limit_per_minute` above
+    # already uses for `REVIEW`. A materially higher recommended default
+    # (`5`, not `0`) than `REVIEW`'s: an `INDEX` job's worst-case cost (a
+    # full-tree-fallback run, up to 20,000 files/2GB) is high enough that
+    # shipping it unthrottled by default is not the same safe-by-default
+    # tradeoff `REVIEW`'s `0` default makes. `0` remains a documented
+    # sentinel (handled at the call site, `apps/webhook_api/main.py`) for an
+    # operator who wants to disable this limit entirely, the same as
+    # `review_enqueue_rate_limit_per_minute`'s own `0` sentinel.
+    index_enqueue_rate_limit_per_minute: int = 5
+
     # --- App manifest/callback setup flow (apps/webhook_api/manifest_routes.py) ---
     # Off by default, per the plan's Phase 4 section ("both ... routes are
     # ... gated behind an explicit SETUP_MODE config flag, off by default")

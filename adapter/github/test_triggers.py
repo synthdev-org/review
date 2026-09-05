@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 import adapter.github.triggers as triggers_module
-from adapter.github.triggers import is_enqueue_trigger
+from adapter.github.triggers import is_enqueue_trigger, is_index_trigger
 
 _TRIGGERING_PAIRS = [
     ("pull_request", "opened"),
@@ -53,3 +53,59 @@ def test_a_hypothetical_new_entry_can_be_added_without_touching_the_lookup_funct
     monkeypatch.setattr(triggers_module, "_ENQUEUE_REVIEW_TRIGGERS", extended)
 
     assert is_enqueue_trigger("pull_request", "edited") is True
+
+
+# --- is_index_trigger (indexing-delivery plan's Phase 1) ---
+
+
+def test_push_to_default_branch_triggers_index() -> None:
+    assert is_index_trigger("push", None, "refs/heads/main", "main") is True
+
+
+def test_push_to_non_default_branch_does_not_trigger_index() -> None:
+    assert is_index_trigger("push", None, "refs/heads/feature-x", "main") is False
+
+
+def test_push_missing_ref_does_not_trigger_index() -> None:
+    """A malformed/adversarial `push` delivery missing `ref` resolves to
+    "no match" rather than raising or guessing."""
+    assert is_index_trigger("push", None, None, "main") is False
+
+
+def test_push_missing_default_branch_does_not_trigger_index() -> None:
+    """`repository.default_branch` is optional per
+    `adapter/github/schemas.py` — a delivery missing it can never match,
+    never crash."""
+    assert is_index_trigger("push", None, "refs/heads/main", None) is False
+
+
+@pytest.mark.parametrize("action", ["opened", "synchronize"])
+def test_pull_request_opened_or_synchronize_triggers_index(action: str) -> None:
+    assert is_index_trigger("pull_request", action, None, None) is True
+
+
+@pytest.mark.parametrize("action", ["reopened", "closed", "labeled", "edited"])
+def test_other_pull_request_actions_do_not_trigger_index(action: str) -> None:
+    """`reopened` triggers a `REVIEW` (per `_ENQUEUE_REVIEW_TRIGGERS`) but
+    never an `INDEX` — reopening a PR with no new commits has nothing new
+    to index, proving the two trigger tables are independent, not aliases
+    of each other."""
+    assert is_index_trigger("pull_request", action, None, None) is False
+
+
+def test_pull_request_none_action_does_not_trigger_index() -> None:
+    assert is_index_trigger("pull_request", None, None, None) is False
+
+
+@pytest.mark.parametrize("event_type", ["ping", "installation", "issues", "check_run"])
+def test_other_event_types_never_trigger_index(event_type: str) -> None:
+    assert is_index_trigger(event_type, "opened", "refs/heads/main", "main") is False
+
+
+def test_a_hypothetical_new_pull_request_index_action_can_be_added_without_touching_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extended = triggers_module._ENQUEUE_INDEX_PULL_REQUEST_TRIGGERS | {("pull_request", "reopened")}
+    monkeypatch.setattr(triggers_module, "_ENQUEUE_INDEX_PULL_REQUEST_TRIGGERS", extended)
+
+    assert is_index_trigger("pull_request", "reopened", None, None) is True

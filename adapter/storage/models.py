@@ -32,9 +32,30 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, String, UniqueConstraint, func
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# Dimension of the bundled local embedding model
+# (`Xenova/all-MiniLM-L6-v2`, per the plan's Assumption 2/Phase 4 section) —
+# duplicated from `adapter/embedding/local_onnx.py`'s own
+# `EMBEDDING_DIMENSION` constant rather than imported, since this module
+# (infra-adjacent but still storage-only) has no reason to import an
+# embedding-adapter module just for one int; both are pinned to the same
+# model and would need to change together regardless.
+_EMBEDDING_DIMENSION = 384
 
 
 class Base(DeclarativeBase):
@@ -100,6 +121,15 @@ class Repo(Base):
     # itself provisions or updates, treating NULL as "not yet resolved"
     # rather than an invariant violation.
     installation_id: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
+    # The default branch's own last-indexed commit SHA (Phase 6 of the
+    # indexing plan) — nullable, no default, the same "NULL means not yet
+    # resolved" pattern `installation_id` above already uses. Scoped to the
+    # default branch only (per the plan's Phase 6 section): a PR-scoped
+    # job's delta calculation compares against this same repo-wide cursor,
+    # never a separate per-PR cursor, and only a `pr_number == 0` job's
+    # completed run ever advances it (Phase 7's own ordering rule, closing
+    # the cursor-level poisoning path an independent security review found).
+    last_indexed_commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -271,4 +301,134 @@ class OrgRepoTeamSetting(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+
+class IndexChunkRow(Base):
+    """One AST-aware chunk (``indexing.chunk.Chunk``) plus its embedding
+    vector (``indexing.embedding.EmbeddingVector``), per the plan's Phase 6
+    section (US3/US4).
+
+    ``pr_number`` (non-null, default ``0`` — ``0`` means default-branch/
+    canonical, per Assumption 9) is folded into the unique key alongside
+    ``file_path``/``chunk_index`` so a PR-branch row (``pr_number > 0``, a
+    potentially zero-permission-fork-authored push) can never collide with,
+    and therefore never overwrite, the canonical ``pr_number = 0`` row for
+    the same file path — closing the fork-PR data-poisoning gap an
+    independent security review found in the original single-key design.
+    """
+
+    __tablename__ = "index_chunk"
+    __table_args__ = (
+        UniqueConstraint(
+            "repo_id",
+            "pr_number",
+            "file_path",
+            "chunk_index",
+            name="uq_index_chunk_repo_pr_file_chunk",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    repo_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("repo.id", ondelete="CASCADE"), nullable=False
+    )
+    pr_number: Mapped[int] = mapped_column(Integer(), nullable=False, default=0, server_default="0")
+    file_path: Mapped[str] = mapped_column(String(4096), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer(), nullable=False)
+    language: Mapped[str] = mapped_column(String(32), nullable=False)
+    symbol_name: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    byte_range_start: Mapped[int] = mapped_column(Integer(), nullable=False)
+    byte_range_end: Mapped[int] = mapped_column(Integer(), nullable=False)
+    content: Mapped[str] = mapped_column(Text(), nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(_EMBEDDING_DIMENSION), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class IndexGraphNodeRow(Base):
+    """One call/import-graph definition node (``indexing.graph.GraphNode``),
+    per the plan's Phase 6 section (US5). Same ``pr_number`` row-scoping
+    reasoning as ``IndexChunkRow`` above.
+    """
+
+    __tablename__ = "index_graph_node"
+    __table_args__ = (
+        UniqueConstraint(
+            "repo_id",
+            "pr_number",
+            "file_path",
+            "symbol_name",
+            name="uq_index_graph_node_repo_pr_file_symbol",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    repo_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("repo.id", ondelete="CASCADE"), nullable=False
+    )
+    pr_number: Mapped[int] = mapped_column(Integer(), nullable=False, default=0, server_default="0")
+    file_path: Mapped[str] = mapped_column(String(4096), nullable=False)
+    symbol_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    language: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class IndexGraphEdgeRow(Base):
+    """One candidate call/import edge (``indexing.graph.GraphEdge``), per
+    the plan's Phase 6 section (US5/US7).
+
+    ``target_symbol_name`` is a plain string, deliberately **not** a
+    foreign key, per US5/US7's dangling-reference design (a call/import
+    target that never matches any node, or a node whose file was since
+    deleted, is left in place as a dangling reference resolved as "no
+    match" by a future query — never an FK violation).
+
+    Unique on ``(source_node_id, target_symbol_name)`` — an independent
+    security review found the original draft specified no uniqueness key
+    here at all, so ordinary repeated pushes to an active file could
+    accumulate duplicate edge rows without bound. ``pr_number`` doesn't
+    need to be repeated here since it's already carried transitively via
+    ``source_node_id``'s own ``(repo_id, pr_number, ...)`` scoping on
+    ``IndexGraphNodeRow``. ``source_node_id``'s own ``ondelete=CASCADE``
+    is what deletes an edge when its *source* node is deleted (US7) — no
+    separate explicit delete needed for that case.
+
+    ``target_symbol_name`` also carries its own standalone index, separate
+    from the compound uniqueness key above (which leads with
+    ``source_node_id`` and so can't serve a "what depends on this symbol"
+    lookup) — the blast-radius query ADR-0007/spec-indexing name as this
+    table's own stated purpose filters by ``target_symbol_name`` alone.
+    """
+
+    __tablename__ = "index_graph_edge"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_node_id", "target_symbol_name", name="uq_index_graph_edge_source_target"
+        ),
+        Index("ix_index_graph_edge_target_symbol_name", "target_symbol_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    source_node_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("index_graph_node.id", ondelete="CASCADE"), nullable=False
+    )
+    target_symbol_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
