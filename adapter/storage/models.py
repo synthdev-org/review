@@ -340,6 +340,13 @@ class IndexChunkRow(Base):
     symbol_name: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     byte_range_start: Mapped[int] = mapped_column(Integer(), nullable=False)
     byte_range_end: Mapped[int] = mapped_column(Integer(), nullable=False)
+    # Nullable — Phase 1 of plan-deliver-context-builder.md's Assumption 5:
+    # populated going forward from `indexing.chunk.Chunk.line_range`, `NULL`
+    # for a chunk indexed before this column's migration and never
+    # re-indexed since. `index_graph_node` deliberately does not get these
+    # columns — see that Assumption's own reasoning.
+    start_line: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    end_line: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     content: Mapped[str] = mapped_column(Text(), nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(_EMBEDDING_DIMENSION), nullable=False)
     created_at: Mapped[datetime] = mapped_column(

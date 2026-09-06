@@ -15,8 +15,16 @@ def _finding(
     line: int | None = 10,
     message: str = "problem",
     source: Source = "llm",
+    context_ref_ids: tuple[int, ...] | None = None,
 ) -> Finding:
-    return Finding(file=file, line=line, severity="medium", message=message, source=source)
+    return Finding(
+        file=file,
+        line=line,
+        severity="medium",
+        message=message,
+        source=source,
+        context_ref_ids=context_ref_ids,
+    )
 
 
 def test_empty_input_returns_empty_output() -> None:
@@ -37,6 +45,72 @@ def test_clear_duplicate_on_same_file_and_line_collapses_to_one() -> None:
     # module's own docstring ("deterministic first pass as the trust
     # anchor" design rationale).
     assert result.findings[0] is static_finding
+
+
+def test_deduped_llm_findings_context_ref_ids_carries_forward_to_the_kept_finding() -> None:
+    """A static-analysis finding (kept, no `context_ref_ids`) deduped
+    against an LLM finding of the same defect (dropped, but citation-
+    bearing) must not silently lose that citation data — `review.output`'s
+    `_apply_citations` pass runs *after* `merge_findings`, so a dropped
+    `context_ref_ids` here can never be recovered downstream. The kept
+    finding's own `message`/`severity`/`source` still come from the
+    static-analysis finding, unchanged."""
+    static_finding = _finding(message="SQL injection risk here", source="semgrep")
+    llm_finding = _finding(
+        message="SQL injection risk detected here", source="llm", context_ref_ids=(0, 2)
+    )
+
+    result = merge_findings([static_finding, llm_finding])
+
+    assert len(result.findings) == 1
+    kept = result.findings[0]
+    assert kept.message == static_finding.message
+    assert kept.source == static_finding.source
+    assert kept.context_ref_ids == (0, 2)
+
+
+def test_kept_findings_own_context_ref_ids_are_not_overwritten_by_a_later_duplicate() -> None:
+    """When the *kept* (first-seen) finding already carries `context_ref_ids`
+    of its own, a later-arriving duplicate's `context_ref_ids` must not
+    overwrite it — "first non-`None` value wins", not "last duplicate
+    wins", consistent with the rest of this module's own "first occurrence
+    wins" precedence."""
+    first_llm_finding = _finding(
+        message="SQL injection risk here", source="llm", context_ref_ids=(1,)
+    )
+    second_llm_finding = _finding(
+        message="SQL injection risk detected here", source="llm", context_ref_ids=(2, 3)
+    )
+
+    result = merge_findings([first_llm_finding, second_llm_finding])
+
+    assert len(result.findings) == 1
+    assert result.findings[0].context_ref_ids == (1,)
+
+
+def test_three_way_duplicate_chain_still_honors_first_non_none_wins() -> None:
+    """`_dedupe`'s own bucket write-back (updating the stored bucket entry
+    to the *merged* finding, not just `deduped`) is load-bearing for a
+    3-way duplicate chain, not dead code: without it, the third finding's
+    "is the kept finding's own `context_ref_ids` still `None`?" check would
+    read a *stale* bucket entry from before the second finding's merge,
+    incorrectly conclude the kept finding still has no citation, and
+    overwrite the second finding's own `context_ref_ids` instead of
+    leaving it alone."""
+    first_finding = _finding(message="SQL injection risk here", source="semgrep")
+    second_finding = _finding(
+        message="SQL injection risk detected here", source="llm", context_ref_ids=(1,)
+    )
+    third_finding = _finding(
+        message="possible SQL injection risk here", source="llm", context_ref_ids=(2, 3)
+    )
+
+    result = merge_findings([first_finding, second_finding, third_finding])
+
+    assert len(result.findings) == 1
+    kept = result.findings[0]
+    assert kept.message == first_finding.message
+    assert kept.context_ref_ids == (1,)
 
 
 def test_two_distinct_findings_on_the_same_line_stay_separate() -> None:

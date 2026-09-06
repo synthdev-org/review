@@ -68,6 +68,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from findings.merge import POSTED_FINDINGS_CEILING, merge_findings
 from findings.models import Finding
+from review.citation import render_citation
+from review.context_bundle import ContextBundle
 from review.pipeline import StepFailureInfo
 from review.step import Step, StepContext
 
@@ -149,6 +151,15 @@ class FindingsOutputInput(BaseModel):
     repo_full_name: str
     pr_number: int
     head_sha: str
+    # Added by docs/plans/plan-deliver-context-builder.md's Phase 6 section
+    # (US6) — forwarded from `review.llm_review.LLMReviewOutput`'s own new
+    # field the same way every other field here already mirrors that
+    # step's output. `None` (the default, matching every non-context-builder
+    # upstream shape — `StaticAnalysisOutput`, `PrefilterOutput`, and the
+    # failure-path `StepFailureInfo.seed_input` alike, none of which carry a
+    # `context_bundle` field) means no finding can have a citation resolved
+    # against anything, which is exactly correct in that case.
+    context_bundle: ContextBundle | None = None
 
 
 class FindingsOutputResult(BaseModel):
@@ -235,6 +246,16 @@ class FindingsOutputStep:
                 },
             )
 
+        # Phase 6 (US6): for any finding whose `context_ref_ids` resolve to
+        # a real citation, build a *new* `Finding` (this model is
+        # `frozen=True`) with the citation text set on its own
+        # `citation_markdown` field, and use that modified `Finding` from
+        # here on — including on the dry-run path below, per this module's
+        # own docstring's "dry-run output must reflect... the same objects a
+        # real post would use" requirement; this must not run only on the
+        # real-post path.
+        findings = self._apply_citations(findings, parsed.context_bundle, job_id=context.job_id)
+
         if context.dry_run:
             logger.info(
                 "dry-run: would post PR review and check-run",
@@ -292,6 +313,42 @@ class FindingsOutputStep:
         return FindingsOutputResult(
             comment_count=len(findings), check_run_conclusion="neutral", posted=True
         )
+
+    @staticmethod
+    def _apply_citations(
+        findings: list[Finding], context_bundle: ContextBundle | None, *, job_id: str
+    ) -> list[Finding]:
+        """Returns `findings` with any citation-bearing entry replaced by a
+        `model_copy`'d `Finding` carrying the rendered citation in its own
+        `citation_markdown` field — never mutating a `Finding` in place
+        (`frozen=True`) and never appended into `message` (see
+        `Finding.citation_markdown`'s own docstring for why: `message` gets
+        `escape_markdown`'d by `adapter/github/posting.py`'s own
+        `_finding_body`, which would mangle `render_citation`'s own Markdown
+        template characters if the two were merged before that pass).
+
+        `context_bundle is None` (no context builder ran, or it ran and
+        produced nothing to render — see `FindingsOutputInput`'s own
+        docstring) short-circuits to returning `findings` unchanged, since
+        no `context_ref_ids` could resolve against anything in that case.
+        """
+
+        if context_bundle is None:
+            return findings
+
+        result: list[Finding] = []
+        for finding in findings:
+            if not finding.context_ref_ids:
+                result.append(finding)
+                continue
+            citation_text = render_citation(
+                list(finding.context_ref_ids), context_bundle, job_id=job_id
+            )
+            if citation_text is None:
+                result.append(finding)
+                continue
+            result.append(finding.model_copy(update={"citation_markdown": citation_text}))
+        return result
 
     async def _run_failure_path(
         self, info: StepFailureInfo, context: StepContext

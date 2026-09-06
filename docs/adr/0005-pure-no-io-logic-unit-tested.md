@@ -89,6 +89,38 @@ rule applies unchanged.
   (`validate_relative_path`, `adapter/analyzers/test_subprocess_runner.py`),
   a pure path-string check with no I/O of its own despite living inside an
   adapter package.
+- Phase 1 of `docs/plans/plan-deliver-context-builder.md` (this ADR's scope
+  extended by that phase's own PR, not a second ADR): `review/context_symbols.py`'s
+  diff-to-chunk resolution logic (US1/US10) —
+  `review/test_context_symbols.py`, against already-fetched
+  `pre_content`/`post_content` dicts (the hunk-header parsing, byte-offset
+  overlap resolution, and per-file `ChunkParseError` isolation genuinely
+  perform no I/O of their own; the module's own `fetch_diff_content`
+  orchestration function, which *does* do real I/O via `DiffFetcher`/
+  `RepoTreeFetcher`, is deliberately excluded from this exemption and proven
+  instead by Phase 5's end-to-end integration test).
+- Phase 4 of `docs/plans/plan-deliver-context-builder.md` (this ADR's scope
+  extended by that phase's own PR, not a second ADR): `review/context_bundle.py`'s
+  context assembly and budget enforcement logic (US9) —
+  `review/test_context_bundle.py`, against already-computed caller-hit and
+  similarity-hit values (per-item cap enforcement, proportional-total
+  truncation, the single-oversized-item-dropped-entirely case, and the
+  `diff_byte_size = 0` case all perform no I/O of their own — `assemble_context_bundle`
+  only aggregates and truncates already-fetched hits handed to it).
+- Phase 5 of `docs/plans/plan-deliver-context-builder.md` (this ADR's scope
+  extended by that phase's own PR, not a second ADR):
+  `apps/worker/settings.py`'s `WorkerSettings._context_builder_timeout_margin_is_valid`
+  validator (Assumption 7's margin invariant) — `apps/worker/test_settings.py`,
+  a pure cross-field numeric comparison with no I/O, mirroring
+  `apps/webhook_api/test_settings.py`'s existing
+  `pytest.raises(ValidationError)` pattern for its own analogous validator.
+- Phase 6 of `docs/plans/plan-deliver-context-builder.md` (this ADR's scope
+  extended by that phase's own PR, not a second ADR): `review/citation.py`'s
+  `render_citation` — `review/test_citation.py`, against an
+  already-assembled `ContextBundle` (looking up already-retrieved metadata
+  by ID, formatting it, and logging on an unknown ID or a missing
+  `line_range` all perform no I/O of their own; `render_citation` never
+  reads a `Chunk`'s content or talks to Postgres itself).
 - Later phases extend this same list as their own pure, no-I/O cases land —
   each phase's own plan section names the specific addition; this ADR's own
   text is updated to list it, rather than a new ADR being created per case.

@@ -99,6 +99,7 @@ import httpx
 
 from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.exceptions import (
+    GitHubBlobTooLargeError,
     GitHubDiffFetchMalformedResponseError,
     GitHubDiffFetchUnreachableError,
     GitHubFileCountMismatchError,
@@ -110,7 +111,13 @@ from adapter.github.exceptions import (
 )
 from adapter.github.git_data import BlobFetchEntry, fetch_blobs, fetch_tree_listing
 from adapter.github.http import auth_headers, client_context, request_with_retry, split_owner_repo
-from ingestion.diff import Diff, DiffFetcher, DiffFile
+from ingestion.diff import (
+    Diff,
+    DiffContentMalformedError,
+    DiffContentUnavailableError,
+    DiffFetcher,
+    DiffFile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -352,40 +359,81 @@ class GitHubDiffFetcher:
         excluded before calling the shared helper (a caller error — same
         behavior as before this extraction), matching ``BlobFetchEntry``'s
         precondition that every entry it's given is real.
-        """
-        token = await self._token_provider.get_token(
-            installation_id=installation_id, repo_full_name=repo_full_name
-        )
-        headers = auth_headers(token)
-        owner, repo = _split_owner_repo(repo_full_name)
-        by_path = {file.path: file for file in diff.files}
-        entries = [
-            BlobFetchEntry(
-                path=path,
-                mode=by_path[path].mode,
-                blob_sha=by_path[path].blob_sha,
-                size=by_path[path].blob_size_bytes,
-            )
-            for path in paths
-            if path in by_path
-        ]
 
-        async with client_context(self._client, timeout=self._timeout) as client:
-            try:
-                return await fetch_blobs(
-                    client,
-                    github_api_base_url=self._github_api_base_url,
-                    owner=owner,
-                    repo=repo,
-                    headers=headers,
-                    entries=entries,
-                    concurrency=self._blob_fetch_concurrency,
-                    max_retry_attempts=self._max_retry_attempts,
+        **Domain-boundary translation** (Phase 1 of
+        docs/plans/plan-deliver-context-builder.md): every
+        ``GitHubDiffFetchError`` this method's own call sites raise —
+        translated from the shared ``adapter.github.git_data`` helpers'
+        failures, exactly as before — is re-raised one further level as the
+        domain-owned ``ingestion.diff.DiffContentMalformedError``/
+        ``DiffContentUnavailableError``, per that Protocol's own updated
+        failure contract: ``ingestion.diff.DiffFetcher`` is a domain
+        Protocol, and a domain-package caller (Phase 5's
+        ``ContextBuilderStep``) must never catch an adapter-owned exception
+        type by name, per architecture.md's "domain never imports adapter
+        code" rule. ``GitHubBlobTooLargeError`` (a ``GitHubGitDataFetchError``
+        *sibling* of ``GitHubDiffFetchError``, never translated into one —
+        see this module's own docstring) gets its own separate ``except``
+        clause into the same ``DiffContentUnavailableError``, rather than a
+        single shared base-class catch that could never actually catch it.
+
+        **Named, accepted residual:** the token-exchange call above
+        (``self._token_provider.get_token``) sits outside this translation
+        — a ``GitHubTokenExchangeError`` still propagates untranslated, the
+        same pre-existing gap ``indexing.tree.RepoTreeFetcher`` already has
+        today, not something this translation is in scope to close.
+        ``review/static_analysis.py`` (Phase 5) already calls this exact
+        method too and is unaffected in behavior by this change — it
+        catches none of these exception types by name today, relying on
+        ``review/pipeline.py``'s generic per-step exception handling — but
+        the exception *type* now surfacing in its own logs/error tracking
+        for this path changes silently, named here rather than left
+        unacknowledged.
+        """
+        try:
+            token = await self._token_provider.get_token(
+                installation_id=installation_id, repo_full_name=repo_full_name
+            )
+            headers = auth_headers(token)
+            owner, repo = _split_owner_repo(repo_full_name)
+            by_path = {file.path: file for file in diff.files}
+            entries = [
+                BlobFetchEntry(
+                    path=path,
+                    mode=by_path[path].mode,
+                    blob_sha=by_path[path].blob_sha,
+                    size=by_path[path].blob_size_bytes,
                 )
-            except GitHubGitDataUnreachableError as exc:
-                raise GitHubDiffFetchUnreachableError(detail=str(exc)) from exc
-            except GitHubGitDataMalformedResponseError as exc:
-                raise GitHubDiffFetchMalformedResponseError(detail=str(exc)) from exc
+                for path in paths
+                if path in by_path
+            ]
+
+            async with client_context(self._client, timeout=self._timeout) as client:
+                try:
+                    return await fetch_blobs(
+                        client,
+                        github_api_base_url=self._github_api_base_url,
+                        owner=owner,
+                        repo=repo,
+                        headers=headers,
+                        entries=entries,
+                        concurrency=self._blob_fetch_concurrency,
+                        max_retry_attempts=self._max_retry_attempts,
+                    )
+                except GitHubGitDataUnreachableError as exc:
+                    raise GitHubDiffFetchUnreachableError(detail=str(exc)) from exc
+                except GitHubGitDataMalformedResponseError as exc:
+                    raise GitHubDiffFetchMalformedResponseError(detail=str(exc)) from exc
+        except GitHubDiffFetchMalformedResponseError as err:
+            raise DiffContentMalformedError(repo_full_name=repo_full_name, detail=str(err)) from err
+        except GitHubDiffFetchUnreachableError as err:
+            raise DiffContentUnavailableError(
+                repo_full_name=repo_full_name, detail=str(err)
+            ) from err
+        except GitHubBlobTooLargeError as err:
+            raise DiffContentUnavailableError(
+                repo_full_name=repo_full_name, detail=str(err)
+            ) from err
 
 
 # Runtime confirmation (not just a docstring claim) that this class actually

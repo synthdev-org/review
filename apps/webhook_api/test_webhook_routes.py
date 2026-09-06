@@ -87,6 +87,7 @@ def _payload(
     installation_id: int = 123,
     pr_number: int | None = 7,
     head_sha: str | None = "deadbeefcafe",
+    base_sha: str | None = None,
     include_pull_request: bool = True,
 ) -> bytes:
     body: dict[str, object] = {"installation": {"id": installation_id}}
@@ -99,6 +100,8 @@ def _payload(
             pr["number"] = pr_number
         if head_sha is not None:
             pr["head"] = {"sha": head_sha}
+        if base_sha is not None:
+            pr["base"] = {"sha": base_sha}
         body["pull_request"] = pr
     return json.dumps(body).encode("utf-8")
 
@@ -363,6 +366,60 @@ async def test_unseen_installation_creates_org_repo_and_enqueues_one_job(
     assert job.payload["head_sha"] == "a1"
     assert job.org_id is not None
     assert job.repo_id is not None
+
+
+@pytest.mark.asyncio
+async def test_base_sha_is_populated_from_pull_request_base_sha(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """docs/plans/plan-deliver-context-builder.md's Phase 1 section:
+    `_build_webhook_event`/`_review_enqueue_payload` must actually carry
+    `pull_request.base.sha` into the enqueued job payload — without this, a
+    wiring bug (wrong JSON key, dropped field) would go undetected despite
+    `base_sha` being load-bearing for Phase 5's citation accuracy
+    (Assumption 1/2).
+    """
+    client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
+    body = _payload(
+        repo_full_name="acme/widgets",
+        installation_id=556,
+        pr_number=1,
+        head_sha="a1",
+        base_sha="base-a1",
+    )
+
+    response = _post(client, body, delivery_id="delivery-base-sha")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len(jobs) == 1
+    assert jobs[0].payload["base_sha"] == "base-a1"
+
+
+@pytest.mark.asyncio
+async def test_missing_base_sha_still_enqueues_with_null_base_sha(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """`base_sha` is optional (per Assumption 2) — a delivery missing
+    `pull_request.base.sha` must still enqueue a REVIEW job (unlike
+    `head_sha`, whose absence blocks enqueueing entirely), just with
+    `base_sha: None` in the payload.
+    """
+    client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
+    body = _payload(
+        repo_full_name="acme/widgets",
+        installation_id=557,
+        pr_number=1,
+        head_sha="a1",
+        base_sha=None,
+    )
+
+    response = _post(client, body, delivery_id="delivery-no-base-sha")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len(jobs) == 1
+    assert jobs[0].payload["base_sha"] is None
 
 
 @pytest.mark.asyncio

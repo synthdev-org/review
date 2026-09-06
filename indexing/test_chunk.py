@@ -402,6 +402,70 @@ def test_chunk_index_is_sequential_per_file() -> None:
 
 
 # ---------------------------------------------------------------------------
+# line_range — docs/plans/plan-deliver-context-builder.md's Phase 1 section
+# (Assumption 5): computed uniformly by counting newlines in the *full*
+# file content up to each end of the chunk's own already-correct,
+# file-absolute byte_range. Round seven/eight added these two cases
+# specifically because three prior computation attempts each would have
+# passed a naive single-window, no-trailing-newline test while still being
+# wrong for exactly these cases.
+# ---------------------------------------------------------------------------
+
+
+def test_second_window_line_range_starts_well_after_line_one() -> None:
+    """A multi-window declaration's *second* window must get a line_range
+    starting well after line 1, matching the real file's own line numbers —
+    not the coincidentally-correct line 1 a single-window case would pass
+    even with a broken computation.
+    """
+    body_lines = "\n".join(f"    x{i} := {i}  // padding padding padding" for i in range(200))
+    source = f"""package main
+
+func Big() int {{
+{body_lines}
+    return 0
+}}
+""".encode()
+
+    result = chunk_file("go", "cmd/big.go", source)
+    big_chunks = [c for c in result.chunks if c.symbol_name == "Big"]
+    assert len(big_chunks) > 1
+
+    second = big_chunks[1]
+    assert second.line_range is not None
+    start_line, end_line = second.line_range
+    assert start_line > 1
+
+    # Independently verify against the real file's own line numbers — by
+    # reconstructing the byte range implied by (start_line, end_line) via a
+    # plain splitlines-based slice (not this module's own `_line_range`
+    # formula under test) and checking it equals the chunk's actual
+    # byte_range slice of the source.
+    file_lines = source.splitlines(keepends=True)
+    reconstructed = b"".join(file_lines[start_line - 1 : end_line])
+    assert source[second.byte_range[0] : second.byte_range[1]] == reconstructed
+
+
+def test_whole_file_chunk_with_trailing_newline_end_line_is_not_off_by_one() -> None:
+    """A whole-file fallback chunk (no matched declarations) of a fixture
+    that *ends with a trailing newline* — the near-universal case for real
+    source files — must get an end_line equal to the file's real last line,
+    not one past it (the exact `byte_range[1] - 1` off-by-one this
+    computation must get right).
+    """
+    source = b"package config\n\nconst MaxRetries = 3\n"
+
+    result = chunk_file("go", "cmd/config.go", source)
+
+    assert len(result.chunks) == 1
+    chunk = result.chunks[0]
+    assert chunk.line_range is not None
+    # Three real lines ("package config", "", "const MaxRetries = 3") — the
+    # trailing "\n" doesn't imply a fourth, empty line.
+    assert chunk.line_range == (1, 3)
+
+
+# ---------------------------------------------------------------------------
 # US10 — one file's parse failure raises a typed error (not yet the "rest
 # of the job still proceeds" isolation, which is Phase 7's own test).
 # ---------------------------------------------------------------------------

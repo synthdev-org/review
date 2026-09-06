@@ -129,6 +129,8 @@ class IndexingRepository:
                     "symbol_name": chunk.symbol_name,
                     "byte_range_start": chunk.byte_range[0],
                     "byte_range_end": chunk.byte_range[1],
+                    "start_line": chunk.line_range[0] if chunk.line_range else None,
+                    "end_line": chunk.line_range[1] if chunk.line_range else None,
                     "content": chunk.content,
                     "embedding": list(vector.values),
                 }
@@ -142,6 +144,8 @@ class IndexingRepository:
                     "symbol_name": chunk_insert.excluded.symbol_name,
                     "byte_range_start": chunk_insert.excluded.byte_range_start,
                     "byte_range_end": chunk_insert.excluded.byte_range_end,
+                    "start_line": chunk_insert.excluded.start_line,
+                    "end_line": chunk_insert.excluded.end_line,
                     "content": chunk_insert.excluded.content,
                     "embedding": chunk_insert.excluded.embedding,
                     "updated_at": func.now(),

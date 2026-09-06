@@ -55,6 +55,18 @@ class JobIdentity(BaseModel):
     imports ``Step``/``StepContext`` from, and explicitly exempt from
     ``review/test_step_boundaries.py``'s step-to-step import-boundary
     check) keeps this a framework-level dependency, not a step-to-step one.
+
+    ``base_sha`` (added by
+    docs/plans/plan-deliver-context-builder.md's Phase 1 section) is
+    **optional** (``str | None = None``), unlike the six required fields
+    above — a required field here would raise a pydantic ``ValidationError``
+    on ``PrefilterStep.run``'s very first ``PrefilterOutput(...)``
+    construction for every job, since GitHub's payload can genuinely omit
+    ``pull_request.base.sha``. Because it's optional, it is **not**
+    automatically carried forward the way the six required fields are — each
+    step's own ``Output`` construction that should carry it forward must
+    still forward it explicitly (``base_sha=input.base_sha``), per that
+    plan's Assumption 2.
     """
 
     org_id: str
@@ -63,6 +75,7 @@ class JobIdentity(BaseModel):
     repo_full_name: str
     pr_number: int
     head_sha: str
+    base_sha: str | None = None
 
 
 class StepContext(BaseModel):

@@ -86,13 +86,34 @@ def _dedupe(findings: Sequence[Finding]) -> list[Finding]:
     # key up front skips the O(n^2) similarity scan entirely for findings on
     # different files/lines, which is the overwhelming majority of pairs on
     # any diff touching more than a couple of files.
-    kept_by_key: dict[tuple[str, int | None], list[Finding]] = {}
+    kept_by_key: dict[tuple[str, int | None], list[tuple[int, Finding]]] = {}
     for finding in findings:
         key = (finding.file, finding.line)
         bucket = kept_by_key.setdefault(key, [])
-        if not any(_messages_similar(finding.message, existing.message) for existing in bucket):
-            bucket.append(finding)
+        duplicate: tuple[int, int, Finding] | None = None
+        for bucket_pos, (deduped_index, existing) in enumerate(bucket):
+            if _messages_similar(finding.message, existing.message):
+                duplicate = (bucket_pos, deduped_index, existing)
+                break
+        if duplicate is None:
             deduped.append(finding)
+            bucket.append((len(deduped) - 1, finding))
+            continue
+        duplicate_bucket_pos, duplicate_index, duplicate_of = duplicate
+        # The first occurrence still wins the message/severity/source — the
+        # PRD's "deterministic first pass as the free trust anchor" rationale
+        # (this module's own docstring) — but if the dropped duplicate is the
+        # one carrying `context_ref_ids` (Phase 6, US6) and the kept finding
+        # isn't, carry that field forward onto the kept finding rather than
+        # silently discarding it. Without this, a static-analysis finding
+        # deduped against a citation-bearing LLM finding for the same defect
+        # would drop the citation entirely — `review.output`'s later
+        # `_apply_citations` pass runs *after* `merge_findings`, so a dropped
+        # `context_ref_ids` here can never be recovered downstream.
+        if duplicate_of.context_ref_ids is None and finding.context_ref_ids is not None:
+            merged = duplicate_of.model_copy(update={"context_ref_ids": finding.context_ref_ids})
+            deduped[duplicate_index] = merged
+            bucket[duplicate_bucket_pos] = (duplicate_index, merged)
     return deduped
 
 

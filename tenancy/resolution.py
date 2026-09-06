@@ -46,11 +46,18 @@ class WebhookEvent(BaseModel):
     adapter-to-domain translation happens once, at that boundary, not
     inside this package.
 
-    ``action``/``pr_number``/``head_sha`` are optional: a real GitHub
-    ``push`` delivery has no top-level ``action`` key and no
+    ``action``/``pr_number``/``head_sha``/``base_sha`` are optional: a real
+    GitHub ``push`` delivery has no top-level ``action`` key and no
     ``pull_request`` object at all, and a required field here would reject
     every such delivery before ``adapter/github/triggers.py``'s lookup ever
-    runs.
+    runs. ``base_sha`` (per
+    docs/plans/plan-deliver-context-builder.md's Phase 1 section) is the
+    PR's base-commit SHA, threaded through for the Context Builder's
+    (Phase 5) pre-change content fetch — optional for the same reason
+    ``head_sha`` already is: GitHub's payload can omit it, and this is a
+    genuine, benign production case (Phase 5 skips the pre-change fetch
+    entirely when it's ``None``), not only a deploy-migration-window
+    concern.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -61,6 +68,7 @@ class WebhookEvent(BaseModel):
     repo_full_name: str
     pr_number: int | None
     head_sha: str | None
+    base_sha: str | None = None
 
 
 class OrgRepoIds(BaseModel):

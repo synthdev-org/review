@@ -107,6 +107,7 @@ from adapter.github.exceptions import GitHubPrivateKeyInvalidError
 from adapter.github.posting import GitHubFindingsPublisher
 from adapter.github.tree import GitHubTreeFetcher
 from adapter.llm.litellm_client import LiteLLMClient
+from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.indexing_repository import IndexingRepository
 from adapter.storage.queue import JobQueueRepository
@@ -124,8 +125,10 @@ from review.config import (
     StepEnablement,
     StepTimeouts,
     check_step_configuration_viable,
+    context_builder_can_produce_value,
     static_analysis_can_produce_findings,
 )
+from review.context_builder import ContextBuilderStep
 from review.llm_review import LLMReviewStep
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
@@ -387,6 +390,7 @@ def _build_step_enablement(settings: WorkerSettings) -> StepEnablement:
     return StepEnablement(
         prefilter_enabled=settings.prefilter_enabled,
         static_analysis_enabled=settings.static_analysis_enabled,
+        context_builder_enabled=settings.context_builder_enabled,
         llm_review_enabled=settings.llm_review_enabled,
         output_enabled=settings.output_enabled,
         static_analysis_gitleaks_enabled=settings.static_analysis_gitleaks_enabled,
@@ -400,6 +404,7 @@ def _build_step_timeouts(settings: WorkerSettings) -> StepTimeouts:
         prefilter_step_timeout_seconds=settings.prefilter_step_timeout_seconds,
         static_analysis_step_timeout_seconds=settings.static_analysis_step_timeout_seconds,
         static_analysis_analyzer_timeout_seconds=settings.static_analysis_analyzer_timeout_seconds,
+        context_builder_step_timeout_seconds=settings.context_builder_step_timeout_seconds,
         llm_review_step_timeout_seconds=settings.llm_review_step_timeout_seconds,
         output_step_timeout_seconds=settings.output_step_timeout_seconds,
     )
@@ -437,6 +442,10 @@ def _build_review_registry(
     enablement: StepEnablement,
     timeouts: StepTimeouts,
     diff_fetcher: GitHubDiffFetcher,
+    tree_fetcher: GitHubTreeFetcher,
+    graph_query: PostgresGraphQuery,
+    similarity_query: PostgresSimilarityQuery,
+    embedding_client: LocalONNXEmbeddingClient,
     redactor: TextRedactor,
     llm_client: LLMClient,
     publisher: GitHubFindingsPublisher,
@@ -454,13 +463,33 @@ def _build_review_registry(
     for the startup connectivity check (`_build_llm_client`, Phase 3) and
     the same `redactor` instance `StaticAnalysisStep` already receives
     (Phase 5's `secret_redaction_enabled` flag gates both steps' redaction
-    uniformly). Phase 7 (this phase) adds the fourth and final step,
+    uniformly). Phase 7 adds the fourth and final step,
     `FindingsOutputStep`, registered as this registry's own `terminal_step`
     (`review/pipeline.py`'s "Terminal step" docstring note) — a genuinely
     new capability the framework's own extension point provides, not
     something `review/pipeline.py`/`review/step.py` needed changing for the
     *registration* of, matching every prior macro step's own
     zero-framework-change property.
+
+    The Context Builder delivery plan's Phase 5 section (this phase) adds a
+    fifth step, `ContextBuilderStep`, inserted between `static_analysis`/
+    `prefilter` and `llm_review` — reusing the same `diff_fetcher` every
+    other step here already shares, plus `tree_fetcher`/`graph_query`/
+    `similarity_query`/`embedding_client` (the same `EmbeddingClient`
+    instance `_build_indexing_deps` already constructs — no second one).
+    **`ContextBuilderStep` is unconditionally constructed and placed in
+    `steps=[...]` below, exactly like every other step, regardless of
+    `context_builder_enabled`** — enablement is controlled purely via the
+    `enabled` mapping `StepRegistry` itself reads, never via a step's
+    presence or absence in this list (see that class's own module
+    docstring's "ContextBuilderStep is unconditionally constructed" note
+    for the full reasoning this phase's plan section gives). The complete,
+    four-combination `depends_on` wiring rule below (`context_builder`'s
+    own dependency, and `llm_review`'s) is this phase's own new composition-
+    root logic — `review/test_step_registry.py`'s existing fake
+    `context_builder` step only proves the framework supports inserting a
+    step at an arbitrary position, not that this repointing needs no new
+    logic here.
 
     `enablement.as_mapping()`/`timeouts.as_mapping()` are each built once
     here and passed unchanged into `StaticAnalysisStep`, which reads the
@@ -470,6 +499,27 @@ def _build_review_registry(
     """
     enabled_mapping = enablement.as_mapping()
     timeouts_mapping = timeouts.as_mapping()
+
+    # Override the raw `context_builder_enabled` flag with the shared
+    # `context_builder_can_produce_value` predicate: the step's only
+    # consumer is `llm_review`, so if that's disabled, running
+    # `ContextBuilderStep` at all only pays its full diff/tree/graph/
+    # embedding cost for a `ContextBundle` nothing will read.
+    enabled_mapping = {
+        **enabled_mapping,
+        "context_builder": context_builder_can_produce_value(enablement),
+    }
+
+    # The complete, four-reachable-combination depends_on rule (Phase 5's
+    # own plan section) — `sa_can_produce_findings` is the same shared
+    # predicate `review.config`'s fail-fast startup check validates
+    # against, so the two can't drift.
+    sa_can_produce_findings = static_analysis_can_produce_findings(enablement)
+    upstream_of_context_builder = "static_analysis" if sa_can_produce_findings else "prefilter"
+    llm_review_depends_on = (
+        "context_builder" if enablement.context_builder_enabled else upstream_of_context_builder
+    )
+
     return StepRegistry(
         steps=[
             PrefilterStep(diff_fetcher),
@@ -481,24 +531,32 @@ def _build_review_registry(
                 enabled=enabled_mapping,
                 timeouts=timeouts_mapping,
             ),
+            ContextBuilderStep(
+                diff_fetcher,
+                tree_fetcher,
+                graph_query,
+                similarity_query,
+                embedding_client,
+                internal_timeout_seconds=settings.context_builder_internal_timeout_seconds,
+                max_total_bytes=settings.llm_max_diff_bytes,
+                # When context_builder_enabled is False, `enabled["context_builder"]`
+                # skips it at run time regardless of this value — this only
+                # needs to name *some* valid, registered step so
+                # StepRegistry.__init__'s dependency validation doesn't
+                # reject it as pointing at an absent step.
+                depends_on=upstream_of_context_builder,
+            ),
             LLMReviewStep(
                 llm_client,
                 redactor=redactor,
                 model=settings.llm_model,
                 timeout=settings.llm_timeout_seconds,
                 max_diff_bytes=settings.llm_max_diff_bytes,
-                # Mirrors FindingsOutputStep's own depends_on wiring below:
-                # static_analysis produces no output at all when disabled
-                # (or when both its analyzer sub-flags are), so llm_review
-                # must fall back to reading prefilter's output directly in
-                # that case instead of declaring an unsatisfiable dependency.
-                # Uses the same shared predicate review.config's fail-fast
-                # startup check validates against, so the two can't drift.
-                depends_on=(
-                    "static_analysis"
-                    if static_analysis_can_produce_findings(enablement)
-                    else "prefilter"
-                ),
+                # context_builder first, regardless of what context_builder
+                # itself depends on, whenever it's enabled; otherwise the
+                # same two-way fallback static_analysis/prefilter as before
+                # this phase.
+                depends_on=llm_review_depends_on,
             ),
             FindingsOutputStep(
                 publisher,
@@ -604,12 +662,26 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
     github_http_client = httpx.AsyncClient(timeout=settings.github_api_timeout_seconds)
     token_provider = _build_token_provider(settings, github_http_client)
     diff_fetcher = _build_diff_fetcher(settings, token_provider, github_http_client)
+    tree_fetcher = _build_tree_fetcher(settings, token_provider, github_http_client)
     redactor = _build_text_redactor(settings, logger)
     publisher = _build_findings_publisher(settings, token_provider, github_http_client)
+    # The same database session factory IndexRepository already uses (see
+    # `_build_indexing_deps` below) — no second connection pool.
+    graph_query = PostgresGraphQuery(session_factory)
+    similarity_query = PostgresSimilarityQuery(session_factory)
     registry = _build_review_registry(
-        enablement, timeouts, diff_fetcher, redactor, client, publisher, settings
+        enablement,
+        timeouts,
+        diff_fetcher,
+        tree_fetcher,
+        graph_query,
+        similarity_query,
+        embedding_client,
+        redactor,
+        client,
+        publisher,
+        settings,
     )
-    tree_fetcher = _build_tree_fetcher(settings, token_provider, github_http_client)
     index_repository = IndexingRepository(session_factory)
     indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)
     worker_id = _build_worker_id()

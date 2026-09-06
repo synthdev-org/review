@@ -23,7 +23,7 @@ from adapter.github.exceptions import (
     GitHubFileCountMismatchError,
     GitHubTreeEntryMissingError,
 )
-from ingestion.diff import Diff, DiffFile
+from ingestion.diff import Diff, DiffContentMalformedError, DiffContentUnavailableError, DiffFile
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -391,7 +391,7 @@ async def test_fetch_content_blob_with_no_size_is_malformed_and_never_fetched(
         )
     )
 
-    with pytest.raises(GitHubDiffFetchMalformedResponseError):
+    with pytest.raises(DiffContentMalformedError) as excinfo:
         await _fetcher(test_rsa_private_key_pem).fetch_content(
             installation_id=_INSTALLATION_ID,
             repo_full_name=_OWNER_REPO,
@@ -400,6 +400,13 @@ async def test_fetch_content_blob_with_no_size_is_malformed_and_never_fetched(
         )
 
     assert blob_route.call_count == 0
+    # Domain-boundary translation (Phase 1 of
+    # plan-deliver-context-builder.md): this used to assert the
+    # adapter-owned GitHubDiffFetchMalformedResponseError directly — now
+    # re-raised one level further as the domain-owned
+    # DiffContentMalformedError, chained via `raise ... from err` so the
+    # original adapter-level exception is still reachable via __cause__.
+    assert isinstance(excinfo.value.__cause__, GitHubDiffFetchMalformedResponseError)
 
 
 @respx.mock
@@ -424,7 +431,7 @@ async def test_fetch_content_blob_at_size_ceiling_is_fatal_and_never_fetched(
 
     with (
         caplog.at_level("ERROR", logger="adapter.github.diff"),
-        pytest.raises(GitHubBlobTooLargeError),
+        pytest.raises(DiffContentUnavailableError) as excinfo,
     ):
         await _fetcher(test_rsa_private_key_pem).fetch_content(
             installation_id=_INSTALLATION_ID,
@@ -435,6 +442,11 @@ async def test_fetch_content_blob_at_size_ceiling_is_fatal_and_never_fetched(
 
     assert blob_route.call_count == 0
     assert any(r.levelname == "ERROR" for r in caplog.records)
+    # Round-seven exception-mapping fix: GitHubBlobTooLargeError (a
+    # GitHubGitDataFetchError *sibling* of GitHubDiffFetchError, never a
+    # subclass of it) re-raises as DiffContentUnavailableError, not
+    # DiffContentMalformedError — the specific branch this test proves.
+    assert isinstance(excinfo.value.__cause__, GitHubBlobTooLargeError)
 
 
 @respx.mock

@@ -47,6 +47,22 @@ class PullRequestHead(BaseModel):
     sha: str | None = None
 
 
+class PullRequestBase(BaseModel):
+    """The ``pull_request.base`` object — only ``sha`` is needed here,
+    mirroring ``PullRequestHead`` exactly. Per
+    docs/plans/plan-deliver-context-builder.md's Phase 1 section: the PR's
+    base-commit SHA the Context Builder (Phase 5) fetches pre-change content
+    at, threaded through from here."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Optional for the same reason as PullRequestHead.sha above: a
+    # malformed/adversarial delivery missing this field must be
+    # accepted-but-degraded (Phase 1's `base_sha is None` handling), never
+    # rejected with a 4xx at the schema layer.
+    sha: str | None = None
+
+
 class PullRequest(BaseModel):
     """The ``pull_request`` object present on every real ``pull_request``
     event payload — absent entirely on other event types (e.g. ``push``)."""
@@ -56,6 +72,7 @@ class PullRequest(BaseModel):
     # Both optional for the same reason as PullRequestHead.sha above.
     number: int | None = None
     head: PullRequestHead | None = None
+    base: PullRequestBase | None = None
 
 
 class PushCommit(BaseModel):

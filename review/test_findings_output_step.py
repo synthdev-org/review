@@ -33,6 +33,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.posting import GitHubFindingsPublisher
 from findings.models import Finding
+from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
 from review.step import StepContext
@@ -105,6 +106,11 @@ class _FakeUpstreamOutput:
     repo_full_name: str = _OWNER_REPO
     pr_number: int = _PR_NUMBER
     head_sha: str = _HEAD_SHA
+    # Added by docs/plans/plan-deliver-context-builder.md's Phase 6 section
+    # (US6) — defaults to `None`, matching `FindingsOutputInput`'s own
+    # default, so every existing test in this file that doesn't set it sees
+    # byte-for-byte the same posted output as before this phase.
+    context_bundle: ContextBundle | None = None
 
 
 @dataclass
@@ -291,6 +297,59 @@ async def test_dry_run_happy_path_makes_zero_calls_and_logs_would_be_payload(
 
 
 @respx.mock
+async def test_dry_run_happy_path_logs_the_citation_appended_message(
+    test_rsa_private_key_pem: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Phase 6 (US6)'s citation `model_copy` step must run *before* the
+    dry-run early return, not only on the real-post path — this module's
+    own docstring requires dry-run output to reflect "the same... objects a
+    real post would use". Proves the dry-run log's own `findings` payload
+    already has `citation_markdown` set (not `None`) — the specific
+    regression risk the plan (round eight) named by name. `message` itself
+    stays the original, citation-less text: `citation_markdown` is a
+    separate field, never appended into `message` (see
+    `Finding.citation_markdown`'s own docstring)."""
+    _mock_token_exchange()
+    respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
+    respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
+
+    context_bundle = ContextBundle(
+        items=(
+            ContextBundleItem(
+                id=0,
+                kind=ContextItemKind.CALLER,
+                file_path="src/caller.ts",
+                symbol_name="do_something",
+                content="function caller() { return doSomething(); }",
+                line_range=(10, 12),
+            ),
+        )
+    )
+    finding = _finding(
+        file="app.py", line=2, message="llm finding", source="llm", context_ref_ids=(0,)
+    )
+    upstream = _FakeUpstreamStep(
+        output=_FakeUpstreamOutput(findings=[finding], context_bundle=context_bundle)
+    )
+    registry = _registry(upstream, _publisher(test_rsa_private_key_pem))
+
+    with caplog.at_level("INFO", logger="review.output"):
+        await registry.run(_SEED_INPUT, _context(dry_run=True))
+
+    dry_run_records = [r for r in caplog.records if "dry-run" in r.getMessage()]
+    assert dry_run_records
+    logged_findings = dry_run_records[0].__dict__["findings"]
+    assert len(logged_findings) == 1
+    assert logged_findings[0]["citation_markdown"] is not None
+    # `.` is escaped by `render_citation` -- this is a plain Python string
+    # here (`model_dump(mode="json")` produces JSON-*compatible* Python
+    # values, not JSON *text*), so a single escaped `.` is one literal
+    # backslash, not a doubled one.
+    assert "src/caller\\.ts:10-12" in logged_findings[0]["citation_markdown"]
+    assert logged_findings[0]["message"] == "llm finding"
+
+
+@respx.mock
 async def test_dry_run_failure_path_makes_zero_calls_and_logs_would_be_failure_payload(
     test_rsa_private_key_pem: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -341,6 +400,115 @@ async def test_partial_post_when_review_succeeds_but_check_run_fails_is_logged_d
     assert partial_post_logs[0].__dict__["pr_number"] == _PR_NUMBER
     assert partial_post_logs[0].__dict__["post_review"] == "succeeded"
     assert partial_post_logs[0].__dict__["post_check_run"] == "failed"
+
+
+# --- Phase 6 (US6): citation rendering --------------------------------------
+
+
+@respx.mock
+async def test_finding_with_a_real_citation_posts_formatted_not_escaped(
+    test_rsa_private_key_pem: str,
+) -> None:
+    """US6: a finding whose `context_ref_ids` resolve against the step
+    input's own `context_bundle` gets a platform-rendered citation set on
+    its own `citation_markdown` field *before* posting, and
+    `adapter/github/posting.py` appends that field to the posted comment
+    body *without* re-running it through `escape_markdown` — regression
+    test for a real bug where the citation used to be appended into
+    `message` and then escaped a second time downstream, which backslash-
+    escaped the citation's own Markdown template (the bold `**Context:**`
+    header, the backtick code-span delimiters) into literal, unformatted
+    text. Under that old code this test's `"**Context:**" in posted_body`
+    and backtick assertions below would have failed (the posted body would
+    instead have contained `\\*\\*Context:\\*\\*` and `\\`...\\``).
+
+    The embedded symbol name (`do_something_now`, containing `_` — a real
+    GFM special character) must still be individually escaped — proving
+    `review/citation.py` itself now does that escaping, rather than relying
+    on (and losing to) a later blanket pass over the combined string.
+    """
+    _mock_token_exchange()
+    reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
+    respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
+
+    context_bundle = ContextBundle(
+        items=(
+            ContextBundleItem(
+                id=0,
+                kind=ContextItemKind.CALLER,
+                file_path="src/caller.ts",
+                symbol_name="do_something_now",
+                content="function caller() { return doSomethingNow(); }",
+                line_range=(10, 12),
+            ),
+        )
+    )
+    finding = _finding(
+        file="app.py", line=2, message="llm finding", source="llm", context_ref_ids=(0,)
+    )
+    upstream = _FakeUpstreamStep(
+        output=_FakeUpstreamOutput(findings=[finding], context_bundle=context_bundle)
+    )
+    registry = _registry(upstream, _publisher(test_rsa_private_key_pem))
+
+    await registry.run(_SEED_INPUT, _context())
+
+    assert reviews_route.call_count == 1
+    payload = json.loads(reviews_route.calls.last.request.content)
+    posted_body = json.dumps(payload)
+    # The citation's own template survives unescaped: a literal bold header
+    # and literal backticks, not `\*\*Context:\*\*` / `\`...\`` -- under the
+    # old buggy code this literal substring would not appear at all (it
+    # would be backslash-escaped instead), so this assertion alone pins the
+    # regression.
+    assert "**Context:**" in posted_body
+    # The embedded file path/symbol name are still individually escaped
+    # (`.` and `_` are both in `escape_markdown`'s escape set) -- inside the
+    # still-literal backticks, not instead of them.
+    assert "`src/caller\\\\.ts:10-12` (`do\\\\_something\\\\_now`)" in posted_body
+    assert "src/caller.ts" not in posted_body
+    assert "do_something_now" not in posted_body
+
+
+@respx.mock
+async def test_finding_with_no_context_ref_ids_posts_exactly_as_a_phase_1_finding_would(
+    test_rsa_private_key_pem: str,
+) -> None:
+    """US6's second Given/When/Then: a finding whose generation drew on no
+    context-bundle item renders exactly as a Phase 1 finding would — no
+    citation section appended — even when the step input carries a
+    non-empty `context_bundle` (proving the absence of `context_ref_ids` on
+    the finding itself, not the absence of a bundle, is what gates
+    citation rendering)."""
+    _mock_token_exchange()
+    reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
+    respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
+
+    context_bundle = ContextBundle(
+        items=(
+            ContextBundleItem(
+                id=0,
+                kind=ContextItemKind.CALLER,
+                file_path="src/caller.ts",
+                symbol_name="caller",
+                content="function caller() { return helper(); }",
+                line_range=(1, 1),
+            ),
+        )
+    )
+    finding = _finding(file="app.py", line=1, message="static finding", source="semgrep")
+    upstream = _FakeUpstreamStep(
+        output=_FakeUpstreamOutput(findings=[finding], context_bundle=context_bundle)
+    )
+    registry = _registry(upstream, _publisher(test_rsa_private_key_pem))
+
+    await registry.run(_SEED_INPUT, _context())
+
+    assert reviews_route.call_count == 1
+    payload = json.loads(reviews_route.calls.last.request.content)
+    posted_body = json.dumps(payload)
+    assert "src/caller.ts" not in posted_body
+    assert "**Context:**" not in posted_body
 
 
 # --- Rollback: depends_on is configurable, not hardcoded to llm_review ------

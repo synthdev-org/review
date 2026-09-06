@@ -72,6 +72,16 @@ def _finding_body(finding: Finding) -> str:
         # this function exists to close.
         detail += f" ({escape_markdown(finding.rule_id)})"
     detail += f"\n\n_source: {escape_markdown(finding.source)}_"
+    if finding.citation_markdown:
+        # Deliberately NOT passed through `escape_markdown` again:
+        # `review.citation.render_citation` already escaped its own embedded
+        # file-path/symbol values and built the rest of this string as
+        # literal, trusted Markdown template syntax (backticks, bold) — a
+        # second blanket escape pass here would backslash-escape that
+        # template too, rendering the citation as literal unformatted text
+        # instead of the intended bold/code styling. See
+        # `Finding.citation_markdown`'s own docstring for the full reasoning.
+        detail += f"\n\n{finding.citation_markdown}"
     return detail
 
 

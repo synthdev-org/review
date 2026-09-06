@@ -95,7 +95,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field, SecretStr
+from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -147,6 +147,12 @@ class WorkerSettings(BaseSettings):
     # field set exactly — `apps/worker/main.py` builds that model from these.
     prefilter_enabled: bool = True
     static_analysis_enabled: bool = True
+    # Context Builder delivery plan's Phase 5 section — this step's own
+    # kill switch (spec-context-builder.md's Rollout & Release Safety
+    # "decided" flag), default `True`: no live config change, a Worker
+    # restart/redeploy toggles it, same operational shape as every other
+    # per-step enable flag here.
+    context_builder_enabled: bool = True
     llm_review_enabled: bool = True
     output_enabled: bool = True
     # Phase 5: the static-analysis step's own two analyzer sub-steps,
@@ -164,6 +170,22 @@ class WorkerSettings(BaseSettings):
     static_analysis_analyzer_timeout_seconds: int = 60
     llm_review_step_timeout_seconds: int = 90
     output_step_timeout_seconds: int = 30
+    # Context Builder delivery plan's Phase 5 section (Assumption 7) — two
+    # distinct settings with an enforced, validated margin, never the same
+    # value: `context_builder_step_timeout_seconds` is the value the outer
+    # `review.pipeline.StepRegistry` reads for this step (same shape as
+    # every other `*_step_timeout_seconds` field above);
+    # `context_builder_internal_timeout_seconds` bounds the *entire*
+    # internal orchestration inside `ContextBuilderStep.run()` itself, in
+    # one `asyncio.wait_for` — never one `wait_for` per internal call. `int`,
+    # not `float` (round seven's own correction — every existing
+    # `StepTimeouts` field and its `as_mapping() -> dict[str, int]` return
+    # type are `int`-typed; `asyncio.wait_for(timeout=...)` accepts an `int`
+    # just as well). The `_context_builder_timeout_margin_is_valid` validator
+    # below enforces `context_builder_step_timeout_seconds >
+    # context_builder_internal_timeout_seconds` at construction time.
+    context_builder_step_timeout_seconds: int = 35
+    context_builder_internal_timeout_seconds: int = 25
 
     # --- Job dispatch loop (Phase 3, apps/worker/dispatch.py) ---
     # How often to poll JobQueueRepository.claim_next() when the queue is
@@ -244,3 +266,33 @@ class WorkerSettings(BaseSettings):
     # scope; an operator opts into dry-run explicitly to validate a fresh
     # deployment before trusting it with real writes.
     dry_run: bool = False
+
+    @model_validator(mode="after")
+    def _context_builder_timeout_margin_is_valid(self) -> WorkerSettings:
+        """Enforces Assumption 7's margin invariant - a pure, cross-field
+        numeric comparison with no I/O, the same shape
+        ``apps/webhook_api/settings.py``'s existing
+        ``_require_setup_state_secret_when_setup_mode_enabled`` validator
+        already handles on the Settings model directly (a closer, lighter
+        precedent than this file's own I/O-driven startup checks in
+        ``apps/worker/main.py``). Two `asyncio.wait_for` calls racing on an
+        identical (or inverted) deadline could let the outer, per-step
+        timeout win and fail the job before ``ContextBuilderStep``'s own
+        internal timeout ever gets a chance to degrade gracefully (US7) -
+        this margin is what this phase's own docstring calls "the single
+        most important correctness property of this phase."
+        """
+        if (
+            self.context_builder_step_timeout_seconds
+            <= self.context_builder_internal_timeout_seconds
+        ):
+            raise ValueError(
+                "context_builder_step_timeout_seconds "
+                f"({self.context_builder_step_timeout_seconds}) must be strictly greater "
+                "than context_builder_internal_timeout_seconds "
+                f"({self.context_builder_internal_timeout_seconds}) - the outer step "
+                "timeout must leave a real margin over the internal orchestration "
+                "timeout, or the outer StepRegistry could time out the whole step before "
+                "its own internal timeout ever gets a chance to degrade gracefully"
+            )
+        return self

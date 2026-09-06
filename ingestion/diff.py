@@ -64,6 +64,45 @@ class Diff(BaseModel):
     files: tuple[DiffFile, ...]
 
 
+class DiffContentUnavailableError(Exception):
+    """Raised by ``DiffFetcher.fetch_content`` when real file content could
+    not be fetched at all — the GitHub (or other host) API was unreachable,
+    its retry budget was exhausted, or a requested blob exceeded the
+    adapter's own size ceiling.
+
+    Domain-owned, defined alongside the ``DiffFetcher`` Protocol it's part
+    of the failure contract for — mirroring ``indexing/tree.py``'s existing
+    ``RepoTreeFetchError``/``RepoTreeTruncatedError`` pattern (a domain
+    package's own typed exceptions for an adapter-implemented Protocol's
+    failure modes) — so a domain-package caller (Phase 5's
+    ``ContextBuilderStep``) can catch this for graceful degradation (US7)
+    without importing an adapter-owned exception type by name, which would
+    violate architecture.md's "domain never imports adapter code" rule. The
+    concrete GitHub-backed implementation
+    (``adapter/github/diff.py``'s ``GitHubDiffFetcher.fetch_content``)
+    translates its own adapter-level exceptions into this one at its own
+    call sites.
+    """
+
+    def __init__(self, *, repo_full_name: str, detail: str) -> None:
+        super().__init__(f"content fetch for {repo_full_name} unavailable: {detail}")
+        self.repo_full_name = repo_full_name
+        self.detail = detail
+
+
+class DiffContentMalformedError(Exception):
+    """Raised by ``DiffFetcher.fetch_content`` when the underlying API
+    responded, but its response could not be parsed into the content this
+    Protocol promises — see ``DiffContentUnavailableError``'s own docstring
+    for the placement/translation rationale, identical here.
+    """
+
+    def __init__(self, *, repo_full_name: str, detail: str) -> None:
+        super().__init__(f"content fetch for {repo_full_name} returned malformed data: {detail}")
+        self.repo_full_name = repo_full_name
+        self.detail = detail
+
+
 class DiffFetcher(Protocol):
     """Fetches a PR's diff and, for a narrowed subset of paths, real file
     content — per the plan's Phase 4 section. Implemented by
@@ -101,5 +140,9 @@ class DiffFetcher(Protocol):
         path. A symlink (``120000``) or submodule (``160000``) entry in
         ``diff`` is skipped entirely (no blob fetched), even if its path is
         present in ``paths``.
+
+        Raises ``DiffContentUnavailableError``/``DiffContentMalformedError``
+        (per docs/plans/plan-deliver-context-builder.md's Phase 1 section) —
+        never an adapter-owned exception type — on failure.
         """
         ...

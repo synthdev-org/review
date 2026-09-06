@@ -41,23 +41,33 @@ import socket
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import cast
 
 import httpx
 import pytest
 
 import apps.worker.main as worker_main
 from adapter.analyzers.gitleaks import GitleaksTextRedactor
+from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
 from adapter.github.diff import GitHubDiffFetcher
 from adapter.github.posting import GitHubFindingsPublisher
+from adapter.github.tree import GitHubTreeFetcher
+from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.queue import JobQueueRepository
 from apps.worker.main import main
 from apps.worker.settings import WorkerSettings
 from findings.redact import NoOpTextRedactor, TextRedactor
+from indexing.chunk import Chunk
+from indexing.embedding import EmbeddingVector
 from indexing.pipeline import IndexingJobDependencies
+from indexing.tree import RepoTreeEntry
+from ingestion.diff import Diff
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
 from review.config import StepEnablement, StepTimeouts
+from review.context_builder import CallerHit
 from review.pipeline import StepRegistry
+from review.step import StepContext
 
 
 @pytest.fixture(autouse=True)
@@ -363,6 +373,10 @@ def _capture_redactor(
         enablement: StepEnablement,
         timeouts: StepTimeouts,
         diff_fetcher: GitHubDiffFetcher,
+        tree_fetcher: GitHubTreeFetcher,
+        graph_query: PostgresGraphQuery,
+        similarity_query: PostgresSimilarityQuery,
+        embedding_client: LocalONNXEmbeddingClient,
         redactor: TextRedactor,
         llm_client: LLMClient,
         publisher: GitHubFindingsPublisher,
@@ -370,7 +384,17 @@ def _capture_redactor(
     ) -> StepRegistry:
         captured.append(redactor)
         return original(
-            enablement, timeouts, diff_fetcher, redactor, llm_client, publisher, settings
+            enablement,
+            timeouts,
+            diff_fetcher,
+            tree_fetcher,
+            graph_query,
+            similarity_query,
+            embedding_client,
+            redactor,
+            llm_client,
+            publisher,
+            settings,
         )
 
     monkeypatch.setattr(worker_main, "_build_review_registry", _capturing)
@@ -439,3 +463,282 @@ def test_gitleaks_scanner_disabled_does_not_disable_redaction(
     captured = capsys.readouterr()
     payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
     assert not [p for p in payloads if "secret redaction is disabled" in p["message"]]
+
+
+# --- Context Builder delivery plan's Phase 5: composition-root wiring ------
+#
+# Exercises `_build_review_registry` directly (not through `main()`) with
+# fakes at every adapter Protocol boundary — a real `StepRegistry`, real
+# `ContextBuilderStep`/`LLMReviewStep`/etc. wiring, but zero real I/O
+# (network, subprocess, database) — proving the complete, four-combination
+# `depends_on` rule this phase's own plan section calls out, including the
+# specific combination (`context_builder_enabled=True`,
+# `static_analysis_can_produce_findings=False`) round two found unhandled:
+# the job completes successfully, not a `RuntimeError`/`PipelineFailedError`
+# from an unsatisfiable dependency.
+#
+# `GitleaksAnalyzer`/`SemgrepAnalyzer` are monkeypatched at the
+# `worker_main` module level (`_build_review_registry` resolves them via
+# that module's own global namespace at call time) so a combination with
+# `static_analysis_can_produce_findings=True` never shells out to the real
+# vendored binaries — this test is about composition-root wiring, not
+# analyzer behavior (already covered elsewhere).
+
+
+class _EmptyDiffFetcher:
+    async def fetch(
+        self, *, installation_id: int, repo_full_name: str, pr_number: int, head_sha: str
+    ) -> Diff:
+        return Diff(files=())
+
+    async def fetch_content(
+        self, *, installation_id: int, repo_full_name: str, diff: Diff, paths: list[str]
+    ) -> dict[str, bytes]:
+        return {}
+
+
+class _EmptyTreeFetcher:
+    async def fetch_tree(
+        self, *, installation_id: int, repo_full_name: str, commit_sha: str
+    ) -> tuple[RepoTreeEntry, ...]:
+        return ()
+
+    async def fetch_content(
+        self,
+        *,
+        installation_id: int,
+        repo_full_name: str,
+        paths_with_blob_sha: list[RepoTreeEntry],
+    ) -> dict[str, bytes]:
+        return {}
+
+
+class _UnusedGraphQuery:
+    """Never actually called in this test's fixture (an empty diff resolves
+    no changed symbols), but still needs to structurally satisfy
+    `review.context_builder.GraphQuery` for `ContextBuilderStep`'s own
+    constructor."""
+
+    async def find_callers(
+        self, *, repo_id: str, symbol_names: list[str], limit_per_symbol: int
+    ) -> dict[str, tuple[CallerHit, ...]]:
+        raise AssertionError("find_callers should never be called for an empty diff")
+
+
+class _UnusedSimilarityQuery:
+    async def find_similar(
+        self, *, repo_id: str, embedding: EmbeddingVector, exclude_file_path: str, limit: int
+    ) -> tuple[Chunk, ...]:
+        raise AssertionError("find_similar should never be called for an empty diff")
+
+
+class _UnusedEmbeddingClient:
+    def embed(self, texts: list[str]) -> tuple[EmbeddingVector, ...]:
+        raise AssertionError("embed should never be called for an empty diff")
+
+
+class _NoOpGitleaksAnalyzer:
+    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[object]:
+        return []
+
+
+class _NoOpSemgrepAnalyzer:
+    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[object]:
+        return []
+
+
+class _EmptyFindingsLLMClient:
+    async def complete(self, request: CompletionRequest, *, timeout: float) -> CompletionResponse:
+        return CompletionResponse(content='{"findings": []}', model=request.model)
+
+
+class _NoOpPublisher:
+    async def post_review(
+        self, *, installation_id: int, repo_full_name: str, pr_number: int, findings: list[object]
+    ) -> None:
+        raise AssertionError("post_review should never be called for zero findings")
+
+    async def post_check_run(
+        self, *, installation_id: int, repo_full_name: str, head_sha: str, finding_count: int
+    ) -> None:
+        return None
+
+    async def post_failure_check_run(
+        self,
+        *,
+        installation_id: int,
+        repo_full_name: str,
+        head_sha: str,
+        failed_step_name: str,
+        error: str,
+    ) -> None:
+        raise AssertionError("post_failure_check_run should never be called on the happy path")
+
+
+def _wiring_test_settings(monkeypatch: pytest.MonkeyPatch) -> WorkerSettings:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    return WorkerSettings(_env_file=None)
+
+
+async def _run_review_registry(registry: StepRegistry) -> dict[str, object]:
+    seed_input = {
+        "org_id": "org-1",
+        "repo_id": "repo-1",
+        "installation_id": 1,
+        "repo_full_name": "acme/widgets",
+        "pr_number": 7,
+        "head_sha": "deadbeef",
+    }
+    outcomes = await registry.run(seed_input=seed_input, context=StepContext(job_id="job-1"))
+    return {name: outcome.status for name, outcome in outcomes.items()}
+
+
+@pytest.mark.parametrize(
+    ("context_builder_enabled", "sa_can_produce_findings", "expected_context_builder_depends_on"),
+    [
+        (True, True, "static_analysis"),
+        (True, False, "prefilter"),
+        (False, True, "static_analysis"),
+        (False, False, "prefilter"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_all_four_context_builder_enablement_combinations_complete_successfully(
+    monkeypatch: pytest.MonkeyPatch,
+    context_builder_enabled: bool,
+    sa_can_produce_findings: bool,
+    expected_context_builder_depends_on: str,
+) -> None:
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    settings = _wiring_test_settings(monkeypatch)
+
+    enablement = StepEnablement(
+        context_builder_enabled=context_builder_enabled,
+        static_analysis_gitleaks_enabled=sa_can_produce_findings,
+        static_analysis_semgrep_enabled=sa_can_produce_findings,
+    )
+    timeouts = StepTimeouts()
+
+    registry = worker_main._build_review_registry(
+        enablement,
+        timeouts,
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+    )
+
+    context_builder_step = registry._by_name["context_builder"]
+    llm_review_step = registry._by_name["llm_review"]
+    assert context_builder_step.depends_on == (expected_context_builder_depends_on,)
+    expected_llm_review_depends_on = (
+        "context_builder" if context_builder_enabled else expected_context_builder_depends_on
+    )
+    assert llm_review_step.depends_on == (expected_llm_review_depends_on,)
+
+    statuses = await _run_review_registry(registry)
+
+    assert statuses["output"] == "success"
+    assert statuses["llm_review"] == "success"
+    assert statuses["context_builder"] == ("success" if context_builder_enabled else "disabled")
+
+
+@pytest.mark.asyncio
+async def test_context_builder_enabled_but_llm_review_disabled_skips_context_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`review.config.context_builder_can_produce_value`'s own regression
+    case: `context_builder_enabled=True`'s raw flag default must not be
+    enough to actually run the step when its one real consumer,
+    `llm_review`, is disabled — running it anyway would pay the full
+    diff/tree/graph/embedding cost for a `ContextBundle` nothing reads.
+    `static_analysis_gitleaks_enabled=True` keeps this a viable
+    configuration (`llm_review_enabled=False` alone would otherwise trip
+    `review.config.check_step_configuration_viable`'s own fail-fast rule)."""
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    settings = _wiring_test_settings(monkeypatch)
+
+    enablement = StepEnablement(
+        context_builder_enabled=True,
+        llm_review_enabled=False,
+        static_analysis_gitleaks_enabled=True,
+        static_analysis_semgrep_enabled=True,
+    )
+    timeouts = StepTimeouts()
+
+    registry = worker_main._build_review_registry(
+        enablement,
+        timeouts,
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+    )
+
+    statuses = await _run_review_registry(registry)
+
+    assert statuses["context_builder"] == "disabled"
+    assert statuses["llm_review"] == "disabled"
+    assert statuses["output"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_context_builder_disabled_produces_byte_for_byte_phase_1_llm_review_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`context_builder_enabled=False` regression case: `llm_review` falls
+    back to depending directly on `static_analysis` (Phase 1's own default),
+    and the completion request it sends carries no context-bundle section —
+    byte-for-byte the same prompt Phase 1 always produced."""
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    settings = _wiring_test_settings(monkeypatch)
+
+    enablement = StepEnablement(context_builder_enabled=False)
+    timeouts = StepTimeouts()
+
+    captured_requests: list[CompletionRequest] = []
+
+    class _RecordingLLMClient:
+        async def complete(
+            self, request: CompletionRequest, *, timeout: float
+        ) -> CompletionResponse:
+            captured_requests.append(request)
+            return CompletionResponse(content='{"findings": []}', model=request.model)
+
+    registry = worker_main._build_review_registry(
+        enablement,
+        timeouts,
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _RecordingLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+    )
+
+    llm_review_step = registry._by_name["llm_review"]
+    assert llm_review_step.depends_on == ("static_analysis",)
+
+    statuses = await _run_review_registry(registry)
+    assert statuses["output"] == "success"
+    assert statuses["context_builder"] == "disabled"
+
+    assert len(captured_requests) == 1
+    user_message = captured_requests[0].messages[-1].content
+    assert "Related code in this repository" not in user_message

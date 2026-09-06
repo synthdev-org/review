@@ -14,9 +14,7 @@ from pathlib import Path
 from adapter.embedding.local_onnx import EMBEDDING_DIMENSION
 from adapter.storage import models
 
-_MIGRATION_0003_PATH = (
-    Path(__file__).parent / "migrations" / "versions" / "0003_indexing_schema.py"
-)
+_MIGRATION_0003_PATH = Path(__file__).parent / "migrations" / "versions" / "0003_indexing_schema.py"
 
 
 def _load_migration_0003() -> object:

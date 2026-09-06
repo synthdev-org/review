@@ -55,12 +55,14 @@ def _chunk(
     chunk_index: int = 0,
     symbol_name: str | None = "foo",
     content: str = "function foo() {}",
+    line_range: tuple[int, int] | None = None,
 ) -> Chunk:
     return Chunk(
         file_path=file_path,
         language="typescript",
         symbol_name=symbol_name,
         byte_range=(0, len(content)),
+        line_range=line_range,
         content=content,
         chunk_index=chunk_index,
     )
@@ -147,6 +149,60 @@ async def test_upsert_chunks_stores_and_updates_row_in_place(
     assert len(rows) == 1
     assert rows[0].content == "v2"
     assert rows[0].embedding[0] == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_upsert_chunks_writes_start_line_and_end_line_columns(
+    repository: IndexingRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """docs/plans/plan-deliver-context-builder.md's Phase 1 section,
+    Assumption 5: `IndexChunkRow` gaining `start_line`/`end_line` columns is
+    only half the fix — `upsert_file`'s own explicit per-column insert/
+    on-conflict-update values dict must also actually write
+    `chunk.line_range` into them, or the new columns silently stay `NULL`
+    for every chunk indexed after deploy with no error. Proven here against
+    real Postgres, including that a delta upsert's on-conflict path updates
+    them too, not just the initial insert.
+    """
+    await repository.upsert_file(
+        repo_id=repo_id,
+        pr_number=0,
+        file_path="src/foo.ts",
+        chunks=[_chunk(content="v1", line_range=(10, 12))],
+        embeddings=[_vector(1.0)],
+        nodes=[],
+        edges=(),
+    )
+
+    async with session_factory() as session:
+        row = (
+            (await session.execute(select(IndexChunkRow).where(IndexChunkRow.repo_id == repo_id)))
+            .scalars()
+            .one()
+        )
+    assert (row.start_line, row.end_line) == (10, 12)
+
+    # On-conflict-update path also carries line_range forward, not just the
+    # initial insert.
+    await repository.upsert_file(
+        repo_id=repo_id,
+        pr_number=0,
+        file_path="src/foo.ts",
+        chunks=[_chunk(content="v2", line_range=(20, 25))],
+        embeddings=[_vector(2.0)],
+        nodes=[],
+        edges=(),
+    )
+
+    async with session_factory() as session:
+        row = (
+            (await session.execute(select(IndexChunkRow).where(IndexChunkRow.repo_id == repo_id)))
+            .scalars()
+            .one()
+        )
+    assert (row.start_line, row.end_line) == (20, 25)
 
 
 @pytest.mark.asyncio

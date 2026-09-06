@@ -28,7 +28,36 @@ _REVIEW_PACKAGE_DIR = Path(__file__).parent
 # Modules that are the framework itself, not a concrete pipeline step —
 # excluded from the "step module" scan below. Test files (`test_*.py`) are
 # excluded separately.
-_FRAMEWORK_MODULES = frozenset({"__init__", "step", "pipeline", "config"})
+#
+# `context_symbols`/`context_bundle` (added by
+# docs/plans/plan-deliver-context-builder.md's Phase 5 section) are Units
+# A/D of the single `context_builder` macro step whose own `Step`
+# implementation (`ContextBuilderStep`) lives in `review/context_builder.py`
+# — internal helper modules of *one* macro step, split into separate files
+# per this codebase's one-module-per-concern convention (Assumption 9), not
+# sibling macro-step modules US-F1 exists to keep decoupled from each
+# other. `context_builder.py` itself is deliberately *not* added here: it
+# is the real macro-step module (it defines `ContextBuilderStep`), so it
+# still needs scanning like `prefilter`/`static_analysis`/`llm_review`/
+# `output` do.
+#
+# `citation` (added by that same plan's Phase 6 section) is, likewise, an
+# internal helper module of the `output` macro step (`review.output`'s own
+# `FindingsOutputStep` calls `render_citation` directly) — it defines no
+# `Step` implementation of its own, so it's excluded from the scan the same
+# way `context_symbols`/`context_bundle` are, not a sibling macro-step
+# module `output.py`'s own import of it would otherwise (falsely) trip.
+_FRAMEWORK_MODULES = frozenset(
+    {
+        "__init__",
+        "step",
+        "pipeline",
+        "config",
+        "context_symbols",
+        "context_bundle",
+        "citation",
+    }
+)
 
 
 def _step_module_names() -> frozenset[str]:

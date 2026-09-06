@@ -107,6 +107,40 @@ async def test_post_review_escapes_untrusted_finding_text(test_rsa_private_key_p
 
 
 @respx.mock
+async def test_post_review_appends_citation_markdown_unescaped(
+    test_rsa_private_key_pem: str,
+) -> None:
+    """`Finding.citation_markdown` (`review.citation.render_citation`'s own
+    already-safe-to-post output) must reach GitHub verbatim -- never passed
+    through `escape_markdown` a second time, which would backslash-escape
+    its own Markdown template (regression test for the citation-escaping
+    bug fixed alongside this test). `message` is still escaped as normal."""
+    _mock_token_exchange()
+    route = respx.post(f"{_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews").mock(
+        return_value=httpx.Response(200, json={"id": 1})
+    )
+
+    findings = [
+        _finding(
+            message="some_message",
+            citation_markdown="**Context:**\n- `src/caller.ts:10-12` (`caller`)",
+        )
+    ]
+
+    await _publisher(test_rsa_private_key_pem).post_review(
+        installation_id=_INSTALLATION_ID,
+        repo_full_name=_OWNER_REPO,
+        pr_number=_PR_NUMBER,
+        findings=findings,
+    )
+
+    payload = json.loads(route.calls.last.request.content)
+    comment_body = payload["comments"][0]["body"]
+    assert "**Context:**\n- `src/caller.ts:10-12` (`caller`)" in comment_body
+    assert "some\\_message" in comment_body
+
+
+@respx.mock
 async def test_post_review_puts_file_level_finding_in_body_not_comments(
     test_rsa_private_key_pem: str,
 ) -> None:

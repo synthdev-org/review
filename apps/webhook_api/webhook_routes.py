@@ -127,6 +127,11 @@ def _build_webhook_event(envelope: GitHubWebhookEnvelope, *, delivery_id: str) -
             if pull_request is not None and pull_request.head is not None
             else None
         ),
+        base_sha=(
+            pull_request.base.sha
+            if pull_request is not None and pull_request.base is not None
+            else None
+        ),
     )
 
 
@@ -169,6 +174,14 @@ def _review_enqueue_payload(
         **_base_job_identity_fields(event, result),
         "pr_number": event.pr_number,
         "head_sha": event.head_sha,
+        # Optional (per docs/plans/plan-deliver-context-builder.md's Phase 1
+        # section) — `event.base_sha` can legitimately be `None` when
+        # GitHub's payload omits `pull_request.base.sha`; a review job still
+        # runs without it (Phase 5's Context Builder skips the pre-change
+        # fetch and degrades to an empty blast-radius context, never a
+        # missing-required-field rejection the way `pr_number`/`head_sha`
+        # above are).
+        "base_sha": event.base_sha,
     }
 
 

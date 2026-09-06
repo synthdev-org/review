@@ -46,7 +46,13 @@ from findings.models import Finding
 from ingestion.diff import Diff, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
-from review.llm_review import REDACTION_FINDING_CEILING, LLMReviewStep, _render_diff
+from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
+from review.llm_review import (
+    _MAX_CONTEXT_REF_IDS_PER_FINDING,
+    REDACTION_FINDING_CEILING,
+    LLMReviewStep,
+    _render_diff,
+)
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
 from review.step import StepContext
 
@@ -89,6 +95,11 @@ class _FakeStaticAnalysisOutput:
     repo_full_name: str = "acme/widgets"
     pr_number: int = 42
     head_sha: str = "deadbeef"
+    # Added by docs/plans/plan-deliver-context-builder.md's Phase 5 section
+    # (US5) — defaults to `None`, matching `_LLMReviewInput`'s own default,
+    # so every existing test in this file that doesn't set it still gets
+    # byte-for-byte the same prompt as before this phase.
+    context_bundle: ContextBundle | None = None
 
 
 class _FakeStaticAnalysisStep:
@@ -190,9 +201,14 @@ def _llm_review_step(
 ResponseFactory = Callable[[], tuple[int, bytes]]
 
 
-def _make_handler(respond: ResponseFactory) -> type[BaseHTTPRequestHandler]:
+def _make_handler(
+    respond: ResponseFactory, *, on_request: Callable[[bytes], None] | None = None
+) -> type[BaseHTTPRequestHandler]:
     class _StubHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
+            if on_request is not None:
+                length = int(self.headers.get("Content-Length", "0"))
+                on_request(self.rfile.read(length))
             status, body = respond()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -206,15 +222,21 @@ def _make_handler(respond: ResponseFactory) -> type[BaseHTTPRequestHandler]:
 
 
 @pytest.fixture
-def stub_llm_server() -> Iterator[Callable[[ResponseFactory], str]]:
-    """Yields a ``start(respond)`` function returning the base URL a
-    ``LiteLLMClient`` can be pointed at — see this file's own docstring for
-    why this is duplicated here rather than imported from
-    ``adapter/llm/conftest.py``."""
+def stub_llm_server() -> Iterator[Callable[..., str]]:
+    """Yields a ``start(respond, on_request=None)`` function returning the
+    base URL a ``LiteLLMClient`` can be pointed at — see this file's own
+    docstring for why this is duplicated here rather than imported from
+    ``adapter/llm/conftest.py``. ``on_request``, when given, receives the
+    raw request body bytes before ``respond()`` is called — the seam
+    US5's own context-bundle-reaches-the-prompt test below uses to inspect
+    exactly what ``LiteLLMClient`` sent over the wire, not merely what
+    ``LLMReviewStep`` built in memory."""
     servers: list[HTTPServer] = []
 
-    def start(respond: ResponseFactory) -> str:
-        server = HTTPServer(("127.0.0.1", 0), _make_handler(respond))
+    def start(
+        respond: ResponseFactory, *, on_request: Callable[[bytes], None] | None = None
+    ) -> str:
+        server = HTTPServer(("127.0.0.1", 0), _make_handler(respond, on_request=on_request))
         servers.append(server)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -293,6 +315,219 @@ async def test_us5_one_completion_call_made_with_diff_and_static_findings_as_con
     assert llm_findings[0].rule_id is None
     assert output.org_id == "org-1"
     assert output.pr_number == 42
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_us5_non_empty_context_bundle_reaches_the_completion_request(
+    stub_llm_server: Callable[..., str],
+) -> None:
+    """US5/Phase 5: Given a non-empty ``context_bundle`` on the upstream
+    step's output, When ``llm_review`` runs, Then the completion request
+    actually sent over the wire (not merely built in memory) includes a
+    clearly-labeled, distinguishable "Related code in this repository"
+    section carrying the bundle's own retrieved content — proving the
+    context bundle reaches ``llm_review``'s completion request end to end
+    through the real ``LiteLLMClient``, not just ``_build_user_message``'s
+    own unit-level behavior."""
+    context_bundle = ContextBundle(
+        items=(
+            ContextBundleItem(
+                id=0,
+                kind=ContextItemKind.CALLER,
+                file_path="src/caller.ts",
+                symbol_name="bar",
+                content="function bar() { add(1, 2); }",
+                line_range=(1, 1),
+            ),
+        )
+    )
+    captured_bodies: list[bytes] = []
+
+    endpoint = stub_llm_server(
+        lambda: (200, _canned_completion_json(_findings_response_json(0))),
+        on_request=captured_bodies.append,
+    )
+    llm_client = LiteLLMClient(endpoint=endpoint, api_key="not-needed")
+    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    static_output = _FakeStaticAnalysisOutput(
+        diff=_diff_with_patch(), context_bundle=context_bundle
+    )
+
+    await step.run(static_output, _context())
+
+    assert len(captured_bodies) == 1
+    sent_request = json.loads(captured_bodies[0])
+    user_message = sent_request["messages"][-1]["content"]
+    assert "Related code in this repository" in user_message
+    assert "src/caller.ts" in user_message
+    assert "function bar() { add(1, 2); }" in user_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_us6_context_ref_ids_round_trips_json_list_to_finding_tuple(
+    stub_llm_server: Callable[..., str],
+) -> None:
+    """Phase 6's own NFR (deferred by Phase 5, per the plan's Traceability
+    table): the LLM's own JSON `context_ref_ids: list[int]` round-trips to
+    `findings.models.Finding.context_ref_ids: tuple[int, ...]` — a plain
+    JSON list on the wire becomes the frozen, hashable tuple `Finding`
+    itself requires — proven against the real `LiteLLMClient`/HTTP round
+    trip, not just `_parse_llm_findings`'s own in-memory behavior."""
+    findings_response = json.dumps(
+        {
+            "findings": [
+                {
+                    "file": "app.py",
+                    "line": 1,
+                    "severity": "medium",
+                    "message": "calls a heavily-used helper",
+                    "context_ref_ids": [0, 1],
+                }
+            ]
+        }
+    )
+    endpoint = stub_llm_server(lambda: (200, _canned_completion_json(findings_response)))
+    llm_client = LiteLLMClient(endpoint=endpoint, api_key="not-needed")
+    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    static_output = _FakeStaticAnalysisOutput(diff=_diff_with_patch())
+
+    output = await step.run(static_output, _context())
+
+    llm_findings = [f for f in output.findings if f.source == "llm"]
+    assert len(llm_findings) == 1
+    assert llm_findings[0].context_ref_ids == (0, 1)
+    assert isinstance(llm_findings[0].context_ref_ids, tuple)
+
+
+@pytest.mark.asyncio
+async def test_context_ref_ids_absent_from_llm_response_defaults_to_none() -> None:
+    """The ordinary case — an LLM response with no `context_ref_ids` field
+    at all — leaves `Finding.context_ref_ids` at its own default (`None`),
+    never an empty tuple, so `review.citation.render_citation` is never
+    even called for a finding that drew on no context."""
+    llm_client = _FakeLLMClient(response_content=_findings_response_json(1))
+    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+
+    output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    llm_findings = [f for f in output.findings if f.source == "llm"]
+    assert len(llm_findings) == 1
+    assert llm_findings[0].context_ref_ids is None
+
+
+@pytest.mark.asyncio
+async def test_one_malformed_finding_is_dropped_not_the_whole_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A single finding whose `context_ref_ids` exceeds
+    `_MAX_CONTEXT_REF_IDS_PER_FINDING` must not fail the whole LLM
+    response — it's dropped and logged at `warning`, while every other,
+    well-formed finding in the same response still survives. Under the
+    pre-fix code (a single `_LLMFindingsResponse.model_validate` call over
+    the whole `findings` list) this exact response would have raised
+    `LLMResponseParseError` for the entire batch instead, escalating to a
+    fatal `PipelineFailedError` under `FailurePolicy.FATAL` and discarding
+    the other 2 well-formed findings along with it."""
+    response = json.dumps(
+        {
+            "findings": [
+                {"file": "a.py", "line": 1, "severity": "medium", "message": "finding a"},
+                {
+                    "file": "b.py",
+                    "line": 2,
+                    "severity": "high",
+                    "message": "finding b",
+                    # One over the cap — invalid on its own, must not sink
+                    # the other two findings in this same response.
+                    "context_ref_ids": list(range(_MAX_CONTEXT_REF_IDS_PER_FINDING + 1)),
+                },
+                {"file": "c.py", "line": 3, "severity": "low", "message": "finding c"},
+            ]
+        }
+    )
+    llm_client = _FakeLLMClient(response_content=response)
+    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+
+    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+        output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    llm_findings = [f for f in output.findings if f.source == "llm"]
+    # `_RecordingTextRedactor` wraps every surviving finding's own message
+    # as `REDACTED[...]` (see its own docstring) — this test's own subject
+    # is which *findings* survive, not redaction, so it asserts against
+    # that wrapped form rather than the raw LLM-authored text.
+    assert {f.message for f in llm_findings} == {"REDACTED[finding a]", "REDACTED[finding c]"}
+    dropped_warnings = [r for r in caplog.records if "dropping one malformed finding" in r.message]
+    assert len(dropped_warnings) == 1
+    assert dropped_warnings[0].finding_index == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_every_finding_failing_validation_logs_error_not_just_warnings(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When *every* item in a non-empty `findings` list fails per-item
+    validation, each drop still logs its own `warning` (unchanged), but
+    this must additionally log once at `error` — otherwise a broken LLM
+    integration or schema regression that fails every finding is
+    indistinguishable, from the step's own successful, empty-findings
+    return value, from a genuinely clean diff with nothing to report."""
+    response = json.dumps(
+        {
+            "findings": [
+                {
+                    "file": "a.py",
+                    "line": 1,
+                    "severity": "medium",
+                    "message": "finding a",
+                    "context_ref_ids": list(range(_MAX_CONTEXT_REF_IDS_PER_FINDING + 1)),
+                },
+                {
+                    "file": "b.py",
+                    "line": 2,
+                    "severity": "high",
+                    "message": "finding b",
+                    "context_ref_ids": list(range(_MAX_CONTEXT_REF_IDS_PER_FINDING + 1)),
+                },
+            ]
+        }
+    )
+    llm_client = _FakeLLMClient(response_content=response)
+    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+
+    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+        output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    assert [f for f in output.findings if f.source == "llm"] == []
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(error_records) == 1
+    assert "every finding" in error_records[0].message
+    assert error_records[0].total_items == 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_findings_key_missing_from_an_otherwise_valid_json_object_is_a_parse_error() -> None:
+    """A distinct malformed-*response* shape from
+    `test_malformed_llm_response_content_is_a_fatal_step_failure_logged_at_error`
+    below (which covers non-JSON content): valid JSON, but missing the
+    top-level `findings` list entirely — still a whole-response parse
+    failure, never silently treated as zero findings, since the two-stage
+    (JSON-shape-check, then per-item) rewrite of `_parse_llm_findings` must
+    keep rejecting a response with no `findings` list to work on at all."""
+    llm_client = _FakeLLMClient(response_content=json.dumps({"not_findings": []}))
+    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    static_output = _FakeStaticAnalysisOutput(diff=_diff_with_patch())
+    registry = StepRegistry(
+        [_FakeStaticAnalysisStep(static_output), step],
+        enabled={"static_analysis": True, "llm_review": True},
+        timeouts={"static_analysis": 5.0, "llm_review": 5.0},
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    with pytest.raises(PipelineFailedError):
+        await registry.run(seed_input=None, context=_context())
 
 
 @pytest.mark.asyncio

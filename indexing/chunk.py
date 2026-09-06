@@ -106,6 +106,16 @@ class Chunk(BaseModel):
     language: ChunkLanguage
     symbol_name: str | None
     byte_range: tuple[int, int]
+    line_range: tuple[int, int] | None = None
+    """1-indexed ``(start_line, end_line)``, inclusive both ends — computed
+    once, uniformly, by ``_line_range`` below from the chunk's own final
+    ``byte_range`` against the *full* file content, per
+    docs/plans/plan-deliver-context-builder.md's Assumption 5. ``None`` only
+    for a ``Chunk`` constructed without it (e.g. directly in a test, or a
+    row indexed before this field's migration and never re-indexed since —
+    see ``adapter/storage/models.py``'s ``IndexChunkRow``) — every chunk
+    ``chunk_file`` itself produces always populates this.
+    """
     content: str
     chunk_index: int
 
@@ -216,6 +226,7 @@ def _is_function_valued_variable_declarator(node: Node) -> bool:
     value = node.child_by_field_name("value")
     return value is not None and value.type in _TS_FUNCTION_VALUE_TYPES
 
+
 _IMPORT_TYPES: dict[ChunkLanguage, frozenset[str]] = {
     "typescript": frozenset({"import_statement"}),
     "tsx": frozenset({"import_statement"}),
@@ -268,6 +279,37 @@ def chunk_file(language: ChunkLanguage, path: str, content: bytes) -> ChunkResul
     return ChunkResult(chunks=chunks, tree=tree)
 
 
+def _line_range(content: bytes, byte_range: tuple[int, int]) -> tuple[int, int]:
+    """Computes a chunk's 1-indexed ``(start_line, end_line)`` by counting
+    newlines in the *full* file ``content`` up to each end of its own
+    already-correct, file-absolute ``byte_range`` — per
+    docs/plans/plan-deliver-context-builder.md's Assumption 5, **not** by
+    reusing any chunking-path-specific internal state (``Node.start_point``/
+    ``end_point``, or ``_pack()``'s own per-window line-span bookkeeping):
+    three prior attempts at exactly this computation were each
+    independently found wrong by multiple reviewers across several rounds,
+    because none of that internal state ever tracks the declaration's own
+    starting *file* line, only offsets into the declaration's own extracted
+    text.
+
+    ``byte_range`` follows this module's existing Python-slice convention
+    (``[start, end)``, exclusive end — see ``content[node.start_byte:node.end_byte]``
+    elsewhere in this module), so ``byte_range[1]`` is one byte *past* the
+    chunk's actual last included byte. Counting newlines up to
+    ``byte_range[1] - 1`` (the real last included byte), not
+    ``byte_range[1]``, avoids silently counting one extra line whenever that
+    last byte is itself a trailing ``\\n`` — the normal case both for a
+    ``_pack_whole_file()`` chunk of a file with a trailing newline
+    (near-universal for real source files) and for every non-final window of
+    a multi-window ``_pack()`` split (each window boundary lands on a line
+    boundary).
+    """
+
+    start_line = content[: byte_range[0]].count(b"\n") + 1
+    end_line = content[: byte_range[1] - 1].count(b"\n") + 1
+    return start_line, end_line
+
+
 def _build_chunks(
     root: Node, *, language: ChunkLanguage, path: str, content: bytes
 ) -> tuple[Chunk, ...]:
@@ -296,6 +338,7 @@ def _build_chunks(
                     language=language,
                     symbol_name=unit.symbol_name,
                     byte_range=(start_byte, end_byte),
+                    line_range=_line_range(content, (start_byte, end_byte)),
                     content=window_text,
                     chunk_index=index,
                 )
@@ -325,6 +368,7 @@ def _pack_whole_file(*, language: ChunkLanguage, path: str, content: bytes) -> t
                 language=language,
                 symbol_name=None,
                 byte_range=(start_byte, end_byte),
+                line_range=_line_range(content, (start_byte, end_byte)),
                 content=window_text,
                 chunk_index=index,
             )

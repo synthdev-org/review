@@ -249,6 +249,7 @@ class StaticAnalysisStep:
             repo_full_name=parsed.repo_full_name,
             pr_number=parsed.pr_number,
             head_sha=parsed.head_sha,
+            base_sha=parsed.base_sha,
         )
 
     async def _run_analyzer_sub_steps(

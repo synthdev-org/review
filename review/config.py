@@ -37,6 +37,11 @@ class StepEnablement(BaseModel):
 
     prefilter_enabled: bool = True
     static_analysis_enabled: bool = True
+    # Added by docs/plans/plan-deliver-context-builder.md's Phase 5 section —
+    # the context_builder step's own kill switch (spec-context-builder.md's
+    # Rollout & Release Safety "decided" flag), default `True`, mirroring
+    # every other macro-step flag's own naming/default convention exactly.
+    context_builder_enabled: bool = True
     llm_review_enabled: bool = True
     output_enabled: bool = True
     static_analysis_gitleaks_enabled: bool = True
@@ -52,6 +57,7 @@ class StepEnablement(BaseModel):
         return {
             "prefilter": self.prefilter_enabled,
             "static_analysis": self.static_analysis_enabled,
+            "context_builder": self.context_builder_enabled,
             "llm_review": self.llm_review_enabled,
             "output": self.output_enabled,
             "gitleaks": self.static_analysis_gitleaks_enabled,
@@ -74,6 +80,13 @@ class StepTimeouts(BaseModel):
     prefilter_step_timeout_seconds: int = 30
     static_analysis_step_timeout_seconds: int = 240
     static_analysis_analyzer_timeout_seconds: int = 60
+    # Added by docs/plans/plan-deliver-context-builder.md's Phase 5
+    # section — the value the outer `StepRegistry` reads for this step
+    # (distinct from `ContextBuilderStep`'s own internal
+    # `context_builder_internal_timeout_seconds`, which never appears here:
+    # this model only carries the *outer*, per-step timeout each step's own
+    # `Step.run()` call is wrapped in, per `review.pipeline.StepRegistry`).
+    context_builder_step_timeout_seconds: int = 35
     llm_review_step_timeout_seconds: int = 90
     output_step_timeout_seconds: int = 30
 
@@ -86,6 +99,7 @@ class StepTimeouts(BaseModel):
         return {
             "prefilter": self.prefilter_step_timeout_seconds,
             "static_analysis": self.static_analysis_step_timeout_seconds,
+            "context_builder": self.context_builder_step_timeout_seconds,
             "llm_review": self.llm_review_step_timeout_seconds,
             "output": self.output_step_timeout_seconds,
             "gitleaks": self.static_analysis_analyzer_timeout_seconds,
@@ -108,6 +122,27 @@ def static_analysis_can_produce_findings(enablement: StepEnablement) -> bool:
     return enablement.static_analysis_enabled and (
         enablement.static_analysis_gitleaks_enabled or enablement.static_analysis_semgrep_enabled
     )
+
+
+def context_builder_can_produce_value(enablement: StepEnablement) -> bool:
+    """Whether running ``ContextBuilderStep`` can actually produce any value
+    under ``enablement`` — true only when the step itself is enabled *and*
+    its one real consumer, ``llm_review``, is also enabled (``llm_review``
+    is the only step that ever reads a job's ``context_bundle`` — see
+    ``review.context_builder.ContextBuilderOutput``'s own docstring).
+
+    Without this check, ``context_builder_enabled``'s default of ``True``
+    means disabling ``llm_review`` alone (e.g. during an LLM-endpoint outage
+    or a cost-control measure) still pays the full cost of every
+    ``ContextBuilderStep`` run — diff/tree content fetch, the blast-radius
+    graph query, and the embedding+similarity query — for a
+    ``ContextBundle`` no step ever consumes. Mirrors
+    ``static_analysis_can_produce_findings``'s own shape and reasoning
+    above: one shared predicate ``apps/worker/main.py`` uses both to gate
+    the step's effective enablement and to keep that decision from drifting
+    out of sync with any other place that needs the same answer.
+    """
+    return enablement.context_builder_enabled and enablement.llm_review_enabled
 
 
 class NoViableStepConfigurationError(Exception):

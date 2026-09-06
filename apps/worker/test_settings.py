@@ -293,3 +293,63 @@ def test_validate_private_key_rejects_a_truncated_key() -> None:
     truncated = TEST_RSA_PRIVATE_KEY_PEM[: len(TEST_RSA_PRIVATE_KEY_PEM) // 2]
     with pytest.raises(GitHubPrivateKeyInvalidError):
         validate_private_key(app_id=123456, private_key_pem=truncated)
+
+
+# --- Context Builder delivery plan's Phase 5: the timeout-margin validator -
+#
+# Assumption 7's own margin invariant, "the single most important
+# correctness property of this phase" by the plan's own words —
+# `context_builder_step_timeout_seconds` (the outer per-step timeout) must
+# be strictly greater than `context_builder_internal_timeout_seconds` (the
+# single `asyncio.wait_for` bounding `ContextBuilderStep`'s whole internal
+# orchestration), mirroring `apps/webhook_api/test_settings.py`'s own
+# `pytest.raises(ValidationError)` pattern for its own analogous validator.
+
+
+def test_context_builder_default_timeouts_have_a_valid_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.context_builder_step_timeout_seconds == 35
+    assert settings.context_builder_internal_timeout_seconds == 25
+    assert settings.context_builder_step_timeout_seconds > (
+        settings.context_builder_internal_timeout_seconds
+    )
+
+
+def test_context_builder_internal_timeout_equal_to_step_timeout_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_CONTEXT_BUILDER_STEP_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("REVIEW_WORKER_CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS", "20")
+
+    with pytest.raises(ValidationError):
+        WorkerSettings(_env_file=None)
+
+
+def test_context_builder_internal_timeout_greater_than_step_timeout_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_CONTEXT_BUILDER_STEP_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("REVIEW_WORKER_CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS", "25")
+
+    with pytest.raises(ValidationError):
+        WorkerSettings(_env_file=None)
+
+
+def test_context_builder_internal_timeout_with_valid_margin_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_CONTEXT_BUILDER_STEP_TIMEOUT_SECONDS", "20")
+    monkeypatch.setenv("REVIEW_WORKER_CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS", "10")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.context_builder_step_timeout_seconds == 20
+    assert settings.context_builder_internal_timeout_seconds == 10
