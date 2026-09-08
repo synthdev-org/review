@@ -155,7 +155,7 @@ from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
 from review.review_generation import ReviewGenerationStep
 from review.static_analysis import StaticAnalysisStep
-from review.verification import VerificationStep
+from review.verification import MemorySuppressionConfig, VerificationStep
 
 
 def _build_llm_client(settings: WorkerSettings) -> LLMClient:
@@ -468,6 +468,27 @@ def _log_verification_disabled_warning(settings: WorkerSettings, logger: logging
         )
 
 
+def _log_memory_suppression_disabled_warning(
+    settings: WorkerSettings, logger: logging.Logger
+) -> None:
+    """A one-time `warning`-level startup log when `memory_suppression_enabled`
+    is `False` (US-M12, `docs/plans/plan-deliver-memory.md`'s Phase 6
+    section) — mirrors `_log_verification_disabled_warning`'s own shape
+    exactly: the deployment can still boot and run correctly (disabling
+    suppression restores exactly this phase's own prior `VerificationStep`
+    behavior, with zero interaction with capture (Phases 2-4) or the admin
+    API (Phase 5), which keep running regardless), but the deviation from
+    the shipped default — no similarity-based suppression, every candidate
+    finding reaches the rubric call — must be visible, not silent.
+    """
+    if not settings.memory_suppression_enabled:
+        logger.warning(
+            "memory suppression is disabled: no similarity-based pre-check will run "
+            "before the rubric call",
+            extra={"memory_suppression_enabled": False},
+        )
+
+
 _DEPRECATED_SETTINGS_ENV_VARS: tuple[tuple[str, str], ...] = (
     ("REVIEW_WORKER_LLM_REVIEW_ENABLED", "REVIEW_WORKER_REVIEW_GENERATION_ENABLED"),
     (
@@ -645,6 +666,7 @@ def _build_review_registry(
     llm_client: LLMClient,
     publisher: GitHubFindingsPublisher,
     settings: WorkerSettings,
+    memory_matcher: PostgresMemoryRepository,
 ) -> StepRegistry:
     """Construct the macro-step registry `REVIEW` jobs dispatch to.
 
@@ -700,6 +722,19 @@ def _build_review_registry(
     same two mappings' own `"gitleaks"`/`"semgrep"` entries for its own
     inner registry — see `review.config.StepEnablement`'s own docstring for
     why this is one shared mapping, not two built separately.
+
+    `docs/plans/plan-deliver-memory.md`'s Phase 6 section (Unit F,
+    Assumption 6) adds `memory_matcher` — `VerificationStep` gets a new
+    `memory_suppression=MemorySuppressionConfig(...)` keyword argument built
+    from it plus the already-built `embedding_client` and three plain
+    `WorkerSettings` fields (`memory_suppression_enabled`/
+    `memory_similarity_threshold`/`memory_decay_half_life_days`) — never
+    `None` when `memory_suppression_enabled` is `True` (else `None`
+    entirely, restoring byte-for-byte the prior `VerificationStep`
+    construction, per US-M12). Unlike the five dynamically-wired steps
+    above, this isn't gated through `enabled_mapping`/`resolved` — it's an
+    internal behavior toggle inside the already-registered `verification`
+    step, not a separate pipeline stage of its own.
     """
     enabled_mapping = enablement.as_mapping()
     timeouts_mapping = timeouts.as_mapping()
@@ -734,6 +769,21 @@ def _build_review_registry(
         "timeout": settings.llm_timeout_seconds,
         "max_diff_bytes": settings.llm_max_diff_bytes,
     }
+
+    # docs/plans/plan-deliver-memory.md's Phase 6 section (Unit F,
+    # Assumption 6) — `None` when `memory_suppression_enabled` is `False`,
+    # restoring exactly this step's pre-Phase-6 construction (US-M12).
+    memory_suppression = (
+        MemorySuppressionConfig(
+            memory_matcher=memory_matcher,
+            embedding_client=embedding_client,
+            similarity_threshold=settings.memory_similarity_threshold,
+            decay_half_life_days=settings.memory_decay_half_life_days,
+            enabled=True,
+        )
+        if settings.memory_suppression_enabled
+        else None
+    )
 
     return StepRegistry(
         steps=[
@@ -776,6 +826,7 @@ def _build_review_registry(
                 llm_client,
                 **llm_step_kwargs,
                 depends_on=resolved["verification"],
+                memory_suppression=memory_suppression,
             ),
             FindingsOutputStep(
                 publisher,
@@ -876,6 +927,7 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
     tree_fetcher = _build_tree_fetcher(settings, token_provider, github_http_client)
     redactor = _build_text_redactor(settings, logger)
     _log_verification_disabled_warning(settings, logger)
+    _log_memory_suppression_disabled_warning(settings, logger)
     # The same database session factory IndexRepository already uses (see
     # `_build_indexing_deps` below) — no second connection pool. Built here,
     # ahead of `publisher`, so `_build_findings_publisher` (Phase 2, US-M11)
@@ -898,6 +950,7 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
         client,
         publisher,
         settings,
+        memory_repository,
     )
     index_repository = IndexingRepository(session_factory)
     indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)
