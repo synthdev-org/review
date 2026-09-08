@@ -1,6 +1,6 @@
 """memory.store — the storage-boundary Protocols Phase 4 (Memory) needs, per
 ``docs/plans/plan-deliver-memory.md``'s Phase 1 section (Unit A, Assumption
-1) and Phase 4 section (Unit D).
+1), Phase 4 section (Unit D), and Phase 5 section (Unit E).
 
 Defined here, alongside ``memory/models.py``'s ``MemoryEntry``/
 ``PostedComment`` — not at any one of their several consumers — per
@@ -8,15 +8,21 @@ Defined here, alongside ``memory/models.py``'s ``MemoryEntry``/
 ``MemorySignalRecorder`` alone has two real consumers spanning two
 entrypoints (``adapter/github/posting.py`` in the Worker, Phase 2;
 ``apps/webhook_api/webhook_routes.py`` in the Webhook API, Phase 3), so
-"the first consumer" would be an arbitrary choice among them. All five
-Protocols below (the original three from Phase 1, plus Phase 4's
-``ReactionFetcher``/``ReactionDedupStore``) are implemented by one concrete
-class, ``adapter/storage/memory_repository.py``'s ``PostgresMemoryRepository``
+"the first consumer" would be an arbitrary choice among them. All six
+Protocols below (the original three from Phase 1, Phase 4's
+``ReactionFetcher``/``ReactionDedupStore``, and Phase 5's
+``PostedCommentReader``) are implemented by one concrete class,
+``adapter/storage/memory_repository.py``'s ``PostgresMemoryRepository``
 (``ReactionFetcher`` being the one exception — implemented by
 ``adapter/github/reactions.py``'s ``GitHubReactionFetcher`` instead, since
 it's a GitHub API read, not a storage concern), per Assumption 8 —
 mirroring ``indexing/repository.py``'s ``IndexRepository``/
 ``IndexCommitTracker`` split, both implemented by one ``IndexingRepository``.
+Every Protocol here is kept at 1-3 methods, per
+``docs/rules/architecture.md``'s Protocol-size rule — ``PostedCommentReader``
+was split out from ``MemoryAdminRepository`` for exactly this reason (see
+that Protocol's own docstring below), rather than merged into it as a
+fourth method.
 
 Zero infra imports, per ``docs/rules/architecture.md``'s domain-package
 rule. Every storage-backed method raises ``MemoryStoreError`` on a real
@@ -154,6 +160,15 @@ class MemoryAdminRepository(Protocol):
     """The admin API's own storage boundary (Phase 5) — list/approve-or-
     reject/delete, per US-M4/US-M5/US-M8. Implemented by
     ``adapter/storage/memory_repository.py``'s ``PostgresMemoryRepository``.
+
+    Kept at exactly three methods, per ``docs/rules/architecture.md``'s
+    "Protocols are 1-3 methods" rule. The approve route's own need to read
+    a linked ``posted_finding_comment`` row before calling ``set_status``
+    (to build a ``dismissed_finding`` entry's embedding input) is served by
+    the separate, single-method ``PostedCommentReader`` Protocol below —
+    mirroring how ``ReactionFetcher``/``ReactionDedupStore`` stay separate,
+    narrow Protocols rather than growing one Protocol past three methods —
+    not folded in here as a fourth method.
     """
 
     async def list_entries(
@@ -201,6 +216,36 @@ class MemoryAdminRepository(Protocol):
         route). Raises ``MemoryEntryNotFoundError`` for an unknown
         ``entry_id``, or ``MemoryStoreError`` on any other Postgres-level
         failure.
+        """
+        ...
+
+
+class PostedCommentReader(Protocol):
+    """One method, kept separate from ``MemoryAdminRepository`` (Phase 5)
+    to stay within ``docs/rules/architecture.md``'s "Protocols are 1-3
+    methods" rule — the same "narrow, single-purpose Protocol" precedent
+    ``ReactionFetcher``/``ReactionDedupStore`` already establish rather
+    than growing one Protocol past three methods. The approve route
+    (US-M4) computes a ``dismissed_finding`` entry's embedding at the
+    FastAPI-route layer, via the composition root's own
+    ``indexing.embedding.EmbeddingClient`` instance — which means it needs
+    the linked finding's fingerprint text (``file``/``rule_id``/``message``)
+    *before* calling ``MemoryAdminRepository.set_status``, not just an
+    opaque ``entry_id``. Implemented by
+    ``adapter/storage/memory_repository.py``'s ``PostgresMemoryRepository``
+    (Assumption 8 — one concrete class implements every Memory Protocol).
+    """
+
+    async def get_posted_comment(self, *, entry_id: str) -> PostedComment:
+        """The ``posted_finding_comment`` row linked to ``entry_id`` (via
+        its own ``posted_finding_comment_id`` FK, which is never nullable —
+        every ``memory_entry`` row is captured against a real posted
+        comment), returned as a ``PostedComment`` so the approve route can
+        build ``memory.fingerprint.build_finding_fingerprint``'s input from
+        it (US-M4). Raises ``MemoryEntryNotFoundError`` for an unknown
+        ``entry_id`` — the same 404 case ``MemoryAdminRepository.set_status``/
+        ``delete_entry`` already raise it for — or ``MemoryStoreError`` on
+        any other Postgres-level failure.
         """
         ...
 

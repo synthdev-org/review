@@ -7,8 +7,9 @@
 # hard requirement of this profile's existence.
 #
 # The operator still MUST supply real values for every credential field
-# below (github.webhookSecret, llm.apiKey, database.url, and
-# github.setupStateSecret if setupMode is ever enabled) — either as
+# below (github.webhookSecret, github.appPrivateKey, llm.apiKey,
+# database.url, adminApi.apiKey, and github.setupStateSecret if setupMode
+# is ever enabled) — either as
 # literals in a private values override file that is never committed, or
 # (preferred for production) via existingSecret references into whatever
 # secret backend already populates this cluster's Secrets. This file

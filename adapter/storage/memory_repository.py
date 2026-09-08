@@ -114,7 +114,9 @@ def _to_entry(row: MemoryEntryRow) -> MemoryEntry:
 class PostgresMemoryRepository:
     """Implements ``memory.store.MemorySignalRecorder``,
     ``memory.store.DismissedFindingMatcher``,
-    ``memory.store.MemoryAdminRepository``, and (Phase 4, Unit D)
+    ``memory.store.MemoryAdminRepository``, ``memory.store.PostedCommentReader``
+    (Phase 5, Unit E — split out from ``MemoryAdminRepository`` to keep both
+    Protocols within the 1-3-method rule), and (Phase 4, Unit D)
     ``memory.store.ReactionDedupStore`` against real Postgres/pgvector
     tables (``posted_finding_comment``, ``memory_entry``,
     ``captured_reaction``).
@@ -382,6 +384,37 @@ class PostgresMemoryRepository:
         deleted = await self._run(operation="delete_entry", fn=_write)
         if not deleted:
             raise MemoryEntryNotFoundError(entry_id=entry_id)
+
+    # -- PostedCommentReader (Phase 5, Unit E) --------------------------------
+
+    async def get_posted_comment(self, *, entry_id: str) -> PostedComment:
+        try:
+            entry_uuid = uuid.UUID(entry_id)
+        except ValueError as exc:
+            raise MemoryStoreError(operation="get_posted_comment", detail=str(exc)) from exc
+
+        async def _read(session: AsyncSession) -> PostedFindingCommentRow | None:
+            statement = (
+                select(PostedFindingCommentRow)
+                .join(
+                    MemoryEntryRow,
+                    MemoryEntryRow.posted_finding_comment_id == PostedFindingCommentRow.id,
+                )
+                .where(MemoryEntryRow.id == entry_uuid)
+            )
+            result = await session.execute(statement)
+            return result.scalar_one_or_none()
+
+        row = await self._run(operation="get_posted_comment", fn=_read)
+        if row is None:
+            raise MemoryEntryNotFoundError(entry_id=entry_id)
+        return PostedComment(
+            comment_id=row.id,
+            file=row.finding_file,
+            line=row.finding_line,
+            rule_id=row.finding_rule_id,
+            message=row.finding_message,
+        )
 
     # -- ReactionDedupStore (Phase 4, Unit D) ---------------------------------
 

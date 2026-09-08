@@ -148,6 +148,19 @@ llm:
       name: ""
       key: ""
 
+# Admin API auth (docs/plans/plan-deliver-memory.md's Phase 5, Unit E,
+# Assumption 7) — mirrors WebhookAPISettings' own `admin_api_key: SecretStr`
+# required-no-default field: the admin router registers unconditionally
+# and enforces this key per-request (US-M10), so an unset value leaves
+# webhook-api unable to boot, the same "no safe default" posture as
+# `github.appPrivateKey` above.
+adminApi:
+  apiKey:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+
 database:
   # Full REVIEW_DATABASE_URL DSN (postgresql+asyncpg://user:pass@host:port/db).
   # Left blank here: when postgresql.enabled is true, the chart derives it

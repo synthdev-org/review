@@ -166,6 +166,26 @@ class WebhookAPISettings(BaseSettings):
     # poll runs here, not in the Worker.
     memory_reaction_poll_max_comments_per_poll: int = 50
 
+    # --- Admin API (docs/plans/plan-deliver-memory.md's Phase 5 section,
+    # Unit E, US-M4/US-M5/US-M8/US-M10) ---
+    # Required, no default (Assumption 7) — mirrors `github_webhook_secret`'s
+    # own "no safe default, dangerous to silently default" pattern, not
+    # `setup_state_secret`'s conditionally-required one: the admin router
+    # registers unconditionally (see `apps/webhook_api/main.py`), enforcing
+    # auth per-request via a Bearer-token dependency, rather than being
+    # registration-gated the way `SETUP_MODE` gates the manifest flow —
+    # there is no "off by default" state for the admin API the way there is
+    # for the one-time setup flow.
+    admin_api_key: SecretStr
+
+    # This entrypoint's own `LocalONNXEmbeddingClient` instance (the admin
+    # API's approve route, US-M4, is its first consumer outside the
+    # Worker's own job pipeline) — same on-disk, Dockerfile-baked model
+    # path/default as `apps/worker/settings.py`'s `embedding_model_path`
+    # field, per that file's own docstring for why this is a filesystem
+    # path, never a network location or a per-entrypoint override.
+    embedding_model_path: str = "/app/models/all-MiniLM-L6-v2"
+
     @model_validator(mode="after")
     def _require_setup_state_secret_when_setup_mode_enabled(self) -> WebhookAPISettings:
         """``setup_state_secret`` signs the manifest flow's CSRF state

@@ -480,6 +480,48 @@ async def test_delete_entry_removes_the_row_and_raises_on_a_repeat_call(
 
 
 @pytest.mark.asyncio
+async def test_get_posted_comment_returns_the_linked_finding_fingerprint(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """Phase 5 (Unit E)'s own addition to this Phase 1 file: the admin
+    API's approve route (US-M4) reads a `dismissed_finding` entry's linked
+    `posted_finding_comment` row via `get_posted_comment` to build the text
+    it embeds — this proves that read against a real Postgres row.
+    """
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9601)
+    await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="reaction",
+        raw_signal_detail={"emoji": "+1"},
+        github_comment_id=None,
+    )
+    entries, _ = await repository.list_entries(
+        org_id=None, repo_id=str(repo_id), team_id=None, status=None, limit=10, offset=0
+    )
+    entry_id = entries[0].id
+
+    posted_comment = await repository.get_posted_comment(entry_id=entry_id)
+
+    assert posted_comment == PostedComment(
+        comment_id=comment_id,
+        file="app/main.py",
+        line=10,
+        rule_id="no-secrets",
+        message="a secret was found",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_posted_comment_raises_not_found_for_an_unknown_id(
+    repository: PostgresMemoryRepository,
+) -> None:
+    with pytest.raises(MemoryEntryNotFoundError):
+        await repository.get_posted_comment(entry_id=str(uuid.uuid4()))
+
+
+@pytest.mark.asyncio
 async def test_best_effective_similarity_returns_none_with_zero_approved_entries(
     repository: PostgresMemoryRepository, repo_id: uuid.UUID
 ) -> None:
