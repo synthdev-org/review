@@ -47,12 +47,19 @@ from fastapi.responses import JSONResponse
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from adapter.github.schemas import GitHubWebhookEnvelope, PushCommit
+from adapter.github.schemas import (
+    GitHubWebhookEnvelope,
+    PullRequestReviewCommentWebhookEnvelope,
+    PullRequestReviewThreadWebhookEnvelope,
+    PushCommit,
+)
 from adapter.github.signature import verify_webhook_signature
-from adapter.github.triggers import is_enqueue_trigger, is_index_trigger
+from adapter.github.triggers import is_enqueue_trigger, is_index_trigger, is_memory_capture_trigger
 from adapter.storage.models import JobType
 from adapter.storage.queue import JobQueueRepository
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
+from findings.redact import TextRedactor
+from memory.store import MemorySignalRecorder, MemoryStoreError
 from tenancy.resolution import ResolutionResult, TenancyStore, WebhookEvent, resolve_installation
 
 # Skipped-reason values a rate-limited candidate can carry (used by the
@@ -463,6 +470,103 @@ async def _handle_matched_triggers(
     return await _run_in_transaction(session_factory, event=event, work=_work)
 
 
+async def _handle_memory_capture(
+    *,
+    raw_payload: object,
+    event_type: str,
+    action: str | None,
+    repo_id: uuid.UUID,
+    provenance_recorder: MemorySignalRecorder,
+    text_redactor: TextRedactor,
+    capture_ceiling_limiter: InMemoryRateLimiter,
+) -> str:
+    """Attempt to capture a reply/thread-resolution raw signal for a
+    webhook event already confirmed to match ``is_memory_capture_trigger``
+    (``adapter/github/triggers.py``), per
+    ``docs/plans/plan-deliver-memory.md``'s Phase 3 section (Unit C,
+    US-M1/US-M2).
+
+    Deliberately outside ``_handle_matched_triggers``'s own job-queue
+    transaction (per the plan's own design): this writes directly to
+    ``memory_entry``, never enqueues a job, and relies on
+    ``MemorySignalRecorder.record_signal``'s own ``ON CONFLICT DO NOTHING``
+    upsert for redelivery-safety rather than the job-queue path's
+    delivery-id guard.
+
+    Returns the outcome reason for the caller's own accepted-but-not-
+    enqueued-style log line: ``"captured"``, ``"not_a_platform_comment"``
+    (the webhook comment/thread this signal is about isn't one the
+    platform posted, or isn't a reply to one — including a malformed
+    envelope, treated the same as "no match" rather than a 4xx, per this
+    route's "every non-enqueuing outcome is still accepted" posture),
+    ``"capture_ceiling_exceeded"`` (the per-repo daily cap — see
+    ``apps/webhook_api/settings.py``'s ``memory_capture_ceiling_per_repo_per_day``),
+    or ``"capture_failed"`` (a genuine Postgres-level failure — logged at
+    ``error`` and swallowed here, never failing the webhook response
+    itself, the same "a secondary write-path concern" posture Phase 2's own
+    provenance capture already establishes for `GitHubFindingsPublisher.post_review`).
+    """
+    if not capture_ceiling_limiter.allow(str(repo_id)):
+        logger.warning(
+            "memory capture rejected",
+            extra={"repo_id": str(repo_id), "reason": "capture_ceiling_exceeded"},
+        )
+        return "capture_ceiling_exceeded"
+
+    try:
+        if event_type == "pull_request_review_comment":
+            comment_envelope = PullRequestReviewCommentWebhookEnvelope.model_validate(raw_payload)
+            in_reply_to_id = comment_envelope.comment.in_reply_to_id
+            if in_reply_to_id is None:
+                # A fresh top-level review comment, not a reply — Assumption
+                # 3, never captured.
+                return "not_a_platform_comment"
+            redacted_body = await text_redactor.redact(comment_envelope.comment.body)
+            found = await provenance_recorder.record_signal(
+                posted_finding_comment_id=in_reply_to_id,
+                raw_signal_type="reply",
+                raw_signal_detail={"body": redacted_body},
+                github_comment_id=comment_envelope.comment.id,
+            )
+            return "captured" if found else "not_a_platform_comment"
+
+        # pull_request_review_thread — "resolved" or "unresolved".
+        thread_envelope = PullRequestReviewThreadWebhookEnvelope.model_validate(raw_payload)
+        comment_ids = [comment.id for comment in thread_envelope.thread.comments]
+        if not comment_ids:
+            return "not_a_platform_comment"
+        resolved = action == "resolved"
+        # The thread event's own comment id, per `MemoryEntryRow.github_comment_id`'s
+        # own docstring — the most recent comment in the thread (the last
+        # entry GitHub's own `thread.comments` array carries), independent
+        # of which id among them turns out to correlate to a
+        # `posted_finding_comment` row below.
+        thread_github_comment_id = comment_ids[-1]
+        for candidate_id in comment_ids:
+            found = await provenance_recorder.record_signal(
+                posted_finding_comment_id=candidate_id,
+                raw_signal_type="thread_resolution",
+                raw_signal_detail={"resolved": resolved},
+                github_comment_id=thread_github_comment_id,
+            )
+            if found:
+                return "captured"
+        return "not_a_platform_comment"
+    except ValidationError:
+        logger.warning(
+            "memory capture rejected",
+            extra={"repo_id": str(repo_id), "reason": "invalid_payload_shape"},
+        )
+        return "not_a_platform_comment"
+    except MemoryStoreError as exc:
+        logger.error(
+            "memory capture failed",
+            extra={"repo_id": str(repo_id), "event_type": event_type},
+            exc_info=exc,
+        )
+        return "capture_failed"
+
+
 def create_webhook_router(
     *,
     webhook_secret: SecretStr,
@@ -474,6 +578,9 @@ def create_webhook_router(
     enqueue_rate_limiter: InMemoryRateLimiter | None,
     indexing_enabled: bool,
     index_enqueue_rate_limiter: InMemoryRateLimiter | None,
+    provenance_recorder: MemorySignalRecorder,
+    text_redactor: TextRedactor,
+    memory_capture_ceiling_limiter: InMemoryRateLimiter,
 ) -> APIRouter:
     """Build the webhook receiver router.
 
@@ -491,6 +598,13 @@ def create_webhook_router(
     ``is_index_trigger`` itself never reads it (see that function's own
     docstring); only this route decides whether a syntactic index-trigger
     match actually gets to attempt an enqueue.
+
+    ``provenance_recorder``/``text_redactor``/``memory_capture_ceiling_limiter``
+    (``docs/plans/plan-deliver-memory.md``'s Phase 3, Unit C) back this
+    route's memory-capture handling (see ``_handle_memory_capture`` above) —
+    always registered, unlike the enqueue rate limiters, since capture has
+    no ``0``-disables-it sentinel of its own (US-M12: only suppression, a
+    later phase's own kill switch, is independently disable-able).
     """
     router = APIRouter()
 
@@ -638,6 +752,44 @@ def create_webhook_router(
                     "skipped_reason": skipped_reason,
                 },
             )
+
+        # Memory capture (docs/plans/plan-deliver-memory.md's Phase 3
+        # section, Unit C) — deliberately independent of the `candidates`/
+        # `_handle_matched_triggers` fan-out above: `is_enqueue_trigger`/
+        # `is_index_trigger` never match a `pull_request_review_comment`/
+        # `pull_request_review_thread` event (different event types
+        # entirely), so `candidates` is always empty here and `result` was
+        # already resolved via the plain `resolve_installation` branch
+        # above — reused, not re-resolved a second time.
+        if is_memory_capture_trigger(event_type, event.action):
+            capture_reason = await _handle_memory_capture(
+                raw_payload=raw_payload,
+                event_type=event_type,
+                action=event.action,
+                repo_id=result.repo_id,
+                provenance_recorder=provenance_recorder,
+                text_redactor=text_redactor,
+                capture_ceiling_limiter=memory_capture_ceiling_limiter,
+            )
+            logger.info(
+                "memory capture accepted"
+                if capture_reason == "captured"
+                else "memory capture accepted; not captured",
+                extra={
+                    "installation_id": event.installation_id,
+                    "org_id": str(result.org_id),
+                    "repo_id": str(result.repo_id),
+                    "delivery_id": event.delivery_id,
+                    "event_type": event_type,
+                    "raw_signal_type": (
+                        "reply"
+                        if event_type == "pull_request_review_comment"
+                        else "thread_resolution"
+                    ),
+                    "reason": capture_reason,
+                },
+            )
+
         return JSONResponse({"status": "accepted"}, status_code=200)
 
     return router

@@ -127,7 +127,7 @@ class _FakeProvenanceRecorder:
         raw_signal_type: str,
         raw_signal_detail: dict[str, object],
         github_comment_id: int | None,
-    ) -> None:
+    ) -> bool:
         raise AssertionError("record_signal is not exercised by this test file")
 
 

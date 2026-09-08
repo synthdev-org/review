@@ -2,10 +2,12 @@
 ``(event_type, action)`` pairs to "this should enqueue a review", per the
 plan's Phase 1 section. Also home to ``is_index_trigger`` (this plan's
 indexing-delivery Phase 1), the equivalent decision for "this should
-enqueue an ``INDEX`` job" — a second, independent pure function alongside
-``is_enqueue_trigger`` rather than folding into it, since the two answer
-genuinely different questions with different trigger tables (see
-``is_index_trigger``'s own docstring).
+enqueue an ``INDEX`` job", and ``is_memory_capture_trigger``
+(``docs/plans/plan-deliver-memory.md``'s Phase 3), the equivalent decision
+for "this should attempt to capture a reply/thread-resolution raw signal" —
+three independent pure functions, not one folded into another, since each
+answers a genuinely different question with its own trigger table (see
+each function's own docstring).
 
 Deliberately a plain ``frozenset[tuple[str, str]]`` membership check, not a
 ``dict`` keyed to a richer decision type — every populated entry today
@@ -51,6 +53,22 @@ _ENQUEUE_INDEX_PULL_REQUEST_TRIGGERS: frozenset[tuple[str, str]] = frozenset(
     {
         ("pull_request", "opened"),
         ("pull_request", "synchronize"),
+    }
+)
+
+# Per docs/plans/plan-deliver-memory.md's Phase 3 section (Unit C, Plan
+# Assumption 3): `issue_comment` is deliberately never a member here —
+# GitHub fires it for a PR's top-level conversation tab, never tied to a
+# specific review/line comment this platform could correlate back to a
+# `posted_finding_comment` row, so subscribing to it would only add unused
+# webhook volume. `pull_request_review_comment` "created" (a reply) and
+# `pull_request_review_thread` "resolved"/"unresolved" are the only shapes
+# GitHub's own API actually supports correlating.
+_MEMORY_CAPTURE_TRIGGERS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("pull_request_review_comment", "created"),
+        ("pull_request_review_thread", "resolved"),
+        ("pull_request_review_thread", "unresolved"),
     }
 )
 
@@ -111,3 +129,24 @@ def is_index_trigger(
             return False
         return (event_type, action) in _ENQUEUE_INDEX_PULL_REQUEST_TRIGGERS
     return False
+
+
+def is_memory_capture_trigger(event_type: str, action: str | None) -> bool:
+    """Whether this ``(event_type, action)`` pair should attempt to capture
+    a reply/thread-resolution raw signal, per
+    ``docs/plans/plan-deliver-memory.md``'s Phase 3 section (Unit C,
+    US-M1/US-M2) — a third, independent trigger table alongside
+    ``is_enqueue_trigger``/``is_index_trigger``, answering yet another
+    different question ("attempt Memory capture", never "enqueue a job";
+    no job is ever enqueued for a matching event here).
+
+    ``action`` is ``None`` for event types that carry no top-level
+    ``action`` key at all — always "no match" here, the same convention
+    ``is_enqueue_trigger`` already establishes.
+
+    Pure, no-I/O logic per ADR-0005, tested at Unit tier
+    (``adapter/github/test_triggers.py``) alongside its two siblings.
+    """
+    if action is None:
+        return False
+    return (event_type, action) in _MEMORY_CAPTURE_TRIGGERS

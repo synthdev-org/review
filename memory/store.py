@@ -86,16 +86,35 @@ class MemorySignalRecorder(Protocol):
         raw_signal_type: RawSignalType,
         raw_signal_detail: dict[str, object],
         github_comment_id: int | None,
-    ) -> None:
+    ) -> bool:
         """Persists one ``pending`` ``memory_entry`` row capturing a single
         raw signal against the ``posted_finding_comment`` row it's about —
         per US-M1/US-M2 (Phase 3) and US-M3 (Phase 4). ``github_comment_id``
         is the reply/thread-event's own GitHub comment id, backing the
         redelivery-safe ``(posted_finding_comment_id, raw_signal_type,
-        github_comment_id)`` uniqueness constraint Phase 3 relies on —
-        ``None`` for a ``reaction`` signal, whose own dedup is
-        ``captured_reaction``'s job instead. Raises ``MemoryStoreError`` on
-        a Postgres-level failure.
+        github_comment_id, signal_variant)`` uniqueness constraint Phase 3
+        relies on — ``None`` for a ``reaction`` signal, whose own dedup is
+        ``captured_reaction``'s job instead. ``signal_variant`` is not a
+        parameter of this method — the implementation derives it internally
+        from ``raw_signal_detail`` (``"resolved"``/``"unresolved"`` for a
+        ``thread_resolution`` signal, ``""`` otherwise) purely to keep a
+        thread's ``resolved`` event and a later ``unresolved`` event on that
+        same thread from colliding on this key and silently discarding the
+        second one (both otherwise share an identical ``raw_signal_type``
+        and ``github_comment_id``) — see
+        ``adapter/storage/models.py``'s ``MemoryEntryRow`` docstring.
+
+        Returns ``True`` when ``posted_finding_comment_id`` correlates to a
+        real ``posted_finding_comment`` row and the signal was recorded —
+        either a fresh insert, or a no-op ``ON CONFLICT DO NOTHING`` against
+        that same uniqueness constraint (a GitHub redelivery of the same
+        reply/thread-resolution event, per Phase 3's own redelivery-safety
+        design). Returns ``False`` when ``posted_finding_comment_id`` does
+        not correlate to any known row (the webhook comment this signal is
+        about isn't one the platform posted, or isn't a reply to one) — the
+        caller (``apps/webhook_api/webhook_routes.py``) treats this as an
+        accepted-but-uncaptured outcome, never an error. Raises
+        ``MemoryStoreError`` on a genuine Postgres-level failure.
         """
         ...
 

@@ -99,6 +99,36 @@ class WebhookAPISettings(BaseSettings):
     # `review_enqueue_rate_limit_per_minute`'s own `0` sentinel.
     index_enqueue_rate_limit_per_minute: int = 5
 
+    # --- Memory capture (docs/plans/plan-deliver-memory.md's Phase 3
+    # section, Unit C) ---
+    # Reply-text redaction before persistence, per that phase's own scope
+    # bullet — mirrors `apps/worker/settings.py`'s `WorkerSettings.secret_redaction_enabled`
+    # field name/default exactly (the same "reused, not reinvented" wiring
+    # choice `apps/webhook_api/main.py`'s new `TextRedactor` dependency
+    # makes; this entrypoint's first consumer of that Protocol).
+    secret_redaction_enabled: bool = True
+
+    # Per-repo capture ceiling (a real gap Phase 3's own plan review pass
+    # found): any GitHub account able to comment/react on a public repo's
+    # PR can generate valid, signed webhook deliveries that each attempt to
+    # create a `pending` `memory_entry` row — not a privileged permission.
+    # Reuses the same `InMemoryRateLimiter` shape
+    # `review_enqueue_rate_limit_per_minute` already establishes for a
+    # materially identical shape of problem, but over a rolling day rather
+    # than a minute. Deliberately placed here (`WebhookAPISettings`), not
+    # `WorkerSettings` as `docs/plans/plan-deliver-memory.md`'s own prose
+    # literally names it — a documented correction, not an oversight: the
+    # capture write this ceiling guards
+    # (`apps/webhook_api/webhook_routes.py`) runs entirely inside the
+    # Webhook API entrypoint, never the Worker, and `WorkerSettings` has no
+    # way to reach a config value into a different process's own
+    # composition root. No `0`-disables-it sentinel, unlike the enqueue
+    # rate limits above — capture has no "off" state of its own per US-M12
+    # (only suppression, a later phase's own kill switch, is independently
+    # disable-able); a deployment that genuinely wants no ceiling can set
+    # this to a very large number instead.
+    memory_capture_ceiling_per_repo_per_day: int = 500
+
     # --- App manifest/callback setup flow (apps/webhook_api/manifest_routes.py) ---
     # Off by default, per the plan's Phase 4 section ("both ... routes are
     # ... gated behind an explicit SETUP_MODE config flag, off by default")

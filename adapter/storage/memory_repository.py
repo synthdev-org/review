@@ -28,11 +28,16 @@ table instead of ``index_chunk``), takes the single closest match, computes
 latency SLA (per ``spec-memory.md``'s NFRs, matching
 ``PostgresSimilarityQuery``'s own v1 posture).
 
-``record_signal`` is a plain insert in this phase — Phase 3's own section is
-what adds the ``ON CONFLICT DO NOTHING`` redelivery-safety upsert against
-``uq_memory_entry_signal`` (this phase's migration already creates that
-constraint; nothing writes through this method with a real risk of
-redelivery until Phase 3's webhook handler exists to call it).
+``record_signal`` (Phase 3, Unit C) upserts via ``ON CONFLICT DO NOTHING``
+against ``uq_memory_entry_signal`` (created by Phase 1's own migration) —
+GitHub's at-least-once webhook delivery semantics mean the same reply/
+thread-resolution event can arrive more than once, and this makes a
+redelivery a silent no-op rather than a duplicate ``pending`` row. Returns
+``True``/``False`` (found-and-recorded vs. no correlating
+``posted_finding_comment`` row) rather than raising for the "no match"
+case — that outcome is a routine, expected one for
+``apps/webhook_api/webhook_routes.py``'s own capture handler (a webhook
+comment/thread this platform never posted), not a failure.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ from datetime import datetime
 from typing import Literal, cast
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -149,7 +155,7 @@ class PostgresMemoryRepository:
         raw_signal_type: RawSignalType,
         raw_signal_detail: dict[str, object],
         github_comment_id: int | None,
-    ) -> None:
+    ) -> bool:
         # `record_signal`'s own Protocol signature takes no repo/org/team
         # scope — the caller (Phase 3's webhook handler, Phase 4's reaction
         # poll job) only ever has the *comment* it's reacting to in scope,
@@ -164,33 +170,59 @@ class PostgresMemoryRepository:
         # same "placeholder, no writer exists" state
         # `OrgRepoTeamSetting`/`ModelRoutingConfig` are already in).
         async def _write(session: AsyncSession) -> bool:
-            result = await session.execute(
+            lookup = await session.execute(
                 select(PostedFindingCommentRow.repo_id, Repo.org_id)
                 .join(Repo, Repo.id == PostedFindingCommentRow.repo_id)
                 .where(PostedFindingCommentRow.id == posted_finding_comment_id)
             )
-            row = result.first()
+            row = lookup.first()
             if row is None:
                 return False
             repo_id, org_id = row
-            session.add(
-                MemoryEntryRow(
+            # `signal_variant` (0006_memory_entry_signal_variant.py):
+            # disambiguates a thread's `resolved` event from a later
+            # `unresolved` event on that *same* thread — both share the
+            # same `raw_signal_type="thread_resolution"` and the same
+            # `github_comment_id` (the thread's own last comment id, not
+            # something that differs by action), so without this the
+            # original 3-column key would collapse them into one row (the
+            # second event's `ON CONFLICT DO NOTHING` silently discarding
+            # real state-change data, not just a genuine redelivery).
+            # Derived from `raw_signal_detail` here, at the storage
+            # boundary, rather than a new `MemorySignalRecorder.record_signal`
+            # parameter — every other signal type (`reply`, `reaction`)
+            # leaves it at its `""` default, so a genuine redelivery of
+            # those still collides on the same key it always has.
+            signal_variant = ""
+            if raw_signal_type == "thread_resolution":
+                signal_variant = "resolved" if raw_signal_detail.get("resolved") else "unresolved"
+            # `ON CONFLICT DO NOTHING` against `uq_memory_entry_signal`
+            # (posted_finding_comment_id, raw_signal_type,
+            # github_comment_id, signal_variant) — Phase 3's own
+            # redelivery-safety design: a GitHub redelivery of the
+            # identical reply/thread-resolution event silently no-ops here
+            # rather than creating a second `pending` row every retry.
+            # Whether this particular call inserted a fresh row or hit the
+            # conflict-skip path is immaterial to the caller — either way
+            # `posted_finding_comment_id` correlated to a real row, which is
+            # what `found` reports.
+            statement = (
+                pg_insert(MemoryEntryRow)
+                .values(
                     repo_id=repo_id,
                     org_id=org_id,
                     posted_finding_comment_id=posted_finding_comment_id,
                     raw_signal_type=raw_signal_type,
                     raw_signal_detail=raw_signal_detail,
                     github_comment_id=github_comment_id,
+                    signal_variant=signal_variant,
                 )
+                .on_conflict_do_nothing(constraint="uq_memory_entry_signal")
             )
+            await session.execute(statement)
             return True
 
-        found = await self._run(operation="record_signal", fn=_write)
-        if not found:
-            raise MemoryStoreError(
-                operation="record_signal",
-                detail=f"posted_finding_comment {posted_finding_comment_id} not found",
-            )
+        return await self._run(operation="record_signal", fn=_write)
 
     # -- DismissedFindingMatcher ---------------------------------------------
 

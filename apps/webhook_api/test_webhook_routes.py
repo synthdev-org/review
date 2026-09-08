@@ -36,7 +36,17 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from adapter.storage.engine import create_session_factory
-from adapter.storage.models import JobQueueRow, JobStatus, JobType, Org, Repo, WebhookDeliveryRow
+from adapter.storage.models import (
+    JobQueueRow,
+    JobStatus,
+    JobType,
+    MemoryEntryRow,
+    MemoryEntryStatus,
+    Org,
+    PostedFindingCommentRow,
+    Repo,
+    WebhookDeliveryRow,
+)
 from adapter.storage.queue import JobQueueRepository
 from apps.webhook_api.main import create_app
 from apps.webhook_api.settings import WebhookAPISettings
@@ -64,6 +74,8 @@ def _build_client(
     review_enqueue_rate_limit_per_minute: int = 0,
     indexing_enabled: bool = False,
     index_enqueue_rate_limit_per_minute: int = 5,
+    secret_redaction_enabled: bool = False,
+    memory_capture_ceiling_per_repo_per_day: int = 500,
 ) -> TestClient:
     settings = WebhookAPISettings(
         environment="development",
@@ -75,6 +87,15 @@ def _build_client(
         review_enqueue_rate_limit_per_minute=review_enqueue_rate_limit_per_minute,
         indexing_enabled=indexing_enabled,
         index_enqueue_rate_limit_per_minute=index_enqueue_rate_limit_per_minute,
+        # `False` by default in this test module: exercises the same
+        # `NoOpTextRedactor` wiring path `apps/worker/test_main.py`'s own
+        # `secret_redaction_enabled=False` tests already establish, so
+        # these route-level tests can assert `raw_signal_detail["body"]`
+        # against the exact input text without depending on the vendored
+        # Gitleaks binary's own behavior (covered elsewhere,
+        # `adapter/analyzers/test_gitleaks.py`).
+        secret_redaction_enabled=secret_redaction_enabled,
+        memory_capture_ceiling_per_repo_per_day=memory_capture_ceiling_per_repo_per_day,
         _env_file=None,
     )
     return TestClient(create_app(settings))
@@ -139,6 +160,53 @@ def _push_payload(
     return json.dumps(body).encode("utf-8")
 
 
+def _review_comment_payload(
+    *,
+    action: str = "created",
+    repo_full_name: str = "acme/widgets",
+    installation_id: int = 123,
+    pr_number: int = 7,
+    comment_id: int = 5001,
+    in_reply_to_id: int | None = 4001,
+    body: str = "I don't think this applies here",
+) -> bytes:
+    """A `pull_request_review_comment` webhook event payload, per
+    `docs/plans/plan-deliver-memory.md`'s Phase 3 section (Unit C).
+    """
+    comment: dict[str, object] = {"id": comment_id, "body": body}
+    if in_reply_to_id is not None:
+        comment["in_reply_to_id"] = in_reply_to_id
+    payload: dict[str, object] = {
+        "action": action,
+        "installation": {"id": installation_id},
+        "repository": {"full_name": repo_full_name},
+        "pull_request": {"number": pr_number},
+        "comment": comment,
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+def _review_thread_payload(
+    *,
+    action: str = "resolved",
+    repo_full_name: str = "acme/widgets",
+    installation_id: int = 123,
+    pr_number: int = 7,
+    comment_ids: list[int] | None = None,
+) -> bytes:
+    """A `pull_request_review_thread` webhook event payload (action
+    `resolved`/`unresolved`), per the plan's Phase 3 section.
+    """
+    payload: dict[str, object] = {
+        "action": action,
+        "installation": {"id": installation_id},
+        "repository": {"full_name": repo_full_name},
+        "pull_request": {"number": pr_number},
+        "thread": {"comments": [{"id": comment_id} for comment_id in (comment_ids or [4001])]},
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
 def _post(
     client: TestClient,
     body: bytes,
@@ -182,6 +250,44 @@ async def _fetch_jobs(engine: AsyncEngine) -> list[JobQueueRow]:
     session_factory = create_session_factory(engine)
     async with session_factory() as session:
         result = await session.execute(select(JobQueueRow))
+        return list(result.scalars().all())
+
+
+async def _repo_id_by_full_name(engine: AsyncEngine, full_name: str) -> uuid.UUID:
+    session_factory = create_session_factory(engine)
+    async with session_factory() as session:
+        result = await session.execute(select(Repo.id).where(Repo.full_name == full_name))
+        return result.scalar_one()
+
+
+async def _seed_posted_comment(
+    engine: AsyncEngine, *, repo_id: uuid.UUID, comment_id: int, pr_number: int = 7
+) -> None:
+    """Directly inserts a `posted_finding_comment` row (Phase 2's own
+    output, this phase's own input) — Phase 3's capture handler correlates
+    an inbound reply/thread-resolution signal's comment id against exactly
+    this table, per `docs/plans/plan-deliver-memory.md`'s Phase 3 section.
+    """
+    session_factory = create_session_factory(engine)
+    async with session_factory() as session, session.begin():
+        session.add(
+            PostedFindingCommentRow(
+                id=comment_id,
+                repo_id=repo_id,
+                pr_number=pr_number,
+                commit_sha="a" * 40,
+                finding_file="app/main.py",
+                finding_line=10,
+                finding_rule_id="no-secrets",
+                finding_message="a secret was found",
+            )
+        )
+
+
+async def _fetch_memory_entries(engine: AsyncEngine) -> list[MemoryEntryRow]:
+    session_factory = create_session_factory(engine)
+    async with session_factory() as session:
+        result = await session.execute(select(MemoryEntryRow))
         return list(result.scalars().all())
 
 
@@ -998,4 +1104,458 @@ async def test_mid_transaction_failure_rolls_back_both_writes(
         "enqueue transaction rolled back" in record.getMessage()
         and getattr(record, "delivery_id", None) == "rollback-delivery"
         for record in caplog.records
+    )
+
+
+# --- Memory capture: replies and thread-resolution ---
+# (docs/plans/plan-deliver-memory.md's Phase 3, Unit C, US-M1/US-M2)
+
+
+async def _provision_repo(
+    client: TestClient, engine: AsyncEngine, *, repo_full_name: str, installation_id: int
+) -> uuid.UUID:
+    """Auto-provisions org/repo for `repo_full_name`/`installation_id` via
+    an ordinary `pull_request opened` webhook — the same auto-provisioning
+    path every other test in this module already exercises — then resolves
+    the real `repo_id` this phase's own tests need to seed a
+    `posted_finding_comment` row against.
+    """
+    body = _payload(repo_full_name=repo_full_name, installation_id=installation_id)
+    response = _post(client, body, delivery_id=f"provision-{repo_full_name}-{installation_id}")
+    assert response.status_code == 200
+    return await _repo_id_by_full_name(engine, repo_full_name)
+
+
+@pytest.mark.asyncio
+async def test_reply_to_posted_comment_creates_pending_memory_entry(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US-M1's Given/When/Then: a `pull_request_review_comment` `created`
+    event whose `comment.in_reply_to_id` matches a `posted_finding_comment`
+    row creates a `pending`, unclassified `memory_entry` capturing the
+    (redacted) reply text, provenance-linked to that row.
+    """
+    # `with` (not a bare `client = ...`): every request below shares one
+    # TestClient portal/event loop — a second, separately-established
+    # portal per bare `.post()` call would leave the app's own internal
+    # engine's asyncpg connection pool straddling two different event
+    # loops, per starlette's own `TestClient` contract.
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/reply-repo", installation_id=901
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4001)
+
+        body = _review_comment_payload(
+            repo_full_name="acme/reply-repo",
+            installation_id=901,
+            comment_id=5001,
+            in_reply_to_id=4001,
+            body="I don't think this applies here",
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_comment", delivery_id="reply-1"
+        )
+
+    assert response.status_code == 200
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.status == MemoryEntryStatus.PENDING
+    assert entry.entry_type is None
+    assert entry.raw_signal_type == "reply"
+    assert entry.raw_signal_detail == {"body": "I don't think this applies here"}
+    assert entry.posted_finding_comment_id == 4001
+    assert entry.github_comment_id == 5001
+
+
+@pytest.mark.asyncio
+async def test_reply_with_no_in_reply_to_id_is_accepted_but_not_captured(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """Assumption 3: a `created` comment with `in_reply_to_id=None` is a
+    fresh top-level review comment, not a reply, and is never captured —
+    still accepted (200)."""
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/fresh-comment-repo", installation_id=902
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4002)
+
+        body = _review_comment_payload(
+            repo_full_name="acme/fresh-comment-repo",
+            installation_id=902,
+            comment_id=5002,
+            in_reply_to_id=None,
+            body="a fresh top-level review comment",
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_comment", delivery_id="fresh-comment-1"
+        )
+
+    assert response.status_code == 200
+    assert await _fetch_memory_entries(migrated_engine) == []
+
+
+@pytest.mark.asyncio
+async def test_reply_to_unknown_comment_is_accepted_but_not_captured(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """A reply whose `in_reply_to_id` doesn't correlate to any
+    `posted_finding_comment` row (not one this platform posted) is accepted
+    (200) and logged, never captured — the "no match" case both Phase 3's
+    plan section and US-M1 describe."""
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/no-match-repo", installation_id=903
+        )
+
+        body = _review_comment_payload(
+            repo_full_name="acme/no-match-repo",
+            installation_id=903,
+            comment_id=5003,
+            in_reply_to_id=999_999,
+            body="replying to something the platform never posted",
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_comment", delivery_id="no-match-1"
+        )
+
+    assert response.status_code == 200
+    assert await _fetch_memory_entries(migrated_engine) == []
+
+
+@pytest.mark.asyncio
+async def test_thread_resolved_creates_pending_memory_entry(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US-M2's Given/When/Then, `resolved` branch."""
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/thread-repo", installation_id=904
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4004)
+
+        body = _review_thread_payload(
+            action="resolved",
+            repo_full_name="acme/thread-repo",
+            installation_id=904,
+            comment_ids=[4004],
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_thread", delivery_id="thread-resolved-1"
+        )
+
+    assert response.status_code == 200
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.status == MemoryEntryStatus.PENDING
+    assert entry.raw_signal_type == "thread_resolution"
+    assert entry.raw_signal_detail == {"resolved": True}
+    assert entry.posted_finding_comment_id == 4004
+
+
+@pytest.mark.asyncio
+async def test_thread_unresolved_creates_pending_memory_entry(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US-M2's Given/When/Then, `unresolved` branch."""
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        repo_id = await _provision_repo(
+            client,
+            migrated_engine,
+            repo_full_name="acme/thread-unresolved-repo",
+            installation_id=905,
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4005)
+
+        body = _review_thread_payload(
+            action="unresolved",
+            repo_full_name="acme/thread-unresolved-repo",
+            installation_id=905,
+            comment_ids=[4005],
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_thread", delivery_id="thread-unresolved-1"
+        )
+
+    assert response.status_code == 200
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert len(entries) == 1
+    assert entries[0].raw_signal_detail == {"resolved": False}
+
+
+@pytest.mark.asyncio
+async def test_thread_resolution_matches_any_comment_id_in_the_thread(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """`thread.comments` can carry ids beyond the platform's own posted
+    comment (other reviewers' replies in the same thread) — any id in the
+    array that correlates to a `posted_finding_comment` row is a match."""
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/thread-multi-repo", installation_id=906
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4006)
+
+        body = _review_thread_payload(
+            action="resolved",
+            repo_full_name="acme/thread-multi-repo",
+            installation_id=906,
+            comment_ids=[9999, 4006, 8888],  # only 4006 is a platform-posted comment
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_thread", delivery_id="thread-multi-1"
+        )
+
+    assert response.status_code == 200
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert len(entries) == 1
+    assert entries[0].posted_finding_comment_id == 4006
+    # `github_comment_id` is the thread's own last comment id, independent
+    # of which id in the thread actually matched.
+    assert entries[0].github_comment_id == 8888
+
+
+@pytest.mark.asyncio
+async def test_thread_resolution_with_no_matching_comment_is_accepted_but_not_captured(
+    migrated_engine: AsyncEngine,
+) -> None:
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        await _provision_repo(
+            client,
+            migrated_engine,
+            repo_full_name="acme/thread-no-match-repo",
+            installation_id=907,
+        )
+
+        body = _review_thread_payload(
+            action="resolved",
+            repo_full_name="acme/thread-no-match-repo",
+            installation_id=907,
+            comment_ids=[111, 222],
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_thread", delivery_id="thread-no-match-1"
+        )
+
+    assert response.status_code == 200
+    assert await _fetch_memory_entries(migrated_engine) == []
+
+
+@pytest.mark.asyncio
+async def test_redelivered_reply_does_not_create_a_duplicate_entry(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """Redelivery-safety (plan's Phase 3 section): even across two distinct
+    `X-GitHub-Delivery` ids (so the job-queue path's own delivery-id guard
+    never applies here), the exact same reply signal
+    (`posted_finding_comment_id`/`raw_signal_type`/`github_comment_id`)
+    only ever produces one `memory_entry` row, via `record_signal`'s own
+    `ON CONFLICT DO NOTHING` upsert.
+    """
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/redelivery-repo", installation_id=908
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4008)
+
+        body = _review_comment_payload(
+            repo_full_name="acme/redelivery-repo",
+            installation_id=908,
+            comment_id=5008,
+            in_reply_to_id=4008,
+            body="redelivered reply",
+        )
+
+        first = _post(
+            client, body, event_type="pull_request_review_comment", delivery_id="redelivery-1"
+        )
+        second = _post(
+            client, body, event_type="pull_request_review_comment", delivery_id="redelivery-2"
+        )
+
+    assert (first.status_code, second.status_code) == (200, 200)
+    assert len(await _fetch_memory_entries(migrated_engine)) == 1
+
+
+@pytest.mark.asyncio
+async def test_thread_toggle_between_resolved_and_unresolved_captures_both(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """A thread `resolved` event followed by a later `unresolved` event on
+    that *same* thread are two distinct real-world state changes, not a
+    redelivery of the same event — both must be captured. Regression test
+    for a review-pass finding on the first Phase 3 implementation: the
+    route always used `raw_signal_type="thread_resolution"` and
+    `github_comment_id=comment_ids[-1]` regardless of `action`, so the
+    redelivery-safety `ON CONFLICT DO NOTHING` upsert silently discarded
+    the second (`unresolved`) event's write, even though `record_signal`
+    still reported `found=True` for it.
+    """
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/thread-toggle-repo", installation_id=910
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4011)
+
+        resolved_body = _review_thread_payload(
+            action="resolved",
+            repo_full_name="acme/thread-toggle-repo",
+            installation_id=910,
+            comment_ids=[4011],
+        )
+        unresolved_body = _review_thread_payload(
+            action="unresolved",
+            repo_full_name="acme/thread-toggle-repo",
+            installation_id=910,
+            comment_ids=[4011],
+        )
+
+        resolved_response = _post(
+            client,
+            resolved_body,
+            event_type="pull_request_review_thread",
+            delivery_id="thread-toggle-resolved",
+        )
+        unresolved_response = _post(
+            client,
+            unresolved_body,
+            event_type="pull_request_review_thread",
+            delivery_id="thread-toggle-unresolved",
+        )
+
+    assert (resolved_response.status_code, unresolved_response.status_code) == (200, 200)
+    entries = await _fetch_memory_entries(migrated_engine)
+    resolved_values = {entry.raw_signal_detail["resolved"] for entry in entries}
+    assert resolved_values == {True, False}
+    assert len(entries) == 2
+
+
+@pytest.mark.asyncio
+async def test_reply_with_redaction_enabled_redacts_secret_before_persisting(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """The plan's Phase 3 Tests subsection explicitly requires this
+    scenario: a reply's raw body is redacted (via the real Gitleaks-backed
+    `TextRedactor`, not `NoOpTextRedactor`) before being persisted as
+    `raw_signal_detail`. Every other reply test in this module uses
+    `_build_client`'s `secret_redaction_enabled=False` default (see that
+    fixture's own docstring) and so only proves pass-through behavior; this
+    is the one test that exercises the real redaction wiring end to end.
+    """
+    planted_secret = 'github_token = "ghp_1234567890abcdefghijklmnopqrstuvwxyz12"'
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        secret_redaction_enabled=True,
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/redact-reply-repo", installation_id=911
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4012)
+
+        body = _review_comment_payload(
+            repo_full_name="acme/redact-reply-repo",
+            installation_id=911,
+            comment_id=5012,
+            in_reply_to_id=4012,
+            body=planted_secret,
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_comment", delivery_id="redact-reply-1"
+        )
+
+    assert response.status_code == 200
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert len(entries) == 1
+    redacted_body = entries[0].raw_signal_detail["body"]
+    assert isinstance(redacted_body, str)
+    assert "ghp_1234567890abcdefghijklmnopqrstuvwxyz12" not in redacted_body
+    assert redacted_body != planted_secret
+
+
+@pytest.mark.asyncio
+async def test_capture_ceiling_exceeded_is_accepted_but_not_persisted(
+    migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A per-repo daily cap on capture writes — a real gap this plan's own
+    review pass found (any GitHub account able to comment on a public
+    repo's PR can otherwise generate unbounded `pending` `memory_entry`
+    rows, no privileged permission required). Exceeding it is still
+    accepted (200), matching this route's own "never reject a well-formed
+    signed webhook" posture, but not persisted.
+    """
+    logging.getLogger("apps.webhook_api.webhook_routes").disabled = False
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        memory_capture_ceiling_per_repo_per_day=1,
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/ceiling-repo", installation_id=909
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4009)
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4010)
+
+        first_body = _review_comment_payload(
+            repo_full_name="acme/ceiling-repo",
+            installation_id=909,
+            comment_id=5009,
+            in_reply_to_id=4009,
+            body="first reply, within the ceiling",
+        )
+        second_body = _review_comment_payload(
+            repo_full_name="acme/ceiling-repo",
+            installation_id=909,
+            comment_id=5010,
+            in_reply_to_id=4010,
+            body="second reply, past the ceiling",
+        )
+
+        with caplog.at_level("WARNING"):
+            first = _post(
+                client,
+                first_body,
+                event_type="pull_request_review_comment",
+                delivery_id="ceiling-1",
+            )
+            second = _post(
+                client,
+                second_body,
+                event_type="pull_request_review_comment",
+                delivery_id="ceiling-2",
+            )
+
+    assert (first.status_code, second.status_code) == (200, 200)
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert len(entries) == 1
+    assert entries[0].posted_finding_comment_id == 4009
+    assert any(
+        getattr(record, "reason", None) == "capture_ceiling_exceeded" for record in caplog.records
     )

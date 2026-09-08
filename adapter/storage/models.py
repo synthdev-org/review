@@ -450,13 +450,32 @@ class MemoryEntryRow(Base):
     ``ModelRoutingConfig`` above already establish, not a new pattern.
 
     ``UniqueConstraint("posted_finding_comment_id", "raw_signal_type",
-    "github_comment_id")`` is Phase 3's own redelivery-idempotency key: a
-    GitHub webhook redelivery of the same reply/thread-resolution event
-    (GitHub's own documented at-least-once semantics) upserts via ``ON
-    CONFLICT DO NOTHING`` against this key rather than creating a duplicate
-    ``pending`` row every retry. ``github_comment_id`` is ``NULL`` for a
-    ``reaction`` entry (Phase 4) — that raw signal type's own dedup lives in
-    ``captured_reaction`` instead, per Assumption 9.
+    "github_comment_id", "signal_variant")`` is Phase 3's own
+    redelivery-idempotency key: a GitHub webhook redelivery of the same
+    reply/thread-resolution event (GitHub's own documented at-least-once
+    semantics) upserts via ``ON CONFLICT DO NOTHING`` against this key
+    rather than creating a duplicate ``pending`` row every retry.
+    ``github_comment_id`` is ``NULL`` for a ``reaction`` entry (Phase 4) —
+    that raw signal type's own dedup lives in ``captured_reaction`` instead,
+    per Assumption 9.
+
+    ``signal_variant`` (added by ``0006_memory_entry_signal_variant.py``,
+    after a review pass on Phase 3 found the original 3-column key
+    collapsed a thread's ``resolved`` event and a later ``unresolved``
+    event on that same thread into a single row — the original key has
+    nothing that differs between them, since both share the same
+    ``raw_signal_type="thread_resolution"`` and the same
+    ``github_comment_id``) disambiguates same-thread, opposite-action
+    events without weakening the redelivery guarantee: it's a plain
+    ``NOT NULL`` column (never ``NULL``, so Postgres's own "NULLs are never
+    equal" unique-index semantics can't silently defeat it the way a
+    nullable/JSONB-expression column would), set to ``"resolved"``/
+    ``"unresolved"`` by ``PostgresMemoryRepository.record_signal`` for a
+    ``thread_resolution`` signal (derived from ``raw_signal_detail``, not a
+    new caller-supplied parameter — no ``MemorySignalRecorder`` Protocol
+    change) and left at its default ``""`` for every other signal type, so
+    a genuine redelivery of a ``reply``/``reaction`` signal still collides
+    on the same key it always has.
     """
 
     __tablename__ = "memory_entry"
@@ -465,6 +484,7 @@ class MemoryEntryRow(Base):
             "posted_finding_comment_id",
             "raw_signal_type",
             "github_comment_id",
+            "signal_variant",
             name="uq_memory_entry_signal",
         ),
     )
@@ -494,6 +514,7 @@ class MemoryEntryRow(Base):
         ForeignKey("posted_finding_comment.id", ondelete="CASCADE"), nullable=False
     )
     github_comment_id: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
+    signal_variant: Mapped[str] = mapped_column(String(16), nullable=False, server_default="")
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(_EMBEDDING_DIMENSION), nullable=True
     )

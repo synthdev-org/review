@@ -184,6 +184,138 @@ async def test_record_signal_persists_a_pending_unclassified_entry(
 
 
 @pytest.mark.asyncio
+async def test_record_signal_returns_true_when_matched(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9102)
+
+    found = await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="reply",
+        raw_signal_detail={"body": "matched"},
+        github_comment_id=556,
+    )
+
+    assert found is True
+
+
+@pytest.mark.asyncio
+async def test_record_signal_returns_false_for_unknown_posted_finding_comment(
+    repository: PostgresMemoryRepository,
+) -> None:
+    """Per Phase 3's own design (docs/plans/plan-deliver-memory.md): a
+    signal whose `posted_finding_comment_id` doesn't correlate to any row
+    this platform posted is a routine, expected outcome — never an error —
+    so `apps/webhook_api/webhook_routes.py`'s capture handler can log it as
+    `"not_a_platform_comment"` and still accept (200) the webhook.
+    """
+    found = await repository.record_signal(
+        posted_finding_comment_id=999_999,
+        raw_signal_type="reply",
+        raw_signal_detail={"body": "orphaned"},
+        github_comment_id=1,
+    )
+
+    assert found is False
+
+
+@pytest.mark.asyncio
+async def test_record_signal_is_idempotent_on_redelivery(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """A GitHub redelivery of the identical reply event (same
+    `posted_finding_comment_id`/`raw_signal_type`/`github_comment_id`
+    triple) upserts via `ON CONFLICT DO NOTHING` rather than creating a
+    second `pending` row every retry — Phase 3's own redelivery-safety
+    design.
+    """
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9103)
+
+    first = await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="reply",
+        raw_signal_detail={"body": "first delivery"},
+        github_comment_id=557,
+    )
+    second = await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="reply",
+        raw_signal_detail={"body": "redelivered"},
+        github_comment_id=557,
+    )
+
+    assert (first, second) == (True, True)
+    async with session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(MemoryEntryRow).where(
+                        MemoryEntryRow.posted_finding_comment_id == comment_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    # The original delivery's content survives; the redelivery's own
+    # (different) body never overwrote it — `ON CONFLICT DO NOTHING` skips
+    # the row entirely rather than upserting new content over it.
+    assert rows[0].raw_signal_detail == {"body": "first delivery"}
+
+
+@pytest.mark.asyncio
+async def test_record_signal_keeps_both_rows_when_a_thread_toggles_resolution(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """A thread `resolved` event followed by a later `unresolved` event on
+    that *same* thread (identical `posted_finding_comment_id`,
+    `raw_signal_type="thread_resolution"`, and `github_comment_id` — the
+    thread's own last comment id never differs by action) are two distinct
+    real-world state changes, not a redelivery of the same event, and must
+    both be captured — regression test for the bug a review pass on the
+    first Phase 3 implementation found (the original 3-column key silently
+    dropped the second call's write via `ON CONFLICT DO NOTHING`, while
+    still reporting `found=True`).
+    """
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9104)
+
+    resolved = await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="thread_resolution",
+        raw_signal_detail={"resolved": True},
+        github_comment_id=558,
+    )
+    unresolved = await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="thread_resolution",
+        raw_signal_detail={"resolved": False},
+        github_comment_id=558,
+    )
+
+    assert (resolved, unresolved) == (True, True)
+    async with session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(MemoryEntryRow)
+                    .where(MemoryEntryRow.posted_finding_comment_id == comment_id)
+                    .order_by(MemoryEntryRow.created_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [row.raw_signal_detail for row in rows] == [{"resolved": True}, {"resolved": False}]
+
+
+@pytest.mark.asyncio
 async def test_list_entries_filters_by_repo_and_status(
     repository: PostgresMemoryRepository,
     repo_id: uuid.UUID,
