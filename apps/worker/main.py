@@ -116,6 +116,7 @@ from adapter.llm.litellm_client import LiteLLMClient
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.indexing_repository import IndexingRepository
+from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
 from apps.worker.dispatch import run_dispatch_loop
 from apps.worker.logging_config import configure_logging
@@ -313,6 +314,7 @@ def _build_findings_publisher(
     settings: WorkerSettings,
     token_provider: GitHubInstallationTokenProvider,
     http_client: httpx.AsyncClient,
+    provenance_recorder: PostgresMemoryRepository,
 ) -> GitHubFindingsPublisher:
     """Wire the domain-defined `FindingsPublisher` Protocol to its
     GitHub-backed implementation (Phase 7), sharing `token_provider` with
@@ -320,9 +322,16 @@ def _build_findings_publisher(
     `adapter/github/posting.py`'s own "no new auth code, no new config, of
     its own" docstring note. See `_build_token_provider`'s own docstring for
     why `http_client` is shared, not built per-publisher.
+
+    `provenance_recorder` — `docs/plans/plan-deliver-memory.md`'s Phase 2
+    section (US-M11) — is the same `PostgresMemoryRepository` instance
+    `_amain` builds alongside `graph_query`/`similarity_query` (Assumption
+    8: one concrete class, one `session_factory`, no second connection
+    pool).
     """
     return GitHubFindingsPublisher(
         token_provider=token_provider,
+        provenance_recorder=provenance_recorder,
         github_api_base_url=settings.github_api_base_url,
         timeout=settings.github_api_timeout_seconds,
         max_retry_attempts=settings.github_retry_max_attempts,
@@ -812,9 +821,14 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
     tree_fetcher = _build_tree_fetcher(settings, token_provider, github_http_client)
     redactor = _build_text_redactor(settings, logger)
     _log_verification_disabled_warning(settings, logger)
-    publisher = _build_findings_publisher(settings, token_provider, github_http_client)
     # The same database session factory IndexRepository already uses (see
-    # `_build_indexing_deps` below) — no second connection pool.
+    # `_build_indexing_deps` below) — no second connection pool. Built here,
+    # ahead of `publisher`, so `_build_findings_publisher` (Phase 2, US-M11)
+    # can pass it through as `provenance_recorder`.
+    memory_repository = PostgresMemoryRepository(session_factory)
+    publisher = _build_findings_publisher(
+        settings, token_provider, github_http_client, memory_repository
+    )
     graph_query = PostgresGraphQuery(session_factory)
     similarity_query = PostgresSimilarityQuery(session_factory)
     registry = _build_review_registry(

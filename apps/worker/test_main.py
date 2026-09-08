@@ -555,7 +555,14 @@ class _EmptyFindingsLLMClient:
 
 class _NoOpPublisher:
     async def post_review(
-        self, *, installation_id: int, repo_full_name: str, pr_number: int, findings: list[object]
+        self,
+        *,
+        installation_id: int,
+        repo_full_name: str,
+        repo_id: str,
+        pr_number: int,
+        head_sha: str,
+        findings: list[object],
     ) -> None:
         raise AssertionError("post_review should never be called for zero findings")
 

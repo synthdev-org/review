@@ -33,6 +33,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.posting import GitHubFindingsPublisher
 from findings.models import Finding
+from memory.models import PostedComment
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
@@ -77,6 +78,7 @@ _PR_NUMBER = 42
 _HEAD_SHA = "a" * 40
 _BASE = "https://api.github.com"
 _REVIEWS_URL = f"{_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews"
+_REVIEW_COMMENTS_URL = f"{_REVIEWS_URL}/1/comments"
 _CHECK_RUNS_URL = f"{_BASE}/repos/{_OWNER_REPO}/check-runs"
 
 
@@ -88,9 +90,52 @@ def _mock_token_exchange() -> None:
     )
 
 
+def _mock_review_comments(comments: list[dict[str, object]] | None = None) -> None:
+    """Mocks Phase 2 (US-M11)'s follow-up ``GET .../reviews/{id}/comments``
+    call, issued by `GitHubFindingsPublisher.post_review` whenever a review
+    with at least one line-attributed finding is posted (mocked review id is
+    always `1` here, matching every `reviews_route`'s own mocked response
+    body). Every real test in this file's own scope is
+    `adapter/github/posting.py`'s posting/merge/dry-run/citation behavior,
+    not this Phase 2 correlation logic itself (that's
+    `adapter/github/test_posting.py`'s job per the plan's Phase 2 Tests
+    section) — defaults to an empty list, which correlates to nothing and
+    never calls the provenance recorder, so this mock never has an opinion
+    on this file's own assertions.
+    """
+    respx.get(_REVIEW_COMMENTS_URL).mock(return_value=httpx.Response(200, json=comments or []))
+
+
+class _FakeProvenanceRecorder:
+    """A no-op `memory.store.MemorySignalRecorder` fake — this file's own
+    scope is `FindingsOutputStep`/`GitHubFindingsPublisher`'s
+    posting/merge/dry-run/citation behavior, not Phase 2's provenance
+    persistence itself (see `adapter/github/test_posting.py`)."""
+
+    def __init__(self) -> None:
+        self.recorded: list[tuple[str, int, str, tuple[PostedComment, ...]]] = []
+
+    async def record_comment_provenance(
+        self, *, repo_id: str, pr_number: int, commit_sha: str, comments: object
+    ) -> None:
+        self.recorded.append((repo_id, pr_number, commit_sha, tuple(comments)))  # type: ignore[arg-type]
+
+    async def record_signal(
+        self,
+        *,
+        posted_finding_comment_id: int,
+        raw_signal_type: str,
+        raw_signal_detail: dict[str, object],
+        github_comment_id: int | None,
+    ) -> None:
+        raise AssertionError("record_signal is not exercised by this test file")
+
+
 def _publisher(test_rsa_private_key_pem: str) -> GitHubFindingsPublisher:
     provider = GitHubInstallationTokenProvider(app_id=1, private_key_pem=test_rsa_private_key_pem)
-    return GitHubFindingsPublisher(token_provider=provider)
+    return GitHubFindingsPublisher(
+        token_provider=provider, provenance_recorder=_FakeProvenanceRecorder()
+    )
 
 
 @dataclass
@@ -183,6 +228,7 @@ async def test_combined_findings_posted_as_one_batched_review(
     test_rsa_private_key_pem: str,
 ) -> None:
     _mock_token_exchange()
+    _mock_review_comments()
     reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
     respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
 
@@ -228,6 +274,7 @@ async def test_non_zero_findings_posts_neutral_check_run_with_count(
     test_rsa_private_key_pem: str,
 ) -> None:
     _mock_token_exchange()
+    _mock_review_comments()
     respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
     check_run_route = respx.post(_CHECK_RUNS_URL).mock(
         return_value=httpx.Response(201, json={"id": 1})
@@ -381,6 +428,7 @@ async def test_partial_post_when_review_succeeds_but_check_run_fails_is_logged_d
     test_rsa_private_key_pem: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     _mock_token_exchange()
+    _mock_review_comments()
     reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
     check_run_route = respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(503))
 
@@ -428,6 +476,7 @@ async def test_finding_with_a_real_citation_posts_formatted_not_escaped(
     on (and losing to) a later blanket pass over the combined string.
     """
     _mock_token_exchange()
+    _mock_review_comments()
     reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
     respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
 
@@ -481,6 +530,7 @@ async def test_finding_with_no_context_ref_ids_posts_exactly_as_a_phase_1_findin
     the finding itself, not the absence of a bundle, is what gates
     citation rendering)."""
     _mock_token_exchange()
+    _mock_review_comments()
     reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
     respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
 
@@ -527,6 +577,7 @@ async def test_depends_on_static_analysis_reads_that_step_own_output_when_config
     same thing against the real, fully-wired five-macro-step registry with a
     verification step that would fail the job if it were invoked at all."""
     _mock_token_exchange()
+    _mock_review_comments()
     reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
     check_run_route = respx.post(_CHECK_RUNS_URL).mock(
         return_value=httpx.Response(201, json={"id": 1})
