@@ -577,3 +577,140 @@ async def test_list_entries_raises_memory_store_error_on_connection_failure(
         await broken_repository.list_entries(
             org_id=None, repo_id=None, team_id=None, status=None, limit=10, offset=0
         )
+
+
+# --- recent_comment_ids / filter_new (Phase 4, Unit D, ReactionDedupStore) ---
+
+
+@pytest.mark.asyncio
+async def test_recent_comment_ids_returns_newest_first_bounded_by_limit(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    for i in range(3):
+        await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9800 + i)
+
+    ids = await repository.recent_comment_ids(repo_id=str(repo_id), pr_number=7, limit=2)
+
+    assert len(ids) == 2
+    # Newest first (highest `created_at`) — 9802 (seeded last) and 9801,
+    # never the oldest, 9800.
+    assert set(ids) == {9801, 9802}
+
+
+@pytest.mark.asyncio
+async def test_recent_comment_ids_scoped_to_repo_and_pr(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    async with session_factory() as session, session.begin():
+        session.add(
+            PostedFindingCommentRow(
+                id=9900,
+                repo_id=repo_id,
+                pr_number=99,
+                commit_sha="a" * 40,
+                finding_file="app/main.py",
+                finding_line=10,
+                finding_rule_id="no-secrets",
+                finding_message="a secret was found",
+            )
+        )
+    await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9901)
+
+    ids = await repository.recent_comment_ids(repo_id=str(repo_id), pr_number=7, limit=50)
+
+    assert ids == (9901,)
+
+
+@pytest.mark.asyncio
+async def test_recent_comment_ids_returns_empty_tuple_with_no_rows(
+    repository: PostgresMemoryRepository, repo_id: uuid.UUID
+) -> None:
+    ids = await repository.recent_comment_ids(repo_id=str(repo_id), pr_number=1, limit=50)
+
+    assert ids == ()
+
+
+@pytest.mark.asyncio
+async def test_filter_new_returns_and_records_previously_unseen_reaction_ids(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9910)
+
+    new_ids = await repository.filter_new(
+        posted_finding_comment_id=comment_id, reaction_ids=(1, 2, 3)
+    )
+
+    assert set(new_ids) == {1, 2, 3}
+
+
+@pytest.mark.asyncio
+async def test_filter_new_excludes_already_captured_reaction_ids(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """The check-then-record race this method closes (Assumption 9): a
+    reaction id already captured by an earlier poll is never returned
+    again, even though it's still present in the fetcher's own response."""
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9911)
+
+    first = await repository.filter_new(posted_finding_comment_id=comment_id, reaction_ids=(1, 2))
+    second = await repository.filter_new(
+        posted_finding_comment_id=comment_id, reaction_ids=(1, 2, 3)
+    )
+
+    assert set(first) == {1, 2}
+    assert set(second) == {3}
+
+
+@pytest.mark.asyncio
+async def test_filter_new_with_no_reaction_ids_is_a_no_op(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9912)
+
+    new_ids = await repository.filter_new(posted_finding_comment_id=comment_id, reaction_ids=())
+
+    assert new_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_filter_new_scopes_dedup_per_comment(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """The same `reaction_id` value on two different comments is captured
+    independently — the dedup key is the `(posted_finding_comment_id,
+    reaction_id)` pair, never `reaction_id` alone."""
+    comment_a = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9913)
+    comment_b = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9914)
+
+    await repository.filter_new(posted_finding_comment_id=comment_a, reaction_ids=(1,))
+    new_for_b = await repository.filter_new(posted_finding_comment_id=comment_b, reaction_ids=(1,))
+
+    assert new_for_b == (1,)
+
+
+@pytest.mark.asyncio
+async def test_recent_comment_ids_raises_memory_store_error_on_connection_failure(
+    broken_repository: PostgresMemoryRepository,
+) -> None:
+    with pytest.raises(MemoryStoreError):
+        await broken_repository.recent_comment_ids(repo_id=str(uuid.uuid4()), pr_number=1, limit=10)
+
+
+@pytest.mark.asyncio
+async def test_filter_new_raises_memory_store_error_on_connection_failure(
+    broken_repository: PostgresMemoryRepository,
+) -> None:
+    with pytest.raises(MemoryStoreError):
+        await broken_repository.filter_new(posted_finding_comment_id=1, reaction_ids=(1,))

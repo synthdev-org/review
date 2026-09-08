@@ -91,3 +91,23 @@ class PostedComment(BaseModel):
     line: int | None
     rule_id: str | None
     message: str
+
+
+class ReactionRecord(BaseModel):
+    """One reaction GitHub's own Reactions API reports against a posted
+    review comment, per ``docs/plans/plan-deliver-memory.md``'s Phase 4
+    section (Unit D, US-M3). ``adapter/github/reactions.py``'s
+    ``GitHubReactionFetcher`` builds these from
+    ``GET .../pulls/comments/{comment_id}/reactions``;
+    ``memory/reaction_poll.py``'s ``run_memory_reaction_poll_job`` uses
+    ``reaction_id`` for ``ReactionDedupStore.filter_new``'s own
+    ``(posted_finding_comment_id, reaction_id)`` dedup key (Assumption 9) and
+    persists ``content`` verbatim as part of a captured entry's
+    ``raw_signal_detail`` — an emoji name, never free text, so no redaction
+    concern applies (per this plan's own Security review).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    reaction_id: int
+    content: str

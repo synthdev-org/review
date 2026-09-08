@@ -65,6 +65,7 @@ from indexing.tree import RepoTreeEntry
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
+from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.config import StepEnablement, StepTimeouts
 from review.context_builder import CallerHit
 from review.pipeline import StepRegistry
@@ -94,6 +95,7 @@ async def _noop_dispatch_loop_forever(
     job_queue: JobQueueRepository,
     registry: StepRegistry,
     indexing_deps: IndexingJobDependencies,
+    memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,

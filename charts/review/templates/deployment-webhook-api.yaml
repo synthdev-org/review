@@ -33,6 +33,8 @@ spec:
                 name: {{ include "review.fullname" . }}-config
           env:
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET" "field" .Values.github.webhookSecret "secretName" (include "review.secretName" .) "secretKey" "github-webhook-secret") | nindent 12 }}
+            {{- /* Synchronous reaction-fetch path (Phase 4, Unit D, US-M3) — same GitHub App identity/Secret key as the worker Deployment's own entry below. */}}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY" "field" .Values.github.appPrivateKey "secretName" (include "review.secretName" .) "secretKey" "github-app-private-key") | nindent 12 }}
             {{- if .Values.webhookApi.setupMode }}
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WEBHOOK_API_SETUP_STATE_SECRET" "field" .Values.github.setupStateSecret "secretName" (include "review.secretName" .) "secretKey" "github-setup-state-secret") | nindent 12 }}
             {{- end }}

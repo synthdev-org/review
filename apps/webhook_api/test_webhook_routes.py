@@ -30,6 +30,9 @@ import uuid
 
 import httpx
 import pytest
+import respx
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import func, select
@@ -58,6 +61,34 @@ _URL = "/webhooks/github"
 _UNREACHABLE_DSN = "postgresql+asyncpg://unused:unused@localhost:5432/unused"
 _DELIVERY_HEADER = "X-GitHub-Delivery"
 _EVENT_HEADER = "X-GitHub-Event"
+_GITHUB_API_BASE = "https://api.github.com"
+# A syntactically-arbitrary placeholder — every test below except the
+# synchronous-reaction-poll ones (which override this with a real generated
+# key) never actually calls `GitHubInstallationTokenProvider.get_token`, so
+# nothing here ever attempts to sign a JWT with it.
+_PLACEHOLDER_GITHUB_APP_PRIVATE_KEY = "test-placeholder-key-never-used-for-real-signing"
+
+
+def _generate_test_rsa_private_key_pem() -> str:
+    """A real (freshly generated, never a committed static blob) RSA
+    private key — genuinely usable by `adapter.github.auth.sign_app_jwt`'s
+    real RS256 signing path. Mirrors `adapter/github/conftest.py`'s own
+    session-scoped `test_rsa_private_key_pem` fixture, which isn't visible
+    to this package's own test collection tree (a different top-level
+    package, not a `conftest.py` ancestor of this one) — generated once,
+    module-level, rather than adding a second `conftest.py` fixture just
+    for this file's one consumer.
+    """
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem_bytes = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return pem_bytes.decode("utf-8")
+
+
+_TEST_RSA_PRIVATE_KEY_PEM = _generate_test_rsa_private_key_pem()
 
 
 def _sign(body: bytes, secret: str = _SECRET) -> str:
@@ -76,6 +107,8 @@ def _build_client(
     index_enqueue_rate_limit_per_minute: int = 5,
     secret_redaction_enabled: bool = False,
     memory_capture_ceiling_per_repo_per_day: int = 500,
+    github_app_id: int = 1,
+    github_app_private_key: str = _PLACEHOLDER_GITHUB_APP_PRIVATE_KEY,
 ) -> TestClient:
     settings = WebhookAPISettings(
         environment="development",
@@ -96,6 +129,16 @@ def _build_client(
         # `adapter/analyzers/test_gitleaks.py`).
         secret_redaction_enabled=secret_redaction_enabled,
         memory_capture_ceiling_per_repo_per_day=memory_capture_ceiling_per_repo_per_day,
+        # US-M3's second `Given/When/Then` branch (Phase 4, Unit D): backs
+        # the synchronous `pull_request closed` reaction-poll path's own
+        # `GitHubInstallationTokenProvider`/`GitHubReactionFetcher` — a
+        # harmless placeholder by default (see
+        # `_PLACEHOLDER_GITHUB_APP_PRIVATE_KEY`'s own comment), overridden
+        # with a real generated key only by the tests that actually
+        # exercise that path.
+        github_app_id=github_app_id,
+        github_app_private_key=SecretStr(github_app_private_key),
+        github_api_base_url=_GITHUB_API_BASE,
         _env_file=None,
     )
     return TestClient(create_app(settings))
@@ -433,7 +476,7 @@ async def test_valid_signature_returns_200(migrated_engine: AsyncEngine) -> None
 
 @pytest.mark.asyncio
 async def test_rate_limit_exceeding_burst_returns_429(migrated_engine: AsyncEngine) -> None:
-    body = _payload(action="closed")  # a real, harmless trigger-non-matching action
+    body = _payload(action="labeled")  # a real, harmless trigger-non-matching action
     headers = {"X-Hub-Signature-256": _sign(body), _EVENT_HEADER: "pull_request"}
 
     with _build_client(
@@ -462,9 +505,14 @@ async def test_unseen_installation_creates_org_repo_and_enqueues_one_job(
     org_count, repo_count = await _org_repo_counts(migrated_engine)
     assert (org_count, repo_count) == (1, 1)
     jobs = await _fetch_jobs(migrated_engine)
-    assert len(jobs) == 1
-    job = jobs[0]
-    assert job.job_type == JobType.REVIEW
+    # `pull_request opened` also matches `is_memory_reaction_poll_trigger`
+    # (docs/plans/plan-deliver-memory.md's Phase 4 section) — a
+    # `MEMORY_REACTION_POLL` job is always enqueued alongside `REVIEW` for
+    # this trigger set, no kill switch of its own.
+    assert len(jobs) == 2
+    jobs_by_type = {job.job_type: job for job in jobs}
+    assert set(jobs_by_type) == {JobType.REVIEW, JobType.MEMORY_REACTION_POLL}
+    job = jobs_by_type[JobType.REVIEW]
     assert job.status == JobStatus.PENDING
     assert job.payload["installation_id"] == 555
     assert job.payload["repo_full_name"] == "acme/widgets"
@@ -472,6 +520,8 @@ async def test_unseen_installation_creates_org_repo_and_enqueues_one_job(
     assert job.payload["head_sha"] == "a1"
     assert job.org_id is not None
     assert job.repo_id is not None
+    reaction_poll_job = jobs_by_type[JobType.MEMORY_REACTION_POLL]
+    assert reaction_poll_job.payload["pr_number"] == 1
 
 
 @pytest.mark.asyncio
@@ -498,8 +548,12 @@ async def test_base_sha_is_populated_from_pull_request_base_sha(
 
     assert response.status_code == 200
     jobs = await _fetch_jobs(migrated_engine)
-    assert len(jobs) == 1
-    assert jobs[0].payload["base_sha"] == "base-a1"
+    # `MEMORY_REACTION_POLL` also enqueues for this trigger — see
+    # `test_unseen_installation_creates_org_repo_and_enqueues_one_job`'s own
+    # comment.
+    assert len(jobs) == 2
+    review_job = next(job for job in jobs if job.job_type == JobType.REVIEW)
+    assert review_job.payload["base_sha"] == "base-a1"
 
 
 @pytest.mark.asyncio
@@ -524,8 +578,12 @@ async def test_missing_base_sha_still_enqueues_with_null_base_sha(
 
     assert response.status_code == 200
     jobs = await _fetch_jobs(migrated_engine)
-    assert len(jobs) == 1
-    assert jobs[0].payload["base_sha"] is None
+    # `MEMORY_REACTION_POLL` also enqueues for this trigger — see
+    # `test_unseen_installation_creates_org_repo_and_enqueues_one_job`'s own
+    # comment.
+    assert len(jobs) == 2
+    review_job = next(job for job in jobs if job.job_type == JobType.REVIEW)
+    assert review_job.payload["base_sha"] is None
 
 
 @pytest.mark.asyncio
@@ -558,9 +616,12 @@ async def test_known_installation_resolves_existing_rows_and_enqueues(
     org_count, repo_count = await _org_repo_counts(migrated_engine)
     assert (org_count, repo_count) == (1, 1)
     jobs = await _fetch_jobs(migrated_engine)
-    assert len(jobs) == 2
-    assert jobs[0].org_id == jobs[1].org_id
-    assert jobs[0].repo_id == jobs[1].repo_id
+    # Two requests (`opened`, `synchronize`), each enqueuing both `REVIEW`
+    # and `MEMORY_REACTION_POLL` (docs/plans/plan-deliver-memory.md's Phase
+    # 4 section) -> 4 jobs total, all sharing the same org/repo.
+    assert len(jobs) == 4
+    assert len({job.org_id for job in jobs}) == 1
+    assert len({job.repo_id for job in jobs}) == 1
 
 
 @pytest.mark.asyncio
@@ -577,7 +638,10 @@ async def test_same_delivery_id_processed_twice_yields_exactly_one_job(
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert await _job_count(migrated_engine) == 1
+    # One request's worth of jobs (`REVIEW` + `MEMORY_REACTION_POLL`, per
+    # docs/plans/plan-deliver-memory.md's Phase 4 section) — the redelivery
+    # itself enqueues nothing new.
+    assert await _job_count(migrated_engine) == 2
     assert await _delivery_count(migrated_engine) == 1
 
 
@@ -585,10 +649,16 @@ async def test_same_delivery_id_processed_twice_yields_exactly_one_job(
 async def test_action_outside_trigger_set_accepted_but_not_enqueued(
     migrated_engine: AsyncEngine,
 ) -> None:
+    # `"labeled"` (not `"closed"`) — since
+    # docs/plans/plan-deliver-memory.md's Phase 4 section, `closed` runs a
+    # synchronous reaction poll (see
+    # `test_pull_request_closed_runs_synchronous_reaction_poll_and_enqueues_no_job`
+    # below), never an enqueue of any kind; `"labeled"` stays genuinely
+    # outside every trigger set this route knows about.
     client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
-    body = _payload(action="closed", repo_full_name="acme/widgets", installation_id=555)
+    body = _payload(action="labeled", repo_full_name="acme/widgets", installation_id=555)
 
-    response = _post(client, body, delivery_id="delivery-closed")
+    response = _post(client, body, delivery_id="delivery-labeled")
 
     assert response.status_code == 200
     assert await _job_count(migrated_engine) == 0
@@ -653,6 +723,9 @@ async def test_missing_pull_request_number_accepted_not_enqueued(
 async def test_missing_head_sha_accepted_not_enqueued(
     migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """`REVIEW` needs `head_sha` and so is not enqueued, but
+    `MEMORY_REACTION_POLL` only needs `pr_number` (present here) — per
+    docs/plans/plan-deliver-memory.md's Phase 4 section, it still enqueues."""
     logging.getLogger("apps.webhook_api.webhook_routes").disabled = False
     client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
     body = _payload(repo_full_name="acme/widgets", installation_id=555, pr_number=1, head_sha=None)
@@ -661,7 +734,9 @@ async def test_missing_head_sha_accepted_not_enqueued(
         response = _post(client, body, delivery_id="delivery-missing-sha")
 
     assert response.status_code == 200
-    assert await _job_count(migrated_engine) == 0
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len(jobs) == 1
+    assert jobs[0].job_type == JobType.MEMORY_REACTION_POLL
     assert any(
         getattr(record, "skipped_reason", None) == "missing_required_fields"
         for record in caplog.records
@@ -693,7 +768,15 @@ async def test_enqueues_past_rate_limit_are_rejected_at_the_boundary(
     assert first.status_code == 200
     assert second.status_code == 200
     assert third.status_code == 200
-    assert await _job_count(migrated_engine) == 2
+    # `review_enqueue_rate_limit_per_minute=2`: the third request's own
+    # `REVIEW` candidate is rate-limited, which (per
+    # `_handle_matched_triggers`'s own "the whole transaction rolls back
+    # together" design) rolls back that *whole* request's transaction,
+    # including its own would-be-successful `MEMORY_REACTION_POLL` enqueue —
+    # so only the first two requests' pairs (`REVIEW` + `MEMORY_REACTION_POLL`
+    # each, per docs/plans/plan-deliver-memory.md's Phase 4 section) land:
+    # 2 * 2 = 4, not the third request's own 2 more.
+    assert await _job_count(migrated_engine) == 4
     assert any(
         getattr(record, "skipped_reason", None) == "rate_limited" for record in caplog.records
     )
@@ -722,7 +805,10 @@ async def test_default_configuration_never_rate_limits(migrated_engine: AsyncEng
             )
             assert response.status_code == 200
 
-    assert await _job_count(migrated_engine) == burst_size
+    # Each of the `burst_size` requests enqueues both `REVIEW` and
+    # `MEMORY_REACTION_POLL` (docs/plans/plan-deliver-memory.md's Phase 4
+    # section — no rate limiter of its own).
+    assert await _job_count(migrated_engine) == burst_size * 2
 
 
 # --- Indexing (INDEX job) enqueue path (plan-indexing-delivery.md US1/US2/US11) ---
@@ -828,10 +914,12 @@ async def test_pull_request_opened_enqueues_review_and_index_jobs(
     migrated_engine: AsyncEngine,
 ) -> None:
     """US2: a `pull_request opened` event, with the kill switch on,
-    enqueues both the pre-existing `REVIEW` job and a new `INDEX` job from
-    the same request/shared transaction. Before this test, no test in this
-    file ever passed `indexing_enabled=True`, so `_index_enqueue_payload`'s
-    `pull_request` branch never executed in any test.
+    enqueues the pre-existing `REVIEW` job, a new `INDEX` job, and (per
+    docs/plans/plan-deliver-memory.md's Phase 4 section) a
+    `MEMORY_REACTION_POLL` job, all from the same request/shared
+    transaction. Before this test, no test in this file ever passed
+    `indexing_enabled=True`, so `_index_enqueue_payload`'s `pull_request`
+    branch never executed in any test.
     """
     client = _build_client(
         dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
@@ -845,9 +933,9 @@ async def test_pull_request_opened_enqueues_review_and_index_jobs(
 
     assert response.status_code == 200
     jobs = await _fetch_jobs(migrated_engine)
-    assert len(jobs) == 2
+    assert len(jobs) == 3
     jobs_by_type = {job.job_type: job for job in jobs}
-    assert set(jobs_by_type) == {JobType.REVIEW, JobType.INDEX}
+    assert set(jobs_by_type) == {JobType.REVIEW, JobType.INDEX, JobType.MEMORY_REACTION_POLL}
     index_job = jobs_by_type[JobType.INDEX]
     assert index_job.payload["pr_number"] == 9
     assert index_job.payload["commit_sha"] == "pr-sha-9"
@@ -855,6 +943,8 @@ async def test_pull_request_opened_enqueues_review_and_index_jobs(
     review_job = jobs_by_type[JobType.REVIEW]
     assert review_job.payload["pr_number"] == 9
     assert review_job.payload["head_sha"] == "pr-sha-9"
+    reaction_poll_job = jobs_by_type[JobType.MEMORY_REACTION_POLL]
+    assert reaction_poll_job.payload["pr_number"] == 9
 
 
 @pytest.mark.asyncio
@@ -979,6 +1069,136 @@ async def test_index_rate_limit_is_shared_across_push_and_pull_request_triggers(
     assert any(
         getattr(record, "skipped_reason", None) == "index_rate_limited" for record in caplog.records
     )
+
+
+# --- Memory reaction polling (docs/plans/plan-deliver-memory.md's Phase 4 --
+# --- section, Unit D, US-M3) --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pull_request_closed_runs_synchronous_reaction_poll_and_enqueues_no_job(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US-M3's second `Given/When/Then` branch (``spec-memory.md`` lines
+    273-275): a `pull_request closed` event runs the reaction fetch
+    synchronously — before the webhook handler returns its HTTP response —
+    rather than enqueuing a `MEMORY_REACTION_POLL` job for the Worker to
+    pick up an indeterminate time later. Since `closed` is outside
+    `is_enqueue_trigger`'s/`is_index_trigger`'s own trigger sets, and (as of
+    this fix) also outside the async `MEMORY_REACTION_POLL` candidate set,
+    no job of any type is enqueued for this event at all — the fetch's own
+    result is instead a `pending` `memory_entry` row, written directly in
+    this same request.
+    """
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        github_app_private_key=_TEST_RSA_PRIVATE_KEY_PEM,
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/closed-repo", installation_id=903
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4100, pr_number=13)
+        jobs_before = await _fetch_jobs(migrated_engine)
+
+        body = _payload(
+            action="closed", repo_full_name="acme/closed-repo", installation_id=903, pr_number=13
+        )
+
+        with respx.mock:
+            respx.post(f"{_GITHUB_API_BASE}/app/installations/903/access_tokens").mock(
+                return_value=httpx.Response(
+                    201, json={"token": "ghs_test_token", "expires_at": "2999-01-01T00:00:00Z"}
+                )
+            )
+            respx.get(
+                f"{_GITHUB_API_BASE}/repos/acme/closed-repo/pulls/comments/4100/reactions"
+            ).mock(
+                return_value=httpx.Response(
+                    200, json=[{"id": 9001, "content": "+1", "user": {"login": "carol"}}]
+                )
+            )
+            response = _post(client, body, delivery_id="delivery-closed-reaction-poll")
+
+    assert response.status_code == 200
+    jobs_after = await _fetch_jobs(migrated_engine)
+    # No new job of any type — the reaction fetch ran synchronously above,
+    # not queued. `jobs_before` already carries `_provision_repo`'s own
+    # `opened`-triggered REVIEW/MEMORY_REACTION_POLL jobs for a *different*
+    # PR (7, `_payload`'s own default) — this asserts the `closed` request
+    # itself added nothing further.
+    assert len(jobs_after) == len(jobs_before)
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.status == MemoryEntryStatus.PENDING
+    assert entry.raw_signal_type == "reaction"
+    assert entry.posted_finding_comment_id == 4100
+    assert entry.raw_signal_detail == {"reaction_id": 9001, "content": "+1"}
+
+
+@pytest.mark.asyncio
+async def test_pull_request_closed_missing_pr_number_is_accepted_but_not_polled(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """A `pull_request closed` payload missing `pull_request.number`
+    entirely (malformed/adversarial) is still accepted (200) and never
+    attempts the synchronous reaction-fetch call — mirrors
+    `_memory_reaction_poll_payload`'s own `event.pr_number is None` guard
+    for the async-job path."""
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        github_app_private_key=_TEST_RSA_PRIVATE_KEY_PEM,
+    ) as client:
+        body = _payload(
+            action="closed",
+            repo_full_name="acme/no-pr-number-repo",
+            installation_id=904,
+            pr_number=None,
+        )
+
+        with respx.mock:
+            # No mocks registered: any attempted call raises inside respx,
+            # failing this test loudly if the guard above doesn't hold.
+            response = _post(client, body, delivery_id="delivery-closed-no-pr-number")
+
+    assert response.status_code == 200
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert entries == []
+
+
+@pytest.mark.asyncio
+async def test_pull_request_synchronize_enqueues_all_three_job_types(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US-M3's own Acceptance wording: "a `pull_request synchronize` event
+    enqueues all three job types from one shared transaction" — with the
+    indexing kill switch on, so `INDEX` is actually eligible to enqueue
+    too."""
+    client = _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        indexing_enabled=True,
+    )
+    body = _payload(
+        action="synchronize",
+        repo_full_name="acme/widgets",
+        installation_id=555,
+        pr_number=14,
+        head_sha="sync-sha-14",
+    )
+
+    response = _post(client, body, delivery_id="delivery-sync-all-three")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    assert len(jobs) == 3
+    assert {job.job_type for job in jobs} == {
+        JobType.REVIEW,
+        JobType.INDEX,
+        JobType.MEMORY_REACTION_POLL,
+    }
+    # All three landed from the same shared transaction — one org/repo pair.
+    assert len({job.org_id for job in jobs}) == 1
+    assert len({job.repo_id for job in jobs}) == 1
 
 
 @pytest.mark.asyncio

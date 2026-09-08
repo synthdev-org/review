@@ -110,7 +110,13 @@ from adapter.github.exceptions import (
     GitHubTreeEntryMissingError,
 )
 from adapter.github.git_data import BlobFetchEntry, fetch_blobs, fetch_tree_listing
-from adapter.github.http import auth_headers, client_context, request_with_retry, split_owner_repo
+from adapter.github.http import (
+    DEFAULT_FAN_OUT_CONCURRENCY,
+    auth_headers,
+    client_context,
+    request_with_retry,
+    split_owner_repo,
+)
 from ingestion.diff import (
     Diff,
     DiffContentMalformedError,
@@ -122,7 +128,11 @@ from ingestion.diff import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_GITHUB_API_BASE_URL = "https://api.github.com"
-_DEFAULT_BLOB_FETCH_CONCURRENCY = 10
+# Reuses `adapter/github/http.py`'s shared `DEFAULT_FAN_OUT_CONCURRENCY`
+# (docs/plans/plan-deliver-memory.md's Phase 4 section) rather than its own
+# independent `10` — see that constant's own docstring for the full "one
+# shared value, not three duplicated `10`s" reasoning.
+_DEFAULT_BLOB_FETCH_CONCURRENCY = DEFAULT_FAN_OUT_CONCURRENCY
 _REMOVED_STATUS = "removed"
 
 

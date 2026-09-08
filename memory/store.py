@@ -1,6 +1,6 @@
-"""memory.store — the three storage-boundary Protocols Phase 4 (Memory)
-needs, per ``docs/plans/plan-deliver-memory.md``'s Phase 1 section (Unit A,
-Assumption 1).
+"""memory.store — the storage-boundary Protocols Phase 4 (Memory) needs, per
+``docs/plans/plan-deliver-memory.md``'s Phase 1 section (Unit A, Assumption
+1) and Phase 4 section (Unit D).
 
 Defined here, alongside ``memory/models.py``'s ``MemoryEntry``/
 ``PostedComment`` — not at any one of their several consumers — per
@@ -8,23 +8,27 @@ Defined here, alongside ``memory/models.py``'s ``MemoryEntry``/
 ``MemorySignalRecorder`` alone has two real consumers spanning two
 entrypoints (``adapter/github/posting.py`` in the Worker, Phase 2;
 ``apps/webhook_api/webhook_routes.py`` in the Webhook API, Phase 3), so
-"the first consumer" would be an arbitrary choice among them. All three
-Protocols are implemented by one concrete class,
-``adapter/storage/memory_repository.py``'s ``PostgresMemoryRepository``, per
-Assumption 8 — mirroring ``indexing/repository.py``'s
-``IndexRepository``/``IndexCommitTracker`` split, both implemented by one
-``IndexingRepository``.
+"the first consumer" would be an arbitrary choice among them. All five
+Protocols below (the original three from Phase 1, plus Phase 4's
+``ReactionFetcher``/``ReactionDedupStore``) are implemented by one concrete
+class, ``adapter/storage/memory_repository.py``'s ``PostgresMemoryRepository``
+(``ReactionFetcher`` being the one exception — implemented by
+``adapter/github/reactions.py``'s ``GitHubReactionFetcher`` instead, since
+it's a GitHub API read, not a storage concern), per Assumption 8 —
+mirroring ``indexing/repository.py``'s ``IndexRepository``/
+``IndexCommitTracker`` split, both implemented by one ``IndexingRepository``.
 
 Zero infra imports, per ``docs/rules/architecture.md``'s domain-package
-rule. Every method raises ``MemoryStoreError`` on a real Postgres-level
-failure — never a raw ``sqlalchemy``/``asyncpg`` exception — the same
-translation contract ``indexing/repository.py``'s ``IndexingRepositoryError``
-and ``review/context_builder.py``'s ``ContextQueryError`` already establish
-for their own concrete adapters. ``MemoryAdminRepository.set_status``/
-``delete_entry`` additionally raise ``MemoryEntryNotFoundError`` — a
-distinct, business-level "no such entry" outcome, never conflated with a
-storage-layer failure — for an unknown ``entry_id`` (US-M5's 404 case,
-translated by Phase 5's admin API into an HTTP 404).
+rule. Every storage-backed method raises ``MemoryStoreError`` on a real
+Postgres-level failure — never a raw ``sqlalchemy``/``asyncpg`` exception —
+the same translation contract ``indexing/repository.py``'s
+``IndexingRepositoryError`` and ``review/context_builder.py``'s
+``ContextQueryError`` already establish for their own concrete adapters.
+``MemoryAdminRepository.set_status``/``delete_entry`` additionally raise
+``MemoryEntryNotFoundError`` — a distinct, business-level "no such entry"
+outcome, never conflated with a storage-layer failure — for an unknown
+``entry_id`` (US-M5's 404 case, translated by Phase 5's admin API into an
+HTTP 404).
 """
 
 from __future__ import annotations
@@ -33,7 +37,14 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Literal, Protocol
 
-from memory.models import MemoryEntry, MemoryEntryType, MemoryStatus, PostedComment, RawSignalType
+from memory.models import (
+    MemoryEntry,
+    MemoryEntryType,
+    MemoryStatus,
+    PostedComment,
+    RawSignalType,
+    ReactionRecord,
+)
 
 
 class MemoryStoreError(Exception):
@@ -189,6 +200,69 @@ class MemoryAdminRepository(Protocol):
         """Permanently removes ``entry_id``'s row (US-M5's ``DELETE``
         route). Raises ``MemoryEntryNotFoundError`` for an unknown
         ``entry_id``, or ``MemoryStoreError`` on any other Postgres-level
+        failure.
+        """
+        ...
+
+
+class ReactionFetcher(Protocol):
+    """Fetches current GitHub reactions for a batch of already-posted
+    review comments — US-M3's own read side (Phase 4, Unit D). One method,
+    per architecture.md's Protocol-size rule. Implemented by
+    ``adapter/github/reactions.py``'s ``GitHubReactionFetcher`` — a GitHub
+    API read, not a storage concern, so (unlike every other Protocol in
+    this module) it is *not* one of ``PostgresMemoryRepository``'s own
+    implemented roles.
+    """
+
+    async def fetch_reactions(
+        self, *, installation_id: int, repo_full_name: str, comment_ids: Sequence[int]
+    ) -> dict[int, tuple[ReactionRecord, ...]]:
+        """The current reactions for each id in ``comment_ids``, keyed by
+        that same comment id. A comment id present in ``comment_ids`` but
+        absent from the returned mapping means that one comment's own fetch
+        failed (logged by the implementation at ``warning``) — per the
+        plan's "one comment's fetch failing never aborts the batch" design,
+        this method itself never raises for a single failed comment; only a
+        whole-job-fatal failure (e.g. the installation token exchange
+        itself failing) propagates as a real exception.
+        """
+        ...
+
+
+class ReactionDedupStore(Protocol):
+    """The storage-boundary half of US-M3's reaction capture (Phase 4, Unit
+    D) — which ``posted_finding_comment`` rows a poll should even look at,
+    and which of a poll's freshly-fetched reactions are genuinely new.
+    Implemented by ``adapter/storage/memory_repository.py``'s
+    ``PostgresMemoryRepository``.
+    """
+
+    async def recent_comment_ids(
+        self, *, repo_id: str, pr_number: int, limit: int
+    ) -> tuple[int, ...]:
+        """The ids of the ``limit`` most-recently-posted
+        ``posted_finding_comment`` rows for ``(repo_id, pr_number)``,
+        ordered newest first — the plan's own "bounded cost, not just
+        bounded per-job" design (``MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL``):
+        a PR with more posted comments than ``limit`` simply never has its
+        oldest comments' reactions polled again, an accepted, logged gap
+        rather than an unbounded cost curve against the installation's
+        shared GitHub API rate limit. Raises ``MemoryStoreError`` on a
+        Postgres-level failure.
+        """
+        ...
+
+    async def filter_new(
+        self, *, posted_finding_comment_id: int, reaction_ids: Sequence[int]
+    ) -> tuple[int, ...]:
+        """Of ``reaction_ids`` (every reaction currently on
+        ``posted_finding_comment_id``, per a fresh ``ReactionFetcher`` call),
+        returns only the ones not already recorded in ``captured_reaction``
+        — and durably records exactly those returned ids as now-captured in
+        this same call (Assumption 9), closing the check-then-record race a
+        separate check/record pair would leave open under concurrent polls
+        of the same PR. Raises ``MemoryStoreError`` on a Postgres-level
         failure.
         """
         ...

@@ -141,6 +141,31 @@ class WebhookAPISettings(BaseSettings):
     github_api_base_url: str = "https://api.github.com"
     github_api_timeout_seconds: float = 10.0
 
+    # --- GitHub App auth / synchronous reaction fetch (Phase 4 of
+    # plan-deliver-memory.md, Unit D, US-M3's second `Given/When/Then`
+    # branch) ---
+    # US-M3 requires the reaction fetch for a `pull_request closed` event
+    # to run "before the webhook handler returns" — not merely enqueued for
+    # the Worker to pick up later (unlike the "later push" branch, which
+    # stays an async `MEMORY_REACTION_POLL` job). That means this
+    # entrypoint, not just the Worker, needs its own installation-token
+    # exchange capability. Required, no default, same fail-fast posture as
+    # `apps/worker/settings.py`'s own `github_app_id`/`github_app_private_key`
+    # fields (JWT signing cannot function without them) — reusing
+    # `github_api_base_url`/`github_api_timeout_seconds` above rather than a
+    # second pair of fields for the same GitHub REST API.
+    github_app_id: int
+    github_app_private_key: SecretStr
+    # Same "retries beyond the first attempt" lever
+    # `apps/worker/settings.py`'s own field of the same name already
+    # documents.
+    github_retry_max_attempts: int = 3
+    # Same ceiling/reasoning as `apps/worker/settings.py`'s own field of the
+    # same name (Assumption/"bounded cost, not just bounded per-job" design)
+    # — this entrypoint's own copy, since the synchronous `closed`-trigger
+    # poll runs here, not in the Worker.
+    memory_reaction_poll_max_comments_per_poll: int = 50
+
     @model_validator(mode="after")
     def _require_setup_state_secret_when_setup_mode_enabled(self) -> WebhookAPISettings:
         """``setup_state_secret`` signs the manifest flow's CSRF state

@@ -295,6 +295,18 @@ class WorkerSettings(BaseSettings):
     # local filesystem path, no network call at inference time.
     embedding_model_path: str = "/app/models/all-MiniLM-L6-v2"
 
+    # --- Memory reaction polling (docs/plans/plan-deliver-memory.md's
+    # Phase 4 section, Unit D, US-M3) ---
+    # Bounds worst-case GitHub API call volume per poll independent of how
+    # many pushes or findings a PR has accumulated over its lifetime — a
+    # concrete ceiling, not unbounded fan-out, per the plan's own "bounded
+    # cost, not just bounded per-job" design. A PR with more posted comments
+    # than this ceiling simply never has its oldest comments' reactions
+    # polled again on a later poll; an accepted, logged gap rather than a
+    # cost curve that grows without bound against the installation's shared
+    # GitHub API rate limit.
+    memory_reaction_poll_max_comments_per_poll: int = 50
+
     # --- Findings-merge-and-output step (Phase 7, review/output.py) ---
     # A single bootstrap-config kill-switch: when set, the full pipeline
     # still runs (including this step's own merge/redaction-consuming

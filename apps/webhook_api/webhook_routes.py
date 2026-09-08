@@ -20,6 +20,16 @@ kind that matched this event — a `pull_request opened`/`synchronize`
 delivery can therefore enqueue both a `REVIEW` and an `INDEX` job from the
 same request, sharing one transaction.
 
+``docs/plans/plan-deliver-memory.md``'s Phase 4 section (Unit D, US-M3) adds
+a fourth, independent trigger kind (`MEMORY_REACTION_POLL`) to the same
+`_JobCandidate`/`_handle_matched_triggers` fan-out: a `pull_request`
+event whose action is `opened`/`synchronize`/`reopened`/`closed` also
+enqueues a `MEMORY_REACTION_POLL` job from the same shared transaction —
+unconditionally, with no kill switch or rate limiter of its own (Assumption
+4), so it always accompanies `REVIEW`'s own trigger set plus `closed`
+(US-M3's second `Given/When/Then` branch, which `REVIEW`/`INDEX` never
+trigger on).
+
 Rejection order matches the plan and Security review precisely: rate limit
 (cheapest — no body read needed) -> body size limit (enforced while
 streaming, before the full body is ever buffered) -> signature verification
@@ -54,12 +64,18 @@ from adapter.github.schemas import (
     PushCommit,
 )
 from adapter.github.signature import verify_webhook_signature
-from adapter.github.triggers import is_enqueue_trigger, is_index_trigger, is_memory_capture_trigger
+from adapter.github.triggers import (
+    is_enqueue_trigger,
+    is_index_trigger,
+    is_memory_capture_trigger,
+    is_memory_reaction_poll_trigger,
+)
 from adapter.storage.models import JobType
 from adapter.storage.queue import JobQueueRepository
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
 from findings.redact import TextRedactor
-from memory.store import MemorySignalRecorder, MemoryStoreError
+from memory.reaction_poll import run_memory_reaction_poll_job
+from memory.store import MemorySignalRecorder, MemoryStoreError, ReactionDedupStore, ReactionFetcher
 from tenancy.resolution import ResolutionResult, TenancyStore, WebhookEvent, resolve_installation
 
 # Skipped-reason values a rate-limited candidate can carry (used by the
@@ -189,6 +205,24 @@ def _review_enqueue_payload(
         # missing-required-field rejection the way `pr_number`/`head_sha`
         # above are).
         "base_sha": event.base_sha,
+    }
+
+
+def _memory_reaction_poll_payload(
+    event: WebhookEvent, result: ResolutionResult
+) -> dict[str, object] | None:
+    """Build the `MEMORY_REACTION_POLL` job payload
+    (``docs/plans/plan-deliver-memory.md``'s Phase 4 section, Unit D), or
+    `None` when `event` is missing the one field this job type cannot run
+    without — mirrors `_review_enqueue_payload`'s own shape, but needs only
+    `pr_number` (no `head_sha`/`commit_sha`: this job polls reactions on
+    already-posted comments, it never fetches a diff).
+    """
+    if event.pr_number is None:
+        return None
+    return {
+        **_base_job_identity_fields(event, result),
+        "pr_number": event.pr_number,
     }
 
 
@@ -567,6 +601,69 @@ async def _handle_memory_capture(
         return "capture_failed"
 
 
+async def _run_synchronous_reaction_poll(
+    *,
+    event: WebhookEvent,
+    result: ResolutionResult,
+    reaction_fetcher: ReactionFetcher,
+    signal_recorder: MemorySignalRecorder,
+    dedup_store: ReactionDedupStore,
+    max_comments_per_poll: int,
+) -> str:
+    """US-M3's second `Given/When/Then` branch (``spec-memory.md`` lines
+    273-275): runs the same reaction-fetch-and-capture logic
+    ``memory.reaction_poll.run_memory_reaction_poll_job`` performs for a
+    `MEMORY_REACTION_POLL` job, but synchronously and inline — called by the
+    route handler for a `pull_request closed` event, before it returns its
+    HTTP response. Enqueuing this as an async job like every other trigger
+    this route handles would only satisfy the spec's *first*
+    `Given/When/Then` branch ("a later push enqueues a new REVIEW job"),
+    never this one's literal "the same reaction fetch runs once for that PR
+    before the webhook handler returns" requirement.
+
+    ``event.pr_number is None`` mirrors ``_memory_reaction_poll_payload``'s
+    own guard — nothing to poll without a PR number, returns
+    ``"missing_required_fields"`` rather than attempting the call.
+
+    A genuine failure (a Postgres-level ``MemoryStoreError``, or the
+    installation-token exchange itself failing before any per-comment fetch
+    even starts — see ``run_memory_reaction_poll_job``'s own docstring) is
+    logged at ``error`` and swallowed here, never failing the webhook
+    response itself — the same "a secondary write-path concern, not this
+    route's own trust boundary" posture ``_handle_memory_capture`` above
+    already establishes for its own Postgres writes. A single comment's own
+    reaction fetch failing is already tolerated inside
+    ``GitHubReactionFetcher`` itself and never reaches this function as an
+    exception at all.
+    """
+    if event.pr_number is None:
+        return "missing_required_fields"
+
+    try:
+        await run_memory_reaction_poll_job(
+            repo_id=str(result.repo_id),
+            pr_number=event.pr_number,
+            installation_id=event.installation_id,
+            repo_full_name=event.repo_full_name,
+            reaction_fetcher=reaction_fetcher,
+            signal_recorder=signal_recorder,
+            dedup_store=dedup_store,
+            max_comments_per_poll=max_comments_per_poll,
+        )
+    except Exception as exc:
+        logger.error(
+            "synchronous memory reaction poll failed",
+            extra={
+                "repo_id": str(result.repo_id),
+                "pr_number": event.pr_number,
+                "installation_id": event.installation_id,
+            },
+            exc_info=exc,
+        )
+        return "reaction_poll_failed"
+    return "reaction_poll_completed"
+
+
 def create_webhook_router(
     *,
     webhook_secret: SecretStr,
@@ -581,6 +678,9 @@ def create_webhook_router(
     provenance_recorder: MemorySignalRecorder,
     text_redactor: TextRedactor,
     memory_capture_ceiling_limiter: InMemoryRateLimiter,
+    reaction_fetcher: ReactionFetcher,
+    reaction_dedup_store: ReactionDedupStore,
+    memory_reaction_poll_max_comments_per_poll: int,
 ) -> APIRouter:
     """Build the webhook receiver router.
 
@@ -605,6 +705,18 @@ def create_webhook_router(
     always registered, unlike the enqueue rate limiters, since capture has
     no ``0``-disables-it sentinel of its own (US-M12: only suppression, a
     later phase's own kill switch, is independently disable-able).
+
+    ``reaction_fetcher``/``reaction_dedup_store``/``memory_reaction_poll_max_comments_per_poll``
+    (Phase 4, Unit D) back US-M3's second ``Given/When/Then`` branch: a
+    `pull_request` `closed` event runs the same reaction-fetch-and-capture
+    logic a `MEMORY_REACTION_POLL` job runs (``memory/reaction_poll.py``'s
+    ``run_memory_reaction_poll_job``), but synchronously, in this request,
+    before the handler returns — see ``_run_synchronous_reaction_poll``
+    below. ``reaction_dedup_store`` is the same ``PostgresMemoryRepository``
+    instance as ``provenance_recorder`` (Assumption 8: one concrete class
+    implements both ``MemorySignalRecorder`` and ``ReactionDedupStore``),
+    typed and named separately here to match each Protocol role
+    ``run_memory_reaction_poll_job`` itself declares.
     """
     router = APIRouter()
 
@@ -712,6 +824,35 @@ def create_webhook_router(
                     )
                 )
 
+        # US-M3's second `Given/When/Then` branch (spec-memory.md lines
+        # 273-275) requires a `pull_request closed` event's reaction fetch
+        # to run "before the webhook handler returns" — enqueuing a
+        # `MEMORY_REACTION_POLL` job for the Worker to pick up later would
+        # not satisfy that (an indeterminate delay, not "before the handler
+        # returns"). `closed` is therefore handled synchronously below
+        # (`_run_synchronous_reaction_poll`), never as an async job
+        # candidate here — unlike `opened`/`synchronize`/`reopened` (US-M3's
+        # first branch, "a later push"), which stay the async job the
+        # Worker's own dispatch loop already handles.
+        is_reaction_poll_close_trigger = event_type == "pull_request" and event.action == "closed"
+        if is_memory_reaction_poll_trigger(event_type, event.action) and not (
+            is_reaction_poll_close_trigger
+        ):
+            # docs/plans/plan-deliver-memory.md's Phase 4 section (Unit D,
+            # Assumption 4): no kill switch, no rate limiter of its own —
+            # this job type does no LLM/expensive work, so `rate_limiter=None`
+            # (the same shape the "indexing disabled" candidate above already
+            # uses), unconditionally attempted whenever the trigger matches.
+            candidates.append(
+                _JobCandidate(
+                    job_type=JobType.MEMORY_REACTION_POLL,
+                    payload_builder=lambda result: _memory_reaction_poll_payload(event, result),
+                    missing_fields_reason="missing_required_fields",
+                    rate_limiter=None,
+                    rate_limited_reason="memory_reaction_poll_rate_limited",
+                )
+            )
+
         outcomes: list[tuple[JobType | None, uuid.UUID | None, str | None]]
         if candidates:
             result, matched_outcomes = await _handle_matched_triggers(
@@ -750,6 +891,36 @@ def create_webhook_router(
                     "job_type": job_type.value if job_type is not None else None,
                     "job_id": str(job_id) if job_id is not None else None,
                     "skipped_reason": skipped_reason,
+                },
+            )
+
+        # US-M3's second `Given/When/Then` branch (Phase 4, Unit D) — runs
+        # after `result` is resolved above (via either branch: `candidates`
+        # is always empty for a `closed` action, since `is_enqueue_trigger`/
+        # `is_index_trigger` never match it, so this always goes through the
+        # plain `resolve_installation` path), and before this handler
+        # returns its HTTP response below, per the spec's own literal
+        # wording — see `_run_synchronous_reaction_poll`'s own docstring.
+        if is_reaction_poll_close_trigger:
+            reaction_poll_reason = await _run_synchronous_reaction_poll(
+                event=event,
+                result=result,
+                reaction_fetcher=reaction_fetcher,
+                signal_recorder=provenance_recorder,
+                dedup_store=reaction_dedup_store,
+                max_comments_per_poll=memory_reaction_poll_max_comments_per_poll,
+            )
+            logger.info(
+                "synchronous memory reaction poll"
+                if reaction_poll_reason == "reaction_poll_completed"
+                else "synchronous memory reaction poll; not completed",
+                extra={
+                    "installation_id": event.installation_id,
+                    "org_id": str(result.org_id),
+                    "repo_id": str(result.repo_id),
+                    "pr_number": event.pr_number,
+                    "delivery_id": event.delivery_id,
+                    "reason": reaction_poll_reason,
                 },
             )
 

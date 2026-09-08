@@ -2,12 +2,14 @@
 ``(event_type, action)`` pairs to "this should enqueue a review", per the
 plan's Phase 1 section. Also home to ``is_index_trigger`` (this plan's
 indexing-delivery Phase 1), the equivalent decision for "this should
-enqueue an ``INDEX`` job", and ``is_memory_capture_trigger``
+enqueue an ``INDEX`` job"; ``is_memory_capture_trigger``
 (``docs/plans/plan-deliver-memory.md``'s Phase 3), the equivalent decision
-for "this should attempt to capture a reply/thread-resolution raw signal" —
-three independent pure functions, not one folded into another, since each
-answers a genuinely different question with its own trigger table (see
-each function's own docstring).
+for "this should attempt to capture a reply/thread-resolution raw signal";
+and ``is_memory_reaction_poll_trigger`` (that same plan's Phase 4, Unit D,
+Assumption 4), the equivalent decision for "this should enqueue a
+``MEMORY_REACTION_POLL`` job" — four independent pure functions, not one
+folded into another, since each answers a genuinely different question
+with its own trigger table (see each function's own docstring).
 
 Deliberately a plain ``frozenset[tuple[str, str]]`` membership check, not a
 ``dict`` keyed to a richer decision type — every populated entry today
@@ -71,6 +73,17 @@ _MEMORY_CAPTURE_TRIGGERS: frozenset[tuple[str, str]] = frozenset(
         ("pull_request_review_thread", "unresolved"),
     }
 )
+
+# Per docs/plans/plan-deliver-memory.md's Phase 4 section (Unit D,
+# Assumption 4): a superset of `_ENQUEUE_REVIEW_TRIGGERS`, adding `"closed"`
+# — US-M3's second trigger (a PR-closed event, independent of whether a
+# `REVIEW` job is even enqueued for it). No new webhook event subscription
+# needed for this addition: `pull_request` is already subscribed (Phase 4 of
+# the walking-skeleton plan) for `REVIEW`'s own trigger set; this only adds
+# one more *action* within that same already-subscribed event.
+_MEMORY_REACTION_POLL_TRIGGERS: frozenset[tuple[str, str]] = _ENQUEUE_REVIEW_TRIGGERS | {
+    ("pull_request", "closed")
+}
 
 
 def is_enqueue_trigger(event_type: str, action: str | None) -> bool:
@@ -150,3 +163,29 @@ def is_memory_capture_trigger(event_type: str, action: str | None) -> bool:
     if action is None:
         return False
     return (event_type, action) in _MEMORY_CAPTURE_TRIGGERS
+
+
+def is_memory_reaction_poll_trigger(event_type: str, action: str | None) -> bool:
+    """Whether this ``(event_type, action)`` pair should enqueue a
+    ``MEMORY_REACTION_POLL`` job, per
+    ``docs/plans/plan-deliver-memory.md``'s Phase 4 section (Unit D,
+    US-M3, Assumption 4).
+
+    True for every action ``is_enqueue_trigger`` already matches
+    (``opened``/``synchronize``/``reopened`` — a later push or a fresh PR is
+    an opportunity to observe reactions accumulated since the last poll)
+    plus ``closed`` (US-M3's second `Given/When/Then` branch — reactions are
+    polled once more before the PR's own comment thread goes quiet for
+    good), independent of whether a `REVIEW`/`INDEX` job is enqueued for the
+    same event.
+
+    ``action`` is ``None`` for event types that carry no top-level
+    ``action`` key at all — always "no match" here, the same convention
+    ``is_enqueue_trigger``/``is_memory_capture_trigger`` already establish.
+
+    Pure, no-I/O logic per ADR-0005, tested at Unit tier
+    (``adapter/github/test_triggers.py``) alongside its three siblings.
+    """
+    if action is None:
+        return False
+    return (event_type, action) in _MEMORY_REACTION_POLL_TRIGGERS

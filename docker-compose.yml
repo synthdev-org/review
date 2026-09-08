@@ -113,6 +113,20 @@ services:
         ${REVIEW_WEBHOOK_API_GITHUB_API_BASE_URL:-https://api.github.com}
       REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS: >-
         ${REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS:-10}
+      # Required, no default (docs/plans/plan-deliver-memory.md's Phase 4,
+      # Unit D, US-M3) — a `pull_request closed` event's reaction fetch
+      # runs synchronously in this route, before the handler returns, so
+      # this entrypoint needs its own installation-token exchange
+      # capability. Same App identity as REVIEW_WORKER_GITHUB_APP_* below —
+      # without these, webhook_api fails to boot; see .env.example.
+      REVIEW_WEBHOOK_API_GITHUB_APP_ID: >-
+        ${REVIEW_WEBHOOK_API_GITHUB_APP_ID:?set REVIEW_WEBHOOK_API_GITHUB_APP_ID in .env, see .env.example}
+      REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY: >-
+        ${REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY:?set REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY in .env, see .env.example}
+      REVIEW_WEBHOOK_API_GITHUB_RETRY_MAX_ATTEMPTS: >-
+        ${REVIEW_WEBHOOK_API_GITHUB_RETRY_MAX_ATTEMPTS:-3}
+      REVIEW_WEBHOOK_API_MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL: >-
+        ${REVIEW_WEBHOOK_API_MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL:-50}
     depends_on:
       migrate:
         condition: service_completed_successfully

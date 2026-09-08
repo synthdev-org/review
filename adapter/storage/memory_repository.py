@@ -1,16 +1,25 @@
 """adapter.storage.memory_repository — the concrete Postgres/pgvector
-implementation of ``memory.store``'s three Protocols
+implementation of ``memory.store``'s storage-backed Protocols
 (``MemorySignalRecorder``, ``DismissedFindingMatcher``,
-``MemoryAdminRepository``), per
-``docs/plans/plan-deliver-memory.md``'s Phase 1 section (Unit A).
+``MemoryAdminRepository``, and — Phase 4, Unit D — ``ReactionDedupStore``),
+per ``docs/plans/plan-deliver-memory.md``'s Phase 1 section (Unit A).
 
-One ``PostgresMemoryRepository`` class implements all three narrow
+One ``PostgresMemoryRepository`` class implements all four narrow
 Protocols (Assumption 8), mirroring ``adapter/storage/indexing_repository.py``'s
 ``IndexingRepository`` own precedent (one concrete class, one
-``session_factory``, both of its own Protocols) — constructed once per
+``session_factory``, every one of its own Protocols) — constructed once per
 entrypoint (Worker and Webhook API each build their own instance from their
 own session factory, the same way ``JobQueueRepository``/
 ``PostgresTenancyStore`` already are).
+
+``recent_comment_ids``/``filter_new`` (Phase 4, Unit D) back US-M3's
+reaction-poll job (``memory/reaction_poll.py``) — the former bounds which
+``posted_finding_comment`` rows a poll even looks at
+(``MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL``); the latter is a single
+``INSERT ... ON CONFLICT DO NOTHING ... RETURNING`` against
+``captured_reaction`` that both checks and durably records a poll's newly-
+observed reaction ids in one round trip, closing the check-then-record race
+a separate pair of calls would leave open.
 
 Reuses ``adapter/storage/unit_of_work.py``'s ``run_in_session`` and
 ``adapter/storage/indexing_repository.py``'s established session-open/
@@ -52,7 +61,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from adapter.storage.models import MemoryEntryRow, MemoryEntryStatus, PostedFindingCommentRow, Repo
+from adapter.storage.models import (
+    CapturedReactionRow,
+    MemoryEntryRow,
+    MemoryEntryStatus,
+    PostedFindingCommentRow,
+    Repo,
+)
 from adapter.storage.unit_of_work import run_in_session
 from memory.decay import effective_similarity
 from memory.models import MemoryEntry, MemoryEntryType, MemoryStatus, PostedComment, RawSignalType
@@ -62,6 +77,7 @@ from memory.store import (
     MemoryEntryNotFoundError,
     MemorySignalRecorder,
     MemoryStoreError,
+    ReactionDedupStore,
 )
 
 
@@ -97,9 +113,11 @@ def _to_entry(row: MemoryEntryRow) -> MemoryEntry:
 
 class PostgresMemoryRepository:
     """Implements ``memory.store.MemorySignalRecorder``,
-    ``memory.store.DismissedFindingMatcher``, and
-    ``memory.store.MemoryAdminRepository`` against real Postgres/pgvector
-    tables (``posted_finding_comment``, ``memory_entry``).
+    ``memory.store.DismissedFindingMatcher``,
+    ``memory.store.MemoryAdminRepository``, and (Phase 4, Unit D)
+    ``memory.store.ReactionDedupStore`` against real Postgres/pgvector
+    tables (``posted_finding_comment``, ``memory_entry``,
+    ``captured_reaction``).
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -365,10 +383,73 @@ class PostgresMemoryRepository:
         if not deleted:
             raise MemoryEntryNotFoundError(entry_id=entry_id)
 
+    # -- ReactionDedupStore (Phase 4, Unit D) ---------------------------------
+
+    async def recent_comment_ids(
+        self, *, repo_id: str, pr_number: int, limit: int
+    ) -> tuple[int, ...]:
+        try:
+            repo_uuid = uuid.UUID(repo_id)
+        except ValueError as exc:
+            raise MemoryStoreError(operation="recent_comment_ids", detail=str(exc)) from exc
+
+        async def _read(session: AsyncSession) -> Sequence[int]:
+            statement = (
+                select(PostedFindingCommentRow.id)
+                .where(
+                    PostedFindingCommentRow.repo_id == repo_uuid,
+                    PostedFindingCommentRow.pr_number == pr_number,
+                )
+                .order_by(
+                    PostedFindingCommentRow.created_at.desc(), PostedFindingCommentRow.id.desc()
+                )
+                .limit(limit)
+            )
+            result = await session.execute(statement)
+            return result.scalars().all()
+
+        ids = await self._run(operation="recent_comment_ids", fn=_read)
+        return tuple(ids)
+
+    async def filter_new(
+        self, *, posted_finding_comment_id: int, reaction_ids: Sequence[int]
+    ) -> tuple[int, ...]:
+        reaction_ids_tuple = tuple(reaction_ids)
+        if not reaction_ids_tuple:
+            return ()
+
+        # A single `INSERT ... ON CONFLICT DO NOTHING ... RETURNING` closes
+        # the check-then-record race a separate "check captured_reaction,
+        # then insert" pair would leave open under concurrent polls of the
+        # same PR (Assumption 9): a row that already exists never appears in
+        # `RETURNING`'s own output, so the returned ids are exactly the ones
+        # this call itself just durably captured, in one round trip.
+        async def _write(session: AsyncSession) -> Sequence[int]:
+            statement = (
+                pg_insert(CapturedReactionRow)
+                .values(
+                    [
+                        {
+                            "posted_finding_comment_id": posted_finding_comment_id,
+                            "reaction_id": reaction_id,
+                        }
+                        for reaction_id in reaction_ids_tuple
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=["posted_finding_comment_id", "reaction_id"])
+                .returning(CapturedReactionRow.reaction_id)
+            )
+            result = await session.execute(statement)
+            return result.scalars().all()
+
+        new_ids = await self._run(operation="filter_new", fn=_write)
+        return tuple(new_ids)
+
 
 # Runtime confirmation (not just a docstring claim) that this concrete
-# implementation actually satisfies all three Protocols it stands in for,
+# implementation actually satisfies every Protocol it stands in for,
 # mirroring adapter/storage/indexing_repository.py's own runtime check.
 _: type[MemorySignalRecorder] = PostgresMemoryRepository
 __: type[DismissedFindingMatcher] = PostgresMemoryRepository
 ___: type[MemoryAdminRepository] = PostgresMemoryRepository
+____: type[ReactionDedupStore] = PostgresMemoryRepository

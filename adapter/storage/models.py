@@ -64,11 +64,32 @@ class Base(DeclarativeBase):
 
 
 class JobType(enum.StrEnum):
-    """The two job types the Worker dispatches, per the C4 doc's Level 2
-    diagram (one Worker pool, dispatched by job type)."""
+    """The job types the Worker dispatches, per the C4 doc's Level 2
+    diagram (one Worker pool, dispatched by job type).
+
+    ``MEMORY_REACTION_POLL`` (``docs/plans/plan-deliver-memory.md``'s Phase
+    4 section, Assumption 4/5) needed a real Alembic migration after all —
+    not the "no migration needed" outcome Assumption 5's own draft reasoning
+    expected (no ``CHECK`` constraint blocks a new value, since
+    ``0001_baseline_schema.py``'s ``sa.Enum(..., native_enum=False)`` sets no
+    ``create_constraint=True``). What that reasoning missed, caught by a
+    real ``StringDataRightTruncationError`` integration-test failure during
+    this phase's own implementation, not assumed away: SQLAlchemy's
+    ``Enum(..., native_enum=False)`` also renders a ``VARCHAR`` sized from
+    the *longest enum member name* known when the DDL was generated
+    (``max(len("INDEX"), len("REVIEW")) == 6``), and stores a column's
+    Python member **name** (``"MEMORY_REACTION_POLL"``, 21 characters), not
+    its ``.value`` — so the original ``VARCHAR(6)`` column couldn't hold
+    this value at all. Widened to ``VARCHAR(32)`` by
+    ``0007_job_queue_job_type_widen.py`` (see that migration's own
+    docstring for the full story); ``length=32`` below keeps this ORM
+    model's own DDL-generation in sync with that real column width, so
+    Alembic's own autogenerate diffing never sees the two drift apart.
+    """
 
     INDEX = "index"
     REVIEW = "review"
+    MEMORY_REACTION_POLL = "memory_reaction_poll"
 
 
 class JobStatus(enum.StrEnum):
@@ -178,7 +199,7 @@ class JobQueueRow(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     job_type: Mapped[JobType] = mapped_column(
-        Enum(JobType, name="job_type", native_enum=False, validate_strings=True),
+        Enum(JobType, name="job_type", native_enum=False, validate_strings=True, length=32),
         nullable=False,
     )
     status: Mapped[JobStatus] = mapped_column(

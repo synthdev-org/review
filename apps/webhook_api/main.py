@@ -39,6 +39,15 @@ entrypoint's first ``findings.redact.TextRedactor`` and
 (reused from the same ``session_factory`` every other storage adapter here
 already shares) — both wired into the webhook router's own memory-capture
 handling, alongside a per-repo daily capture-ceiling ``InMemoryRateLimiter``.
+
+``docs/plans/plan-deliver-memory.md``'s Phase 4 (Unit D, US-M3) adds this
+entrypoint's first outbound GitHub REST API caller other than the manifest
+flow: a ``GitHubInstallationTokenProvider``/``GitHubReactionFetcher`` pair
+(``_build_reaction_fetcher``), needed because US-M3's second
+``Given/When/Then`` branch requires a PR-closed event's reaction fetch to
+run synchronously, before the webhook handler returns — not queued for the
+Worker to pick up later, unlike every other job type this entrypoint
+enqueues.
 """
 
 from __future__ import annotations
@@ -48,6 +57,8 @@ import logging
 from fastapi import FastAPI
 
 from adapter.analyzers.gitleaks import GitleaksTextRedactor
+from adapter.github.auth import GitHubInstallationTokenProvider
+from adapter.github.reactions import GitHubReactionFetcher
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
@@ -154,6 +165,38 @@ def _build_text_redactor(settings: WebhookAPISettings, logger: logging.Logger) -
     return NoOpTextRedactor()
 
 
+def _build_reaction_fetcher(settings: WebhookAPISettings) -> GitHubReactionFetcher:
+    """Wire the Memory domain's `ReactionFetcher` Protocol to its
+    GitHub-backed implementation, per `docs/plans/plan-deliver-memory.md`'s
+    Phase 4 section (Unit D, US-M3) — this entrypoint's own instance,
+    distinct from `apps/worker/main.py`'s, since US-M3's second
+    `Given/When/Then` branch (a `pull_request closed` event) requires the
+    reaction fetch to run synchronously inside this process, before the
+    webhook handler returns, not queued for the Worker to pick up later.
+
+    `client=None` (unlike the Worker's own shared, long-lived
+    `httpx.AsyncClient`): this route calls GitHub's API rarely (once per
+    `closed` event, not per job in a tight dispatch loop), so
+    `adapter/github/http.py`'s `client_context` opening/tearing down a
+    throwaway client per call is an acceptable trade-off here, and avoids
+    this entrypoint needing its own FastAPI lifespan-managed client
+    lifecycle for what would otherwise be its only consumer.
+    """
+    token_provider = GitHubInstallationTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_pem=settings.github_app_private_key.get_secret_value(),
+        github_api_base_url=settings.github_api_base_url,
+        timeout=settings.github_api_timeout_seconds,
+        max_retry_attempts=settings.github_retry_max_attempts,
+    )
+    return GitHubReactionFetcher(
+        token_provider=token_provider,
+        github_api_base_url=settings.github_api_base_url,
+        timeout=settings.github_api_timeout_seconds,
+        max_retry_attempts=settings.github_retry_max_attempts,
+    )
+
+
 def _build_memory_capture_ceiling_limiter(settings: WebhookAPISettings) -> InMemoryRateLimiter:
     """Per-repo daily cap on Memory capture writes (Phase 3, Unit C) — see
     `apps/webhook_api/settings.py`'s `memory_capture_ceiling_per_repo_per_day`
@@ -190,6 +233,13 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
     memory_repository = PostgresMemoryRepository(session_factory)
     text_redactor = _build_text_redactor(settings, logger)
     memory_capture_ceiling_limiter = _build_memory_capture_ceiling_limiter(settings)
+    # US-M3's second `Given/When/Then` branch (Phase 4, Unit D): a
+    # `pull_request closed` event's reaction fetch runs synchronously in
+    # this route, so this entrypoint needs its own `ReactionFetcher` —
+    # `memory_repository` above already implements `ReactionDedupStore`
+    # (Assumption 8, the same instance also serving `MemorySignalRecorder`
+    # for Phase 3's capture handling above).
+    reaction_fetcher = _build_reaction_fetcher(settings)
 
     if not settings.indexing_enabled:
         logger.warning(
@@ -216,6 +266,11 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
             provenance_recorder=memory_repository,
             text_redactor=text_redactor,
             memory_capture_ceiling_limiter=memory_capture_ceiling_limiter,
+            reaction_fetcher=reaction_fetcher,
+            reaction_dedup_store=memory_repository,
+            memory_reaction_poll_max_comments_per_poll=(
+                settings.memory_reaction_poll_max_comments_per_poll
+            ),
         )
     )
 

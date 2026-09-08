@@ -86,6 +86,16 @@ and bundled into `indexing.pipeline.IndexingJobDependencies`, threaded into
 prior `INDEX`-job stub with a real call into
 `indexing.pipeline.run_indexing_job`.
 
+`docs/plans/plan-deliver-memory.md`'s Phase 4 section (Unit D, US-M3) adds
+this composition root's third and final job-dispatch dependency bundle:
+`adapter.github.reactions.GitHubReactionFetcher` (sharing the same
+`token_provider`/`github_http_client` every other GitHub adapter here
+already shares) and `memory.reaction_poll.MemoryReactionPollJobDependencies`
+(reusing the same `memory_repository` instance Phase 2 already built as
+both its `MemorySignalRecorder` and, this phase, its `ReactionDedupStore`
+role — Assumption 8), threaded into `apps/worker/dispatch.py`'s
+`run_dispatch_loop` alongside `indexing_deps`.
+
 Settings are parsed and logging configured inside `main()`, not at module
 import time, so importing this module (mypy, pytest collection) never
 requires environment variables or performs process-level side effects.
@@ -111,6 +121,7 @@ from adapter.github.auth import GitHubInstallationTokenProvider, validate_privat
 from adapter.github.diff import GitHubDiffFetcher
 from adapter.github.exceptions import GitHubPrivateKeyInvalidError
 from adapter.github.posting import GitHubFindingsPublisher
+from adapter.github.reactions import GitHubReactionFetcher
 from adapter.github.tree import GitHubTreeFetcher
 from adapter.llm.litellm_client import LiteLLMClient
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
@@ -127,6 +138,7 @@ from indexing.pipeline import IndexingJobDependencies
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMError
 from llmgateway.startup_check import check_llm_reachable
+from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.config import (
     NoViableStepConfigurationError,
     StepEnablement,
@@ -357,6 +369,47 @@ def _build_tree_fetcher(
         timeout=settings.github_api_timeout_seconds,
         max_retry_attempts=settings.github_retry_max_attempts,
         client=http_client,
+    )
+
+
+def _build_reaction_fetcher(
+    settings: WorkerSettings,
+    token_provider: GitHubInstallationTokenProvider,
+    http_client: httpx.AsyncClient,
+) -> GitHubReactionFetcher:
+    """Wire the Memory domain's `ReactionFetcher` Protocol to its
+    GitHub-backed implementation (`docs/plans/plan-deliver-memory.md`'s
+    Phase 4 section, Unit D), sharing `token_provider`/`http_client` with
+    every other GitHub adapter here — see `_build_token_provider`'s own
+    docstring for why.
+    """
+    return GitHubReactionFetcher(
+        token_provider=token_provider,
+        github_api_base_url=settings.github_api_base_url,
+        timeout=settings.github_api_timeout_seconds,
+        max_retry_attempts=settings.github_retry_max_attempts,
+        client=http_client,
+    )
+
+
+def _build_memory_reaction_poll_deps(
+    settings: WorkerSettings,
+    reaction_fetcher: GitHubReactionFetcher,
+    memory_repository: PostgresMemoryRepository,
+) -> MemoryReactionPollJobDependencies:
+    """Bundle `MEMORY_REACTION_POLL`'s three Protocol-typed dependencies
+    (`docs/plans/plan-deliver-memory.md`'s Phase 4 section) plus its one
+    plain-config field — `memory_repository` (Assumption 8) implements both
+    `MemorySignalRecorder` and `ReactionDedupStore`, the same instance
+    `_build_findings_publisher`'s own `provenance_recorder` already is, so
+    the same instance is passed for both roles here, mirroring
+    `_build_indexing_deps`'s own precedent.
+    """
+    return MemoryReactionPollJobDependencies(
+        reaction_fetcher=reaction_fetcher,
+        signal_recorder=memory_repository,
+        dedup_store=memory_repository,
+        max_comments_per_poll=settings.memory_reaction_poll_max_comments_per_poll,
     )
 
 
@@ -749,6 +802,7 @@ async def _run_dispatch_loop_forever(
     job_queue: JobQueueRepository,
     registry: StepRegistry,
     indexing_deps: IndexingJobDependencies,
+    memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
@@ -772,6 +826,7 @@ async def _run_dispatch_loop_forever(
             job_queue=job_queue,
             review_registry=registry,
             indexing_deps=indexing_deps,
+            memory_reaction_poll_deps=memory_reaction_poll_deps,
             worker_id=worker_id,
             poll_interval_seconds=settings.poll_interval_seconds,
             stuck_job_warning_threshold_seconds=settings.stuck_job_warning_threshold_seconds,
@@ -846,11 +901,24 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
     )
     index_repository = IndexingRepository(session_factory)
     indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)
+    # docs/plans/plan-deliver-memory.md's Phase 4 section (Unit D) — reuses
+    # `token_provider`/`github_http_client`/`memory_repository`, no second
+    # token cache, no second connection pool.
+    reaction_fetcher = _build_reaction_fetcher(settings, token_provider, github_http_client)
+    memory_reaction_poll_deps = _build_memory_reaction_poll_deps(
+        settings, reaction_fetcher, memory_repository
+    )
     worker_id = _build_worker_id()
 
     logger.info("worker started", extra={"worker_id": worker_id})
     await _run_dispatch_loop_forever(
-        job_queue, registry, indexing_deps, settings, worker_id, github_http_client
+        job_queue,
+        registry,
+        indexing_deps,
+        memory_reaction_poll_deps,
+        settings,
+        worker_id,
+        github_http_client,
     )
 
 

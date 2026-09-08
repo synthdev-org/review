@@ -64,6 +64,8 @@ from ingestion.diff import Diff, DiffFetcher, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMUnreachableError
 from llmgateway.models import CompletionRequest, CompletionResponse
+from memory.models import ReactionRecord
+from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
@@ -364,6 +366,45 @@ def _null_indexing_deps() -> IndexingJobDependencies:
     )
 
 
+class _NullMemoryReactionPollDeps:
+    """A trivial `ReactionFetcher`/`MemorySignalRecorder`/`ReactionDedupStore`
+    stand-in — this file's own tests dispatch only `REVIEW` jobs, never
+    `MEMORY_REACTION_POLL` (docs/plans/plan-deliver-memory.md's Phase 4
+    section), so `run_dispatch_loop`'s now-required
+    `memory_reaction_poll_deps` argument never needs to do real work here
+    (see `apps/worker/test_dispatch.py`'s identical fake for the dedicated
+    `MEMORY_REACTION_POLL`-job dispatch tests)."""
+
+    async def fetch_reactions(self, **kwargs: object) -> dict[int, tuple[ReactionRecord, ...]]:
+        raise AssertionError("_NullMemoryReactionPollDeps.fetch_reactions should never be called")
+
+    async def record_comment_provenance(self, **kwargs: object) -> None:
+        raise AssertionError(
+            "_NullMemoryReactionPollDeps.record_comment_provenance should never be called"
+        )
+
+    async def record_signal(self, **kwargs: object) -> bool:
+        raise AssertionError("_NullMemoryReactionPollDeps.record_signal should never be called")
+
+    async def recent_comment_ids(self, **kwargs: object) -> tuple[int, ...]:
+        raise AssertionError(
+            "_NullMemoryReactionPollDeps.recent_comment_ids should never be called"
+        )
+
+    async def filter_new(self, **kwargs: object) -> tuple[int, ...]:
+        raise AssertionError("_NullMemoryReactionPollDeps.filter_new should never be called")
+
+
+def _null_memory_reaction_poll_deps() -> MemoryReactionPollJobDependencies:
+    null_deps = _NullMemoryReactionPollDeps()
+    return MemoryReactionPollJobDependencies(
+        reaction_fetcher=null_deps,
+        signal_recorder=null_deps,
+        dedup_store=null_deps,
+        max_comments_per_poll=50,
+    )
+
+
 @contextlib.asynccontextmanager
 async def _running_dispatch_loop(
     *, job_queue: JobQueueRepository, review_registry: StepRegistry
@@ -373,6 +414,7 @@ async def _running_dispatch_loop(
             job_queue=job_queue,
             review_registry=review_registry,
             indexing_deps=_null_indexing_deps(),
+            memory_reaction_poll_deps=_null_memory_reaction_poll_deps(),
             worker_id="test-worker",
             poll_interval_seconds=_POLL_INTERVAL_SECONDS,
             stuck_job_warning_threshold_seconds=30.0,
