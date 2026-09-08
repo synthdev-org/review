@@ -24,7 +24,7 @@ Zero infra imports, per architecture.md's domain-package rule.
 ``indexing.chunk``/``indexing.tree`` are both domain packages too — this
 module importing their types directly is a deliberate, named
 cross-bounded-context dependency (Assumption 4), the same ordinary shape
-``review/llm_review.py`` already has on ``llmgateway.models``.
+``review/review_generation.py`` already has on ``llmgateway.models``.
 """
 
 from __future__ import annotations

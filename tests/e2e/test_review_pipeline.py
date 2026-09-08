@@ -21,7 +21,14 @@ too (self-contained to this file, on its own port, rather than reusing
 own behavior is fixed, shared with `test_compose_stack.py`, and this file
 needs per-test-configurable LLM outcomes, which would mean either mutating
 shared package fixture state other tests don't expect or a second,
-equivalent stub anyway).
+equivalent stub anyway). Since the verification pipeline delivery plan
+extended a single review job from one LLM Gateway call to three
+(`intent_summary`, `review_generation`, `verification`, in that fixed
+order — the last only when `review_generation` actually produced a
+`source: "llm"` finding), the stub also tracks *which* call in that
+sequence it is currently answering (`_StubLLMHandler`'s own docstring
+covers the mechanism) and responds with the shape that call's own step
+actually expects, rather than one fixed response regardless of caller.
 
 One Compose stack is brought up once for the whole module (`running_stack`,
 module-scoped) rather than per test function — `docker compose up --build`
@@ -237,33 +244,110 @@ def _reset_github_scenario(server: HTTPServer, scenario: _GitHubScenario) -> Non
 
 class _StubLLMHandler(BaseHTTPRequestHandler):
     """Answers `POST /v1/chat/completions` (and, for the Worker's own
-    startup reachability check, whatever else LiteLLM sends) with either a
-    well-formed, empty-findings completion (the default — every case except
-    the LLM-timeout one below needs llm-review to *succeed*, since only
-    that one case is this stub's own reason for existing at a per-test-
-    configurable granularity) or a `500` (the "llm_failure" mode), per
-    `self.server.mode`.
+    startup reachability check, whatever else LiteLLM sends).
+
+    A single review job now makes up to three calls to this endpoint, in a
+    fixed order — `intent_summary`, then `review_generation`, then (only
+    when `review_generation` actually produced at least one
+    `source: "llm"` finding) `verification` — and each expects a
+    differently-shaped response (plain text; `{"findings": [...]}`;
+    `{"verdicts": [...]}`, respectively). This handler tracks a per-test
+    call counter on `self.server.call_count` (reset by `_reset_llm_scenario`
+    at the start of every test function, not only once at server startup —
+    see that helper's own docstring for why) so it can answer each call in
+    a job's own sequence with the shape *that* call's own step actually
+    expects, rather than the single fixed `{"findings": []}` completion
+    every call used to receive regardless of which step made it — a stub
+    that couldn't have caught a wiring regression silently skipping
+    `intent_summary`/`verification` entirely.
+
+    `self.server.mode` still gates the pre-existing `"success"`/
+    `"llm_failure"` behavior: a `"llm_failure"` response (`500`) is
+    returned unconditionally, regardless of call position — this is what
+    the LLM-timeout/failure test case still needs (the very first LLM call
+    in the chain, whichever step makes it, must fail). Only under
+    `"success"` does call position matter: `self.server.
+    review_generation_scenario` (`"zero_findings"` — the default, matching
+    every pre-existing test's expectations — or `"one_finding"`) picks
+    `review_generation`'s own response; `self.server.verification_scenario`
+    (`"verified"` — the default — or `"rejected"`) picks `verification`'s
+    own response, for whichever test cases actually reach that third call.
     """
 
-    _SUCCESS_BODY = json.dumps(
+    _INTENT_SUMMARY_CONTENT = "This PR makes a small, self-contained change."
+    _ZERO_FINDINGS_CONTENT = json.dumps({"findings": []})
+    _ONE_FINDING_CONTENT = json.dumps(
         {
-            "id": "chatcmpl-e2e-review-stub",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "local-model",
-            "choices": [
+            "findings": [
+                {
+                    "file": "README.md",
+                    "line": 3,
+                    "severity": "medium",
+                    "message": "This section could clarify the expected behavior further.",
+                }
+            ]
+        }
+    )
+    _VERDICT_VERIFIED_CONTENT = json.dumps(
+        {
+            "verdicts": [
+                {"index": 0, "valid": True, "actionable": True, "specific": True, "valuable": True}
+            ]
+        }
+    )
+    _VERDICT_REJECTED_CONTENT = json.dumps(
+        {
+            "verdicts": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": '{"findings": []}'},
-                    "finish_reason": "stop",
+                    "valid": True,
+                    "actionable": True,
+                    "specific": False,
+                    "valuable": True,
                 }
-            ],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            ]
         }
-    ).encode()
+    )
 
     def log_message(self, format: str, *args: object) -> None:
         pass
+
+    def _completion_body(self, content: str) -> bytes:
+        return json.dumps(
+            {
+                "id": "chatcmpl-e2e-review-stub",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "local-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+        ).encode()
+
+    def _content_for_call(self, call_number: int) -> str:
+        """`call_number` is this server's own 1-based position within the
+        current test's own sequence (per `_reset_llm_scenario`'s reset) —
+        1 = `intent_summary`, 2 = `review_generation`, 3 (or beyond, though
+        no real job ever makes a fourth call) = `verification`."""
+        if call_number <= 1:
+            return self._INTENT_SUMMARY_CONTENT
+        if call_number == 2:
+            scenario = getattr(self.server, "review_generation_scenario", "zero_findings")
+            return (
+                self._ONE_FINDING_CONTENT
+                if scenario == "one_finding"
+                else self._ZERO_FINDINGS_CONTENT
+            )
+        scenario = getattr(self.server, "verification_scenario", "verified")
+        if scenario == "rejected":
+            return self._VERDICT_REJECTED_CONTENT
+        return self._VERDICT_VERIFIED_CONTENT
 
     def do_POST(self) -> None:
         mode = getattr(self.server, "mode", "success")
@@ -274,16 +358,22 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error": "simulated failure"}')
             return
 
+        call_number = getattr(self.server, "call_count", 0) + 1
+        self.server.call_count = call_number  # type: ignore[attr-defined]
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(self._SUCCESS_BODY)
+        self.wfile.write(self._completion_body(self._content_for_call(call_number)))
 
 
 @pytest.fixture(scope="module")
 def stub_llm_review_server() -> Iterator[HTTPServer]:
     server = HTTPServer(("0.0.0.0", STUB_LLM_REVIEW_PORT), _StubLLMHandler)
     server.mode = "success"  # type: ignore[attr-defined]
+    server.call_count = 0  # type: ignore[attr-defined]
+    server.review_generation_scenario = "zero_findings"  # type: ignore[attr-defined]
+    server.verification_scenario = "verified"  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -291,6 +381,30 @@ def stub_llm_review_server() -> Iterator[HTTPServer]:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _reset_llm_scenario(
+    server: HTTPServer,
+    *,
+    mode: str = "success",
+    review_generation: str = "zero_findings",
+    verification: str = "verified",
+) -> None:
+    """Resets the stub LLM Gateway server's per-test scenario state —
+    mirrors `_reset_github_scenario`'s own shape. Called at the start of
+    every test function, not only once at server startup: the Worker's own
+    one-time startup LLM-reachability check (`llmgateway/startup_check.py`)
+    fires once when the Compose stack first comes up (module-scoped
+    `running_stack` fixture), before any individual test's own reset —
+    resetting `call_count` to `0` here keeps each test's own call-position
+    numbering (call 1 = `intent_summary`, call 2 = `review_generation`,
+    call 3 = `verification`) independent of that earlier startup call and
+    of every other test sharing this one module-scoped server.
+    """
+    server.mode = mode  # type: ignore[attr-defined]
+    server.call_count = 0  # type: ignore[attr-defined]
+    server.review_generation_scenario = review_generation  # type: ignore[attr-defined]
+    server.verification_scenario = verification  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +511,7 @@ def test_happy_path_full_chain_posts_review_and_check_run(
     stub_github_server: HTTPServer,
     stub_llm_review_server: HTTPServer,
 ) -> None:
-    stub_llm_review_server.mode = "success"  # type: ignore[attr-defined]
+    _reset_llm_scenario(stub_llm_review_server)
     _reset_github_scenario(stub_github_server, _single_file_scenario())
     pr_number, head_sha = _fresh_pr()
 
@@ -426,7 +540,7 @@ def test_llm_timeout_posts_failure_check_run_and_zero_comments(
     stub_github_server: HTTPServer,
     stub_llm_review_server: HTTPServer,
 ) -> None:
-    stub_llm_review_server.mode = "llm_failure"  # type: ignore[attr-defined]
+    _reset_llm_scenario(stub_llm_review_server, mode="llm_failure")
     _reset_github_scenario(stub_github_server, _single_file_scenario())
     pr_number, head_sha = _fresh_pr()
 
@@ -440,8 +554,6 @@ def test_llm_timeout_posts_failure_check_run_and_zero_comments(
     assert calls.review_bodies == []
     assert calls.check_run_bodies[-1]["conclusion"] == "failure"
 
-    stub_llm_review_server.mode = "success"  # type: ignore[attr-defined]
-
 
 # --- No findings from either analyzer or the LLM ----------------------------
 
@@ -451,7 +563,7 @@ def test_no_findings_posts_no_findings_neutral_check_run(
     stub_github_server: HTTPServer,
     stub_llm_review_server: HTTPServer,
 ) -> None:
-    stub_llm_review_server.mode = "success"  # type: ignore[attr-defined]
+    _reset_llm_scenario(stub_llm_review_server)
     _reset_github_scenario(
         stub_github_server,
         _single_file_scenario(path="README.md", content=b"# hello\n\nnothing interesting here.\n"),
@@ -485,7 +597,7 @@ def test_files_endpoint_error_posts_failure_check_run_not_silent_failure(
     full-stack level, not only via the directly-enqueued dispatch-loop case
     in `apps/worker/test_dispatch.py`.
     """
-    stub_llm_review_server.mode = "success"  # type: ignore[attr-defined]
+    _reset_llm_scenario(stub_llm_review_server)
     scenario = _single_file_scenario()
     scenario.files_endpoint_status = 500
     _reset_github_scenario(stub_github_server, scenario)
@@ -510,7 +622,7 @@ def test_malformed_signature_rejected_401_never_reaches_enqueue(
     stub_github_server: HTTPServer,
     stub_llm_review_server: HTTPServer,
 ) -> None:
-    stub_llm_review_server.mode = "success"  # type: ignore[attr-defined]
+    _reset_llm_scenario(stub_llm_review_server)
     _reset_github_scenario(stub_github_server, _single_file_scenario())
     pr_number, head_sha = _fresh_pr()
     body = _webhook_payload(action="opened", pr_number=pr_number, head_sha=head_sha)
@@ -524,3 +636,95 @@ def test_malformed_signature_rejected_401_never_reaches_enqueue(
     time.sleep(2)
     calls: _CallLog = stub_github_server.calls  # type: ignore[attr-defined]
     assert calls.calls == []
+
+
+# --- Verified LLM finding: proves the six-step chain actually ran ----------
+
+
+def test_verified_llm_finding_reaches_github_after_three_llm_calls(
+    running_stack: dict[str, str],
+    stub_github_server: HTTPServer,
+    stub_llm_review_server: HTTPServer,
+) -> None:
+    """The traceability-table gap this test (and the rejected-finding case
+    below) closes: the pre-existing happy-path test only proved the
+    pipeline *completes* with a zero-findings response every LLM Gateway
+    call answered identically — it would have kept passing unchanged even
+    if `intent_summary`/`verification` were silently disabled or wired to
+    the wrong upstream dependency (e.g. a broken
+    `review.config.resolve_review_pipeline_depends_on`). Asserting all
+    three LLM Gateway calls actually happened, plus the one surviving,
+    verified finding actually reaching the posted PR review, proves the
+    real six-step chain (`prefilter -> static_analysis -> context_builder
+    -> intent_summary -> review_generation -> verification -> output`) ran
+    end-to-end, not merely that *some* chain producing zero findings did.
+    """
+    _reset_llm_scenario(
+        stub_llm_review_server, review_generation="one_finding", verification="verified"
+    )
+    _reset_github_scenario(
+        stub_github_server,
+        _single_file_scenario(path="README.md", content=b"# hello\n\nnothing interesting here.\n"),
+    )
+    pr_number, head_sha = _fresh_pr()
+
+    body = _webhook_payload(action="opened", pr_number=pr_number, head_sha=head_sha)
+    status = _post_webhook(running_stack, body=body, signature=_sign(body))
+    assert status == 200
+
+    calls: _CallLog = stub_github_server.calls  # type: ignore[attr-defined]
+    _wait_until_calls_received(calls)
+
+    # All three LLM Gateway calls really happened: intent_summary,
+    # review_generation, and verification each ran, in that order — not
+    # silently skipped by a wiring regression.
+    assert getattr(stub_llm_review_server, "call_count", 0) == 3
+    assert calls.check_run_bodies[-1]["conclusion"] == "neutral"
+    assert len(calls.review_bodies) == 1
+    comments = calls.review_bodies[-1]["comments"]
+    assert isinstance(comments, list)
+    assert len(comments) == 1
+
+
+# --- Rejected LLM finding: verification ran but the finding never posts ----
+
+
+def test_rejected_llm_finding_never_reaches_github(
+    running_stack: dict[str, str],
+    stub_github_server: HTTPServer,
+    stub_llm_review_server: HTTPServer,
+) -> None:
+    """The mirror image of the verified-finding case above: verification
+    still runs its one, structurally separate rubric-judgment call (proven
+    by the 3-call assertion below — this is not merely "verification was
+    skipped and nothing was posted anyway"), but a finding failing at least
+    one of the four rubric criteria (here: `specific=False`) is dropped
+    before `findings-merge-and-output` ever sees it (US-V4). With no other
+    findings in this scenario (`README.md`, a static-analysis-clean file),
+    the merged findings list is empty — `review/output.py`'s own
+    `FindingsOutputStep._run_happy_path` only calls `post_review(...)` when
+    `findings` is non-empty (`if findings:`), so `post_review` is never
+    called at all, not called with a zero-comment body.
+    """
+    _reset_llm_scenario(
+        stub_llm_review_server, review_generation="one_finding", verification="rejected"
+    )
+    _reset_github_scenario(
+        stub_github_server,
+        _single_file_scenario(path="README.md", content=b"# hello\n\nnothing interesting here.\n"),
+    )
+    pr_number, head_sha = _fresh_pr()
+
+    body = _webhook_payload(action="opened", pr_number=pr_number, head_sha=head_sha)
+    status = _post_webhook(running_stack, body=body, signature=_sign(body))
+    assert status == 200
+
+    calls: _CallLog = stub_github_server.calls  # type: ignore[attr-defined]
+    _wait_until_calls_received(calls)
+
+    # Verification's own LLM call really happened (rubric judgment ran, it
+    # just rejected the one candidate finding) — not skipped.
+    assert getattr(stub_llm_review_server, "call_count", 0) == 3
+    assert calls.review_bodies == []
+    assert calls.check_run_bodies[-1]["conclusion"] == "neutral"
+    assert "no findings" in str(calls.check_run_bodies[-1]["output"]).casefold()

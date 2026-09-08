@@ -1,5 +1,10 @@
-"""Tests for review.llm_review.LLMReviewStep, per the plan's Phase 6
-section.
+"""Tests for review.review_generation.ReviewGenerationStep — renamed from
+review.llm_review.LLMReviewStep per
+docs/plans/plan-deliver-verification-pipeline.md's Phase 2 section (Unit B)
+and docs/specs/spec-verification-pipeline.md's US-V2. Existing coverage
+(originally written for the plan-deliver-context-builder.md's Phase 6
+section) carries over unchanged under the new module/class names; new
+US-V2 cases (the intent-summary prompt section) are added alongside it.
 
 Integration cases (per docs/rules/testing.md's "LLM gateway against a
 recorded LiteLLM cassette" convention, and the PRD's Testing table, marked
@@ -47,13 +52,15 @@ from ingestion.diff import Diff, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
-from review.llm_review import (
+from review.diff_prompt import render_diff
+from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
+from review.review_generation import (
     _MAX_CONTEXT_REF_IDS_PER_FINDING,
     REDACTION_FINDING_CEILING,
-    LLMReviewStep,
-    _render_diff,
+    ReviewGenerationStep,
+    _build_system_prompt,
+    _build_user_message,
 )
-from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
 from review.step import StepContext
 
 # --- Shared fixtures/helpers -------------------------------------------------
@@ -83,8 +90,8 @@ def _context() -> StepContext:
 @dataclass
 class _FakeStaticAnalysisOutput:
     """Structurally mirrors ``review.static_analysis.StaticAnalysisOutput``
-    (never imported here — see ``review/llm_review.py``'s own "Import
-    boundary" note) closely enough for ``_LLMReviewInput.model_validate(...,
+    (never imported here — see ``review/review_generation.py``'s own "Import
+    boundary" note) closely enough for ``_ReviewGenerationInput.model_validate(...,
     from_attributes=True)`` to read it."""
 
     diff: Diff
@@ -96,15 +103,20 @@ class _FakeStaticAnalysisOutput:
     pr_number: int = 42
     head_sha: str = "deadbeef"
     # Added by docs/plans/plan-deliver-context-builder.md's Phase 5 section
-    # (US5) — defaults to `None`, matching `_LLMReviewInput`'s own default,
+    # (US5) — defaults to `None`, matching `_ReviewGenerationInput`'s own default,
     # so every existing test in this file that doesn't set it still gets
     # byte-for-byte the same prompt as before this phase.
     context_bundle: ContextBundle | None = None
+    # Added by docs/plans/plan-deliver-verification-pipeline.md's Phase 2
+    # section (US-V2) — defaults to `None`, matching `_ReviewGenerationInput`'s
+    # own default, so every existing test in this file that doesn't set it
+    # still gets byte-for-byte the same prompt as before this phase.
+    intent_summary: str | None = None
 
 
 class _FakeStaticAnalysisStep:
     """Stands in for ``review.static_analysis.StaticAnalysisStep`` so
-    ``LLMReviewStep`` (which declares ``depends_on = ("static_analysis",)``)
+    ``ReviewGenerationStep`` (which declares ``depends_on = ("static_analysis",)``)
     can be registered into a real, fully-wired outer ``StepRegistry`` — the
     only way to observe ``PipelineFailedError`` propagate and the
     registry's own generic per-step failure log fire, mirroring
@@ -157,7 +169,7 @@ class _FakeLLMClient:
 
 class _RecordingTextRedactor:
     """A fake ``TextRedactor`` recording every call, isolating
-    ``LLMReviewStep``'s own "call every LLM finding" behavior from
+    ``ReviewGenerationStep``'s own "call every LLM finding" behavior from
     ``GitleaksTextRedactor``'s own redaction-correctness test
     (``adapter/analyzers/test_gitleaks.py``) — per the plan's Phase 5 Tests
     section, reused here for this step's own second call site.
@@ -176,15 +188,15 @@ class _RaisingTextRedactor:
         raise RuntimeError("redaction backend unavailable")
 
 
-def _llm_review_step(
+def _review_generation_step(
     *,
     llm_client: LLMClient,
     redactor: Any,
     max_diff_bytes: int = 200_000,
     timeout: float = 5.0,
     model: str = "local-model",
-) -> LLMReviewStep:
-    return LLMReviewStep(
+) -> ReviewGenerationStep:
+    return ReviewGenerationStep(
         llm_client,
         redactor=redactor,
         model=model,
@@ -230,7 +242,7 @@ def stub_llm_server() -> Iterator[Callable[..., str]]:
     raw request body bytes before ``respond()`` is called — the seam
     US5's own context-bundle-reaches-the-prompt test below uses to inspect
     exactly what ``LiteLLMClient`` sent over the wire, not merely what
-    ``LLMReviewStep`` built in memory."""
+    ``ReviewGenerationStep`` built in memory."""
     servers: list[HTTPServer] = []
 
     def start(
@@ -297,7 +309,7 @@ async def test_us5_one_completion_call_made_with_diff_and_static_findings_as_con
 
     endpoint = stub_llm_server(respond)
     llm_client = LiteLLMClient(endpoint=endpoint, api_key="not-needed")
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
     static_output = _FakeStaticAnalysisOutput(
         diff=_diff_with_patch(patch="@@ -1 +1 @@\n-foo\n+bar\n"), findings=[static_finding]
     )
@@ -323,13 +335,13 @@ async def test_us5_non_empty_context_bundle_reaches_the_completion_request(
     stub_llm_server: Callable[..., str],
 ) -> None:
     """US5/Phase 5: Given a non-empty ``context_bundle`` on the upstream
-    step's output, When ``llm_review`` runs, Then the completion request
-    actually sent over the wire (not merely built in memory) includes a
-    clearly-labeled, distinguishable "Related code in this repository"
-    section carrying the bundle's own retrieved content — proving the
-    context bundle reaches ``llm_review``'s completion request end to end
-    through the real ``LiteLLMClient``, not just ``_build_user_message``'s
-    own unit-level behavior."""
+    step's output, When ``review_generation`` runs, Then the completion
+    request actually sent over the wire (not merely built in memory)
+    includes a clearly-labeled, distinguishable "Related code in this
+    repository" section carrying the bundle's own retrieved content —
+    proving the context bundle reaches ``review_generation``'s completion
+    request end to end through the real ``LiteLLMClient``, not just
+    ``_build_user_message``'s own unit-level behavior."""
     context_bundle = ContextBundle(
         items=(
             ContextBundleItem(
@@ -349,7 +361,7 @@ async def test_us5_non_empty_context_bundle_reaches_the_completion_request(
         on_request=captured_bodies.append,
     )
     llm_client = LiteLLMClient(endpoint=endpoint, api_key="not-needed")
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
     static_output = _FakeStaticAnalysisOutput(
         diff=_diff_with_patch(), context_bundle=context_bundle
     )
@@ -362,6 +374,74 @@ async def test_us5_non_empty_context_bundle_reaches_the_completion_request(
     assert "Related code in this repository" in user_message
     assert "src/caller.ts" in user_message
     assert "function bar() { add(1, 2); }" in user_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_us_v2_intent_summary_reaches_the_completion_request(
+    stub_llm_server: Callable[..., str],
+) -> None:
+    """US-V2 (first scenario): Given a non-``None`` ``intent_summary`` on the
+    upstream step's output, When ``review_generation`` runs, Then the
+    completion request actually sent over the wire includes a
+    clearly-labeled "What this PR is trying to do" section carrying that
+    text, inserted before the static-findings/diff/context-bundle
+    sections."""
+    captured_bodies: list[bytes] = []
+
+    endpoint = stub_llm_server(
+        lambda: (200, _canned_completion_json(_findings_response_json(0))),
+        on_request=captured_bodies.append,
+    )
+    llm_client = LiteLLMClient(endpoint=endpoint, api_key="not-needed")
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    static_output = _FakeStaticAnalysisOutput(
+        diff=_diff_with_patch(), intent_summary="Refactors the widget loader for clarity."
+    )
+
+    await step.run(static_output, _context())
+
+    assert len(captured_bodies) == 1
+    sent_request = json.loads(captured_bodies[0])
+    user_message = sent_request["messages"][-1]["content"]
+    assert "What this PR is trying to do" in user_message
+    assert "Refactors the widget loader for clarity." in user_message
+    assert user_message.index("What this PR is trying to do") < user_message.index(
+        "Static-analysis findings"
+    )
+
+
+def test_build_user_message_separates_intent_summary_from_static_findings_section() -> None:
+    """A non-``None`` ``intent_summary`` must not run directly into the
+    following "Static-analysis findings" section with no whitespace between
+    them — ``_render_intent_summary_section``'s own returned text has to
+    end with a separator, mirroring every other section in this prompt
+    (``render_context_bundle_section``'s own leading ``\\n\\n``)."""
+    user_message = _build_user_message("diff text", [], None, "Fixes the null pointer bug.")
+
+    assert "bug.Static-analysis findings" not in user_message
+    assert "bug.\n\nStatic-analysis findings" in user_message
+
+
+@pytest.mark.asyncio
+async def test_us_v2_intent_summary_absent_produces_byte_identical_prompt() -> None:
+    """US-V2 (second scenario): Given ``intent_summary=None`` (the default —
+    e.g. ``intent_summary_enabled=False``, or any upstream shape that
+    predates this phase), When ``review_generation`` runs, Then its prompt
+    is byte-for-byte identical to a prompt built with no intent-summary
+    section at all — the section contributes exactly the empty string."""
+    llm_client = _FakeLLMClient()
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+
+    await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    sent_user_message = llm_client.calls[0].messages[-1].content
+    assert "What this PR is trying to do" not in sent_user_message
+    assert sent_user_message == _build_user_message(render_diff(_diff_with_patch()), [], None, None)
+
+    sent_system_message = llm_client.calls[0].messages[0].content
+    assert "What this PR is trying to do" not in sent_system_message
+    assert sent_system_message == _build_system_prompt(None)
 
 
 @pytest.mark.asyncio
@@ -390,7 +470,7 @@ async def test_us6_context_ref_ids_round_trips_json_list_to_finding_tuple(
     )
     endpoint = stub_llm_server(lambda: (200, _canned_completion_json(findings_response)))
     llm_client = LiteLLMClient(endpoint=endpoint, api_key="not-needed")
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
     static_output = _FakeStaticAnalysisOutput(diff=_diff_with_patch())
 
     output = await step.run(static_output, _context())
@@ -408,7 +488,7 @@ async def test_context_ref_ids_absent_from_llm_response_defaults_to_none() -> No
     never an empty tuple, so `review.citation.render_citation` is never
     even called for a finding that drew on no context."""
     llm_client = _FakeLLMClient(response_content=_findings_response_json(1))
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
 
     output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
 
@@ -448,9 +528,9 @@ async def test_one_malformed_finding_is_dropped_not_the_whole_response(
         }
     )
     llm_client = _FakeLLMClient(response_content=response)
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
 
-    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+    with caplog.at_level(logging.WARNING, logger="review.review_generation"):
         output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
 
     llm_findings = [f for f in output.findings if f.source == "llm"]
@@ -495,9 +575,9 @@ async def test_every_finding_failing_validation_logs_error_not_just_warnings(
         }
     )
     llm_client = _FakeLLMClient(response_content=response)
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
 
-    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+    with caplog.at_level(logging.WARNING, logger="review.review_generation"):
         output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
 
     assert [f for f in output.findings if f.source == "llm"] == []
@@ -517,12 +597,12 @@ async def test_findings_key_missing_from_an_otherwise_valid_json_object_is_a_par
     (JSON-shape-check, then per-item) rewrite of `_parse_llm_findings` must
     keep rejecting a response with no `findings` list to work on at all."""
     llm_client = _FakeLLMClient(response_content=json.dumps({"not_findings": []}))
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
     static_output = _FakeStaticAnalysisOutput(diff=_diff_with_patch())
     registry = StepRegistry(
         [_FakeStaticAnalysisStep(static_output), step],
-        enabled={"static_analysis": True, "llm_review": True},
-        timeouts={"static_analysis": 5.0, "llm_review": 5.0},
+        enabled={"static_analysis": True, "review_generation": True},
+        timeouts={"static_analysis": 5.0, "review_generation": 5.0},
         on_failure=FailurePolicy.FATAL,
     )
 
@@ -541,12 +621,12 @@ async def test_malformed_llm_response_content_is_a_fatal_step_failure_logged_at_
     job-failing case, not an isolated sub-step case."""
     endpoint = stub_llm_server(lambda: (200, _canned_completion_json("not valid json at all {{{")))
     llm_client = LiteLLMClient(endpoint=endpoint, api_key="not-needed")
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
     static_output = _FakeStaticAnalysisOutput(diff=_diff_with_patch())
     registry = StepRegistry(
         [_FakeStaticAnalysisStep(static_output), step],
-        enabled={"static_analysis": True, "llm_review": True},
-        timeouts={"static_analysis": 5.0, "llm_review": 5.0},
+        enabled={"static_analysis": True, "review_generation": True},
+        timeouts={"static_analysis": 5.0, "review_generation": 5.0},
         on_failure=FailurePolicy.FATAL,
     )
 
@@ -559,7 +639,7 @@ async def test_malformed_llm_response_content_is_a_fatal_step_failure_logged_at_
     error_records = [
         r
         for r in caplog.records
-        if r.levelname == "ERROR" and getattr(r, "step_name", None) == "llm_review"
+        if r.levelname == "ERROR" and getattr(r, "step_name", None) == "review_generation"
     ]
     assert len(error_records) == 1
 
@@ -574,12 +654,14 @@ async def test_llm_gateway_timeout_is_a_fatal_step_failure_logged_at_error(
     with a timeout/connection-error response, and — matching case (1) —
     that this also logs at ``error`` per the same Phase 2 default."""
     llm_client = LiteLLMClient(endpoint=_unused_port_endpoint(), api_key="not-needed")
-    step = _llm_review_step(llm_client=llm_client, redactor=_RecordingTextRedactor(), timeout=2.0)
+    step = _review_generation_step(
+        llm_client=llm_client, redactor=_RecordingTextRedactor(), timeout=2.0
+    )
     static_output = _FakeStaticAnalysisOutput(diff=_diff_with_patch())
     registry = StepRegistry(
         [_FakeStaticAnalysisStep(static_output), step],
-        enabled={"static_analysis": True, "llm_review": True},
-        timeouts={"static_analysis": 5.0, "llm_review": 5.0},
+        enabled={"static_analysis": True, "review_generation": True},
+        timeouts={"static_analysis": 5.0, "review_generation": 5.0},
         on_failure=FailurePolicy.FATAL,
     )
 
@@ -592,7 +674,7 @@ async def test_llm_gateway_timeout_is_a_fatal_step_failure_logged_at_error(
     error_records = [
         r
         for r in caplog.records
-        if r.levelname == "ERROR" and getattr(r, "step_name", None) == "llm_review"
+        if r.levelname == "ERROR" and getattr(r, "step_name", None) == "review_generation"
     ]
     assert len(error_records) == 1
 
@@ -607,8 +689,8 @@ async def test_llm_gateway_timeout_is_a_fatal_step_failure_logged_at_error(
 def _diff_of_patch_byte_length(length: int) -> Diff:
     """A single-file ``Diff`` whose patch text is ``length`` repeated ``x``
     bytes — the actual rendered prompt byte count (patch text plus
-    ``_render_diff``'s own per-file header) is computed per-test via
-    ``_render_diff`` directly, rather than assumed, so these boundary tests
+    ``render_diff``'s own per-file header) is computed per-test via
+    ``render_diff`` directly, rather than assumed, so these boundary tests
     assert against the real rendered byte count rather than the raw patch
     length."""
     return Diff(files=(DiffFile(path="app.py", status="modified", patch="x" * length),))
@@ -617,9 +699,9 @@ def _diff_of_patch_byte_length(length: int) -> Diff:
 @pytest.mark.asyncio
 async def test_diff_exactly_at_ceiling_is_not_truncated() -> None:
     diff = _diff_of_patch_byte_length(1_000)
-    rendered_bytes = len(_render_diff(diff).encode("utf-8"))
+    rendered_bytes = len(render_diff(diff).encode("utf-8"))
     llm_client = _FakeLLMClient()
-    step = _llm_review_step(
+    step = _review_generation_step(
         llm_client=llm_client, redactor=_RecordingTextRedactor(), max_diff_bytes=rendered_bytes
     )
 
@@ -634,13 +716,13 @@ async def test_diff_one_byte_over_ceiling_is_truncated_and_logs_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     diff = _diff_of_patch_byte_length(1_000)
-    rendered_bytes = len(_render_diff(diff).encode("utf-8"))
+    rendered_bytes = len(render_diff(diff).encode("utf-8"))
     llm_client = _FakeLLMClient()
-    step = _llm_review_step(
+    step = _review_generation_step(
         llm_client=llm_client, redactor=_RecordingTextRedactor(), max_diff_bytes=rendered_bytes - 1
     )
 
-    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+    with caplog.at_level(logging.WARNING, logger="review.review_generation"):
         await step.run(_FakeStaticAnalysisOutput(diff=diff), _context())
 
     sent_user_message = llm_client.calls[0].messages[-1].content
@@ -657,11 +739,11 @@ async def test_diff_comfortably_under_ceiling_is_not_truncated_no_warning(
 ) -> None:
     diff = _diff_of_patch_byte_length(10)
     llm_client = _FakeLLMClient()
-    step = _llm_review_step(
+    step = _review_generation_step(
         llm_client=llm_client, redactor=_RecordingTextRedactor(), max_diff_bytes=1_000
     )
 
-    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+    with caplog.at_level(logging.WARNING, logger="review.review_generation"):
         await step.run(_FakeStaticAnalysisOutput(diff=diff), _context())
 
     assert not [r for r in caplog.records if "diff truncated" in r.message]
@@ -677,7 +759,7 @@ async def test_every_llm_finding_message_is_redacted_before_merge() -> None:
     test (``adapter/analyzers/test_gitleaks.py``)."""
     llm_client = _FakeLLMClient(response_content=_findings_response_json(2))
     redactor = _RecordingTextRedactor()
-    step = _llm_review_step(llm_client=llm_client, redactor=redactor)
+    step = _review_generation_step(llm_client=llm_client, redactor=redactor)
 
     output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
 
@@ -696,12 +778,12 @@ async def test_redaction_failure_produces_the_fatal_pipeline_failed_error_path()
     redaction-failure propagation is proven directly, not left as an
     unverified extrapolation."""
     llm_client = _FakeLLMClient(response_content=_findings_response_json(1))
-    step = _llm_review_step(llm_client=llm_client, redactor=_RaisingTextRedactor())
+    step = _review_generation_step(llm_client=llm_client, redactor=_RaisingTextRedactor())
     static_output = _FakeStaticAnalysisOutput(diff=_diff_with_patch())
     registry = StepRegistry(
         [_FakeStaticAnalysisStep(static_output), step],
-        enabled={"static_analysis": True, "llm_review": True},
-        timeouts={"static_analysis": 5.0, "llm_review": 5.0},
+        enabled={"static_analysis": True, "review_generation": True},
+        timeouts={"static_analysis": 5.0, "review_generation": 5.0},
         on_failure=FailurePolicy.FATAL,
     )
 
@@ -718,9 +800,9 @@ async def test_redaction_ceiling_exactly_at_cap_all_findings_survive(
 ) -> None:
     llm_client = _FakeLLMClient(response_content=_findings_response_json(REDACTION_FINDING_CEILING))
     redactor = _RecordingTextRedactor()
-    step = _llm_review_step(llm_client=llm_client, redactor=redactor)
+    step = _review_generation_step(llm_client=llm_client, redactor=redactor)
 
-    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+    with caplog.at_level(logging.WARNING, logger="review.review_generation"):
         output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
 
     llm_findings = [f for f in output.findings if f.source == "llm"]
@@ -737,9 +819,9 @@ async def test_redaction_ceiling_one_over_drops_exactly_one_and_logs_warning(
         response_content=_findings_response_json(REDACTION_FINDING_CEILING + 1)
     )
     redactor = _RecordingTextRedactor()
-    step = _llm_review_step(llm_client=llm_client, redactor=redactor)
+    step = _review_generation_step(llm_client=llm_client, redactor=redactor)
 
-    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+    with caplog.at_level(logging.WARNING, logger="review.review_generation"):
         output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
 
     llm_findings = [f for f in output.findings if f.source == "llm"]
@@ -751,14 +833,55 @@ async def test_redaction_ceiling_one_over_drops_exactly_one_and_logs_warning(
 
 
 @pytest.mark.asyncio
+async def test_redaction_ceiling_keeps_critical_finding_placed_after_the_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A completion listing a critical finding after
+    ``REDACTION_FINDING_CEILING`` low-severity ones must not have that
+    critical finding silently dropped — the ceiling sorts by severity first
+    (see ``review.review_generation``'s own module docstring), mirroring
+    ``findings.merge.merge_findings``'s own severity-aware ceiling (US-V8)
+    one stage downstream.
+    """
+    findings = [
+        {
+            "file": f"file{i}.py",
+            "line": i + 1,
+            "severity": "low",
+            "message": f"low finding {i}",
+        }
+        for i in range(REDACTION_FINDING_CEILING)
+    ]
+    findings.append(
+        {
+            "file": "critical.py",
+            "line": 1,
+            "severity": "critical",
+            "message": "critical finding placed last in the response",
+        }
+    )
+    llm_client = _FakeLLMClient(response_content=json.dumps({"findings": findings}))
+    redactor = _RecordingTextRedactor()
+    step = _review_generation_step(llm_client=llm_client, redactor=redactor)
+
+    with caplog.at_level(logging.WARNING, logger="review.review_generation"):
+        output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    llm_findings = [f for f in output.findings if f.source == "llm"]
+    assert len(llm_findings) == REDACTION_FINDING_CEILING
+    assert any(f.severity == "critical" for f in llm_findings)
+    assert sum(1 for f in llm_findings if f.severity == "low") == REDACTION_FINDING_CEILING - 1
+
+
+@pytest.mark.asyncio
 async def test_redaction_ceiling_comfortably_under_no_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     llm_client = _FakeLLMClient(response_content=_findings_response_json(3))
     redactor = _RecordingTextRedactor()
-    step = _llm_review_step(llm_client=llm_client, redactor=redactor)
+    step = _review_generation_step(llm_client=llm_client, redactor=redactor)
 
-    with caplog.at_level(logging.WARNING, logger="review.llm_review"):
+    with caplog.at_level(logging.WARNING, logger="review.review_generation"):
         output = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
 
     llm_findings = [f for f in output.findings if f.source == "llm"]

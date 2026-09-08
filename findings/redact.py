@@ -14,7 +14,7 @@ free-text output, uniformly, regardless of source tool.
 ``TextRedactor`` produces no data model of its own, but substantively
 operates on ``findings.models.Finding``'s free-text fields, and has two real
 step-module consumers (``review/static_analysis.py``, this phase;
-``review/llm_review.py``, Phase 6) — under ADR-0006's rule, it's defined
+``review/review_generation.py``, Phase 6) — under ADR-0006's rule, it's defined
 here (the data's own package) rather than arbitrarily inside one of its two
 consumers, which would also make one step module import another (forbidden
 by ``review/test_step_boundaries.py``, per US-F1).
@@ -71,7 +71,7 @@ def apply_redaction_ceiling(findings: list[Finding], ceiling: int) -> tuple[list
     """Cap ``findings`` at ``ceiling`` entries, returning ``(kept, dropped)``.
 
     Shared by ``review/static_analysis.py`` (ceiling 50) and
-    ``review/llm_review.py`` (ceiling 20) — both steps redact every
+    ``review/review_generation.py`` (ceiling 20) — both steps redact every
     surviving finding's own message via a ``TextRedactor`` call, so each
     caps its own finding count first to bound how many redaction calls (one
     subprocess spawn each, per ``adapter/analyzers/gitleaks.py``'s
@@ -96,7 +96,7 @@ async def redact_findings(
 ) -> list[Finding]:
     """Redact every ``finding.message`` via ``redactor``, fanned out
     concurrently, with the shared logging shape both
-    ``review/static_analysis.py``'s and ``review/llm_review.py``'s own
+    ``review/static_analysis.py``'s and ``review/review_generation.py``'s own
     ``_redact_all`` used to duplicate byte-for-byte (see each module's own
     ``_redact_all`` docstring for why redaction is fatal on failure and why
     it's fanned out via ``asyncio.gather`` rather than awaited in a loop).

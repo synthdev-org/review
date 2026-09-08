@@ -1,0 +1,384 @@
+"""review.verification — the ``verification`` pipeline step (Unit C), per
+docs/plans/plan-deliver-verification-pipeline.md's Phase 3 section and
+docs/specs/spec-verification-pipeline.md's US-V3 through US-V6.
+
+Judges every ``source == "llm"`` finding ``review_generation`` produced
+against a fixed, four-criterion rubric (Sourcery's own decided
+valid/actionable/specific/valuable gate — see the spec's Scope section) in
+exactly one, structurally separate completion call — never a follow-up in
+the same conversation that produced the findings, per design goal 6's
+"never self-critique" requirement. Static-analysis findings
+(``source in {"gitleaks", "semgrep"}``) bypass this entirely: they are the
+platform's own deterministic, free trust anchor (design goal 4) and are
+forwarded through this step's output completely unchanged (US-V6).
+
+**Import boundary, per US-F1:** mirrors ``review/review_generation.py``'s own
+established pattern — ``_VerificationInput`` below structurally mirrors
+``review.review_generation.ReviewGenerationOutput`` (this step's normal
+immediate predecessor) via ``from_attributes=True`` rather than importing
+it directly.
+
+**Fail-closed verdict correlation (Assumption 5 of the plan above).** The
+LLM's own batched response correlates each verdict to a candidate finding
+by an explicit, LLM-echoed ``index`` field (that finding's 0-based position
+in the array supplied in the prompt) — never by the response array's own
+position, which nothing enforces stays aligned with the request array's
+order. A finding whose index is missing from the response, duplicated, or
+out of range is treated as **rejected**, never silently kept — the same
+fail-closed posture ``findings/redact.py``'s "a redaction call's own
+failure is fatal" and ``review_generation``'s own malformed-finding-drop
+already establish for a structurally identical kind of gap.
+
+**No new redaction surface.** ``_VerificationVerdictItem`` carries only an
+``index`` and four booleans — no free-text field an LLM could use to echo
+diff/secret content back into a log or a posted comment. This step never
+redacts anything itself; it operates on findings ``review_generation``
+already redacted.
+
+Zero infra imports beyond ``llmgateway`` (per architecture.md's
+domain-package rule) — this module binds ``llmgateway.client.LLMClient``,
+not ``adapter.llm`` directly.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from findings.models import Finding
+from ingestion.diff import Diff
+from llmgateway.client import LLMClient
+from review.context_bundle import ContextBundle, render_context_bundle_section
+from review.diff_prompt import render_and_truncate_diff
+from review.llm_response import build_completion_request, parse_llm_json_envelope
+from review.step import JobIdentity, Step, StepContext, job_identity_fields
+
+logger = logging.getLogger(__name__)
+
+_SYSTEM_PROMPT = (
+    "You are an automated code review verification assistant — a structurally "
+    "separate check, never the same call that produced the findings you are "
+    "given. You will be given a list of candidate findings an earlier review "
+    "pass produced for a single pull request's unified diff, each tagged with "
+    'its own integer "index" (its position in the list you were given), plus '
+    'the diff itself and, optionally, a "Related code in this repository" '
+    "section of context. For EACH candidate finding, independently judge it "
+    "against all four of these fixed criteria:\n"
+    "- valid: is the finding actually correct about the code shown in the diff?\n"
+    "- actionable: could the PR author actually act on this finding?\n"
+    "- specific: does it point at a specific, identifiable issue, not a vague "
+    "generality?\n"
+    "- valuable: is this worth the PR author's time to read?\n\n"
+    "Respond with ONLY a single JSON object, no other text, matching exactly "
+    "this shape:\n"
+    '{"verdicts": [{"index": <int>, "valid": <bool>, "actionable": <bool>, '
+    '"specific": <bool>, "valuable": <bool>}, ...]}\n\n'
+    "Include exactly one verdict per candidate finding, echoing back its own "
+    'given "index" value unchanged.'
+)
+
+
+class VerificationResponseParseError(Exception):
+    """Raised when the LLM's completion response content does not parse as
+    valid JSON with a top-level ``verdicts`` list — mirrors
+    ``review.review_generation.LLMResponseParseError``'s own shape/role.
+    Never caught within ``VerificationStep.run`` — propagates as this
+    step's own fatal failure, identical mechanism to
+    ``review_generation``'s own parse-error path (US-V7, made fatal by
+    Phase 5's registration into the existing ``FailurePolicy.FATAL``
+    registry).
+    """
+
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(
+            f"could not parse verification response against the verdicts schema: {detail}"
+        )
+        self.detail = detail
+
+
+class _VerificationVerdictItem(BaseModel):
+    """One item of the LLM's own batched verdicts response — the fixed
+    schema stated in ``_SYSTEM_PROMPT`` above: which candidate finding
+    (``index``) this verdict is for, plus the four fixed rubric criteria.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    index: int
+    valid: bool
+    actionable: bool
+    specific: bool
+    valuable: bool
+
+
+class _VerificationInput(JobIdentity):
+    """Mirrors ``review.review_generation.ReviewGenerationOutput``'s shape
+    (this step's normal immediate predecessor) without importing it — see
+    the module docstring's "Import boundary" note. ``from_attributes=True``
+    lets ``model_validate`` read this shape off the real upstream instance
+    the outer registry hands this step as its own ``input``.
+    """
+
+    model_config = ConfigDict(frozen=True, from_attributes=True, arbitrary_types_allowed=True)
+
+    diff: Diff
+    findings: list[Finding] = Field(default_factory=list)
+    context_bundle: ContextBundle | None = None
+
+
+class VerificationOutput(JobIdentity):
+    """This step's own output: the same shape as ``_VerificationInput``,
+    with ``findings`` replaced by this step's own filtered/annotated list —
+    rejected findings excluded entirely, surviving ``source == "llm"``
+    findings marked ``verification_status="verified"``, every
+    ``source != "llm"`` finding forwarded completely unchanged (US-V6).
+    ``head_sha``/``context_bundle`` forwarded unchanged, mirroring
+    ``ReviewGenerationOutput``'s own forwarding.
+    """
+
+    model_config = ConfigDict(frozen=True, from_attributes=True, arbitrary_types_allowed=True)
+
+    findings: list[Finding]
+    head_sha: str
+    context_bundle: ContextBundle | None = None
+
+
+def _pass_through_job_fields(parsed: _VerificationInput) -> dict[str, Any]:
+    """The ``JobIdentity`` fields (via ``review.step.job_identity_fields``)
+    plus ``context_bundle`` that ``VerificationOutput`` forwards unchanged
+    from ``_VerificationInput`` on every return path
+    (``VerificationStep.run``'s no-LLM-findings early return and its normal
+    end-of-method return alike) — extracted so a future field addition
+    doesn't have to be kept in sync by hand across two call sites.
+    """
+    return {**job_identity_fields(parsed), "context_bundle": parsed.context_bundle}
+
+
+def _render_candidate_findings(findings: list[Finding]) -> str:
+    """Renders every candidate (``source == "llm"``) finding as the JSON
+    array supplied in the verification prompt — each item carries its own
+    explicit ``"index"`` field (its 0-based position in ``findings``, per
+    Assumption 5), the value the LLM is expected to echo back on its own
+    verdict for that finding.
+    """
+    return json.dumps(
+        [
+            {
+                "index": index,
+                "file": finding.file,
+                "line": finding.line,
+                "message": finding.message,
+                "context_ref_ids": (
+                    list(finding.context_ref_ids) if finding.context_ref_ids is not None else None
+                ),
+            }
+            for index, finding in enumerate(findings)
+        ]
+    )
+
+
+def _build_user_message(
+    diff_text: str, candidate_findings: list[Finding], context_bundle: ContextBundle | None
+) -> str:
+    findings_json = _render_candidate_findings(candidate_findings)
+    context_bundle_section = render_context_bundle_section(context_bundle)
+    return (
+        'Candidate findings to verify (each tagged with its own "index"):\n'
+        f"{findings_json}\n\n"
+        f"Diff:\n{diff_text}"
+        f"{context_bundle_section}"
+    )
+
+
+def _parse_verdicts(content: str, *, job_id: str) -> list[_VerificationVerdictItem]:
+    """Parses ``response.content`` against the fixed verdicts schema,
+    raising ``VerificationResponseParseError`` (never an unhandled
+    exception) on a malformed/unparseable *response* — not JSON at all, or
+    missing the top-level ``verdicts`` list entirely.
+
+    **One malformed verdict item never fails the whole response** — each
+    item in ``verdicts`` is validated independently against
+    ``_VerificationVerdictItem``; a single item that doesn't match the
+    fixed shape is dropped and logged at ``warning``, mirroring
+    ``review.review_generation._parse_llm_findings``'s own per-item-tolerant
+    pattern.
+    """
+    return parse_llm_json_envelope(
+        content,
+        envelope_key="verdicts",
+        item_model=_VerificationVerdictItem,
+        make_parse_error=lambda detail: VerificationResponseParseError(detail=detail),
+        logger=logger,
+        job_id=job_id,
+        step_name="verification",
+        item_label="verdict",
+        item_index_field="verdict_position",
+    )
+
+
+def _correlate_verdicts(
+    verdicts: list[_VerificationVerdictItem], *, candidate_count: int, job_id: str
+) -> dict[int, _VerificationVerdictItem]:
+    """Builds ``index -> verdict`` from the parsed, per-item-validated
+    ``verdicts`` list, per Assumption 5's fail-closed correlation design.
+
+    A duplicate ``index`` keeps the first occurrence — the second (and any
+    later) occurrence is dropped and logged at ``warning`` with the
+    offending ``index``/``job_id`` as structured ``extra`` fields, never a
+    bare message. An ``index`` outside ``range(candidate_count)`` is
+    dropped and logged the same structured way, under its own distinct
+    message — both cases get the same visible-not-silent treatment (the
+    plan's own "asymmetric treatment" fix).
+    """
+    verdict_by_index: dict[int, _VerificationVerdictItem] = {}
+    for verdict in verdicts:
+        if verdict.index < 0 or verdict.index >= candidate_count:
+            message = "verification: dropping out-of-range verdict index"
+        elif verdict.index in verdict_by_index:
+            message = "verification: dropping duplicate verdict index; keeping first occurrence"
+        else:
+            verdict_by_index[verdict.index] = verdict
+            continue
+        logger.warning(message, extra={"job_id": job_id, "index": verdict.index})
+    return verdict_by_index
+
+
+#: The four load-bearing rubric criteria `_VerificationVerdictItem` carries
+#: (Sourcery's four criteria, per docs/research/research-current-art.md) —
+#: shared by `_passes_rubric` and `VerificationStep.run`'s per-criterion
+#: failure-count aggregation so the two can't drift apart.
+_RUBRIC_CRITERIA: tuple[str, ...] = ("valid", "actionable", "specific", "valuable")
+
+
+def _passes_rubric(verdict: _VerificationVerdictItem) -> bool:
+    return all(getattr(verdict, criterion) for criterion in _RUBRIC_CRITERIA)
+
+
+class VerificationStep:
+    """``review.step.Step`` implementation for US-V3 through US-V6 — see
+    this module's own docstring for the full design."""
+
+    name = "verification"
+
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        *,
+        model: str,
+        timeout: float,
+        max_diff_bytes: int,
+        depends_on: str = "review_generation",
+    ) -> None:
+        """``depends_on`` names this step's single upstream dependency —
+        ``"review_generation"`` by default, its normal immediate
+        predecessor in the six-step chain (``context_builder ->
+        intent_summary -> review_generation -> verification -> output``).
+
+        A constructor parameter, not a fixed class attribute, mirrors
+        ``review.review_generation.ReviewGenerationStep``'s/
+        ``review.intent_summary.IntentSummaryStep``'s own identical
+        reasoning: ``review.pipeline.StepRegistry`` resolves this step's
+        ``input`` from exactly its declared dependency's output, and the
+        composition root (``apps/worker/main.py``, Phase 5) determines the
+        actual value once it knows which upstream steps are enabled for a
+        given deployment.
+        """
+        self._llm_client = llm_client
+        self._model = model
+        self._timeout = timeout
+        self._max_diff_bytes = max_diff_bytes
+        self.depends_on: tuple[str, ...] = (depends_on,)
+
+    async def run(self, input: Any, context: StepContext) -> VerificationOutput:
+        # Any (not _VerificationInput) because the registry passes the raw
+        # upstream step output here for validation — see the module
+        # docstring's "Import boundary" note.
+        parsed = _VerificationInput.model_validate(input, from_attributes=True)
+
+        llm_findings = [finding for finding in parsed.findings if finding.source == "llm"]
+        other_findings = [finding for finding in parsed.findings if finding.source != "llm"]
+
+        if not llm_findings:
+            # US-V3's second scenario: nothing to judge, so no LLM Gateway
+            # call is made at all — static/other findings still pass
+            # through unchanged (US-V6).
+            return VerificationOutput(
+                findings=other_findings,
+                **_pass_through_job_fields(parsed),
+            )
+
+        truncated_text = render_and_truncate_diff(
+            parsed.diff,
+            self._max_diff_bytes,
+            logger=logger,
+            job_id=context.job_id,
+            step_name="verification",
+        )
+
+        request = build_completion_request(
+            self._model,
+            system_content=_SYSTEM_PROMPT,
+            user_content=_build_user_message(truncated_text, llm_findings, parsed.context_bundle),
+        )
+        response = await self._llm_client.complete(request, timeout=self._timeout)
+        verdicts = _parse_verdicts(response.content, job_id=context.job_id)
+        verdict_by_index = _correlate_verdicts(
+            verdicts, candidate_count=len(llm_findings), job_id=context.job_id
+        )
+
+        # Aggregate per-criterion failure counts over correlated verdicts
+        # only, computed before filtering — never over an unmatched
+        # finding, which has no verdict to fail a criterion at all. Looped
+        # over `_RUBRIC_CRITERIA` (the same four criteria `_passes_rubric`
+        # checks) rather than one hand-written `if not verdict.X: X_failures
+        # += 1` block per criterion, so adding/renaming a criterion can't
+        # leave one of four near-identical blocks out of sync with the rest.
+        criterion_failures = dict.fromkeys(_RUBRIC_CRITERIA, 0)
+        for verdict in verdict_by_index.values():
+            for criterion in _RUBRIC_CRITERIA:
+                if not getattr(verdict, criterion):
+                    criterion_failures[criterion] += 1
+
+        kept_llm_findings: list[Finding] = []
+        rejected_count = 0
+        unmatched_count = 0
+        for index, finding in enumerate(llm_findings):
+            correlated_verdict = verdict_by_index.get(index)
+            if correlated_verdict is None:
+                # Fail-closed per Assumption 5: no verdict correlated to
+                # this finding's index at all — rejected, not silently kept.
+                rejected_count += 1
+                unmatched_count += 1
+                continue
+            if not _passes_rubric(correlated_verdict):
+                rejected_count += 1
+                continue
+            kept_llm_findings.append(finding.model_copy(update={"verification_status": "verified"}))
+
+        log_fn = logger.warning if rejected_count > 0 else logger.info
+        log_fn(
+            "verification: batch judgment completed",
+            extra={
+                "job_id": context.job_id,
+                "judged_count": len(llm_findings),
+                "rejected_count": rejected_count,
+                "unmatched_count": unmatched_count,
+                **{
+                    f"{criterion}_failures": count
+                    for criterion, count in criterion_failures.items()
+                },
+            },
+        )
+
+        return VerificationOutput(
+            findings=[*other_findings, *kept_llm_findings],
+            **_pass_through_job_fields(parsed),
+        )
+
+
+# Runtime confirmation (not just a docstring claim) that this class actually
+# satisfies the domain-defined Protocol it's built to implement.
+_: type[Step[Any, VerificationOutput]] = VerificationStep

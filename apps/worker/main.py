@@ -40,14 +40,16 @@ passthrough plus a one-time `warning`-level startup log otherwise, per
 registered as `review.static_analysis.StaticAnalysisStep` in the same
 macro-step registry `PrefilterStep` already sits in.
 
-Phase 6 of the delivery plan adds the llm-review step:
-`review.llm_review.LLMReviewStep`, the third macro step registered into the
-same registry, binding the already-built `LLMClient` this composition root
-already constructs for the startup connectivity check (`_build_llm_client`,
-Phase 3) — no second client is built — and reusing the exact same
-`TextRedactor` instance `StaticAnalysisStep` already receives (Phase 5's
-`secret_redaction_enabled` flag gates both step's redaction uniformly, per
-`review/llm_review.py`'s own module docstring).
+Phase 6 of the delivery plan adds the llm-review step (renamed
+`review.review_generation.ReviewGenerationStep` by
+docs/plans/plan-deliver-verification-pipeline.md's Phase 2 section — see
+that module's own module docstring): the third macro step registered into
+the same registry, binding the already-built `LLMClient` this composition
+root already constructs for the startup connectivity check
+(`_build_llm_client`, Phase 3) — no second client is built — and reusing
+the exact same `TextRedactor` instance `StaticAnalysisStep` already
+receives (Phase 5's `secret_redaction_enabled` flag gates both step's
+redaction uniformly).
 
 Phase 7 of the delivery plan adds the fourth and final macro step,
 `review.output.FindingsOutputStep`, registered as the registry's own
@@ -93,8 +95,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
+from collections.abc import Sequence
+from typing import TypedDict
 
+import dotenv
 import httpx
 
 from adapter.analyzers.gitleaks import GitleaksAnalyzer, GitleaksTextRedactor
@@ -126,14 +132,17 @@ from review.config import (
     StepTimeouts,
     check_step_configuration_viable,
     context_builder_can_produce_value,
-    static_analysis_can_produce_findings,
+    intent_summary_can_produce_value,
+    resolve_review_pipeline_depends_on,
 )
 from review.context_builder import ContextBuilderStep
-from review.llm_review import LLMReviewStep
+from review.intent_summary import IntentSummaryStep
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
+from review.review_generation import ReviewGenerationStep
 from review.static_analysis import StaticAnalysisStep
+from review.verification import VerificationStep
 
 
 def _build_llm_client(settings: WorkerSettings) -> LLMClient:
@@ -380,6 +389,103 @@ def _build_text_redactor(settings: WorkerSettings, logger: logging.Logger) -> Te
     return NoOpTextRedactor()
 
 
+def _log_verification_disabled_warning(settings: WorkerSettings, logger: logging.Logger) -> None:
+    """A one-time `warning`-level startup log when `verification_enabled` is
+    `False` (US-V9's second scenario,
+    docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section) —
+    mirrors `_build_text_redactor`'s own `secret_redaction_enabled=False`
+    warning above exactly: the deployment can still boot and run correctly
+    (disabling `verification` restores exactly Phase 1/2's original,
+    already-shipped behavior), but the deviation from the shipped default —
+    unverified LLM findings posted directly — must be visible, not silent.
+    """
+    if not settings.verification_enabled:
+        logger.warning(
+            "verification is disabled: unverified LLM findings will be posted directly",
+            extra={"verification_enabled": False},
+        )
+
+
+_DEPRECATED_SETTINGS_ENV_VARS: tuple[tuple[str, str], ...] = (
+    ("REVIEW_WORKER_LLM_REVIEW_ENABLED", "REVIEW_WORKER_REVIEW_GENERATION_ENABLED"),
+    (
+        "REVIEW_WORKER_LLM_REVIEW_STEP_TIMEOUT_SECONDS",
+        "REVIEW_WORKER_REVIEW_GENERATION_STEP_TIMEOUT_SECONDS",
+    ),
+)
+"""The (old name, new name) pairs from the deliberate, documented breaking
+bootstrap-config rename (Assumption 7 of
+docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section) —
+`StepEnablement.llm_review_enabled`/`StepTimeouts.llm_review_step_timeout_seconds`
+became `review_generation_enabled`/`review_generation_step_timeout_seconds`.
+"""
+
+
+def _check_deprecated_settings_env_vars(
+    logger: logging.Logger,
+    *,
+    env_file: str | os.PathLike[str] | Sequence[str | os.PathLike[str]] | None = (
+        WorkerSettings.model_config["env_file"]
+    ),
+) -> None:
+    """A one-time startup check for the deprecated `llm_review_*` env var
+    names (Assumption 7/8 of docs/plans/plan-deliver-verification-pipeline.md's
+    Phase 5 section, revised after a second review round found the first
+    version incomplete) — `WorkerSettings`' `extra="ignore"` config
+    (`apps/worker/settings.py`) means an operator's own, externally-owned
+    deployment config setting one of these old names would silently stop
+    taking effect after the rename, falling back to the new field's default
+    with zero error or log line.
+
+    `env_file`'s default is **read from `WorkerSettings.model_config`
+    itself**, not independently hard-coded to `".env"` a second time — the
+    same "two definitions could drift" risk Assumption 6 already names
+    elsewhere for `resolve_review_pipeline_depends_on`: if `WorkerSettings`'
+    own `env_file` location ever changes, this check must never silently
+    stop reading the file the real settings loader actually uses.
+
+    Builds one case-insensitive set of key **names** (membership only, never
+    value truthiness — a deprecated var present but set to an empty string
+    must still trigger the warning) from both `os.environ` and, if the file
+    exists, `dotenv.dotenv_values(env_file)` (the same loader
+    pydantic-settings itself uses internally via its dependency on
+    `python-dotenv` — no new dependency) — `os.environ`-only would miss a
+    deprecated key set only in a `.env` file, since pydantic-settings' own
+    dotenv source never populates `os.environ` with the file's contents.
+    Case-insensitive because pydantic-settings' own env source is
+    case-insensitive by default, so a differently-cased deprecated key would
+    otherwise still silently take effect in settings parsing while bypassing
+    an exact-case-only check here.
+
+    Each deprecated name present logs its **own** `warning` naming that
+    specific old/new pair — two independent checks, not one combined
+    message regardless of which is actually set — a `warning`, not a
+    fail-fast `SystemExit(1)`, because the deployment can still boot and run
+    correctly on the new field's default; what's lost is only the
+    operator's prior, now-silently-overridden intent.
+    """
+    present_names: set[str] = {name.upper() for name in os.environ}
+
+    env_files: tuple[str | os.PathLike[str], ...]
+    if env_file is None:
+        env_files = ()
+    elif isinstance(env_file, (str, os.PathLike)):
+        env_files = (env_file,)
+    else:
+        env_files = tuple(env_file)
+
+    for candidate in env_files:
+        if os.path.exists(candidate):
+            present_names |= {name.upper() for name in dotenv.dotenv_values(candidate)}
+
+    for old_name, new_name in _DEPRECATED_SETTINGS_ENV_VARS:
+        if old_name.upper() in present_names:
+            logger.warning(
+                "deprecated setting name is still set and no longer has any effect",
+                extra={"deprecated_name": old_name, "current_name": new_name},
+            )
+
+
 def _build_step_enablement(settings: WorkerSettings) -> StepEnablement:
     """Translate `WorkerSettings`' own per-step fields into a
     `review.config.StepEnablement` instance — the one place `apps/worker`
@@ -391,7 +497,9 @@ def _build_step_enablement(settings: WorkerSettings) -> StepEnablement:
         prefilter_enabled=settings.prefilter_enabled,
         static_analysis_enabled=settings.static_analysis_enabled,
         context_builder_enabled=settings.context_builder_enabled,
-        llm_review_enabled=settings.llm_review_enabled,
+        intent_summary_enabled=settings.intent_summary_enabled,
+        review_generation_enabled=settings.review_generation_enabled,
+        verification_enabled=settings.verification_enabled,
         output_enabled=settings.output_enabled,
         static_analysis_gitleaks_enabled=settings.static_analysis_gitleaks_enabled,
         static_analysis_semgrep_enabled=settings.static_analysis_semgrep_enabled,
@@ -405,7 +513,9 @@ def _build_step_timeouts(settings: WorkerSettings) -> StepTimeouts:
         static_analysis_step_timeout_seconds=settings.static_analysis_step_timeout_seconds,
         static_analysis_analyzer_timeout_seconds=settings.static_analysis_analyzer_timeout_seconds,
         context_builder_step_timeout_seconds=settings.context_builder_step_timeout_seconds,
-        llm_review_step_timeout_seconds=settings.llm_review_step_timeout_seconds,
+        intent_summary_step_timeout_seconds=settings.intent_summary_step_timeout_seconds,
+        review_generation_step_timeout_seconds=settings.review_generation_step_timeout_seconds,
+        verification_step_timeout_seconds=settings.verification_step_timeout_seconds,
         output_step_timeout_seconds=settings.output_step_timeout_seconds,
     )
 
@@ -433,9 +543,32 @@ def _check_step_configuration(
 
     logger.info(
         "step configuration valid",
-        extra={"enabled_steps": enablement.as_mapping(), "step_timeouts": timeouts.as_mapping()},
+        extra={
+            "enabled_steps": enablement.as_mapping(),
+            "step_timeouts": timeouts.as_mapping(),
+            # Phase 5 of docs/plans/plan-deliver-verification-pipeline.md —
+            # so an operator can confirm from Worker startup logs alone
+            # which of the five dynamically-wired steps ended up pointing
+            # at which upstream, without needing to inspect a job's own
+            # step-level logs.
+            "review_pipeline_depends_on": resolve_review_pipeline_depends_on(enablement),
+        },
     )
     return enablement, timeouts
+
+
+class _LLMStepKwargs(TypedDict):
+    """The shared keyword-argument shape ``IntentSummaryStep``,
+    ``ReviewGenerationStep``, and ``VerificationStep`` all accept for their
+    LLM Gateway call (``model``/``timeout``/``max_diff_bytes``) — typed
+    explicitly so mypy can check the ``**llm_step_kwargs`` splat below
+    against each constructor's actual parameter types, instead of widening
+    to ``dict[str, object]``.
+    """
+
+    model: str
+    timeout: float
+    max_diff_bytes: int
 
 
 def _build_review_registry(
@@ -458,23 +591,25 @@ def _build_review_registry(
     requires zero changes to `review/pipeline.py`/`review/step.py`
     themselves, per US-F3). Phase 5 adds the second, `StaticAnalysisStep` —
     the same zero-framework-change property, now exercised by a second real
-    step. Phase 6 adds the third, `LLMReviewStep`, reusing the same
-    already-built `llm_client` this composition root already constructed
-    for the startup connectivity check (`_build_llm_client`, Phase 3) and
-    the same `redactor` instance `StaticAnalysisStep` already receives
-    (Phase 5's `secret_redaction_enabled` flag gates both steps' redaction
-    uniformly). Phase 7 adds the fourth and final step,
-    `FindingsOutputStep`, registered as this registry's own `terminal_step`
-    (`review/pipeline.py`'s "Terminal step" docstring note) — a genuinely
-    new capability the framework's own extension point provides, not
-    something `review/pipeline.py`/`review/step.py` needed changing for the
+    step. Phase 6 adds the third (renamed `ReviewGenerationStep` by
+    docs/plans/plan-deliver-verification-pipeline.md's Phase 2 section),
+    reusing the same already-built `llm_client` this composition root
+    already constructed for the startup connectivity check
+    (`_build_llm_client`, Phase 3) and the same `redactor` instance
+    `StaticAnalysisStep` already receives (Phase 5's
+    `secret_redaction_enabled` flag gates both steps' redaction uniformly).
+    Phase 7 adds the fourth and final step, `FindingsOutputStep`, registered
+    as this registry's own `terminal_step` (`review/pipeline.py`'s
+    "Terminal step" docstring note) — a genuinely new capability the
+    framework's own extension point provides, not something
+    `review/pipeline.py`/`review/step.py` needed changing for the
     *registration* of, matching every prior macro step's own
     zero-framework-change property.
 
-    The Context Builder delivery plan's Phase 5 section (this phase) adds a
-    fifth step, `ContextBuilderStep`, inserted between `static_analysis`/
-    `prefilter` and `llm_review` — reusing the same `diff_fetcher` every
-    other step here already shares, plus `tree_fetcher`/`graph_query`/
+    The Context Builder delivery plan's Phase 5 section adds a fifth step,
+    `ContextBuilderStep`, inserted between `static_analysis`/`prefilter` and
+    `review_generation` — reusing the same `diff_fetcher` every other step
+    here already shares, plus `tree_fetcher`/`graph_query`/
     `similarity_query`/`embedding_client` (the same `EmbeddingClient`
     instance `_build_indexing_deps` already constructs — no second one).
     **`ContextBuilderStep` is unconditionally constructed and placed in
@@ -483,13 +618,20 @@ def _build_review_registry(
     `enabled` mapping `StepRegistry` itself reads, never via a step's
     presence or absence in this list (see that class's own module
     docstring's "ContextBuilderStep is unconditionally constructed" note
-    for the full reasoning this phase's plan section gives). The complete,
-    four-combination `depends_on` wiring rule below (`context_builder`'s
-    own dependency, and `llm_review`'s) is this phase's own new composition-
-    root logic — `review/test_step_registry.py`'s existing fake
-    `context_builder` step only proves the framework supports inserting a
-    step at an arbitrary position, not that this repointing needs no new
-    logic here.
+    for the full reasoning that phase's plan section gives).
+
+    The verification pipeline delivery plan's Phase 5 section (this phase)
+    adds the sixth and seventh steps, `IntentSummaryStep` (between
+    `context_builder` and `review_generation`) and `VerificationStep`
+    (between `review_generation` and `output`) — the same
+    unconditionally-constructed, `enabled`-mapping-gated pattern
+    `ContextBuilderStep` already established, extended from two
+    dynamically-wired steps to five. `review.config.resolve_review_pipeline_depends_on`
+    (Assumption 6 of that plan) is the one shared computation for every one
+    of the five steps' own `depends_on` value — this function no longer
+    hand-derives that chain itself, so it can't drift from
+    `review.config.check_step_configuration_viable`'s own use of the same
+    function to validate the configuration at startup.
 
     `enablement.as_mapping()`/`timeouts.as_mapping()` are each built once
     here and passed unchanged into `StaticAnalysisStep`, which reads the
@@ -500,25 +642,36 @@ def _build_review_registry(
     enabled_mapping = enablement.as_mapping()
     timeouts_mapping = timeouts.as_mapping()
 
-    # Override the raw `context_builder_enabled` flag with the shared
-    # `context_builder_can_produce_value` predicate: the step's only
-    # consumer is `llm_review`, so if that's disabled, running
-    # `ContextBuilderStep` at all only pays its full diff/tree/graph/
-    # embedding cost for a `ContextBundle` nothing will read.
+    # Override the raw `context_builder_enabled`/`intent_summary_enabled`
+    # flags with their own shared `*_can_produce_value` predicates: each
+    # step's only consumer is `review_generation`, so if that's disabled,
+    # running either step at all only pays its own real cost (diff/tree/
+    # graph/embedding fetch for context_builder; a full LLM call for
+    # intent_summary) for a field nothing will read.
     enabled_mapping = {
         **enabled_mapping,
         "context_builder": context_builder_can_produce_value(enablement),
+        "intent_summary": intent_summary_can_produce_value(enablement),
     }
 
-    # The complete, four-reachable-combination depends_on rule (Phase 5's
-    # own plan section) — `sa_can_produce_findings` is the same shared
-    # predicate `review.config`'s fail-fast startup check validates
-    # against, so the two can't drift.
-    sa_can_produce_findings = static_analysis_can_produce_findings(enablement)
-    upstream_of_context_builder = "static_analysis" if sa_can_produce_findings else "prefilter"
-    llm_review_depends_on = (
-        "context_builder" if enablement.context_builder_enabled else upstream_of_context_builder
-    )
+    # The one shared chain-resolution function (Assumption 6 of
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section) —
+    # also used by `review.config.check_step_configuration_viable`'s own
+    # additive check, so the two can't drift.
+    resolved = resolve_review_pipeline_depends_on(enablement)
+
+    # The three LLM-calling review-generation-stage steps (intent_summary,
+    # review_generation, verification) all read the same three fields off
+    # `settings` for their LLM Gateway call — per the "no per-stage model
+    # routing yet" scope decision (docs/specs/spec-verification-pipeline.md).
+    # Built once here rather than repeated verbatim at each constructor call
+    # below, so a future per-stage override only needs one call site changed
+    # per step, not the shared-args tuple re-typed from scratch each time.
+    llm_step_kwargs: _LLMStepKwargs = {
+        "model": settings.llm_model,
+        "timeout": settings.llm_timeout_seconds,
+        "max_diff_bytes": settings.llm_max_diff_bytes,
+    }
 
     return StepRegistry(
         steps=[
@@ -544,33 +697,27 @@ def _build_review_registry(
                 # needs to name *some* valid, registered step so
                 # StepRegistry.__init__'s dependency validation doesn't
                 # reject it as pointing at an absent step.
-                depends_on=upstream_of_context_builder,
+                depends_on=resolved["context_builder"],
             ),
-            LLMReviewStep(
+            IntentSummaryStep(
+                llm_client,
+                **llm_step_kwargs,
+                depends_on=resolved["intent_summary"],
+            ),
+            ReviewGenerationStep(
                 llm_client,
                 redactor=redactor,
-                model=settings.llm_model,
-                timeout=settings.llm_timeout_seconds,
-                max_diff_bytes=settings.llm_max_diff_bytes,
-                # context_builder first, regardless of what context_builder
-                # itself depends on, whenever it's enabled; otherwise the
-                # same two-way fallback static_analysis/prefilter as before
-                # this phase.
-                depends_on=llm_review_depends_on,
+                **llm_step_kwargs,
+                depends_on=resolved["review_generation"],
+            ),
+            VerificationStep(
+                llm_client,
+                **llm_step_kwargs,
+                depends_on=resolved["verification"],
             ),
             FindingsOutputStep(
                 publisher,
-                # Deliberately checks the raw flag, not
-                # static_analysis_can_produce_findings(enablement) (unlike
-                # LLMReviewStep's depends_on above): when llm_review is
-                # disabled, review.config.check_step_configuration_viable's
-                # own fail-fast startup check already guarantees
-                # static_analysis_can_produce_findings(enablement) is True
-                # (it raises NoViableStepConfigurationError otherwise), so
-                # falling back to "static_analysis" here is always safe
-                # without re-deriving that guarantee — re-checking the
-                # predicate here would be redundant, not more correct.
-                depends_on="llm_review" if enablement.llm_review_enabled else "static_analysis",
+                depends_on=resolved["output"],
             ),
         ],
         enabled=enabled_mapping,
@@ -664,6 +811,7 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
     diff_fetcher = _build_diff_fetcher(settings, token_provider, github_http_client)
     tree_fetcher = _build_tree_fetcher(settings, token_provider, github_http_client)
     redactor = _build_text_redactor(settings, logger)
+    _log_verification_disabled_warning(settings, logger)
     publisher = _build_findings_publisher(settings, token_provider, github_http_client)
     # The same database session factory IndexRepository already uses (see
     # `_build_indexing_deps` below) — no second connection pool.
@@ -706,6 +854,8 @@ def main() -> None:
     configure_logging(settings.log_level)
 
     logger = logging.getLogger(__name__)
+    _check_deprecated_settings_env_vars(logger)
+
     logger.info("worker starting", extra={"environment": settings.environment})
 
     client = _build_llm_client(settings)

@@ -42,7 +42,22 @@ class StepEnablement(BaseModel):
     # Rollout & Release Safety "decided" flag), default `True`, mirroring
     # every other macro-step flag's own naming/default convention exactly.
     context_builder_enabled: bool = True
-    llm_review_enabled: bool = True
+    # Added by docs/plans/plan-deliver-verification-pipeline.md's Phase 5
+    # section — the intent_summary step's own kill switch (US-V9), default
+    # `True`, mirroring every other macro-step flag's own naming/default
+    # convention exactly.
+    intent_summary_enabled: bool = True
+    # Renamed from `llm_review_enabled` by
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    # this step is now specifically one of three review-generation-stage
+    # steps (intent_summary, review_generation, verification), so the old
+    # name would be confusingly narrow.
+    review_generation_enabled: bool = True
+    # Added by docs/plans/plan-deliver-verification-pipeline.md's Phase 5
+    # section — the verification step's own kill switch (US-V9), default
+    # `True`, mirroring every other macro-step flag's own naming/default
+    # convention exactly.
+    verification_enabled: bool = True
     output_enabled: bool = True
     static_analysis_gitleaks_enabled: bool = True
     static_analysis_semgrep_enabled: bool = True
@@ -58,7 +73,9 @@ class StepEnablement(BaseModel):
             "prefilter": self.prefilter_enabled,
             "static_analysis": self.static_analysis_enabled,
             "context_builder": self.context_builder_enabled,
-            "llm_review": self.llm_review_enabled,
+            "intent_summary": self.intent_summary_enabled,
+            "review_generation": self.review_generation_enabled,
+            "verification": self.verification_enabled,
             "output": self.output_enabled,
             "gitleaks": self.static_analysis_gitleaks_enabled,
             "semgrep": self.static_analysis_semgrep_enabled,
@@ -87,7 +104,20 @@ class StepTimeouts(BaseModel):
     # this model only carries the *outer*, per-step timeout each step's own
     # `Step.run()` call is wrapped in, per `review.pipeline.StepRegistry`).
     context_builder_step_timeout_seconds: int = 35
-    llm_review_step_timeout_seconds: int = 90
+    # Added by docs/plans/plan-deliver-verification-pipeline.md's Phase 5
+    # section — a short summarization call, lighter than
+    # `review_generation_step_timeout_seconds` below (see that plan's US-V9
+    # NFR section for the full worst-case-chain-sum reasoning).
+    intent_summary_step_timeout_seconds: int = 30
+    # Renamed from `llm_review_step_timeout_seconds` by
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    # mirrors `StepEnablement.review_generation_enabled`'s own rename.
+    review_generation_step_timeout_seconds: int = 90
+    # Added by docs/plans/plan-deliver-verification-pipeline.md's Phase 5
+    # section — a moderate batched-judgment call, lighter than
+    # `review_generation_step_timeout_seconds` (see that plan's US-V9 NFR
+    # section for the full worst-case-chain-sum reasoning).
+    verification_step_timeout_seconds: int = 60
     output_step_timeout_seconds: int = 30
 
     def as_mapping(self) -> dict[str, int]:
@@ -100,7 +130,9 @@ class StepTimeouts(BaseModel):
             "prefilter": self.prefilter_step_timeout_seconds,
             "static_analysis": self.static_analysis_step_timeout_seconds,
             "context_builder": self.context_builder_step_timeout_seconds,
-            "llm_review": self.llm_review_step_timeout_seconds,
+            "intent_summary": self.intent_summary_step_timeout_seconds,
+            "review_generation": self.review_generation_step_timeout_seconds,
+            "verification": self.verification_step_timeout_seconds,
             "output": self.output_step_timeout_seconds,
             "gitleaks": self.static_analysis_analyzer_timeout_seconds,
             "semgrep": self.static_analysis_analyzer_timeout_seconds,
@@ -112,10 +144,11 @@ def static_analysis_can_produce_findings(enablement: StepEnablement) -> bool:
     ``enablement`` — true only when the macro step itself is enabled *and*
     at least one of its two analyzer sub-steps is. Shared by
     ``check_step_configuration_viable`` below (the fail-fast startup check)
-    and ``apps/worker/main.py``'s ``_build_review_registry`` (which uses the
-    same predicate to decide whether ``LLMReviewStep`` depends on
-    ``"static_analysis"`` or falls back to depending on ``"prefilter"``
-    directly) — one definition so the two stay in lockstep; duplicating it
+    and ``apps/worker/main.py``'s ``_build_review_registry`` (which, via
+    ``resolve_review_pipeline_depends_on`` below, uses the same predicate to
+    decide whether the chain depends on ``"static_analysis"`` or falls back
+    to depending on ``"prefilter"`` directly) — one definition so the two
+    stay in lockstep; duplicating it
     would let the startup check validate a configuration the registry then
     wires incorrectly.
     """
@@ -127,13 +160,26 @@ def static_analysis_can_produce_findings(enablement: StepEnablement) -> bool:
 def context_builder_can_produce_value(enablement: StepEnablement) -> bool:
     """Whether running ``ContextBuilderStep`` can actually produce any value
     under ``enablement`` — true only when the step itself is enabled *and*
-    its one real consumer, ``llm_review``, is also enabled (``llm_review``
-    is the only step that ever reads a job's ``context_bundle`` — see
-    ``review.context_builder.ContextBuilderOutput``'s own docstring).
+    ``review_generation`` is also enabled.
+
+    ``review_generation`` is this predicate's one gating consumer, but as of
+    Phase 5's ``verification`` step it is no longer the *only* step that ever
+    reads a job's ``context_bundle`` — ``review.verification.VerificationStep``
+    also forwards and reads it (see ``review.verification._VerificationInput``).
+    That's still safe to gate on ``review_generation_enabled`` alone today:
+    ``verification`` always depends (directly or transitively) on
+    ``review_generation``'s own output in this codebase's one pipeline chain
+    (see ``resolve_review_pipeline_depends_on`` below), so
+    ``review_generation`` disabled already means ``verification`` never
+    receives a real ``context_bundle`` either, regardless of this predicate.
+    If a future change ever lets ``verification`` run independently of
+    ``review_generation``, this predicate must be revisited to also consider
+    ``enablement.verification_enabled``, or it will silently starve
+    ``verification`` of a ``context_bundle`` it needs.
 
     Without this check, ``context_builder_enabled``'s default of ``True``
-    means disabling ``llm_review`` alone (e.g. during an LLM-endpoint outage
-    or a cost-control measure) still pays the full cost of every
+    means disabling ``review_generation`` alone (e.g. during an LLM-endpoint
+    outage or a cost-control measure) still pays the full cost of every
     ``ContextBuilderStep`` run — diff/tree content fetch, the blast-radius
     graph query, and the embedding+similarity query — for a
     ``ContextBundle`` no step ever consumes. Mirrors
@@ -142,7 +188,76 @@ def context_builder_can_produce_value(enablement: StepEnablement) -> bool:
     the step's effective enablement and to keep that decision from drifting
     out of sync with any other place that needs the same answer.
     """
-    return enablement.context_builder_enabled and enablement.llm_review_enabled
+    return enablement.context_builder_enabled and enablement.review_generation_enabled
+
+
+def intent_summary_can_produce_value(enablement: StepEnablement) -> bool:
+    """Whether running ``IntentSummaryStep`` can actually produce any value
+    under ``enablement`` — true only when the step itself is enabled *and*
+    its one real consumer, ``review_generation``, is also enabled
+    (``review_generation`` is the only step that ever reads a job's
+    ``intent_summary`` — see ``review.intent_summary.IntentSummaryOutput``'s
+    own docstring). Mirrors ``context_builder_can_produce_value``'s own
+    shape/reasoning exactly, for the symmetric problem: running
+    ``IntentSummaryStep`` while ``review_generation`` is disabled would waste
+    a full LLM call producing an ``intent_summary`` field nothing reads.
+    """
+    return enablement.intent_summary_enabled and enablement.review_generation_enabled
+
+
+def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, str]:
+    """Resolves ``depends_on`` for the five dynamically-wired steps in the
+    one review pipeline this codebase has (``context_builder ->
+    intent_summary -> review_generation -> verification -> output``) —
+    **one small, concrete, hard-coded-to-this-one-chain function, not a
+    general-purpose, arbitrary-chain-length utility** (Assumption 6 of
+    docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section: an
+    earlier draft's generic ``resolve_chain_depends_on(chain: Sequence[str],
+    enabled: Mapping[str, bool])`` utility was correctly flagged as
+    speculative generality this codebase's own architecture.md rejects —
+    exactly one review pipeline exists, so nothing here accepts or expects a
+    different chain).
+
+    Shared by ``check_step_configuration_viable`` (to validate) and
+    ``apps/worker/main.py``'s ``_build_review_registry`` (to wire) so the
+    two can't drift, the same "one definition" reasoning
+    ``static_analysis_can_produce_findings``'s own docstring already gives
+    for a simpler, one-predicate case.
+
+    Pure, no I/O — see ``review/test_config.py`` and
+    docs/adr/0005-pure-no-io-logic-unit-tested.md's own scope list.
+    """
+    sa_can_produce_findings = static_analysis_can_produce_findings(enablement)
+    upstream_of_context_builder = "static_analysis" if sa_can_produce_findings else "prefilter"
+
+    context_builder_effectively_enabled = context_builder_can_produce_value(enablement)
+
+    intent_summary_effectively_enabled = intent_summary_can_produce_value(enablement)
+    intent_summary_depends_on = (
+        "context_builder" if context_builder_effectively_enabled else upstream_of_context_builder
+    )
+
+    upstream_of_review_generation = (
+        "intent_summary" if intent_summary_effectively_enabled else intent_summary_depends_on
+    )
+
+    verification_depends_on = (
+        "review_generation"
+        if enablement.review_generation_enabled
+        else upstream_of_review_generation
+    )
+
+    output_depends_on = (
+        "verification" if enablement.verification_enabled else verification_depends_on
+    )
+
+    return {
+        "context_builder": upstream_of_context_builder,
+        "intent_summary": intent_summary_depends_on,
+        "review_generation": upstream_of_review_generation,
+        "verification": verification_depends_on,
+        "output": output_depends_on,
+    }
 
 
 class NoViableStepConfigurationError(Exception):
@@ -160,8 +275,9 @@ def check_step_configuration_viable(enablement: StepEnablement) -> None:
     split.
 
     Phase 2's own granularity: a review can only ever be produced if
-    static-analysis or llm-review — the two finding-producing macro steps
-    — is enabled; pre-filter and output produce no findings of their own.
+    static-analysis or review-generation — the two finding-producing macro
+    steps — is enabled; pre-filter and output produce no findings of their
+    own.
     **Refined in Phase 5** now that the static-analysis step's own two
     analyzer sub-flags exist: a configuration with ``static_analysis_enabled``
     set but *both* analyzers individually disabled is, for this predicate's
@@ -171,13 +287,13 @@ def check_step_configuration_viable(enablement: StepEnablement) -> None:
     possible" leg of this predicate's ``or``.
     """
     sa_can_produce_findings = static_analysis_can_produce_findings(enablement)
-    if not sa_can_produce_findings and not enablement.llm_review_enabled:
+    if not sa_can_produce_findings and not enablement.review_generation_enabled:
         raise NoViableStepConfigurationError(
             "no enabled step can produce a review: static-analysis (or both its analyzer "
-            "sub-steps) and llm-review are all disabled"
+            "sub-steps) and review-generation are all disabled"
         )
     # StaticAnalysisStep (review/static_analysis.py) declares a fixed
-    # depends_on=("prefilter",) — unlike llm_review/output, it has no
+    # depends_on=("prefilter",) — unlike review_generation/output, it has no
     # constructor parameter letting the composition root re-point it at a
     # different upstream step when prefilter is disabled. Disabling
     # prefilter while static_analysis stays enabled therefore wires a step
@@ -191,23 +307,20 @@ def check_step_configuration_viable(enablement: StepEnablement) -> None:
             "fixed dependency on prefilter's output, so this configuration would fail every "
             "review job at runtime"
         )
-    # apps/worker/main.py wires LLMReviewStep to depend directly on
+    # apps/worker/main.py wires ReviewGenerationStep to depend directly on
     # "prefilter" whenever static-analysis can't itself produce findings
     # (mirroring StaticAnalysisStep's own fixed dependency above) — so the
     # same fail-fast rule applies transitively: prefilter disabled while
-    # llm-review is enabled and static-analysis can't produce findings
-    # would also fail every review job at runtime.
-    if (
-        enablement.llm_review_enabled
-        and not sa_can_produce_findings
-        and not enablement.prefilter_enabled
-    ):
-        raise NoViableStepConfigurationError(
-            "llm-review is enabled but prefilter is disabled and static-analysis cannot "
-            "produce findings: llm_review falls back to depending directly on prefilter's "
-            "output in that case, so this configuration would fail every review job at "
-            "runtime"
-        )
+    # review-generation is enabled and static-analysis can't produce
+    # findings would also fail every review job at runtime. Not a
+    # hand-written check here (it used to be — dropped once genuinely
+    # subsumed): the generic loop below, driven by
+    # ``resolve_review_pipeline_depends_on``, already catches exactly this
+    # combination (``review_generation``/``context_builder``/
+    # ``intent_summary`` all effectively resolve back to a disabled
+    # ``prefilter``) — keeping a second, hand-written copy of the same rule
+    # risked the two silently diverging if the resolver's own fallback logic
+    # ever changed without a matching edit here.
     # The registered `terminal_step` ("output") is the only step that ever
     # posts a review/check-run to GitHub — review.pipeline.StepRegistry
     # treats a disabled step as a silent skip, not a failure, so disabling
@@ -218,3 +331,32 @@ def check_step_configuration_viable(enablement: StepEnablement) -> None:
             "output is disabled: no review or check-run would ever be posted, and nothing "
             "would signal that at runtime — every job would silently produce no visible result"
         )
+    # Added in Phase 5 (docs/plans/plan-deliver-verification-pipeline.md): a
+    # strict superset of the remaining hand-written `static_analysis`/
+    # `prefilter` check above, now covering all five dynamically-wired steps
+    # uniformly via the one shared resolver both this check and
+    # `apps/worker/main.py`'s own wiring use. The one hand-written check this
+    # loop fully subsumed (the `review_generation`-falls-back-to-`prefilter`
+    # case) was removed rather than kept as a second, hand-maintained copy of
+    # the same rule — see the comment above the `output_enabled` check. The
+    # `static_analysis`-depends-on-`prefilter` check above stays hand-written
+    # because `static_analysis` isn't one of this loop's five dynamically-
+    # wired steps (its `depends_on` is fixed, not resolved). Catches, e.g.,
+    # `verification` enabled while `review_generation` is disabled
+    # (verification would depend on a step that never runs).
+    resolved_depends_on = resolve_review_pipeline_depends_on(enablement)
+    effectively_enabled: dict[str, bool] = {
+        "prefilter": enablement.prefilter_enabled,
+        "static_analysis": sa_can_produce_findings,
+        "context_builder": context_builder_can_produce_value(enablement),
+        "intent_summary": intent_summary_can_produce_value(enablement),
+        "review_generation": enablement.review_generation_enabled,
+        "verification": enablement.verification_enabled,
+        "output": enablement.output_enabled,
+    }
+    for step_name, target_name in resolved_depends_on.items():
+        if effectively_enabled[step_name] and not effectively_enabled[target_name]:
+            raise NoViableStepConfigurationError(
+                f"{step_name} is enabled but its resolved dependency {target_name!r} is not "
+                "— this configuration would fail every review job at runtime"
+            )

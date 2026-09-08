@@ -310,7 +310,7 @@ class StaticAnalysisStep:
         too. A redaction failure is fatal for this macro step.
 
         The redact-fan-out-and-log mechanics (previously duplicated
-        byte-for-byte in ``review/llm_review.py``'s own ``_redact_all``) now
+        byte-for-byte in ``review/review_generation.py``'s own ``_redact_all``) now
         live once in ``findings.redact.redact_findings`` — see that
         function's own docstring.
         """

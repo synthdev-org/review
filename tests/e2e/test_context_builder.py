@@ -18,7 +18,8 @@ real, platform-rendered citation referencing the real caller.
 2. A ``pull_request`` ``opened`` webhook, whose diff modifies
    ``helper.ts``'s body (base = ``_INDEX_COMMIT_SHA``, head =
    ``_HEAD_SHA``), drives the real review pipeline: prefilter ->
-   static_analysis -> context_builder -> llm_review -> output.
+   static_analysis -> context_builder -> intent_summary ->
+   review_generation -> verification -> output.
    ``context_builder`` resolves the changed ``helper`` symbol, queries the
    default-branch graph, finds ``caller``'s real one-hop call edge, and
    assembles a non-empty ``ContextBundle`` whose first item (id ``0``) is
@@ -264,14 +265,26 @@ def stub_github_server() -> Iterator[HTTPServer]:
 
 # ---------------------------------------------------------------------------
 # Stub LLM Gateway — self-contained to this file (mirrors
-# tests/e2e/test_review_pipeline.py's own `_StubLLMHandler`), always
-# answering with one canned finding whose `context_ref_ids: [0]` names the
-# context bundle's own first item — the real caller hit this scenario's
-# whole point is to prove reaches a posted citation.
+# tests/e2e/test_review_pipeline.py's own `_StubLLMHandler`). A single review
+# job now makes up to three calls to this endpoint, in a fixed order —
+# `intent_summary`, then `review_generation`, then `verification` — each
+# expecting a differently-shaped response (plain text; `{"findings": [...]}`;
+# `{"verdicts": [...]}`, respectively). This handler routes by the
+# per-server `call_count` position, same as `test_review_pipeline.py`'s own
+# `_StubLLMHandler`, rather than answering every call with the same
+# `{"findings": [...]}` body regardless of which step made it — the latter
+# broke `verification`'s own response parsing once this plan added it as a
+# third call on the same endpoint. `review_generation`'s canned finding
+# (call 2) still carries `context_ref_ids: [0]` naming the context bundle's
+# own first item — the real caller hit this scenario's whole point is to
+# prove reaches a posted citation — and `verification`'s canned verdict
+# (call 3) passes that one finding on all four criteria so it survives to
+# the posted review.
 # ---------------------------------------------------------------------------
 
 
 class _StubLLMHandler(BaseHTTPRequestHandler):
+    _INTENT_SUMMARY_CONTENT = "This PR changes a function's return value."
     _FINDINGS_CONTENT = json.dumps(
         {
             "findings": [
@@ -285,11 +298,29 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             ]
         }
     )
+    _VERDICT_VERIFIED_CONTENT = json.dumps(
+        {
+            "verdicts": [
+                {"index": 0, "valid": True, "actionable": True, "specific": True, "valuable": True}
+            ]
+        }
+    )
 
     def log_message(self, format: str, *args: object) -> None:
         pass
 
+    def _content_for_call(self, call_number: int) -> str:
+        """1 = `intent_summary`, 2 = `review_generation`, 3 = `verification`."""
+        if call_number <= 1:
+            return self._INTENT_SUMMARY_CONTENT
+        if call_number == 2:
+            return self._FINDINGS_CONTENT
+        return self._VERDICT_VERIFIED_CONTENT
+
     def do_POST(self) -> None:
+        call_number = getattr(self.server, "call_count", 0) + 1
+        self.server.call_count = call_number  # type: ignore[attr-defined]
+
         body = json.dumps(
             {
                 "id": "chatcmpl-e2e-context-builder-stub",
@@ -299,7 +330,10 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": self._FINDINGS_CONTENT},
+                        "message": {
+                            "role": "assistant",
+                            "content": self._content_for_call(call_number),
+                        },
                         "finish_reason": "stop",
                     }
                 ],
@@ -315,6 +349,7 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
 @pytest.fixture(scope="module")
 def stub_llm_review_server() -> Iterator[HTTPServer]:
     server = HTTPServer(("0.0.0.0", STUB_LLM_REVIEW_PORT), _StubLLMHandler)
+    server.call_count = 0  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -499,9 +534,19 @@ def test_pr_modifying_a_called_function_posts_a_finding_with_a_real_citation(
     dsn = _dsn(running_stack)
     _wait_for_indexed(dsn, repo_full_name=_OWNER_REPO)
 
+    # Resets the stub LLM Gateway's call-position counter to 0 — the
+    # Worker's own one-time startup LLM-reachability check
+    # (`llmgateway/startup_check.py`) already fired once when `running_stack`
+    # first came up, consuming call 1 before this test's own PR-triggered
+    # job makes any call; without this reset, `_StubLLMHandler`'s
+    # call-position routing (1 = `intent_summary`, 2 = `review_generation`,
+    # 3 = `verification`) would be off by one for the job below. Mirrors
+    # `tests/e2e/test_review_pipeline.py`'s own `_reset_llm_scenario`.
+    stub_llm_review_server.call_count = 0  # type: ignore[attr-defined]
+
     # 2. A PR that changes `helper`'s body — the review pipeline's own
     #    context_builder step should find `caller`'s real one-hop edge and
-    #    hand it to llm_review; the stub LLM Gateway's canned finding then
+    #    hand it to review_generation; the stub LLM Gateway's canned finding then
     #    cites it back via `context_ref_ids: [0]`.
     pr_status = _post_webhook(
         running_stack, body=_pull_request_payload(), event_type="pull_request"

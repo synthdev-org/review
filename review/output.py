@@ -126,8 +126,8 @@ class FindingsPublisher(Protocol):
 
 class FindingsOutputInput(BaseModel):
     """This step's own ``input`` on the happy path — mirrors
-    ``review.llm_review.LLMReviewOutput``'s field shape without importing
-    it, the same "Import boundary" pattern every downstream step in this
+    ``review.verification.VerificationOutput``'s field shape without
+    importing it, the same "Import boundary" pattern every downstream step in this
     plan already follows for its own upstream dependency (per US-F1;
     ``review/test_step_boundaries.py``).
 
@@ -152,7 +152,7 @@ class FindingsOutputInput(BaseModel):
     pr_number: int
     head_sha: str
     # Added by docs/plans/plan-deliver-context-builder.md's Phase 6 section
-    # (US6) — forwarded from `review.llm_review.LLMReviewOutput`'s own new
+    # (US6) — forwarded from `review.verification.VerificationOutput`'s own new
     # field the same way every other field here already mirrors that
     # step's output. `None` (the default, matching every non-context-builder
     # upstream shape — `StaticAnalysisOutput`, `PrefilterOutput`, and the
@@ -187,35 +187,39 @@ class FindingsOutputStep:
 
     name = "output"
 
-    def __init__(self, publisher: FindingsPublisher, *, depends_on: str = "llm_review") -> None:
+    def __init__(self, publisher: FindingsPublisher, *, depends_on: str = "verification") -> None:
         """``depends_on`` names this step's single upstream dependency —
-        ``"llm_review"`` by default (the ordinary, both-steps-enabled case),
-        or ``"static_analysis"`` when the composition root
-        (``apps/worker/main.py``) determines ``llm_review`` is disabled.
+        ``"verification"`` by default (the ordinary, all-steps-enabled case),
+        or a fallback further up the chain (``"review_generation"``,
+        ``"context_builder"``, ``"static_analysis"``, ...) when the
+        composition root (``apps/worker/main.py``) determines a later step
+        is disabled.
 
         **Why this is a constructor parameter, not a fixed class attribute
         (a bug this plan's own review caught):** ``review.pipeline.StepRegistry``
         resolves each step's ``input`` from exactly its declared dependency's
         output (``_resolve_input``); a disabled step never produces one. With
-        a fixed ``depends_on=("llm_review",)``, disabling ``llm_review`` — a
-        configuration this phase's own "Rollback" section documents as a
-        supported fallback to static-analysis-only output — left this step
-        with no satisfiable dependency, and the registry's own generic
-        "no defined behavior for that combination" ``RuntimeError`` propagated
-        as an unhandled exception, bypassing the terminal-step failure-signal
-        mechanism (Phase 7's own "always produce a GitHub-visible signal"
-        goal) entirely. The composition root, which already knows
-        ``StepEnablement.llm_review_enabled`` before it builds this registry,
-        instead passes the one upstream step actually guaranteed to run —
+        a fixed ``depends_on=("llm_review",)`` (this step's original,
+        pre-Phase-3 name for what is now ``review_generation``), disabling
+        that step — a configuration this phase's own "Rollback" section
+        documents as a supported fallback to static-analysis-only output —
+        left this step with no satisfiable dependency, and the registry's own
+        generic "no defined behavior for that combination" ``RuntimeError``
+        propagated as an unhandled exception, bypassing the terminal-step
+        failure-signal mechanism (Phase 7's own "always produce a
+        GitHub-visible signal" goal) entirely. The composition root, which
+        already knows every step's enablement flag before it builds this
+        registry, instead passes the one upstream step actually guaranteed to
+        run — ``resolve_review_pipeline_depends_on``/
         ``check_step_configuration_viable`` (``review/config.py``) already
-        proves ``static_analysis`` can produce findings whenever
-        ``llm_review`` is disabled, so this is never ambiguous.
-        ``LLMReviewOutput`` and ``StaticAnalysisOutput`` share the same
-        `from_attributes`-readable field shape `FindingsOutputInput` needs
-        (both carry `findings`/`org_id`/`repo_id`/`installation_id`/
-        `repo_full_name`/`pr_number`/`head_sha`), so no change to this
-        step's own input handling is needed — only which step's output it
-        reads.
+        prove ``static_analysis`` can produce findings whenever every later
+        step is disabled, so this is never ambiguous.
+        ``VerificationOutput``, ``ReviewGenerationOutput``, and
+        ``StaticAnalysisOutput`` share the same `from_attributes`-readable
+        field shape `FindingsOutputInput` needs (all carry
+        `findings`/`org_id`/`repo_id`/`installation_id`/`repo_full_name`/
+        `pr_number`/`head_sha`), so no change to this step's own input
+        handling is needed — only which step's output it reads.
         """
         self._publisher = publisher
         self.depends_on: tuple[str, ...] = (depends_on,)

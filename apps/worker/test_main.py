@@ -41,6 +41,7 @@ import socket
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -635,39 +636,58 @@ async def test_all_four_context_builder_enablement_combinations_complete_success
     )
 
     context_builder_step = registry._by_name["context_builder"]
-    llm_review_step = registry._by_name["llm_review"]
+    intent_summary_step = registry._by_name["intent_summary"]
+    review_generation_step = registry._by_name["review_generation"]
+    verification_step = registry._by_name["verification"]
     assert context_builder_step.depends_on == (expected_context_builder_depends_on,)
-    expected_llm_review_depends_on = (
+    # `intent_summary_enabled`/`review_generation_enabled` are both at their
+    # default (`True`) in this parametrization, so `intent_summary` is
+    # always effectively enabled — it inherits exactly the same
+    # `context_builder`-or-fallback rule `review_generation` used to have
+    # directly, one link earlier in the chain.
+    expected_intent_summary_depends_on = (
         "context_builder" if context_builder_enabled else expected_context_builder_depends_on
     )
-    assert llm_review_step.depends_on == (expected_llm_review_depends_on,)
+    assert intent_summary_step.depends_on == (expected_intent_summary_depends_on,)
+    # `review_generation` always depends on `intent_summary` here, since
+    # `intent_summary` is always effectively enabled in this parametrization
+    # regardless of `context_builder_enabled`/`sa_can_produce_findings`.
+    assert review_generation_step.depends_on == ("intent_summary",)
+    assert verification_step.depends_on == ("review_generation",)
 
     statuses = await _run_review_registry(registry)
 
     assert statuses["output"] == "success"
-    assert statuses["llm_review"] == "success"
+    assert statuses["intent_summary"] == "success"
+    assert statuses["review_generation"] == "success"
+    assert statuses["verification"] == "success"
     assert statuses["context_builder"] == ("success" if context_builder_enabled else "disabled")
 
 
 @pytest.mark.asyncio
-async def test_context_builder_enabled_but_llm_review_disabled_skips_context_builder(
+async def test_context_builder_enabled_but_review_generation_disabled_skips_context_builder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`review.config.context_builder_can_produce_value`'s own regression
     case: `context_builder_enabled=True`'s raw flag default must not be
     enough to actually run the step when its one real consumer,
-    `llm_review`, is disabled — running it anyway would pay the full
+    `review_generation`, is disabled — running it anyway would pay the full
     diff/tree/graph/embedding cost for a `ContextBundle` nothing reads.
+    `intent_summary` (`review.config.intent_summary_can_produce_value`'s own
+    identical case) is skipped for the same reason. `verification` still
+    runs — its own enablement is not gated by `review_generation_enabled` —
+    falling back all the way to `static_analysis`'s output.
     `static_analysis_gitleaks_enabled=True` keeps this a viable
-    configuration (`llm_review_enabled=False` alone would otherwise trip
-    `review.config.check_step_configuration_viable`'s own fail-fast rule)."""
+    configuration (`review_generation_enabled=False` alone would otherwise
+    trip `review.config.check_step_configuration_viable`'s own fail-fast
+    rule)."""
     monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
     monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
     settings = _wiring_test_settings(monkeypatch)
 
     enablement = StepEnablement(
         context_builder_enabled=True,
-        llm_review_enabled=False,
+        review_generation_enabled=False,
         static_analysis_gitleaks_enabled=True,
         static_analysis_semgrep_enabled=True,
     )
@@ -690,18 +710,22 @@ async def test_context_builder_enabled_but_llm_review_disabled_skips_context_bui
     statuses = await _run_review_registry(registry)
 
     assert statuses["context_builder"] == "disabled"
-    assert statuses["llm_review"] == "disabled"
+    assert statuses["intent_summary"] == "disabled"
+    assert statuses["review_generation"] == "disabled"
+    assert statuses["verification"] == "success"
     assert statuses["output"] == "success"
 
 
 @pytest.mark.asyncio
-async def test_context_builder_disabled_produces_byte_for_byte_phase_1_llm_review_input(
+async def test_context_builder_disabled_produces_byte_for_byte_phase_1_review_generation_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`context_builder_enabled=False` regression case: `llm_review` falls
-    back to depending directly on `static_analysis` (Phase 1's own default),
-    and the completion request it sends carries no context-bundle section —
-    byte-for-byte the same prompt Phase 1 always produced."""
+    """`context_builder_enabled=False` regression case: `review_generation`'s
+    own completion request carries no context-bundle section — byte-for-byte
+    the same prompt Phase 1/2 always produced — even though it now depends
+    on `intent_summary` rather than directly on `static_analysis` (that
+    link's own `depends_on` fallback, one step earlier in the chain, is what
+    changed by this phase)."""
     monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
     monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
     settings = _wiring_test_settings(monkeypatch)
@@ -732,13 +756,186 @@ async def test_context_builder_disabled_produces_byte_for_byte_phase_1_llm_revie
         settings,
     )
 
-    llm_review_step = registry._by_name["llm_review"]
-    assert llm_review_step.depends_on == ("static_analysis",)
+    intent_summary_step = registry._by_name["intent_summary"]
+    review_generation_step = registry._by_name["review_generation"]
+    assert intent_summary_step.depends_on == ("static_analysis",)
+    assert review_generation_step.depends_on == ("intent_summary",)
 
     statuses = await _run_review_registry(registry)
     assert statuses["output"] == "success"
     assert statuses["context_builder"] == "disabled"
 
-    assert len(captured_requests) == 1
-    user_message = captured_requests[0].messages[-1].content
+    # `_RecordingLLMClient` is shared across `intent_summary`/
+    # `review_generation`/`verification` (mirroring the real composition
+    # root's own single-`llm_client` wiring) — `review_generation`'s own
+    # request is the one whose user message names the static-findings
+    # section only `_build_user_message` (review/review_generation.py)
+    # builds, distinguishing it from `intent_summary`'s bare-diff prompt.
+    review_generation_requests = [
+        request
+        for request in captured_requests
+        if "Static-analysis findings" in request.messages[-1].content
+    ]
+    assert len(review_generation_requests) == 1
+    user_message = review_generation_requests[0].messages[-1].content
     assert "Related code in this repository" not in user_message
+
+
+# --- Phase 5 (verification pipeline plan): deprecated settings env vars ----
+#
+# `_check_deprecated_settings_env_vars` (Assumption 7/8 of
+# docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section) — an
+# operator's own, externally-owned deployment config still setting one of
+# the renamed `llm_review_*` names must get a one-time `warning`, not a
+# silent no-op, and the Worker must still start successfully either way.
+
+
+def _deprecated_warning_payloads(payloads: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        p
+        for p in payloads
+        if p["message"] == "deprecated setting name is still set and no longer has any effect"
+    ]
+
+
+def test_deprecated_llm_review_enabled_env_var_warns_and_worker_still_starts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "true")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()  # must not raise SystemExit
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    matching = _deprecated_warning_payloads(payloads)
+    assert len(matching) == 1
+    assert matching[0]["deprecated_name"] == "REVIEW_WORKER_LLM_REVIEW_ENABLED"
+    assert matching[0]["current_name"] == "REVIEW_WORKER_REVIEW_GENERATION_ENABLED"
+    assert matching[0]["level"] == "WARNING"
+    assert any(p["message"] == "worker started" for p in payloads)
+
+
+def test_deprecated_timeout_env_var_set_only_via_dotenv_file_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Proves the `.env`-file path is actually read, not just `os.environ` —
+    the deprecated name is set only in a `.env` file at the (monkeypatched)
+    current working directory, never via `monkeypatch.setenv`."""
+    (tmp_path / ".env").write_text("REVIEW_WORKER_LLM_REVIEW_STEP_TIMEOUT_SECONDS=45\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.delenv("REVIEW_WORKER_LLM_REVIEW_STEP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()  # must not raise SystemExit
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    matching = _deprecated_warning_payloads(payloads)
+    assert len(matching) == 1
+    assert matching[0]["deprecated_name"] == "REVIEW_WORKER_LLM_REVIEW_STEP_TIMEOUT_SECONDS"
+    assert matching[0]["current_name"] == "REVIEW_WORKER_REVIEW_GENERATION_STEP_TIMEOUT_SECONDS"
+    assert any(p["message"] == "worker started" for p in payloads)
+
+
+def test_deprecated_env_var_detected_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("review_worker_llm_review_enabled", "true")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()  # must not raise SystemExit
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    matching = _deprecated_warning_payloads(payloads)
+    assert len(matching) == 1
+    assert matching[0]["deprecated_name"] == "REVIEW_WORKER_LLM_REVIEW_ENABLED"
+    assert any(p["message"] == "worker started" for p in payloads)
+
+
+def test_no_deprecated_env_vars_set_logs_no_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    assert _deprecated_warning_payloads(payloads) == []
+
+
+# --- Phase 5 (verification pipeline plan): verification_enabled=False ------
+#
+# Mirrors the existing `secret_redaction_enabled=False` test case above
+# exactly, per US-V9's second scenario.
+
+
+def test_verification_disabled_logs_warning_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_VERIFICATION_ENABLED", "false")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    matching = [
+        p
+        for p in payloads
+        if p["message"]
+        == "verification is disabled: unverified LLM findings will be posted directly"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["level"] == "WARNING"
+
+
+def test_verification_default_enabled_logs_no_disabled_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    assert not [p for p in payloads if "verification is disabled" in p["message"]]
+
+
+# --- Phase 5 (verification pipeline plan): resolved depends_on in startup log
+
+
+def test_step_configuration_valid_log_includes_resolved_depends_on(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    matching = [p for p in payloads if p["message"] == "step configuration valid"]
+    assert len(matching) == 1
+    assert matching[0]["review_pipeline_depends_on"] == {
+        "context_builder": "static_analysis",
+        "intent_summary": "context_builder",
+        "review_generation": "intent_summary",
+        "verification": "review_generation",
+        "output": "verification",
+    }

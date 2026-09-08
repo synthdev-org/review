@@ -10,7 +10,7 @@ analysis finding and an LLM finding both flagging the same defect on the
 same line rarely word it identically, so an exact string match alone would
 under-merge. The **first** occurrence in `findings` order wins (its own
 `Finding` object is kept, later duplicates dropped) — since
-`review.llm_review.LLMReviewOutput.findings` always lists static-analysis
+`review.review_generation.ReviewGenerationOutput.findings` always lists static-analysis
 findings before LLM-sourced ones (see that module's own docstring), this
 means a static-analysis finding is preferred over an LLM-sourced duplicate
 of it wherever both fire on the same defect, per the PRD's own "deterministic
@@ -38,7 +38,7 @@ from difflib import SequenceMatcher
 
 from pydantic import BaseModel, ConfigDict
 
-from findings.models import Finding
+from findings.models import SEVERITY_RANK, Finding
 
 # After dedupe, findings beyond this ceiling are dropped entirely — never
 # posted. See this module's own docstring for the full reasoning.
@@ -128,6 +128,20 @@ def merge_findings(findings: Sequence[Finding]) -> MergeResult:
     if len(deduped) <= POSTED_FINDINGS_CEILING:
         return MergeResult(findings=deduped, dropped_by_ceiling_count=0)
 
-    kept = deduped[:POSTED_FINDINGS_CEILING]
+    # US-V8: once the ceiling actually truncates, order survivors by
+    # severity first, then source-trust (non-"llm" — i.e. static-analysis —
+    # ahead of "llm" at equal severity; by the time a finding reaches here,
+    # any "llm"-sourced one has already survived verification, or
+    # verification was disabled entirely, so `source` alone is a
+    # well-defined trust signal either way). `sorted()` is stable, so
+    # original relative order is preserved as the final tiebreak for free.
+    ordered = sorted(
+        deduped,
+        key=lambda finding: (
+            SEVERITY_RANK[finding.severity],
+            0 if finding.source != "llm" else 1,
+        ),
+    )
+    kept = ordered[:POSTED_FINDINGS_CEILING]
     dropped_count = len(deduped) - POSTED_FINDINGS_CEILING
     return MergeResult(findings=kept, dropped_by_ceiling_count=dropped_count)

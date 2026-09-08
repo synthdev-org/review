@@ -23,7 +23,7 @@ returns ``tuple[indexing.chunk.Chunk, ...]`` and takes an
 ``indexing.embedding.EmbeddingVector`` as its query vector, so this module
 does import both directly — the same ordinary cross-bounded-context shape
 ``review/context_symbols.py`` already has on ``indexing.chunk``/
-``indexing.tree``, and ``review/llm_review.py`` has on ``llmgateway.models``,
+``indexing.tree``, and ``review/review_generation.py`` has on ``llmgateway.models``,
 per Assumption 4's own reasoning. Not a violation of architecture.md: both
 ``indexing`` and ``review`` are domain packages, and one importing another's
 pure, zero-infra-import types is the ordinary shape, not a boundary
@@ -90,6 +90,7 @@ from review.context_bundle import (
     serialized_item_size,
 )
 from review.context_symbols import fetch_diff_content, resolve_changed_symbols
+from review.diff_prompt import render_diff
 from review.step import JobIdentity, Step, StepContext
 
 logger = logging.getLogger(__name__)
@@ -216,7 +217,7 @@ class SimilarityQuery(Protocol):
 class _ContextBuilderInput(JobIdentity):
     """Mirrors ``review.static_analysis.StaticAnalysisOutput``'s own field
     shape without importing it — the same "Import boundary" pattern
-    ``review.llm_review._LLMReviewInput`` already established for the
+    ``review.review_generation._ReviewGenerationInput`` already established for the
     identical situation. ``from_attributes=True`` lets ``model_validate``
     read this shape off *any* object with matching attributes, including
     the real ``StaticAnalysisOutput``/``PrefilterOutput`` instance the
@@ -231,14 +232,14 @@ class _ContextBuilderInput(JobIdentity):
     # `review.prefilter.PrefilterOutput` (which carries no `findings` of its
     # own) when the composition root wires `depends_on="prefilter"` because
     # `static_analysis` can't produce findings — mirroring
-    # `review.llm_review._LLMReviewInput`'s identical fallback.
+    # `review.review_generation._ReviewGenerationInput`'s identical fallback.
     findings: list[Finding] = Field(default_factory=list)
 
 
 class ContextBuilderOutput(JobIdentity):
     """This step's own output: the diff and findings, forwarded unchanged
     (this step adds no findings of its own — it only retrieves context for
-    ``llm_review``, this step's own downstream dependency, to consume),
+    ``review_generation``, this step's own downstream dependency, to consume),
     plus the newly-assembled ``context_bundle``.
 
     ``base_sha`` is explicitly forwarded at construction (Assumption 2's
@@ -256,22 +257,16 @@ class ContextBuilderOutput(JobIdentity):
 
 def _diff_byte_size(diff: Diff) -> int:
     """The bare-diff byte size Non-Functional Requirements' proportional
-    context budget is stated against — deliberately **not** imported from
-    ``review.llm_review._render_diff`` (that would be exactly the
-    step-to-step import US-F1 forbids, per this module's own docstring);
-    a small, independent re-implementation of the same "per-file header
-    plus patch text" shape instead, since the two moduless only need to
-    agree closely enough to produce a *reasonable* proportional budget, not
-    a byte-identical one — ``llm_review`` may independently truncate its
-    own rendering, and this function's result is only ever an input to
-    ``assemble_context_bundle``'s own ``min(diff_byte_size, max_total_bytes)``
-    clamp, never compared against ``llm_review``'s own byte count directly.
+    context budget is stated against — computed via
+    ``review.diff_prompt.render_diff``, the same rendering every LLM-calling
+    step uses to build its own diff prompt section. ``diff_prompt`` is a
+    shared framework helper, not a sibling step module (see
+    ``review/test_step_boundaries.py``'s ``_FRAMEWORK_MODULES``), so calling
+    it here is not a US-F1 step-to-step import; it also keeps this budget
+    figure from silently drifting out of sync with a future change to
+    ``render_diff``'s per-file header format.
     """
-    total = 0
-    for file in diff.files:
-        patch = file.patch if file.patch is not None else "(no patch available)"
-        total += len(f"--- {file.path} ({file.status})\n{patch}".encode())
-    return total
+    return len(render_diff(diff).encode())
 
 
 class ContextBuilderStep:
@@ -331,7 +326,7 @@ class ContextBuilderStep:
         ``"static_analysis"`` by default (the ordinary, both-steps-enabled
         case), or ``"prefilter"`` when the composition root
         (``apps/worker/main.py``) determines ``static_analysis`` can never
-        produce findings — mirroring ``review.llm_review.LLMReviewStep``'s
+        produce findings — mirroring ``review.review_generation.ReviewGenerationStep``'s
         own identical constructor-parameter fix for the identical problem
         (see that class's own docstring for the full "why this is a
         constructor parameter, not a fixed class attribute" reasoning).

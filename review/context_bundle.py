@@ -5,7 +5,7 @@ docs/specs/spec-context-builder.md's US9.
 
 Combines Phase 2's blast-radius caller hits and Phase 3's semantic-similarity
 matches into one ordered, ID-indexed ``ContextBundle`` — the shape Phase 5's
-``ContextBuilderStep`` forwards to ``llm_review`` and Phase 6's citation
+``ContextBuilderStep`` forwards to ``review_generation`` and Phase 6's citation
 rendering references by integer ID — under two independent budget layers,
 mirroring ``indexing/pipeline.py``'s own ``_apply_cost_ceilings`` shape:
 
@@ -74,6 +74,7 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict
 
 from indexing.chunk import Chunk
+from review.diff_prompt import INERT_REFERENCE_DATA_FRAMING
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +217,7 @@ def _serialized_size(
 ) -> int:
     """The UTF-8 byte size of one item's JSON-serialized form — the same
     ``json.dumps(...).encode("utf-8")`` convention
-    ``review/llm_review.py``'s own ``_render_static_findings_context``
+    ``review/review_generation.py``'s own ``_render_static_findings_context``
     already uses for rendering structured context into the prompt, applied
     here per-item so this module's budget enforcement measures the same
     unit of "bytes actually added to the prompt" that ``diff_byte_size`` and
@@ -233,6 +234,43 @@ def _serialized_size(
         "line_range": list(line_range) if line_range is not None else None,
     }
     return len(json.dumps(payload).encode("utf-8"))
+
+
+def render_context_bundle_section(context_bundle: ContextBundle | None) -> str:
+    """Renders the "Related code in this repository" prompt section from a
+    non-empty ``context_bundle`` — a clearly-labeled, distinguishable
+    section, never merged into the diff text as if the retrieved code were
+    part of the PR's own changes. Returns the empty string for ``None`` or
+    an empty bundle, so a caller's own prompt-builder produces byte-for-byte
+    the same prompt as when no bundle is available (the context-bundle
+    section's own established backwards-compatibility requirement).
+
+    Public (moved here from ``review/review_generation.py``'s former
+    private ``_render_context_bundle_section``, per
+    docs/plans/plan-deliver-verification-pipeline.md's Phase 2 Assumption 3)
+    — this module already owns ``ContextBundle``/``ContextBundleItem``, the
+    data this function renders, and it now has two real consumers
+    (``review.review_generation``, ``review.verification``).
+
+    **Prefaced with an explicit instruction that this content is inert
+    reference data, never a set of instructions to follow** — cheap
+    defense-in-depth against arbitrary existing repo content reaching an LLM
+    prompt: every item's ``content`` is real source code already present in
+    the customer's own repo (never PR-supplied), but nothing about *how* it
+    reached the index guarantees it can't itself contain text shaped like an
+    instruction.
+    """
+    if context_bundle is None or not context_bundle.items:
+        return ""
+
+    items_json = json.dumps(
+        [item.model_dump(mode="json") for item in context_bundle.items],
+    )
+    return (
+        "\n\nRelated code in this repository (context, retrieved from this repo's own "
+        f"index — {INERT_REFERENCE_DATA_FRAMING}):\n"
+        f"{items_json}"
+    )
 
 
 def serialized_item_size(item: ContextBundleItem) -> int:

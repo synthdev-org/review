@@ -5,7 +5,7 @@
 at its first consumer, per ``docs/adr/0006-protocol-defined-at-data-model.md``:**
 ``ingestion/diff.py`` isn't itself one of ``DiffFetcher``'s consumers
 (``review/prefilter.py`` this phase; ``review/static_analysis.py`` and
-``review/llm_review.py`` in later phases are) — it's the package that owns
+``review/review_generation.py`` in later phases are) — it's the package that owns
 the ``Diff`` model every consumer receives, mirroring how ``findings/models.py``
 owns ``Finding`` for every consumer that produces or reads one. See that
 ADR for the general rule this instance follows.

@@ -14,7 +14,7 @@ item's underlying ``ContextBundleItem.content`` (the chunk's real source
 text).** This is a deliberate scope boundary, not an oversight:
 ``review.output.FindingsOutputStep`` posts citation text *after*
 ``findings.redact.TextRedactor`` has already run (upstream, inside
-``review/llm_review.py``/``review/static_analysis.py``, per that module's
+``review/review_generation.py``/``review/static_analysis.py``, per that module's
 own docstring) — a citation that echoed raw chunk content would bypass
 redaction entirely and could post an unrelated file's real source
 (potentially containing a secret nobody flagged for removal) verbatim into

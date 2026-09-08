@@ -47,6 +47,21 @@ _REVIEW_PACKAGE_DIR = Path(__file__).parent
 # `Step` implementation of its own, so it's excluded from the scan the same
 # way `context_symbols`/`context_bundle` are, not a sibling macro-step
 # module `output.py`'s own import of it would otherwise (falsely) trip.
+#
+# `diff_prompt` (added by
+# docs/plans/plan-deliver-verification-pipeline.md's Phase 1 section,
+# Assumption 2) holds `render_diff`/`truncate_diff_text`, shared by every
+# step module that builds an LLM prompt from a job's bare diff
+# (`intent_summary`, `review_generation`, `verification`) — the same
+# "internal helper module, no `Step` implementation of its own" shape as
+# `context_symbols`/`context_bundle`/`citation` above, excluded here for
+# the identical reason.
+#
+# `llm_response` holds `parse_llm_json_envelope`, shared by every step
+# module that parses a batched LLM completion response against a fixed
+# JSON envelope schema (`review_generation`, `verification`) — the same
+# "internal helper module, no `Step` implementation of its own" shape as
+# `diff_prompt` immediately above, excluded here for the identical reason.
 _FRAMEWORK_MODULES = frozenset(
     {
         "__init__",
@@ -56,6 +71,8 @@ _FRAMEWORK_MODULES = frozenset(
         "context_symbols",
         "context_bundle",
         "citation",
+        "diff_prompt",
+        "llm_response",
     }
 )
 

@@ -102,30 +102,63 @@ def test_step_enablement_and_timeout_fields_default_per_the_plan(
 
     assert settings.prefilter_enabled is True
     assert settings.static_analysis_enabled is True
-    assert settings.llm_review_enabled is True
+    assert settings.review_generation_enabled is True
     assert settings.output_enabled is True
     assert settings.prefilter_step_timeout_seconds == 30
     assert settings.static_analysis_step_timeout_seconds == 240
     assert settings.static_analysis_analyzer_timeout_seconds == 60
-    assert settings.llm_review_step_timeout_seconds == 90
+    assert settings.review_generation_step_timeout_seconds == 90
     assert settings.output_step_timeout_seconds == 30
 
 
 def test_individual_step_flags_are_overridable_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
     monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "false")
-    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_STEP_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("REVIEW_WORKER_REVIEW_GENERATION_STEP_TIMEOUT_SECONDS", "45")
 
     settings = WorkerSettings(_env_file=None)
 
     assert settings.static_analysis_enabled is False
-    assert settings.llm_review_step_timeout_seconds == 45
+    assert settings.review_generation_step_timeout_seconds == 45
+
+
+def test_new_verification_pipeline_step_fields_default_per_the_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    the three new/renamed steps' own enablement/timeout fields."""
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.intent_summary_enabled is True
+    assert settings.verification_enabled is True
+    assert settings.intent_summary_step_timeout_seconds == 30
+    assert settings.verification_step_timeout_seconds == 60
+    assert settings.stuck_job_warning_threshold_seconds == 600.0
+
+
+def test_new_verification_pipeline_step_fields_are_overridable_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_INTENT_SUMMARY_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_VERIFICATION_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_INTENT_SUMMARY_STEP_TIMEOUT_SECONDS", "15")
+    monkeypatch.setenv("REVIEW_WORKER_VERIFICATION_STEP_TIMEOUT_SECONDS", "45")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.intent_summary_enabled is False
+    assert settings.verification_enabled is False
+    assert settings.intent_summary_step_timeout_seconds == 15
+    assert settings.verification_step_timeout_seconds == 45
 
 
 # --- US-F7: an all-disabled step configuration is caught at startup --------
 #
 # Per the plan's Phase 2 section, this predicate operates at the
-# granularity Phase 2 actually has: static-analysis and llm-review are the
+# granularity Phase 2 actually has: static-analysis and review-generation are
 # only two finding-producing macro steps (pre-filter and output produce no
 # findings of their own). "Zero analyzers enabled" is expressed here as
 # "static-analysis disabled" — Phase 5 refines this once the
@@ -141,7 +174,7 @@ def _step_enablement_from(settings: WorkerSettings) -> StepEnablement:
     return StepEnablement(
         prefilter_enabled=settings.prefilter_enabled,
         static_analysis_enabled=settings.static_analysis_enabled,
-        llm_review_enabled=settings.llm_review_enabled,
+        review_generation_enabled=settings.review_generation_enabled,
         output_enabled=settings.output_enabled,
     )
 
@@ -151,7 +184,7 @@ def test_all_finding_producing_steps_disabled_fails_the_viability_check(
 ) -> None:
     monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
     monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "false")
-    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_REVIEW_GENERATION_ENABLED", "false")
 
     settings = WorkerSettings(_env_file=None)
 
@@ -159,12 +192,12 @@ def test_all_finding_producing_steps_disabled_fails_the_viability_check(
         check_step_configuration_viable(_step_enablement_from(settings))
 
 
-def test_one_analyzer_enabled_and_llm_review_disabled_passes_the_viability_check(
+def test_one_analyzer_enabled_and_review_generation_disabled_passes_the_viability_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
     monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "true")
-    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_REVIEW_GENERATION_ENABLED", "false")
 
     settings = WorkerSettings(_env_file=None)
 
@@ -188,29 +221,29 @@ def test_static_analysis_enabled_with_prefilter_disabled_fails_the_viability_che
         check_step_configuration_viable(_step_enablement_from(settings))
 
 
-def test_llm_review_falling_back_to_disabled_prefilter_fails_the_viability_check(
+def test_review_generation_falling_back_to_disabled_prefilter_fails_the_viability_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
     monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "false")
-    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_REVIEW_GENERATION_ENABLED", "true")
     monkeypatch.setenv("REVIEW_WORKER_PREFILTER_ENABLED", "false")
 
     settings = WorkerSettings(_env_file=None)
 
     # static-analysis can't produce findings here, so apps/worker/main.py
-    # wires llm_review to depend directly on prefilter's output — a
+    # wires review_generation to depend directly on prefilter's output — a
     # disabled prefilter would fail every review job at runtime.
     with pytest.raises(NoViableStepConfigurationError):
         check_step_configuration_viable(_step_enablement_from(settings))
 
 
-def test_llm_review_depending_on_static_analysis_tolerates_disabled_prefilter_check(
+def test_review_generation_depending_on_static_analysis_tolerates_disabled_prefilter_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
     monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ENABLED", "true")
-    monkeypatch.setenv("REVIEW_WORKER_LLM_REVIEW_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_REVIEW_GENERATION_ENABLED", "true")
     monkeypatch.setenv("REVIEW_WORKER_PREFILTER_ENABLED", "false")
 
     settings = WorkerSettings(_env_file=None)

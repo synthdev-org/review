@@ -58,8 +58,10 @@ redaction of a secret the LLM, Phase 6, echoes back verbatim into its own
 finding prose).
 
 Phase 6 of the delivery plan adds ``llm_max_diff_bytes`` (the llm-review
-step's own diff-size prompt ceiling — see ``review/llm_review.py``'s module
-docstring: diff size is fully PR-author-controlled and directly drives LLM
+step's own diff-size prompt ceiling — see ``review/review_generation.py``'s
+module docstring, renamed from ``review/llm_review.py`` by
+docs/plans/plan-deliver-verification-pipeline.md's Phase 2 section: diff
+size is fully PR-author-controlled and directly drives LLM
 token cost, so an oversized PR truncates rather than sending an unbounded
 prompt). No new LLM-endpoint fields: ``llm_endpoint``/``llm_api_key``/
 ``llm_model``/``llm_timeout_seconds`` (Phase 3, above) are reused unchanged
@@ -153,7 +155,24 @@ class WorkerSettings(BaseSettings):
     # restart/redeploy toggles it, same operational shape as every other
     # per-step enable flag here.
     context_builder_enabled: bool = True
-    llm_review_enabled: bool = True
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    # the intent_summary step's own kill switch (US-V9), default `True`,
+    # mirroring every other macro-step flag's own naming/default convention.
+    intent_summary_enabled: bool = True
+    # Renamed from `llm_review_enabled` by
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    # this step is now specifically one of three review-generation-stage
+    # steps (intent_summary, review_generation, verification), so the old
+    # name would be confusingly narrow. This is a deliberate, documented
+    # breaking bootstrap-config rename (see that plan's Compatibility &
+    # rollout section) — `apps/worker/main.py`'s
+    # `_check_deprecated_settings_env_vars` startup check warns an operator
+    # still setting the old `REVIEW_WORKER_LLM_REVIEW_ENABLED` name.
+    review_generation_enabled: bool = True
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    # the verification step's own kill switch (US-V9), default `True`,
+    # mirroring every other macro-step flag's own naming/default convention.
+    verification_enabled: bool = True
     output_enabled: bool = True
     # Phase 5: the static-analysis step's own two analyzer sub-steps,
     # toggled independently per US-F4 — mirrors review.config.StepEnablement's
@@ -168,7 +187,20 @@ class WorkerSettings(BaseSettings):
     prefilter_step_timeout_seconds: int = 30
     static_analysis_step_timeout_seconds: int = 240
     static_analysis_analyzer_timeout_seconds: int = 60
-    llm_review_step_timeout_seconds: int = 90
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    # a short summarization call, lighter than
+    # `review_generation_step_timeout_seconds` below (see that plan's US-V9
+    # NFR section for the full worst-case-chain-sum reasoning).
+    intent_summary_step_timeout_seconds: int = 30
+    # Renamed from `llm_review_step_timeout_seconds` by
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    # mirrors `review_generation_enabled`'s own rename above.
+    review_generation_step_timeout_seconds: int = 90
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
+    # a moderate batched-judgment call, lighter than
+    # `review_generation_step_timeout_seconds` (see that plan's US-V9 NFR
+    # section for the full worst-case-chain-sum reasoning).
+    verification_step_timeout_seconds: int = 60
     output_step_timeout_seconds: int = 30
     # Context Builder delivery plan's Phase 5 section (Assumption 7) — two
     # distinct settings with an enforced, validated margin, never the same
@@ -192,14 +224,18 @@ class WorkerSettings(BaseSettings):
     # empty — a concrete default, not left unspecified, per the plan's
     # Phase 3 section.
     poll_interval_seconds: float = 2.0
-    # The four macro steps run strictly sequentially (see each phase's own
-    # "Why here" note), so their worst-case healthy-run duration is the sum
-    # of their own configured timeouts above, not their max: 30
-    # (prefilter) + 240 (static_analysis) + 90 (llm_review) + 30 (output) =
-    # 390 seconds. 450 gives that sum roughly 15% headroom — comfortably
-    # longer than the worst healthy-run total without leaving a genuinely
-    # stuck job unwarned for an unreasonable stretch.
-    stuck_job_warning_threshold_seconds: float = 450.0
+    # The macro steps run strictly sequentially (see each phase's own "Why
+    # here" note), so their worst-case healthy-run duration is the sum of
+    # their own configured timeouts above, not their max. Recalculated by
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section
+    # (US-V9's NFR) now that intent_summary/verification exist: 30
+    # (prefilter) + 240 (static_analysis) + 35 (context_builder) + 30
+    # (intent_summary) + 90 (review_generation) + 60 (verification) + 30
+    # (output) = 515 seconds. 600 gives that sum roughly 15% headroom —
+    # comfortably longer than the worst healthy-run total without leaving a
+    # genuinely stuck job unwarned for an unreasonable stretch (515 * 1.15
+    # ~= 592, rounded up).
+    stuck_job_warning_threshold_seconds: float = 600.0
 
     # --- GitHub App auth / diff fetch (Phase 4, adapter/github/auth.py + diff.py) ---
     # Required, no default: adapter/github/auth.py's JWT signing (the
@@ -240,7 +276,9 @@ class WorkerSettings(BaseSettings):
     # own module docstring.
     secret_redaction_enabled: bool = True
 
-    # --- LLM-review step (Phase 6, review/llm_review.py) ---
+    # --- Review-generation step (Phase 6, review/review_generation.py,
+    # renamed from review/llm_review.py by
+    # docs/plans/plan-deliver-verification-pipeline.md's Phase 2 section) ---
     # A fixed byte ceiling on the diff text included in the LLM prompt —
     # roughly a few hundred changed lines, generous for a genuine
     # review-sized PR while bounding worst-case token cost, matching every
@@ -266,6 +304,42 @@ class WorkerSettings(BaseSettings):
     # scope; an operator opts into dry-run explicitly to validate a fresh
     # deployment before trusting it with real writes.
     dry_run: bool = False
+
+    @model_validator(mode="after")
+    def _stuck_job_warning_threshold_covers_worst_case_chain(self) -> WorkerSettings:
+        """Enforces that ``stuck_job_warning_threshold_seconds`` never drops
+        below the seven macro steps' own worst-case sequential-run sum (the
+        515-second figure this field's own docstring comment hand-derives).
+
+        The steps run strictly sequentially, so that sum — not any single
+        step's timeout — is the true worst-case healthy-run duration; a
+        threshold below it would flag a still-healthy, still-running job as
+        "stuck" before it could possibly finish. Enforced here (the same
+        pure, cross-field, no-I/O validator shape
+        ``_context_builder_timeout_margin_is_valid`` above already
+        establishes) rather than left as a comment a future step-timeout
+        edit could silently fall out of sync with — the sum is genuinely
+        recomputed from the live field values every time settings are
+        constructed, not re-typed by hand.
+        """
+        worst_case_chain_seconds = (
+            self.prefilter_step_timeout_seconds
+            + self.static_analysis_step_timeout_seconds
+            + self.context_builder_step_timeout_seconds
+            + self.intent_summary_step_timeout_seconds
+            + self.review_generation_step_timeout_seconds
+            + self.verification_step_timeout_seconds
+            + self.output_step_timeout_seconds
+        )
+        if self.stuck_job_warning_threshold_seconds < worst_case_chain_seconds:
+            raise ValueError(
+                "stuck_job_warning_threshold_seconds "
+                f"({self.stuck_job_warning_threshold_seconds}) must be at least the sum of "
+                f"every macro step's own timeout ({worst_case_chain_seconds}) - the steps run "
+                "strictly sequentially, so a threshold below their worst-case sum would flag "
+                "a still-healthy job as stuck before it could possibly finish"
+            )
+        return self
 
     @model_validator(mode="after")
     def _context_builder_timeout_margin_is_valid(self) -> WorkerSettings:

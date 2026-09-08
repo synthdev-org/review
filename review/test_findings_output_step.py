@@ -95,7 +95,7 @@ def _publisher(test_rsa_private_key_pem: str) -> GitHubFindingsPublisher:
 
 @dataclass
 class _FakeUpstreamOutput:
-    """Stands in for `review.llm_review.LLMReviewOutput` — this step's own
+    """Stands in for `review.verification.VerificationOutput` — this step's own
     real `input`, validated structurally (`from_attributes=True`) rather
     than requiring the real upstream step's own module import."""
 
@@ -115,13 +115,13 @@ class _FakeUpstreamOutput:
 
 @dataclass
 class _FakeUpstreamStep:
-    """A fake `llm_review` step — this file's own concern is
-    `FindingsOutputStep`'s behavior, not re-proving llm-review's own (that's
-    `review/test_llm_review_step.py`'s job)."""
+    """A fake `verification` step — this file's own concern is
+    `FindingsOutputStep`'s behavior, not re-proving verification's own (that's
+    `review/test_verification_step.py`'s job)."""
 
     output: _FakeUpstreamOutput | None = None
     error: Exception | None = None
-    name: str = "llm_review"
+    name: str = "verification"
     depends_on: tuple[str, ...] = ()
     calls: list[object] = field(default_factory=list)
 
@@ -149,7 +149,7 @@ def _registry(
     upstream: _FakeUpstreamStep,
     publisher: GitHubFindingsPublisher,
     *,
-    depends_on: str = "llm_review",
+    depends_on: str = "verification",
 ) -> StepRegistry:
     step = FindingsOutputStep(publisher, depends_on=depends_on)
     return StepRegistry(
@@ -511,21 +511,21 @@ async def test_finding_with_no_context_ref_ids_posts_exactly_as_a_phase_1_findin
     assert "**Context:**" not in posted_body
 
 
-# --- Rollback: depends_on is configurable, not hardcoded to llm_review ------
+# --- Rollback: depends_on is configurable, not hardcoded to verification ---
 
 
 @respx.mock
 async def test_depends_on_static_analysis_reads_that_step_own_output_when_configured(
     test_rsa_private_key_pem: str,
 ) -> None:
-    """Phase 6's own "Rollback" claim — disabling llm_review falls back to
+    """Phase 6's own "Rollback" claim — disabling verification falls back to
     static-analysis-only output — depends on `FindingsOutputStep.depends_on`
     being settable to `"static_analysis"` rather than a fixed
-    `("llm_review",)`. This is the single-step-tier proof that a fake
+    `("verification",)`. This is the single-step-tier proof that a fake
     `static_analysis`-named upstream step's own output flows through
     unchanged; `review/test_review_job.py`'s own equivalent case proves the
-    same thing against the real, fully-wired four-macro-step registry with a
-    llm-review step that would fail the job if it were invoked at all."""
+    same thing against the real, fully-wired five-macro-step registry with a
+    verification step that would fail the job if it were invoked at all."""
     _mock_token_exchange()
     reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
     check_run_route = respx.post(_CHECK_RUNS_URL).mock(

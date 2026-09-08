@@ -6,7 +6,7 @@ tests too" rule. No real I/O.
 from __future__ import annotations
 
 from findings.merge import POSTED_FINDINGS_CEILING, merge_findings
-from findings.models import Finding, Source
+from findings.models import Finding, Severity, Source
 
 
 def _finding(
@@ -15,12 +15,13 @@ def _finding(
     line: int | None = 10,
     message: str = "problem",
     source: Source = "llm",
+    severity: Severity = "medium",
     context_ref_ids: tuple[int, ...] | None = None,
 ) -> Finding:
     return Finding(
         file=file,
         line=line,
-        severity="medium",
+        severity=severity,
         message=message,
         source=source,
         context_ref_ids=context_ref_ids,
@@ -166,7 +167,97 @@ def test_merged_output_one_over_the_ceiling_drops_exactly_the_excess() -> None:
 
     assert len(result.findings) == POSTED_FINDINGS_CEILING
     assert result.dropped_by_ceiling_count == 1
-    # The kept findings are the first `POSTED_FINDINGS_CEILING`, in order —
-    # the same "flag, don't silently reorder/truncate coverage" posture
-    # every other ceiling in this plan keeps.
+    # All findings share the same severity/source here, so the US-V8 sort
+    # is a no-op tie across the board — original order survives as the
+    # tiebreak, keeping the first `POSTED_FINDINGS_CEILING`, in order.
     assert result.findings == findings[:POSTED_FINDINGS_CEILING]
+
+
+# --- US-V8: severity/source-trust ordering once the ceiling truncates ------
+
+
+def test_ceiling_truncation_promotes_a_higher_severity_finding_ahead_of_lower_ones() -> None:
+    """A single `critical` finding, even though it's the very last item in
+    the deduped list, must survive the ceiling ahead of a `low`-severity
+    finding that would otherwise have been kept by plain position — US-V8's
+    "top-N ordered first by severity" rule."""
+    low_severity_findings = [
+        _finding(line=i, message=f"low priority issue {i}", severity="low", source="llm")
+        for i in range(POSTED_FINDINGS_CEILING)
+    ]
+    critical_finding = _finding(
+        line=POSTED_FINDINGS_CEILING,
+        message="critical issue arriving last",
+        severity="critical",
+        source="semgrep",
+    )
+    deduped = [*low_severity_findings, critical_finding]
+
+    result = merge_findings(deduped)
+
+    assert len(result.findings) == POSTED_FINDINGS_CEILING
+    assert result.dropped_by_ceiling_count == 1
+    # The critical finding is promoted to the front despite arriving last;
+    # the lowest-ranked `low`-severity finding (the last one in original
+    # order) is the one dropped to make room.
+    assert result.findings[0] == critical_finding
+    assert result.findings[1:] == low_severity_findings[:-1]
+
+
+def test_ceiling_truncation_prefers_non_llm_source_ahead_of_llm_at_equal_severity() -> None:
+    """At equal severity, a static-analysis (`semgrep`) finding outranks an
+    `llm`-sourced one, even when it arrives last in the deduped list —
+    US-V8's "static-analysis-sourced findings ahead of verified-LLM-sourced
+    findings at equal severity" rule."""
+    llm_findings = [
+        _finding(line=i, message=f"llm-sourced issue {i}", severity="medium", source="llm")
+        for i in range(POSTED_FINDINGS_CEILING)
+    ]
+    static_finding = _finding(
+        line=POSTED_FINDINGS_CEILING,
+        message="static-analysis issue arriving last",
+        severity="medium",
+        source="semgrep",
+    )
+    deduped = [*llm_findings, static_finding]
+
+    result = merge_findings(deduped)
+
+    assert len(result.findings) == POSTED_FINDINGS_CEILING
+    assert result.dropped_by_ceiling_count == 1
+    assert result.findings[0] == static_finding
+    # The last `llm`-sourced finding in original order is the one dropped.
+    assert result.findings[1:] == llm_findings[:-1]
+
+
+def test_ceiling_truncation_falls_back_to_original_order_for_equal_severity_and_source() -> None:
+    """With severity and source both tied, `sorted()`'s own stability keeps
+    original relative order as the final tiebreak — the third criterion
+    US-V8 states."""
+    findings = [
+        _finding(line=i, message=f"distinct unrelated issue number {i}", severity="high")
+        for i in range(POSTED_FINDINGS_CEILING + 1)
+    ]
+
+    result = merge_findings(findings)
+
+    assert result.findings == findings[:POSTED_FINDINGS_CEILING]
+
+
+def test_under_ceiling_mixed_severity_list_is_completely_unaffected_by_the_sort() -> None:
+    """US-V8's sort only ever runs once truncation actually happens — a
+    deduped list under the ceiling, even with wildly mixed severities and
+    sources in an order that is *not* severity-sorted, must come back in
+    exactly its own original order, not merely contain the same set of
+    findings."""
+    findings = [
+        _finding(line=1, message="a low severity issue", severity="low", source="llm"),
+        _finding(line=2, message="a critical issue", severity="critical", source="llm"),
+        _finding(line=3, message="a medium severity issue", severity="medium", source="semgrep"),
+        _finding(line=4, message="a high severity issue", severity="high", source="llm"),
+        _finding(line=5, message="an info severity issue", severity="info", source="semgrep"),
+    ]
+
+    result = merge_findings(findings)
+
+    assert result.findings == findings

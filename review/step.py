@@ -28,7 +28,7 @@ live, never here or in ``review/pipeline.py``.
 
 from __future__ import annotations
 
-from typing import Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel
 
@@ -45,12 +45,13 @@ class JobIdentity(BaseModel):
     the way to the final findings-output step — see
     ``review/prefilter.py``'s ``PrefilterOutput``,
     ``review/static_analysis.py``'s ``StaticAnalysisOutput``, and
-    ``review/llm_review.py``'s ``LLMReviewOutput`` docstrings for why.
+    ``review/review_generation.py``'s ``ReviewGenerationOutput`` docstrings
+    for why.
 
     A concrete step's own Input/Output model inherits this instead of
     repeating the same six fields six times across three files — previously
     duplicated byte-for-byte in ``review/prefilter.py``,
-    ``review/static_analysis.py``, and ``review/llm_review.py``. Living in
+    ``review/static_analysis.py``, and ``review/review_generation.py``. Living in
     ``review/step.py`` (a framework module every step module already
     imports ``Step``/``StepContext`` from, and explicitly exempt from
     ``review/test_step_boundaries.py``'s step-to-step import-boundary
@@ -76,6 +77,21 @@ class JobIdentity(BaseModel):
     pr_number: int
     head_sha: str
     base_sha: str | None = None
+
+
+def job_identity_fields(source: JobIdentity) -> dict[str, Any]:
+    """``source``'s own seven ``JobIdentity`` fields, as a dict keyed by
+    field name — for a step's own Output construction that forwards every
+    ``JobIdentity`` field unchanged from its parsed input, without
+    hand-listing each of the seven keyword arguments. Previously duplicated
+    byte-for-byte across ``review/review_generation.py``,
+    ``review/intent_summary.py``, and ``review/verification.py``'s own
+    Output-construction return statements; living here for the same
+    "framework module every step already imports from, exempt from the
+    step-to-step import-boundary check" reason ``JobIdentity`` itself does
+    (see that class's own docstring).
+    """
+    return source.model_dump(include=set(JobIdentity.model_fields))
 
 
 class StepContext(BaseModel):

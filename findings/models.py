@@ -30,6 +30,22 @@ LLM Gateway boundary) — so no downstream consumer (Phase 7's merge/output
 step) ever has to reconcile three different vocabularies of its own.
 """
 
+SEVERITY_RANK: dict[Severity, int] = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+    "info": 4,
+}
+"""``Severity``'s own fixed ordinal ranking ("critical" sorts first, "info"
+last) — colocated with the vocabulary it ranks so every consumer that needs
+to sort ``Finding``s by severity (``findings.merge.merge_findings``'s US-V8
+posted-findings-ceiling ordering; ``review.review_generation``'s
+redaction-finding-count ceiling, which the same "highest severity survives a
+truncating ceiling" reasoning applies to) shares one definition rather than
+each inventing its own.
+"""
+
 Source = Literal["gitleaks", "semgrep", "llm"]
 """Which producer generated a given ``Finding`` — lets a downstream consumer
 (redaction, dedupe, an operator reading logs) distinguish "the free,
@@ -74,7 +90,7 @@ class Finding(BaseModel):
     ``indexing.chunk.Chunk.line_range`` already applied. Defaults to
     ``None`` so every existing (static-analysis-sourced) ``Finding``
     construction site is unaffected — only
-    ``review.llm_review._parse_llm_findings`` ever sets it, converting the
+    ``review.review_generation._parse_llm_findings`` ever sets it, converting the
     LLM's own JSON ``list[int]`` to a tuple at construction time.
 
     ``citation_markdown`` — set by ``review.output.FindingsOutputStep``'s
@@ -95,6 +111,22 @@ class Finding(BaseModel):
     exposing a bundle item's real ``content``: this field only ever holds
     file path/symbol/line-range metadata, never raw source text that could
     carry a secret.
+
+    ``verification_status`` — set by ``review.verification.VerificationStep``
+    (docs/plans/plan-deliver-verification-pipeline.md's Phase 3/4), never by
+    a finding producer directly. A plain scalar field, not a tuple like
+    ``context_ref_ids``: ``Finding`` stays ``frozen=True``/hashable
+    regardless, since a single ``Literal``-or-``None`` value hashes exactly
+    like any other scalar field already on this model. Defaults to ``None``
+    for every existing (static-analysis, and any pre-verification LLM)
+    ``Finding`` construction site — only ``VerificationStep.run`` ever sets
+    it, to ``"verified"`` for an ``source == "llm"`` finding that passed
+    every rubric criterion. A rejected finding is excluded from that step's
+    output entirely rather than ever being constructed with
+    ``verification_status="rejected"`` in this codebase's own pipeline
+    today; the ``"rejected"`` literal exists in the schema because it's part
+    of the field's own documented vocabulary (per the spec), not because any
+    current producer sets it.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -107,3 +139,4 @@ class Finding(BaseModel):
     rule_id: str | None = None
     context_ref_ids: tuple[int, ...] | None = None
     citation_markdown: str | None = None
+    verification_status: Literal["verified", "rejected"] | None = None

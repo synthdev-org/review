@@ -121,6 +121,40 @@ rule applies unchanged.
   by ID, formatting it, and logging on an unknown ID or a missing
   `line_range` all perform no I/O of their own; `render_citation` never
   reads a `Chunk`'s content or talks to Postgres itself).
+- Phase 5 of `docs/plans/plan-deliver-verification-pipeline.md` (this ADR's
+  scope extended by that phase's own PR, not a second ADR):
+  `review/config.py`'s `resolve_review_pipeline_depends_on` (Assumption 6's
+  hard-coded-to-this-one-chain resolver) and `intent_summary_can_produce_value`
+  — `review/test_config.py`, against hand-built `StepEnablement` fixtures
+  (both are pure, no-I/O boolean/dict logic operating only on an already-
+  constructed `StepEnablement` instance, the same shape
+  `context_builder_can_produce_value`/`static_analysis_can_produce_findings`
+  already established this exemption for).
+- Phase 1 of `docs/plans/plan-deliver-verification-pipeline.md` (this ADR's
+  scope extended by that phase's own PR, not a second ADR): `review/diff_prompt.py`'s
+  `render_diff`/`truncate_diff_text` (extracted from `review/review_generation.py`'s
+  former private `_render_diff`/`_truncate_diff_text` once `review/intent_summary.py`
+  needed the identical logic) and `review/intent_summary.py`'s `_cap_intent_summary`
+  — `review/test_diff_prompt.py` and `review/test_intent_summary_step.py`, against
+  already-rendered diff text/already-received LLM response text (per-file
+  header/patch concatenation and byte- or char-boundary truncation, neither
+  of which perform any I/O of their own).
+- Phase 3 of `docs/plans/plan-deliver-verification-pipeline.md` (this ADR's
+  scope extended by that phase's own PR, not a second ADR): `review/verification.py`'s
+  `_parse_verdicts`, `_correlate_verdicts`, and `_passes_rubric` — `review/test_verification.py`,
+  against hand-built LLM response payloads/`_VerificationVerdictItem` fixtures
+  (JSON parsing with per-item validation tolerance, index correlation with
+  fail-closed duplicate/out-of-range handling, and the four-criterion rubric
+  check all operate only on already-received data, with no I/O of their own).
+- Phase 2 of `docs/plans/plan-deliver-verification-pipeline.md` (this ADR's
+  scope extended by that phase's own PR, not a second ADR): `review/llm_response.py`'s
+  `build_completion_request` and `parse_llm_json_envelope` (extracted once
+  `review/review_generation.py`, `review/intent_summary.py`, and
+  `review/verification.py` all needed the identical completion-request
+  assembly and JSON-envelope-parsing logic) — `review/test_llm_response.py`,
+  against hand-built request parameters/already-received LLM response text
+  (assembling a request payload and parsing/validating an already-received
+  JSON envelope perform no I/O of their own).
 - Later phases extend this same list as their own pure, no-I/O cases land —
   each phase's own plan section names the specific addition; this ADR's own
   text is updated to list it, rather than a new ADR being created per case.

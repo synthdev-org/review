@@ -64,6 +64,17 @@ dependencies = [
     # migration (0001), but no Python-side binding was installed until this
     # phase actually needed to declare a vector-typed column.
     "pgvector>=0.3,<1",
+    # Phase 3 (verification-pipeline plan): apps/worker/main.py's
+    # `_check_deprecated_settings_env_vars` calls `dotenv.dotenv_values`
+    # directly (WorkerSettings' `extra="ignore"` config means the built
+    # settings instance can never reveal a deprecated env var's presence,
+    # so raw `.env`/`os.environ` inspection is the only way to detect one).
+    # Previously only present transitively via pydantic-settings' own
+    # optional dotenv extra — pinned as a direct dependency now that a
+    # production code path imports it, so a future pydantic-settings
+    # version that drops or optionalizes that transitive pull doesn't
+    # silently break the worker at startup.
+    "python-dotenv>=1.0,<2",
 ]
 
 [dependency-groups]
