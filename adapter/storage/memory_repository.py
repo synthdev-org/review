@@ -1,0 +1,342 @@
+"""adapter.storage.memory_repository — the concrete Postgres/pgvector
+implementation of ``memory.store``'s three Protocols
+(``MemorySignalRecorder``, ``DismissedFindingMatcher``,
+``MemoryAdminRepository``), per
+``docs/plans/plan-deliver-memory.md``'s Phase 1 section (Unit A).
+
+One ``PostgresMemoryRepository`` class implements all three narrow
+Protocols (Assumption 8), mirroring ``adapter/storage/indexing_repository.py``'s
+``IndexingRepository`` own precedent (one concrete class, one
+``session_factory``, both of its own Protocols) — constructed once per
+entrypoint (Worker and Webhook API each build their own instance from their
+own session factory, the same way ``JobQueueRepository``/
+``PostgresTenancyStore`` already are).
+
+Reuses ``adapter/storage/unit_of_work.py``'s ``run_in_session`` and
+``adapter/storage/indexing_repository.py``'s established session-open/
+``(SQLAlchemyError, OSError)``-translation ``_run`` wrapper shape — the same
+precedent ``adapter/storage/context_query.py``'s ``PostgresGraphQuery``/
+``PostgresSimilarityQuery`` already follow.
+
+``best_effective_similarity`` queries ``memory_entry`` filtered by
+``repo_id``/``status="approved"``/``entry_type="dismissed_finding"``,
+ordered by ``embedding.cosine_distance(vector)`` (mirroring
+``PostgresSimilarityQuery.find_similar``'s exact query shape against a new
+table instead of ``index_chunk``), takes the single closest match, computes
+``1 - cosine_distance`` for a raw cosine similarity, and applies
+``memory.decay.effective_similarity`` before returning — no ANN index, no
+latency SLA (per ``spec-memory.md``'s NFRs, matching
+``PostgresSimilarityQuery``'s own v1 posture).
+
+``record_signal`` is a plain insert in this phase — Phase 3's own section is
+what adds the ``ON CONFLICT DO NOTHING`` redelivery-safety upsert against
+``uq_memory_entry_signal`` (this phase's migration already creates that
+constraint; nothing writes through this method with a real risk of
+redelivery until Phase 3's webhook handler exists to call it).
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import datetime
+from typing import Literal, cast
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from adapter.storage.models import MemoryEntryRow, MemoryEntryStatus, PostedFindingCommentRow, Repo
+from adapter.storage.unit_of_work import run_in_session
+from memory.decay import effective_similarity
+from memory.models import MemoryEntry, MemoryEntryType, MemoryStatus, PostedComment, RawSignalType
+from memory.store import (
+    DismissedFindingMatcher,
+    MemoryAdminRepository,
+    MemoryEntryNotFoundError,
+    MemorySignalRecorder,
+    MemoryStoreError,
+)
+
+
+def _to_entry(row: MemoryEntryRow) -> MemoryEntry:
+    # `memory_entry.repo_id` is a nullable FK at the schema level (the same
+    # "narrow the scope" convention as org_id/team_id), but
+    # `memory.models.MemoryEntry.repo_id` is a required `str` — every writer
+    # this phase has (`record_signal`) always resolves and persists a real
+    # `repo_id`, raising `MemoryStoreError` if it can't. A `NULL` here would
+    # be a genuine data-integrity violation, not a value to silently coerce
+    # into the literal string `"None"` past the pydantic boundary.
+    if row.repo_id is None:
+        raise MemoryStoreError(
+            operation="_to_entry", detail=f"memory_entry {row.id} has NULL repo_id"
+        )
+    return MemoryEntry(
+        id=str(row.id),
+        repo_id=str(row.repo_id),
+        org_id=str(row.org_id) if row.org_id is not None else None,
+        team_id=str(row.team_id) if row.team_id is not None else None,
+        entry_type=cast("MemoryEntryType", row.entry_type),
+        status=row.status.value,
+        raw_signal_type=cast("RawSignalType", row.raw_signal_type),
+        raw_signal_detail=row.raw_signal_detail,
+        posted_finding_comment_id=row.posted_finding_comment_id,
+        embedding=tuple(row.embedding) if row.embedding is not None else None,
+        approved_at=row.approved_at,
+        approved_by=row.approved_by,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+class PostgresMemoryRepository:
+    """Implements ``memory.store.MemorySignalRecorder``,
+    ``memory.store.DismissedFindingMatcher``, and
+    ``memory.store.MemoryAdminRepository`` against real Postgres/pgvector
+    tables (``posted_finding_comment``, ``memory_entry``).
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def _run[T](self, *, operation: str, fn: Callable[[AsyncSession], Awaitable[T]]) -> T:
+        """Shared open-a-session-then-translate-the-failure wrapper, the
+        same shape ``adapter/storage/indexing_repository.py``'s own
+        ``_run`` uses against these exact tables.
+        """
+        try:
+            return await run_in_session(self._session_factory, None, fn)
+        except (SQLAlchemyError, OSError) as exc:
+            raise MemoryStoreError(operation=operation, detail=str(exc)) from exc
+
+    # -- MemorySignalRecorder ----------------------------------------------
+
+    async def record_comment_provenance(
+        self, *, repo_id: str, pr_number: int, commit_sha: str, comments: Sequence[PostedComment]
+    ) -> None:
+        comments_tuple = tuple(comments)
+        if not comments_tuple:
+            return
+
+        try:
+            repo_uuid = uuid.UUID(repo_id)
+        except ValueError as exc:
+            raise MemoryStoreError(operation="record_comment_provenance", detail=str(exc)) from exc
+
+        async def _write(session: AsyncSession) -> None:
+            session.add_all(
+                [
+                    PostedFindingCommentRow(
+                        id=comment.comment_id,
+                        repo_id=repo_uuid,
+                        pr_number=pr_number,
+                        commit_sha=commit_sha,
+                        finding_file=comment.file,
+                        finding_line=comment.line,
+                        finding_rule_id=comment.rule_id,
+                        finding_message=comment.message,
+                    )
+                    for comment in comments_tuple
+                ]
+            )
+
+        await self._run(operation="record_comment_provenance", fn=_write)
+
+    async def record_signal(
+        self,
+        *,
+        posted_finding_comment_id: int,
+        raw_signal_type: RawSignalType,
+        raw_signal_detail: dict[str, object],
+        github_comment_id: int | None,
+    ) -> None:
+        # `record_signal`'s own Protocol signature takes no repo/org/team
+        # scope — the caller (Phase 3's webhook handler, Phase 4's reaction
+        # poll job) only ever has the *comment* it's reacting to in scope,
+        # not a fresh lookup of that comment's own repo. Resolved here via
+        # `posted_finding_comment_id`'s own FK to `posted_finding_comment`
+        # (repo_id) and that row's `repo.org_id` (one join, in the same
+        # write transaction as the insert) — `memory_entry.repo_id`/`org_id`
+        # are what `list_entries`'s filters and `best_effective_similarity`'s
+        # own `WHERE repo_id = ...` scoping actually read; leaving them NULL
+        # here would silently break both. `team_id` is left NULL — nothing
+        # in this codebase associates a PR/comment with a team yet (the
+        # same "placeholder, no writer exists" state
+        # `OrgRepoTeamSetting`/`ModelRoutingConfig` are already in).
+        async def _write(session: AsyncSession) -> bool:
+            result = await session.execute(
+                select(PostedFindingCommentRow.repo_id, Repo.org_id)
+                .join(Repo, Repo.id == PostedFindingCommentRow.repo_id)
+                .where(PostedFindingCommentRow.id == posted_finding_comment_id)
+            )
+            row = result.first()
+            if row is None:
+                return False
+            repo_id, org_id = row
+            session.add(
+                MemoryEntryRow(
+                    repo_id=repo_id,
+                    org_id=org_id,
+                    posted_finding_comment_id=posted_finding_comment_id,
+                    raw_signal_type=raw_signal_type,
+                    raw_signal_detail=raw_signal_detail,
+                    github_comment_id=github_comment_id,
+                )
+            )
+            return True
+
+        found = await self._run(operation="record_signal", fn=_write)
+        if not found:
+            raise MemoryStoreError(
+                operation="record_signal",
+                detail=f"posted_finding_comment {posted_finding_comment_id} not found",
+            )
+
+    # -- DismissedFindingMatcher ---------------------------------------------
+
+    async def best_effective_similarity(
+        self, *, repo_id: str, embedding: tuple[float, ...], half_life_days: float, now: datetime
+    ) -> float | None:
+        try:
+            repo_uuid = uuid.UUID(repo_id)
+        except ValueError as exc:
+            raise MemoryStoreError(operation="best_effective_similarity", detail=str(exc)) from exc
+        vector = list(embedding)
+
+        async def _read(session: AsyncSession) -> tuple[float, datetime] | None:
+            statement = (
+                select(MemoryEntryRow.approved_at, MemoryEntryRow.embedding.cosine_distance(vector))
+                .where(
+                    MemoryEntryRow.repo_id == repo_uuid,
+                    MemoryEntryRow.status == MemoryEntryStatus.APPROVED,
+                    MemoryEntryRow.entry_type == "dismissed_finding",
+                    MemoryEntryRow.embedding.is_not(None),
+                )
+                .order_by(MemoryEntryRow.embedding.cosine_distance(vector))
+                .limit(1)
+            )
+            result = await session.execute(statement)
+            row = result.first()
+            if row is None:
+                return None
+            approved_at, cosine_distance = row
+            return (float(cosine_distance), approved_at)
+
+        found = await self._run(operation="best_effective_similarity", fn=_read)
+        if found is None:
+            return None
+        cosine_distance, approved_at = found
+        raw_similarity = 1.0 - cosine_distance
+        return effective_similarity(
+            raw_similarity, approved_at=approved_at, half_life_days=half_life_days, now=now
+        )
+
+    # -- MemoryAdminRepository -----------------------------------------------
+
+    async def list_entries(
+        self,
+        *,
+        org_id: str | None,
+        repo_id: str | None,
+        team_id: str | None,
+        status: MemoryStatus | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[tuple[MemoryEntry, ...], int]:
+        try:
+            org_uuid = uuid.UUID(org_id) if org_id is not None else None
+            repo_uuid = uuid.UUID(repo_id) if repo_id is not None else None
+            team_uuid = uuid.UUID(team_id) if team_id is not None else None
+        except ValueError as exc:
+            raise MemoryStoreError(operation="list_entries", detail=str(exc)) from exc
+
+        conditions = []
+        if org_uuid is not None:
+            conditions.append(MemoryEntryRow.org_id == org_uuid)
+        if repo_uuid is not None:
+            conditions.append(MemoryEntryRow.repo_id == repo_uuid)
+        if team_uuid is not None:
+            conditions.append(MemoryEntryRow.team_id == team_uuid)
+        if status is not None:
+            conditions.append(MemoryEntryRow.status == MemoryEntryStatus(status))
+
+        async def _read(session: AsyncSession) -> tuple[Sequence[MemoryEntryRow], int]:
+            entries_statement = (
+                select(MemoryEntryRow)
+                .where(*conditions)
+                .order_by(MemoryEntryRow.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            entries_result = await session.execute(entries_statement)
+            rows = entries_result.scalars().all()
+
+            count_statement = select(func.count()).select_from(MemoryEntryRow).where(*conditions)
+            count_result = await session.execute(count_statement)
+            total = count_result.scalar_one()
+            return rows, total
+
+        rows, total = await self._run(operation="list_entries", fn=_read)
+        return tuple(_to_entry(row) for row in rows), total
+
+    async def set_status(
+        self,
+        *,
+        entry_id: str,
+        status: Literal["approved", "rejected"],
+        entry_type: MemoryEntryType,
+        embedding: tuple[float, ...] | None,
+    ) -> MemoryEntry:
+        try:
+            entry_uuid = uuid.UUID(entry_id)
+        except ValueError as exc:
+            raise MemoryStoreError(operation="set_status", detail=str(exc)) from exc
+
+        async def _write(session: AsyncSession) -> MemoryEntryRow | None:
+            result = await session.execute(
+                select(MemoryEntryRow).where(MemoryEntryRow.id == entry_uuid).with_for_update()
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            row.status = MemoryEntryStatus(status)
+            row.entry_type = entry_type
+            row.embedding = list(embedding) if embedding is not None else None
+            if status == "approved":
+                row.approved_at = func.now()
+            await session.flush()
+            await session.refresh(row)
+            return row
+
+        row = await self._run(operation="set_status", fn=_write)
+        if row is None:
+            raise MemoryEntryNotFoundError(entry_id=entry_id)
+        return _to_entry(row)
+
+    async def delete_entry(self, *, entry_id: str) -> None:
+        try:
+            entry_uuid = uuid.UUID(entry_id)
+        except ValueError as exc:
+            raise MemoryStoreError(operation="delete_entry", detail=str(exc)) from exc
+
+        async def _write(session: AsyncSession) -> bool:
+            result = await session.execute(
+                select(MemoryEntryRow).where(MemoryEntryRow.id == entry_uuid)
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            await session.delete(row)
+            return True
+
+        deleted = await self._run(operation="delete_entry", fn=_write)
+        if not deleted:
+            raise MemoryEntryNotFoundError(entry_id=entry_id)
+
+
+# Runtime confirmation (not just a docstring claim) that this concrete
+# implementation actually satisfies all three Protocols it stands in for,
+# mirroring adapter/storage/indexing_repository.py's own runtime check.
+_: type[MemorySignalRecorder] = PostgresMemoryRepository
+__: type[DismissedFindingMatcher] = PostgresMemoryRepository
+___: type[MemoryAdminRepository] = PostgresMemoryRepository

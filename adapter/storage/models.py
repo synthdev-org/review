@@ -40,6 +40,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -394,6 +395,137 @@ class IndexGraphNodeRow(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+
+class MemoryEntryStatus(enum.StrEnum):
+    """A ``memory_entry`` row's lifecycle state — mirrors
+    ``memory.models.MemoryStatus``'s literal values exactly (storage-layer
+    enum vs. domain-layer ``Literal``, the same split ``JobType``/``JobStatus``
+    already establish for ``job_queue``)."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class PostedFindingCommentRow(Base):
+    """One inline review comment the platform actually posted, and which
+    finding it was about — per US-M11 (``docs/plans/plan-deliver-memory.md``'s
+    Phase 1/Unit A section). ``id`` *is* GitHub's own comment id, not a
+    separate surrogate key — the same "the natural key already guarantees
+    the invariant" reasoning ``WebhookDeliveryRow`` above already
+    establishes, since this id is exactly what an inbound reply/reaction/
+    thread-resolution signal correlates back against.
+
+    ``finding_message`` is already-redacted text by the time it reaches
+    here (``review/review_generation.py``'s existing ``_redact_all`` pass
+    already ran before ``FindingsOutputStep`` ever sees it, per Phase 2's
+    own section) — this table introduces no new redaction gap.
+    """
+
+    __tablename__ = "posted_finding_comment"
+
+    id: Mapped[int] = mapped_column(BigInteger(), primary_key=True)
+    repo_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("repo.id", ondelete="CASCADE"), nullable=False
+    )
+    pr_number: Mapped[int] = mapped_column(Integer(), nullable=False)
+    commit_sha: Mapped[str] = mapped_column(String(64), nullable=False)
+    finding_file: Mapped[str] = mapped_column(String(4096), nullable=False)
+    finding_line: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    finding_rule_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    finding_message: Mapped[str] = mapped_column(Text(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MemoryEntryRow(Base):
+    """One captured signal (raw, or human-classified once approved), per
+    ``docs/plans/plan-deliver-memory.md``'s Phase 1/Unit A section and
+    [ADR-0009](../../docs/adr/0009-memory-entry-schema-and-dismissal-similarity-signal.md).
+
+    ``org_id``/``repo_id``/``team_id`` are all nullable FKs — the same
+    "narrow the scope" convention ``OrgRepoTeamSetting``/
+    ``ModelRoutingConfig`` above already establish, not a new pattern.
+
+    ``UniqueConstraint("posted_finding_comment_id", "raw_signal_type",
+    "github_comment_id")`` is Phase 3's own redelivery-idempotency key: a
+    GitHub webhook redelivery of the same reply/thread-resolution event
+    (GitHub's own documented at-least-once semantics) upserts via ``ON
+    CONFLICT DO NOTHING`` against this key rather than creating a duplicate
+    ``pending`` row every retry. ``github_comment_id`` is ``NULL`` for a
+    ``reaction`` entry (Phase 4) — that raw signal type's own dedup lives in
+    ``captured_reaction`` instead, per Assumption 9.
+    """
+
+    __tablename__ = "memory_entry"
+    __table_args__ = (
+        UniqueConstraint(
+            "posted_finding_comment_id",
+            "raw_signal_type",
+            "github_comment_id",
+            name="uq_memory_entry_signal",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("org.id", ondelete="CASCADE"), nullable=True
+    )
+    repo_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("repo.id", ondelete="CASCADE"), nullable=True
+    )
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("team.id", ondelete="CASCADE"), nullable=True
+    )
+    entry_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[MemoryEntryStatus] = mapped_column(
+        Enum(
+            MemoryEntryStatus, name="memory_entry_status", native_enum=False, validate_strings=True
+        ),
+        nullable=False,
+        default=MemoryEntryStatus.PENDING,
+        server_default=MemoryEntryStatus.PENDING.value,
+    )
+    raw_signal_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    raw_signal_detail: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    posted_finding_comment_id: Mapped[int] = mapped_column(
+        ForeignKey("posted_finding_comment.id", ondelete="CASCADE"), nullable=False
+    )
+    github_comment_id: Mapped[int | None] = mapped_column(BigInteger(), nullable=True)
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(_EMBEDDING_DIMENSION), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class CapturedReactionRow(Base):
+    """Junction table backing US-M3's reaction dedup — a composite primary
+    key, not a separate surrogate key (Assumption 9's "the natural key
+    already guarantees the invariant" pattern), so a repeat poll of the same
+    comment/reaction pair is an ``O(1)``-lookup no-op rather than a
+    ``raw_signal_detail->>'reaction_id'`` predicate whose cost grows with
+    total captured-signal volume.
+    """
+
+    __tablename__ = "captured_reaction"
+    __table_args__ = (PrimaryKeyConstraint("posted_finding_comment_id", "reaction_id"),)
+
+    posted_finding_comment_id: Mapped[int] = mapped_column(
+        ForeignKey("posted_finding_comment.id", ondelete="CASCADE"), nullable=False
+    )
+    reaction_id: Mapped[int] = mapped_column(BigInteger(), nullable=False)
 
 
 class IndexGraphEdgeRow(Base):
