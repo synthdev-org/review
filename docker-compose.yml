@@ -133,6 +133,14 @@ services:
       # webhook_api fails to boot. See .env.example.
       REVIEW_WEBHOOK_API_ADMIN_API_KEY: >-
         ${REVIEW_WEBHOOK_API_ADMIN_API_KEY:?set REVIEW_WEBHOOK_API_ADMIN_API_KEY in .env, see .env.example}
+    # docs/plans/plan-deliver-memory.md's Phase 3/4 (Unit C/D) gave this
+    # service its own outbound GitHub calls (the synchronous `pull_request
+    # closed` reaction poll, Unit D's second branch) — it needs the same
+    # `host.docker.internal` mapping the `worker` service below already
+    # carries, for the identical reason (see that service's own comment):
+    # plain Docker Engine on Linux doesn't resolve this hostname for free.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       migrate:
         condition: service_completed_successfully
