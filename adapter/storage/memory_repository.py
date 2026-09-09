@@ -28,14 +28,16 @@ precedent ``adapter/storage/context_query.py``'s ``PostgresGraphQuery``/
 ``PostgresSimilarityQuery`` already follow.
 
 ``best_effective_similarity`` queries ``memory_entry`` filtered by
-``repo_id``/``status="approved"``/``entry_type="dismissed_finding"``,
-ordered by ``embedding.cosine_distance(vector)`` (mirroring
-``PostgresSimilarityQuery.find_similar``'s exact query shape against a new
-table instead of ``index_chunk``), takes the single closest match, computes
-``1 - cosine_distance`` for a raw cosine similarity, and applies
-``memory.decay.effective_similarity`` before returning — no ANN index, no
-latency SLA (per ``spec-memory.md``'s NFRs, matching
-``PostgresSimilarityQuery``'s own v1 posture).
+``repo_id``/``status="approved"``/``entry_type="dismissed_finding"``
+(mirroring ``PostgresSimilarityQuery.find_similar``'s exact query shape
+against a new table instead of ``index_chunk``), computes ``1 -
+cosine_distance`` for every candidate's raw cosine similarity, applies
+``memory.decay.effective_similarity`` to each, and returns the maximum —
+no ANN index, no top-``N`` pre-filter, no latency SLA (per
+``spec-memory.md``'s NFRs, matching ``PostgresSimilarityQuery``'s own v1
+posture): decay can reorder candidates relative to raw similarity, so only
+considering the raw-nearest row would silently miss a more-recently-
+approved, slightly-less-similar entry with a higher decay-weighted score.
 
 ``record_signal`` (Phase 3, Unit C) upserts via ``ON CONFLICT DO NOTHING``
 against ``uq_memory_entry_signal`` (created by Phase 1's own migration) —
@@ -135,6 +137,18 @@ class PostgresMemoryRepository:
         except (SQLAlchemyError, OSError) as exc:
             raise MemoryStoreError(operation=operation, detail=str(exc)) from exc
 
+    @staticmethod
+    def _parse_uuid(value: str, *, operation: str) -> uuid.UUID:
+        """Shared malformed-id-to-``MemoryStoreError`` translation — every
+        public method below that accepts a caller-supplied id string
+        (``repo_id``/``entry_id``/``org_id``/``team_id``) parses it through
+        here instead of repeating the same ``try/except ValueError`` block.
+        """
+        try:
+            return uuid.UUID(value)
+        except ValueError as exc:
+            raise MemoryStoreError(operation=operation, detail=str(exc)) from exc
+
     # -- MemorySignalRecorder ----------------------------------------------
 
     async def record_comment_provenance(
@@ -144,10 +158,7 @@ class PostgresMemoryRepository:
         if not comments_tuple:
             return
 
-        try:
-            repo_uuid = uuid.UUID(repo_id)
-        except ValueError as exc:
-            raise MemoryStoreError(operation="record_comment_provenance", detail=str(exc)) from exc
+        repo_uuid = self._parse_uuid(repo_id, operation="record_comment_provenance")
 
         async def _write(session: AsyncSession) -> None:
             session.add_all(
@@ -210,12 +221,38 @@ class PostgresMemoryRepository:
             # real state-change data, not just a genuine redelivery).
             # Derived from `raw_signal_detail` here, at the storage
             # boundary, rather than a new `MemorySignalRecorder.record_signal`
-            # parameter — every other signal type (`reply`, `reaction`)
-            # leaves it at its `""` default, so a genuine redelivery of
-            # those still collides on the same key it always has.
+            # parameter — every other signal type (`reply`) leaves it at its
+            # `""` default, so a genuine redelivery of those still collides
+            # on the same key it always has.
+            #
+            # `reaction` also needs its own per-signal variant: unlike
+            # `reply`/`thread_resolution` (one signal per webhook event, so
+            # the 3-column key already identifies "this event"), a single
+            # `posted_finding_comment_id` can carry several *distinct*
+            # reactions (👍 from one reviewer, 👎 from another), each its
+            # own `memory.reaction_poll` call with `github_comment_id=None`
+            # every time — without a variant, the second reaction's insert
+            # collides with the first's on the exact same key and is
+            # silently dropped by `ON CONFLICT DO NOTHING`, even though it's
+            # not a redelivery of anything. Keyed on the reaction's own id
+            # rather than its content, so two people reacting with the same
+            # emoji still both get captured. This does *not* also give this
+            # constraint redelivery-idempotency for `reaction` the way it
+            # does for `reply`/`thread_resolution`: `github_comment_id` is
+            # always `NULL` here, and Postgres's own "NULLs are never equal"
+            # unique-index semantics mean `uq_memory_entry_signal` never
+            # actually matches a `reaction` row against another one,
+            # regardless of `signal_variant` — real redelivery-safety for
+            # reactions lives entirely in `ReactionDedupStore.filter_new`'s
+            # own non-nullable `(posted_finding_comment_id, reaction_id)`
+            # key (Assumption 9), called before this method ever runs, which
+            # already guarantees `record_signal` sees a given reaction id at
+            # most once.
             signal_variant = ""
             if raw_signal_type == "thread_resolution":
                 signal_variant = "resolved" if raw_signal_detail.get("resolved") else "unresolved"
+            elif raw_signal_type == "reaction":
+                signal_variant = str(raw_signal_detail.get("reaction_id", ""))[:16]
             # `ON CONFLICT DO NOTHING` against `uq_memory_entry_signal`
             # (posted_finding_comment_id, raw_signal_type,
             # github_comment_id, signal_variant) — Phase 3's own
@@ -249,38 +286,43 @@ class PostgresMemoryRepository:
     async def best_effective_similarity(
         self, *, repo_id: str, embedding: tuple[float, ...], half_life_days: float, now: datetime
     ) -> float | None:
-        try:
-            repo_uuid = uuid.UUID(repo_id)
-        except ValueError as exc:
-            raise MemoryStoreError(operation="best_effective_similarity", detail=str(exc)) from exc
+        repo_uuid = self._parse_uuid(repo_id, operation="best_effective_similarity")
         vector = list(embedding)
 
-        async def _read(session: AsyncSession) -> tuple[float, datetime] | None:
-            statement = (
-                select(MemoryEntryRow.approved_at, MemoryEntryRow.embedding.cosine_distance(vector))
-                .where(
-                    MemoryEntryRow.repo_id == repo_uuid,
-                    MemoryEntryRow.status == MemoryEntryStatus.APPROVED,
-                    MemoryEntryRow.entry_type == "dismissed_finding",
-                    MemoryEntryRow.embedding.is_not(None),
-                )
-                .order_by(MemoryEntryRow.embedding.cosine_distance(vector))
-                .limit(1)
+        # Decay is applied per-candidate below, not in this query — ordering
+        # by raw cosine distance and taking the single closest row would
+        # only ever decay *that* row, but a slightly-less-similar, more
+        # recently-approved entry can have a *higher* decay-weighted
+        # similarity than the raw-closest one (this Protocol's own contract
+        # is "the highest decay-weighted similarity ... any approved ...
+        # entry", not "the raw-nearest entry's decayed similarity"). No
+        # `LIMIT`, matching this module's own "no ANN index, no latency SLA"
+        # v1 posture (see this module's docstring) — every approved
+        # `dismissed_finding` candidate must be considered to answer the
+        # Protocol's actual question.
+        async def _read(session: AsyncSession) -> Sequence[tuple[datetime, float]]:
+            statement = select(
+                MemoryEntryRow.approved_at, MemoryEntryRow.embedding.cosine_distance(vector)
+            ).where(
+                MemoryEntryRow.repo_id == repo_uuid,
+                MemoryEntryRow.status == MemoryEntryStatus.APPROVED,
+                MemoryEntryRow.entry_type == "dismissed_finding",
+                MemoryEntryRow.embedding.is_not(None),
             )
             result = await session.execute(statement)
-            row = result.first()
-            if row is None:
-                return None
-            approved_at, cosine_distance = row
-            return (float(cosine_distance), approved_at)
+            return [(approved_at, cosine_distance) for approved_at, cosine_distance in result]
 
-        found = await self._run(operation="best_effective_similarity", fn=_read)
-        if found is None:
+        candidates = await self._run(operation="best_effective_similarity", fn=_read)
+        if not candidates:
             return None
-        cosine_distance, approved_at = found
-        raw_similarity = 1.0 - cosine_distance
-        return effective_similarity(
-            raw_similarity, approved_at=approved_at, half_life_days=half_life_days, now=now
+        return max(
+            effective_similarity(
+                1.0 - float(cosine_distance),
+                approved_at=approved_at,
+                half_life_days=half_life_days,
+                now=now,
+            )
+            for approved_at, cosine_distance in candidates
         )
 
     # -- MemoryAdminRepository -----------------------------------------------
@@ -295,12 +337,15 @@ class PostgresMemoryRepository:
         limit: int,
         offset: int,
     ) -> tuple[tuple[MemoryEntry, ...], int]:
-        try:
-            org_uuid = uuid.UUID(org_id) if org_id is not None else None
-            repo_uuid = uuid.UUID(repo_id) if repo_id is not None else None
-            team_uuid = uuid.UUID(team_id) if team_id is not None else None
-        except ValueError as exc:
-            raise MemoryStoreError(operation="list_entries", detail=str(exc)) from exc
+        org_uuid = (
+            self._parse_uuid(org_id, operation="list_entries") if org_id is not None else None
+        )
+        repo_uuid = (
+            self._parse_uuid(repo_id, operation="list_entries") if repo_id is not None else None
+        )
+        team_uuid = (
+            self._parse_uuid(team_id, operation="list_entries") if team_id is not None else None
+        )
 
         conditions = []
         if org_uuid is not None:
@@ -339,10 +384,7 @@ class PostgresMemoryRepository:
         entry_type: MemoryEntryType,
         embedding: tuple[float, ...] | None,
     ) -> MemoryEntry:
-        try:
-            entry_uuid = uuid.UUID(entry_id)
-        except ValueError as exc:
-            raise MemoryStoreError(operation="set_status", detail=str(exc)) from exc
+        entry_uuid = self._parse_uuid(entry_id, operation="set_status")
 
         async def _write(session: AsyncSession) -> MemoryEntryRow | None:
             result = await session.execute(
@@ -366,10 +408,7 @@ class PostgresMemoryRepository:
         return _to_entry(row)
 
     async def delete_entry(self, *, entry_id: str) -> None:
-        try:
-            entry_uuid = uuid.UUID(entry_id)
-        except ValueError as exc:
-            raise MemoryStoreError(operation="delete_entry", detail=str(exc)) from exc
+        entry_uuid = self._parse_uuid(entry_id, operation="delete_entry")
 
         async def _write(session: AsyncSession) -> bool:
             result = await session.execute(
@@ -388,10 +427,7 @@ class PostgresMemoryRepository:
     # -- PostedCommentReader (Phase 5, Unit E) --------------------------------
 
     async def get_posted_comment(self, *, entry_id: str) -> PostedComment:
-        try:
-            entry_uuid = uuid.UUID(entry_id)
-        except ValueError as exc:
-            raise MemoryStoreError(operation="get_posted_comment", detail=str(exc)) from exc
+        entry_uuid = self._parse_uuid(entry_id, operation="get_posted_comment")
 
         async def _read(session: AsyncSession) -> PostedFindingCommentRow | None:
             statement = (
@@ -421,10 +457,7 @@ class PostgresMemoryRepository:
     async def recent_comment_ids(
         self, *, repo_id: str, pr_number: int, limit: int
     ) -> tuple[int, ...]:
-        try:
-            repo_uuid = uuid.UUID(repo_id)
-        except ValueError as exc:
-            raise MemoryStoreError(operation="recent_comment_ids", detail=str(exc)) from exc
+        repo_uuid = self._parse_uuid(repo_id, operation="recent_comment_ids")
 
         async def _read(session: AsyncSession) -> Sequence[int]:
             statement = (

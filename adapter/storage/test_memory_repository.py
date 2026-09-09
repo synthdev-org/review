@@ -15,6 +15,7 @@ age, and a real Postgres-level failure surfacing as `MemoryStoreError`
 
 from __future__ import annotations
 
+import math
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,7 @@ from adapter.storage.models import (
     Org,
     PostedFindingCommentRow,
     Repo,
+    Team,
 )
 from memory.models import PostedComment
 from memory.store import MemoryEntryNotFoundError, MemoryStoreError
@@ -44,6 +46,22 @@ _EMBEDDING_DIMENSION = 384
 
 def _vector(fill: float = 0.0) -> tuple[float, ...]:
     return tuple(float(fill) for _ in range(_EMBEDDING_DIMENSION))
+
+
+def _vector_with_similarity(cosine_similarity: float) -> tuple[float, ...]:
+    """A `_EMBEDDING_DIMENSION`-dim vector whose cosine similarity to the
+    all-ones query vector (`_vector(1.0)`) is exactly `cosine_similarity` —
+    split half-and-half between `cos(theta) + sin(theta)` and
+    `cos(theta) - sin(theta)` (`theta = acos(cosine_similarity)`), which
+    works out to exactly `cos(theta)` cosine similarity against an all-ones
+    vector of any dimension (the two halves are each other's orthogonal
+    complement relative to the all-ones direction).
+    """
+    theta = math.acos(cosine_similarity)
+    a = math.cos(theta) + math.sin(theta)
+    b = math.cos(theta) - math.sin(theta)
+    half = _EMBEDDING_DIMENSION // 2
+    return tuple([a] * half + [b] * (_EMBEDDING_DIMENSION - half))
 
 
 @pytest_asyncio.fixture
@@ -316,6 +334,53 @@ async def test_record_signal_keeps_both_rows_when_a_thread_toggles_resolution(
 
 
 @pytest.mark.asyncio
+async def test_record_signal_keeps_both_rows_for_two_distinct_reactions_on_one_comment(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """Two distinct reactions on the same posted comment (identical
+    `posted_finding_comment_id`, `raw_signal_type="reaction"`, and
+    `github_comment_id=None` — `memory.reaction_poll` always passes `None`
+    for a reaction signal) are two distinct real-world signals, not a
+    redelivery of the same one, and must both be captured — regression test
+    for the bug a review pass found (without a per-reaction `signal_variant`,
+    the second reaction's insert collided with the first's on the exact same
+    `uq_memory_entry_signal` key and was silently dropped by
+    `ON CONFLICT DO NOTHING`, while still reporting `found=True`).
+    """
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9105)
+
+    thumbs_up = await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="reaction",
+        raw_signal_detail={"reaction_id": 1, "content": "+1"},
+        github_comment_id=None,
+    )
+    thumbs_down = await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="reaction",
+        raw_signal_detail={"reaction_id": 2, "content": "-1"},
+        github_comment_id=None,
+    )
+
+    assert (thumbs_up, thumbs_down) == (True, True)
+    async with session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(MemoryEntryRow)
+                    .where(MemoryEntryRow.posted_finding_comment_id == comment_id)
+                    .order_by(MemoryEntryRow.created_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert [row.raw_signal_detail["reaction_id"] for row in rows] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_list_entries_filters_by_repo_and_status(
     repository: PostgresMemoryRepository,
     repo_id: uuid.UUID,
@@ -364,6 +429,105 @@ async def test_list_entries_filters_by_repo_and_status(
     )
     assert total == 0
     assert entries == ()
+
+
+@pytest.mark.asyncio
+async def test_list_entries_filters_by_org_id(
+    repository: PostgresMemoryRepository,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """A regression test for the exact gap `plan-deliver-memory.md` itself
+    calls out: an earlier draft of `MemoryAdminRepository.list_entries`
+    dropped `org_id`/`team_id` down to `repo_id` alone. `record_signal`
+    derives `memory_entry.org_id` from the comment's own repo's `org_id`
+    (see its own docstring), so seeding two repos under two different orgs
+    and recording a signal against each proves the filter genuinely
+    isolates by org, not merely by repo."""
+    async with session_factory() as session, session.begin():
+        org_a = Org(name="org-a", slug=f"org-a-{uuid.uuid4().hex}")
+        org_b = Org(name="org-b", slug=f"org-b-{uuid.uuid4().hex}")
+        session.add_all([org_a, org_b])
+        await session.flush()
+        repo_a = Repo(org_id=org_a.id, name="repo-a", full_name=f"org-a/repo-a-{uuid.uuid4().hex}")
+        repo_b = Repo(org_id=org_b.id, name="repo-b", full_name=f"org-b/repo-b-{uuid.uuid4().hex}")
+        session.add_all([repo_a, repo_b])
+        await session.flush()
+        org_a_id, repo_a_id, repo_b_id = org_a.id, repo_a.id, repo_b.id
+
+    comment_a = await _seed_posted_comment(session_factory, repo_id=repo_a_id, comment_id=9210)
+    comment_b = await _seed_posted_comment(session_factory, repo_id=repo_b_id, comment_id=9211)
+
+    await repository.record_signal(
+        posted_finding_comment_id=comment_a,
+        raw_signal_type="reaction",
+        raw_signal_detail={"emoji": "+1"},
+        github_comment_id=None,
+    )
+    await repository.record_signal(
+        posted_finding_comment_id=comment_b,
+        raw_signal_type="reaction",
+        raw_signal_detail={"emoji": "-1"},
+        github_comment_id=None,
+    )
+
+    entries, total = await repository.list_entries(
+        org_id=str(org_a_id), repo_id=None, team_id=None, status=None, limit=50, offset=0
+    )
+
+    assert total == 1
+    assert len(entries) == 1
+    assert entries[0].posted_finding_comment_id == comment_a
+    assert entries[0].raw_signal_detail == {"emoji": "+1"}
+
+
+@pytest.mark.asyncio
+async def test_list_entries_filters_by_team_id(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """Nothing in this codebase writes `memory_entry.team_id` yet (per
+    `MemoryEntryRow`'s own docstring — a documented placeholder, no writer
+    exists), so unlike `org_id`/`repo_id` this filter can't be proven
+    through `record_signal`. Seeds two rows directly, one scoped to a real
+    `team_id` and one not, and proves `list_entries`'s `team_id` filter
+    isolates the former without `repo_id`/`org_id` in play."""
+    comment_a = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9212)
+    comment_b = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9213)
+
+    async with session_factory() as session, session.begin():
+        org = (await session.execute(select(Repo.org_id).where(Repo.id == repo_id))).scalar_one()
+        team = Team(org_id=org, name=f"team-{uuid.uuid4().hex}")
+        session.add(team)
+        await session.flush()
+        team_id = team.id
+        session.add(
+            MemoryEntryRow(
+                posted_finding_comment_id=comment_a,
+                repo_id=repo_id,
+                team_id=team_id,
+                raw_signal_type="reaction",
+                raw_signal_detail={"emoji": "+1"},
+            )
+        )
+        session.add(
+            MemoryEntryRow(
+                posted_finding_comment_id=comment_b,
+                repo_id=repo_id,
+                team_id=None,
+                raw_signal_type="reaction",
+                raw_signal_detail={"emoji": "-1"},
+            )
+        )
+
+    entries, total = await repository.list_entries(
+        org_id=None, repo_id=None, team_id=str(team_id), status=None, limit=50, offset=0
+    )
+
+    assert total == 1
+    assert len(entries) == 1
+    assert entries[0].posted_finding_comment_id == comment_a
+    assert entries[0].raw_signal_detail == {"emoji": "+1"}
 
 
 @pytest.mark.asyncio
@@ -575,6 +739,94 @@ async def test_best_effective_similarity_returns_the_correct_decayed_value(
     # Identical vectors -> cosine_distance == 0 -> raw_cosine_similarity == 1.0.
     # One half-life (180 / 180) -> 1.0 * 0.5 ** 1 == 0.5.
     assert result == pytest.approx(0.5, abs=1e-4)
+
+
+async def _seed_approved_dismissed_finding(
+    session_factory: async_sessionmaker[Any],
+    *,
+    repo_id: uuid.UUID,
+    repository: PostgresMemoryRepository,
+    comment_id: int,
+    embedding: tuple[float, ...],
+    approved_at: datetime,
+) -> None:
+    posted_comment_id = await _seed_posted_comment(
+        session_factory, repo_id=repo_id, comment_id=comment_id
+    )
+    await repository.record_signal(
+        posted_finding_comment_id=posted_comment_id,
+        raw_signal_type="reply",
+        raw_signal_detail={"body": "not applicable"},
+        github_comment_id=comment_id,
+    )
+    entries, _ = await repository.list_entries(
+        org_id=None, repo_id=str(repo_id), team_id=None, status=None, limit=100, offset=0
+    )
+    entry_id = next(
+        entry.id for entry in entries if entry.posted_finding_comment_id == posted_comment_id
+    )
+    await repository.set_status(
+        entry_id=entry_id, status="approved", entry_type="dismissed_finding", embedding=embedding
+    )
+    async with session_factory() as session, session.begin():
+        row = (
+            await session.execute(
+                select(MemoryEntryRow).where(MemoryEntryRow.id == uuid.UUID(entry_id))
+            )
+        ).scalar_one()
+        row.approved_at = approved_at
+
+
+@pytest.mark.asyncio
+async def test_best_effective_similarity_considers_every_candidate_not_just_the_raw_nearest(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """Regression test for the bug a review pass found: the query used to
+    order by raw `cosine_distance` and `LIMIT 1` *before* applying decay, so
+    decay only ever got a chance to run on the single raw-nearest row. A
+    slightly-less-similar but much more recently-approved entry can have a
+    higher *decay-weighted* similarity than the raw-nearest one — this
+    Protocol's own contract (`memory.store.DismissedFindingMatcher
+    .best_effective_similarity`) is "the highest decay-weighted similarity
+    ... any approved ... entry", not "the raw-nearest entry's decayed
+    similarity".
+    """
+    now = datetime.now(UTC)
+    half_life_days = 30.0
+
+    # Raw-nearest (0.95) but approved 200 days ago -> heavily decayed.
+    await _seed_approved_dismissed_finding(
+        session_factory,
+        repo_id=repo_id,
+        repository=repository,
+        comment_id=9602,
+        embedding=_vector_with_similarity(0.95),
+        approved_at=now - timedelta(days=200),
+    )
+    # Raw-further (0.85) but approved 2 days ago -> barely decayed, and its
+    # decayed similarity ends up higher than the raw-nearest entry's.
+    await _seed_approved_dismissed_finding(
+        session_factory,
+        repo_id=repo_id,
+        repository=repository,
+        comment_id=9603,
+        embedding=_vector_with_similarity(0.85),
+        approved_at=now - timedelta(days=2),
+    )
+
+    result = await repository.best_effective_similarity(
+        repo_id=str(repo_id),
+        embedding=_vector(1.0),
+        half_life_days=half_life_days,
+        now=now,
+    )
+
+    expected_from_recent_entry = 0.85 * 0.5 ** (2.0 / half_life_days)
+    expected_from_old_entry = 0.95 * 0.5 ** (200.0 / half_life_days)
+    assert expected_from_recent_entry > expected_from_old_entry  # sanity-check the fixture
+    assert result == pytest.approx(expected_from_recent_entry, abs=1e-3)
 
 
 @pytest.mark.asyncio

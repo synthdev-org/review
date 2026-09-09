@@ -25,10 +25,11 @@ adds a third branch: ``MEMORY_REACTION_POLL`` jobs run through
 ``memory.reaction_poll.run_memory_reaction_poll_job``, wired with real
 adapters via ``memory.reaction_poll.MemoryReactionPollJobDependencies``
 (the same small-bundle pattern ``IndexingJobDependencies`` already
-establishes). This job type has no dedicated whole-job-failure exception of
-its own (see that module's own docstring) — any exception it raises falls
-through to this loop's own generic bug-resilience handling below, the same
-as a genuine bug in the dispatch loop itself.
+establishes). ``MemoryReactionPollJobFailedError`` (that job type's own
+analog of ``IndexingJobFailedError``/``PipelineFailedError``) is caught by
+``_run_claimed_job`` the same way as the other two — marking the job
+``FAILED`` with a "job failed" log line, never the generic bug-resilience
+catch-all.
 
 Lives in ``apps/worker`` (an entrypoint package, per
 docs/rules/architecture.md — entrypoints depend on the domain and wire
@@ -81,6 +82,7 @@ from adapter.storage.schemas import ClaimedJob
 from indexing.pipeline import IndexingJobDependencies, IndexingJobFailedError, run_indexing_job
 from memory.reaction_poll import (
     MemoryReactionPollJobDependencies,
+    MemoryReactionPollJobFailedError,
     MemoryReactionPollJobPayload,
     run_memory_reaction_poll_job,
 )
@@ -158,13 +160,11 @@ async def _run_claimed_job(
     ``stuck_job_warning_threshold_seconds`` — and mark it ``DONE``/``FAILED``
     accordingly.
 
-    Any exception other than ``PipelineFailedError``/``IndexingJobFailedError``
-    escaping ``_dispatch_claimed_job`` (a bug in the loop, not a
-    pipeline-reported failure, or a ``MEMORY_REACTION_POLL`` job's own
-    whole-job failure — see ``memory/reaction_poll.py``'s own docstring for
-    why that job type has no dedicated exception type of its own) is
-    deliberately left uncaught here — the caller (``run_dispatch_loop``) is
-    where that distinction is handled, per this module's own docstring.
+    Any exception other than ``PipelineFailedError``/``IndexingJobFailedError``/
+    ``MemoryReactionPollJobFailedError`` escaping ``_dispatch_claimed_job``
+    (a bug in the loop, not a pipeline/job-reported failure) is deliberately
+    left uncaught here — the caller (``run_dispatch_loop``) is where that
+    distinction is handled, per this module's own docstring.
     """
     task: asyncio.Task[None] = asyncio.create_task(
         _dispatch_claimed_job(
@@ -196,7 +196,7 @@ async def _run_claimed_job(
 
     try:
         task.result()
-    except (PipelineFailedError, IndexingJobFailedError) as exc:
+    except (PipelineFailedError, IndexingJobFailedError, MemoryReactionPollJobFailedError) as exc:
         await job_queue.mark_failed(job.id)
         logger.error(
             "job failed",

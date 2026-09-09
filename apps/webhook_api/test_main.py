@@ -92,3 +92,44 @@ def test_enqueue_rate_limiter_active_logs_info_once(caplog: pytest.LogCaptureFix
         for r in caplog.records
         if r.levelname == "WARNING" and "review-enqueue rate limiting" in r.getMessage()
     ]
+
+
+def test_create_app_succeeds_with_loadable_embedding_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """docs/plans/plan-deliver-memory.md's Phase 5 section: this entrypoint's
+    own `LocalONNXEmbeddingClient` startup check, mirroring
+    `apps/worker/test_main.py::test_main_succeeds_with_loadable_embedding_model`
+    — no mocking, the real Dockerfile-baked model, exercised for real."""
+    logging.getLogger("apps.webhook_api.main").disabled = False
+    settings = _settings()  # embedding_model_path defaults to the real baked model
+
+    with caplog.at_level("INFO", logger="apps.webhook_api.main"):
+        create_app(settings)  # must not raise SystemExit
+
+    assert any(
+        record.name == "apps.webhook_api.main"
+        and record.getMessage() == "local embedding model loaded"
+        for record in caplog.records
+    )
+
+
+def test_create_app_exits_non_zero_with_unloadable_embedding_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logging.getLogger("apps.webhook_api.main").disabled = False
+    settings = _settings(embedding_model_path="/nonexistent/model/path")
+
+    with (
+        caplog.at_level("ERROR", logger="apps.webhook_api.main"),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        create_app(settings)
+
+    assert excinfo.value.code == 1
+    assert any(
+        record.name == "apps.webhook_api.main"
+        and record.getMessage() == "local embedding model is not usable at startup; exiting"
+        and record.levelname == "ERROR"
+        for record in caplog.records
+    )

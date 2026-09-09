@@ -504,6 +504,21 @@ async def _handle_matched_triggers(
     return await _run_in_transaction(session_factory, event=event, work=_work)
 
 
+# Every outcome `_handle_memory_capture` can return, per its own docstring —
+# `create_webhook_router`'s route handler's own info-level summary log line
+# maps `capture_reason` through this dict rather than an if/elif chain that
+# would re-derive the same enumeration at a second call site. `"captured"`/
+# `"capture_failed"` get their own distinct wording; the two routine,
+# expected non-events share one, so a genuine failure never reads as an
+# unremarkable no-op at the info level (see that log line's own comment).
+_MEMORY_CAPTURE_LOG_MESSAGES: dict[str, str] = {
+    "captured": "memory capture accepted",
+    "capture_failed": "memory capture accepted; capture attempt failed",
+    "not_a_platform_comment": "memory capture accepted; not captured",
+    "capture_ceiling_exceeded": "memory capture accepted; not captured",
+}
+
+
 async def _handle_memory_capture(
     *,
     raw_payload: object,
@@ -539,13 +554,27 @@ async def _handle_memory_capture(
     ``error`` and swallowed here, never failing the webhook response
     itself, the same "a secondary write-path concern" posture Phase 2's own
     provenance capture already establishes for `GitHubFindingsPublisher.post_review`).
+    For a ``pull_request_review_thread`` event with more than one correlating
+    comment id, each id is its own capture attempt (its own ceiling check,
+    its own isolated ``MemoryStoreError``) — ``"captured"`` is returned if
+    *any* candidate succeeded (even if a later one then hit the ceiling or
+    failed), so a partial per-thread outcome is never reported as a total
+    failure/rejection.
     """
-    if not capture_ceiling_limiter.allow(str(repo_id)):
+
+    def _ceiling_exceeded() -> bool:
+        # Shared by both branches below: the ceiling bounds actual capture
+        # attempts (and the Postgres lookup/write each one costs), not the
+        # volume of unrelated webhook deliveries a repo happens to receive,
+        # so each branch only calls this once it has a genuine capture
+        # candidate in hand.
+        if capture_ceiling_limiter.allow(str(repo_id)):
+            return False
         logger.warning(
             "memory capture rejected",
             extra={"repo_id": str(repo_id), "reason": "capture_ceiling_exceeded"},
         )
-        return "capture_ceiling_exceeded"
+        return True
 
     try:
         if event_type == "pull_request_review_comment":
@@ -553,8 +582,15 @@ async def _handle_memory_capture(
             in_reply_to_id = comment_envelope.comment.in_reply_to_id
             if in_reply_to_id is None:
                 # A fresh top-level review comment, not a reply — Assumption
-                # 3, never captured.
+                # 3, never captured. Checked before the ceiling: an ordinary
+                # (non-reply) review comment isn't a capture candidate at
+                # all, so it must not consume the per-repo daily quota meant
+                # to bound genuine capture attempts.
                 return "not_a_platform_comment"
+
+            if _ceiling_exceeded():
+                return "capture_ceiling_exceeded"
+
             redacted_body = await text_redactor.redact(comment_envelope.comment.body)
             found = await provenance_recorder.record_signal(
                 posted_finding_comment_id=in_reply_to_id,
@@ -569,6 +605,7 @@ async def _handle_memory_capture(
         comment_ids = [comment.id for comment in thread_envelope.thread.comments]
         if not comment_ids:
             return "not_a_platform_comment"
+
         resolved = action == "resolved"
         # The thread event's own comment id, per `MemoryEntryRow.github_comment_id`'s
         # own docstring — the most recent comment in the thread (the last
@@ -576,16 +613,59 @@ async def _handle_memory_capture(
         # of which id among them turns out to correlate to a
         # `posted_finding_comment` row below.
         thread_github_comment_id = comment_ids[-1]
+        # Record against every candidate id that correlates to a
+        # `posted_finding_comment` row, not just the first — a single
+        # resolved/unresolved thread can contain more than one of the
+        # platform's own posted findings (e.g. two separate review passes
+        # attaching comments to the same line/thread), and each still needs
+        # its own `thread_resolution` signal.
+        #
+        # The ceiling is checked once per candidate here, not once for the
+        # whole thread — each iteration is its own Postgres lookup/write,
+        # exactly what the ceiling bounds (see `_ceiling_exceeded`'s own
+        # comment), so a thread with several correlating comments must
+        # consume several units of the daily cap, not one. A candidate's own
+        # `MemoryStoreError` is isolated to that candidate rather than
+        # aborting the loop, so one transient failure doesn't discard
+        # signals already durably recorded for earlier candidates in this
+        # same thread.
+        # A single `outcome` set in priority order as candidates are
+        # processed — "captured" (any candidate succeeded) outranks
+        # "capture_failed" (a candidate's own `MemoryStoreError`), which
+        # outranks "capture_ceiling_exceeded" (nothing succeeded or failed
+        # before the ceiling stopped the loop), which outranks the
+        # "not_a_platform_comment" baseline (nothing correlated at all).
+        # Each `if outcome == ...`/`if outcome != ...` guard below only ever
+        # *raises* the outcome's priority, never lowers it.
+        outcome = "not_a_platform_comment"
         for candidate_id in comment_ids:
-            found = await provenance_recorder.record_signal(
-                posted_finding_comment_id=candidate_id,
-                raw_signal_type="thread_resolution",
-                raw_signal_detail={"resolved": resolved},
-                github_comment_id=thread_github_comment_id,
-            )
+            if _ceiling_exceeded():
+                if outcome == "not_a_platform_comment":
+                    outcome = "capture_ceiling_exceeded"
+                break
+            try:
+                found = await provenance_recorder.record_signal(
+                    posted_finding_comment_id=candidate_id,
+                    raw_signal_type="thread_resolution",
+                    raw_signal_detail={"resolved": resolved},
+                    github_comment_id=thread_github_comment_id,
+                )
+            except MemoryStoreError as exc:
+                if outcome != "captured":
+                    outcome = "capture_failed"
+                logger.error(
+                    "memory capture failed for one thread candidate; continuing with the rest",
+                    extra={
+                        "repo_id": str(repo_id),
+                        "event_type": event_type,
+                        "posted_finding_comment_id": candidate_id,
+                    },
+                    exc_info=exc,
+                )
+                continue
             if found:
-                return "captured"
-        return "not_a_platform_comment"
+                outcome = "captured"
+        return outcome
     except ValidationError:
         logger.warning(
             "memory capture rejected",
@@ -625,16 +705,36 @@ async def _run_synchronous_reaction_poll(
     own guard — nothing to poll without a PR number, returns
     ``"missing_required_fields"`` rather than attempting the call.
 
-    A genuine failure (a Postgres-level ``MemoryStoreError``, or the
+    A genuine whole-job failure (a Postgres-level error, or the
     installation-token exchange itself failing before any per-comment fetch
-    even starts — see ``run_memory_reaction_poll_job``'s own docstring) is
-    logged at ``error`` and swallowed here, never failing the webhook
+    even starts — see ``run_memory_reaction_poll_job``'s own docstring,
+    which raises ``MemoryReactionPollJobFailedError`` for exactly this case)
+    is logged at ``error`` and swallowed here, never failing the webhook
     response itself — the same "a secondary write-path concern, not this
     route's own trust boundary" posture ``_handle_memory_capture`` above
     already establishes for its own Postgres writes. A single comment's own
     reaction fetch failing is already tolerated inside
-    ``GitHubReactionFetcher`` itself and never reaches this function as an
-    exception at all.
+    ``GitHubReactionFetcher`` itself, and a single reaction's own
+    ``record_signal`` failure is isolated and logged inside
+    ``run_memory_reaction_poll_job``'s own per-comment loop — neither
+    ordinarily reaches this function as an exception at all.
+
+    The catch below is still bare ``except Exception``, not narrowed to
+    ``MemoryReactionPollJobFailedError`` — deliberately: this function's own
+    "never failing the webhook response itself" promise is unconditional,
+    not scoped to Postgres/GitHub failures alone. A genuine bug inside this
+    secondary write path (a ``TypeError``/``KeyError`` from a code defect,
+    not just an anticipated infra failure) must not be allowed to take down
+    a GitHub-facing webhook response any more than an anticipated one would
+    — the same "belt-and-braces, every failure mode, not just the
+    anticipated ones" posture ``adapter/github/posting.py``'s own
+    ``post_review`` already establishes for its own terminal-step provenance
+    capture (see that module's docstring's "Provenance persistence"
+    section). Narrowing this to a specific exception type would trade a
+    known, accepted risk (a genuinely unanticipated bug here fails silently
+    instead of loudly) for a worse one (a bug in a secondary, best-effort
+    signal-capture path takes down the primary webhook response GitHub is
+    waiting on).
     """
     if event.pr_number is None:
         return "missing_required_fields"
@@ -942,10 +1042,23 @@ def create_webhook_router(
                 text_redactor=text_redactor,
                 capture_ceiling_limiter=memory_capture_ceiling_limiter,
             )
+            # A genuine `MemoryStoreError` is already logged at `error` with
+            # `exc_info` inside `_handle_memory_capture` itself — this line
+            # is a per-request summary, not the only signal a failure
+            # produced. It still must not describe `capture_failed` with the
+            # same "accepted; not captured" wording used for routine,
+            # expected non-events (`not_a_platform_comment`,
+            # `capture_ceiling_exceeded`) — someone scanning info-level
+            # messages alone (not `extra.reason`, not the error-level log
+            # above) would otherwise see a real Postgres-level failure as an
+            # unremarkable no-op. One dict, keyed by every outcome
+            # `_handle_memory_capture` can return, rather than an if/elif
+            # chain re-deriving that same enumeration at a second call site.
+            capture_log_message = _MEMORY_CAPTURE_LOG_MESSAGES.get(
+                capture_reason, "memory capture accepted; not captured"
+            )
             logger.info(
-                "memory capture accepted"
-                if capture_reason == "captured"
-                else "memory capture accepted; not captured",
+                capture_log_message,
                 extra={
                     "installation_id": event.installation_id,
                     "org_id": str(result.org_id),

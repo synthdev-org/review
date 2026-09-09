@@ -28,13 +28,54 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Awaitable
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict
 
-from memory.store import MemorySignalRecorder, ReactionDedupStore, ReactionFetcher
+from memory.store import MemorySignalRecorder, MemoryStoreError, ReactionDedupStore, ReactionFetcher
 
 logger = logging.getLogger(__name__)
+
+
+class MemoryReactionPollJobFailedError(Exception):
+    """Raised by ``run_memory_reaction_poll_job`` when the whole job cannot
+    proceed — a ``ReactionDedupStore``/``ReactionFetcher``/
+    ``MemorySignalRecorder`` failure before/between per-comment processing
+    (e.g. a Postgres-level error, or the installation token exchange itself
+    failing), as distinct from a single reaction's ``record_signal`` failure
+    inside the per-comment loop, which is isolated to that one reaction and
+    never raises this (see the loop's own ``except Exception`` below).
+
+    Mirrors ``review.pipeline.PipelineFailedError``/
+    ``indexing.pipeline.IndexingJobFailedError``'s role for ``REVIEW``/
+    ``INDEX`` jobs: ``apps/worker/dispatch.py``'s dispatch loop catches this
+    the same way, marking the job ``FAILED`` via its own typed-exception
+    path rather than the generic "unhandled exception in dispatch loop"
+    bug-resilience fallback used for genuine dispatch-loop bugs — so an
+    on-call engineer can tell "this job legitimately failed" (a transient
+    GitHub/Postgres error) from "the dispatch loop itself has a bug" the
+    same way they already can for the other two job types.
+    """
+
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(f"memory reaction poll job failed: {detail}")
+        self.detail = detail
+
+
+async def _fatal_on_error[T](awaitable: Awaitable[T]) -> T:
+    """Await ``awaitable``, translating any exception it raises into
+    ``MemoryReactionPollJobFailedError`` — the one place
+    ``run_memory_reaction_poll_job`` below marks a call as "whole-job
+    fatal", used at each of its three ``ReactionDedupStore``/
+    ``ReactionFetcher`` calls instead of repeating the same
+    ``try/except Exception as exc: raise MemoryReactionPollJobFailedError(...)
+    from exc`` block inline at each call site.
+    """
+    try:
+        return await awaitable
+    except Exception as exc:
+        raise MemoryReactionPollJobFailedError(detail=str(exc)) from exc
 
 
 class MemoryReactionPollJobPayload(BaseModel):
@@ -99,20 +140,23 @@ async def run_memory_reaction_poll_job(
        Assumption 9's ``captured_reaction`` dedup) and persist one ``pending``
        ``memory_entry`` per newly-observed reaction.
 
-    Raises whatever ``ReactionDedupStore``/``ReactionFetcher``/
-    ``MemorySignalRecorder`` themselves raise for a genuine whole-job
-    failure (e.g. a Postgres-level error, or the installation token
-    exchange itself failing before any per-comment fetch even starts) —
-    uncaught here, propagating to ``apps/worker/dispatch.py``'s own generic
-    bug-resilience handling, which marks the job ``FAILED``. This job type
-    has no dedicated whole-job-failure exception of its own (unlike
-    ``review.pipeline.PipelineFailedError``/``indexing.pipeline.IndexingJobFailedError``)
-    — nothing in this job's own design distinguishes a "some findings failed"
-    partial outcome from a "the whole job is broken" one the way those two
-    pipelines' own per-stage isolation does.
+    Raises ``MemoryReactionPollJobFailedError`` for a genuine whole-job
+    failure (e.g. a Postgres-level error, or the installation token exchange
+    itself failing before any per-comment fetch even starts) — caught by
+    ``apps/worker/dispatch.py``'s dispatch loop the same way it already
+    catches ``PipelineFailedError``/``IndexingJobFailedError``, marking the
+    job ``FAILED`` via its own typed path rather than the generic
+    "unhandled exception in dispatch loop" bug-resilience fallback. A single
+    reaction's own ``record_signal`` failure inside the per-comment loop is
+    isolated to that one reaction and never raises this — nothing in this
+    job's own design distinguishes a "some findings failed" partial outcome
+    from a "the whole job is broken" one, the same per-item isolation those
+    two pipelines' own per-stage handling already establishes.
     """
-    comment_ids = await dedup_store.recent_comment_ids(
-        repo_id=repo_id, pr_number=pr_number, limit=max_comments_per_poll
+    comment_ids = await _fatal_on_error(
+        dedup_store.recent_comment_ids(
+            repo_id=repo_id, pr_number=pr_number, limit=max_comments_per_poll
+        )
     )
     if not comment_ids:
         logger.info(
@@ -137,8 +181,10 @@ async def run_memory_reaction_poll_job(
         },
     )
 
-    reactions_by_comment = await reaction_fetcher.fetch_reactions(
-        installation_id=installation_id, repo_full_name=repo_full_name, comment_ids=comment_ids
+    reactions_by_comment = await _fatal_on_error(
+        reaction_fetcher.fetch_reactions(
+            installation_id=installation_id, repo_full_name=repo_full_name, comment_ids=comment_ids
+        )
     )
 
     captured_count = 0
@@ -146,20 +192,45 @@ async def run_memory_reaction_poll_job(
         if not reactions:
             continue
         content_by_reaction_id = {reaction.reaction_id: reaction.content for reaction in reactions}
-        new_reaction_ids = await dedup_store.filter_new(
-            posted_finding_comment_id=comment_id,
-            reaction_ids=tuple(content_by_reaction_id),
+        new_reaction_ids = await _fatal_on_error(
+            dedup_store.filter_new(
+                posted_finding_comment_id=comment_id,
+                reaction_ids=tuple(content_by_reaction_id),
+            )
         )
         for reaction_id in new_reaction_ids:
-            await signal_recorder.record_signal(
-                posted_finding_comment_id=comment_id,
-                raw_signal_type="reaction",
-                raw_signal_detail={
-                    "reaction_id": reaction_id,
-                    "content": content_by_reaction_id[reaction_id],
-                },
-                github_comment_id=None,
-            )
+            # ``filter_new`` above already durably marked every id in
+            # ``new_reaction_ids`` as captured (Assumption 9's dedup INSERT
+            # commits in its own transaction, ahead of this loop) — so a
+            # failure recording one reaction's signal must not abort the
+            # whole job and lose every other already-fetched reaction too.
+            # The failed id's own signal is still lost (a retry will find it
+            # pre-marked in ``captured_reaction`` and skip it), which is a
+            # known, accepted gap in the two-phase capture/record design —
+            # but it must stay scoped to that one id, not the whole batch.
+            try:
+                await signal_recorder.record_signal(
+                    posted_finding_comment_id=comment_id,
+                    raw_signal_type="reaction",
+                    raw_signal_detail={
+                        "reaction_id": reaction_id,
+                        "content": content_by_reaction_id[reaction_id],
+                    },
+                    github_comment_id=None,
+                )
+            except MemoryStoreError:
+                logger.exception(
+                    "memory reaction poll: failed to record signal for an "
+                    "already-dedup-marked reaction; this reaction's signal "
+                    "is lost, continuing with the rest of the batch",
+                    extra={
+                        "repo_id": repo_id,
+                        "pr_number": pr_number,
+                        "posted_finding_comment_id": comment_id,
+                        "reaction_id": reaction_id,
+                    },
+                )
+                continue
             captured_count += 1
 
     logger.info(

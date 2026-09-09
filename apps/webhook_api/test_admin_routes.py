@@ -15,6 +15,7 @@ valid key.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
@@ -22,6 +23,7 @@ import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from adapter.storage.engine import create_session_factory
@@ -31,6 +33,7 @@ from adapter.storage.models import (
     Org,
     PostedFindingCommentRow,
     Repo,
+    Team,
 )
 from apps.webhook_api.main import create_app
 from apps.webhook_api.settings import WebhookAPISettings
@@ -85,6 +88,8 @@ async def _seed_pending_entry(
     message: str = "a secret was found",
     status: MemoryEntryStatus = MemoryEntryStatus.PENDING,
     entry_type: str | None = None,
+    org_id: uuid.UUID | None = None,
+    team_id: uuid.UUID | None = None,
 ) -> str:
     """Seeds a real `posted_finding_comment` row plus the `memory_entry`
     row that references it, directly via SQLAlchemy — the admin API only
@@ -109,6 +114,8 @@ async def _seed_pending_entry(
     async with session_factory() as session, session.begin():
         entry = MemoryEntryRow(
             repo_id=repo_id,
+            org_id=org_id,
+            team_id=team_id,
             posted_finding_comment_id=comment_id,
             raw_signal_type="reaction",
             raw_signal_detail={"emoji": "+1"},
@@ -219,6 +226,53 @@ async def test_list_filters_by_repo_and_status(
     assert len(body["entries"]) == 1
     assert body["entries"][0]["posted_finding_comment_id"] == 8001
     assert response_wrong_status.json() == {"entries": [], "total": 0}
+
+
+@pytest.mark.asyncio
+async def test_list_filters_by_org_id_and_team_id(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+) -> None:
+    """`org_id`/`team_id` are documented as filter parameters in their own
+    right, not merely an alias for `repo_id` — a real regression an earlier
+    plan draft introduced (see `spec-memory.md`'s "Admin key scope"
+    clarification). Seeds two entries under the same repo but different
+    `org_id`/`team_id` scope and proves each filter isolates independently
+    over HTTP, through the real admin route, not just at the repository
+    layer."""
+    async with session_factory() as session, session.begin():
+        org = (await session.execute(select(Repo.org_id).where(Repo.id == repo_id))).scalar_one()
+        team = Team(org_id=org, name=f"team-{uuid.uuid4().hex}")
+        other_org = Org(name="other-org", slug=f"other-{uuid.uuid4().hex}")
+        session.add_all([team, other_org])
+        await session.flush()
+        team_id, other_org_id = team.id, other_org.id
+
+    await _seed_pending_entry(
+        session_factory, repo_id=repo_id, comment_id=8010, org_id=org, team_id=team_id
+    )
+    await _seed_pending_entry(
+        session_factory, repo_id=repo_id, comment_id=8011, org_id=other_org_id, team_id=None
+    )
+
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        by_org = client.get(
+            "/admin/memory-entries", params={"org_id": str(org)}, headers=_auth_headers()
+        )
+        by_team = client.get(
+            "/admin/memory-entries", params={"team_id": str(team_id)}, headers=_auth_headers()
+        )
+
+    assert by_org.status_code == 200
+    assert by_org.json()["total"] == 1
+    assert by_org.json()["entries"][0]["posted_finding_comment_id"] == 8010
+
+    assert by_team.status_code == 200
+    assert by_team.json()["total"] == 1
+    assert by_team.json()["entries"][0]["posted_finding_comment_id"] == 8010
 
 
 @pytest.mark.asyncio
@@ -408,6 +462,52 @@ async def test_approve_and_reject_flip_classification_in_either_direction(
     assert reapproved["status"] == "approved"
     assert reapproved["entry_type"] == "correction"
     assert reapproved["embedding"] is None
+
+
+@pytest.mark.asyncio
+async def test_approve_reject_delete_log_the_audit_trail_at_info(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`spec-memory.md`'s Observability section names an audit trail for
+    every approve/reject/delete call (entry id, action, timestamp); the
+    `timestamp` field is added by `JSONFormatter` for every log record, not
+    a per-call concern, so this test proves the `entry_id`/`action` fields
+    this route itself is responsible for are present and correct."""
+    approve_entry_id = await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8302)
+    reject_entry_id = await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8303)
+    delete_entry_id = await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8304)
+
+    logging.getLogger("apps.webhook_api.admin_routes").disabled = False
+    with (
+        caplog.at_level("INFO", logger="apps.webhook_api.admin_routes"),
+        _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False))) as client,
+    ):
+        client.post(
+            f"/admin/memory-entries/{approve_entry_id}/approve",
+            json={"entry_type": "correction"},
+            headers=_auth_headers(),
+        )
+        client.post(f"/admin/memory-entries/{reject_entry_id}/reject", headers=_auth_headers())
+        client.delete(
+            f"/admin/memory-entries/{delete_entry_id}?confirm=true", headers=_auth_headers()
+        )
+
+    admin_records = [r for r in caplog.records if r.name == "apps.webhook_api.admin_routes"]
+
+    approved = next(r for r in admin_records if r.getMessage() == "memory entry approved")
+    assert getattr(approved, "entry_id", None) == approve_entry_id
+    assert getattr(approved, "action", None) == "approve"
+
+    rejected = next(r for r in admin_records if r.getMessage() == "memory entry rejected")
+    assert getattr(rejected, "entry_id", None) == reject_entry_id
+    assert getattr(rejected, "action", None) == "reject"
+
+    deleted = next(r for r in admin_records if r.getMessage() == "memory entry deleted")
+    assert getattr(deleted, "entry_id", None) == delete_entry_id
+    assert getattr(deleted, "action", None) == "delete"
 
 
 def test_reject_unknown_entry_id_returns_404(migrated_engine: AsyncEngine) -> None:

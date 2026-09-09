@@ -26,9 +26,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from adapter.storage.engine import create_session_factory
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.models import MemoryEntryRow, Org, PostedFindingCommentRow, Repo
-from memory.models import ReactionRecord
+from memory.models import RawSignalType, ReactionRecord
 from memory.reaction_poll import run_memory_reaction_poll_job
-from memory.store import ReactionFetcher
+from memory.store import MemorySignalRecorder, MemoryStoreError, ReactionFetcher
 
 pytestmark = pytest.mark.integration
 
@@ -55,6 +55,42 @@ class _FakeReactionFetcher:
 
 
 _: type[ReactionFetcher] = _FakeReactionFetcher
+
+
+@dataclass
+class _FlakySignalRecorder:
+    """A `MemorySignalRecorder` fake delegating every call to a real
+    `PostgresMemoryRepository` except for a caller-chosen set of
+    `reaction_id`s, which raise `MemoryStoreError` instead — lets a test
+    force one reaction's own `record_signal` to fail without faking the
+    Postgres persistence of the rest of the batch.
+    """
+
+    delegate: MemorySignalRecorder
+    fails_for_reaction_ids: set[int]
+
+    async def record_comment_provenance(self, **kwargs: Any) -> None:
+        await self.delegate.record_comment_provenance(**kwargs)
+
+    async def record_signal(
+        self,
+        *,
+        posted_finding_comment_id: int,
+        raw_signal_type: RawSignalType,
+        raw_signal_detail: dict[str, object],
+        github_comment_id: int | None,
+    ) -> bool:
+        if raw_signal_detail.get("reaction_id") in self.fails_for_reaction_ids:
+            raise MemoryStoreError(operation="record_signal", detail="simulated Postgres failure")
+        return await self.delegate.record_signal(
+            posted_finding_comment_id=posted_finding_comment_id,
+            raw_signal_type=raw_signal_type,
+            raw_signal_detail=raw_signal_detail,
+            github_comment_id=github_comment_id,
+        )
+
+
+__: type[MemorySignalRecorder] = _FlakySignalRecorder
 
 
 @pytest.fixture
@@ -163,6 +199,48 @@ async def test_a_new_reaction_creates_a_pending_memory_entry(
     assert entries[0].raw_signal_detail == {"reaction_id": 101, "content": "heart"}
     assert entries[0].status.value == "pending"
     assert entries[0].github_comment_id is None
+
+
+@pytest.mark.asyncio
+async def test_one_reactions_record_signal_failure_does_not_lose_the_rest_of_the_batch(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """Regression test for the per-reaction isolation this job's own
+    docstring promises: a single reaction's `record_signal` failing (a
+    `MemoryStoreError`) must not abort the whole job and lose every other
+    already-fetched reaction in the same poll — it stays scoped to that one
+    id, its own known/accepted "signal is lost, a retry will find it
+    pre-marked in `captured_reaction` and skip it" gap, while the rest of
+    the batch is still captured.
+    """
+    await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=8004, pr_number=1)
+    fetcher = _FakeReactionFetcher(
+        reactions_by_comment={
+            8004: (
+                ReactionRecord(reaction_id=401, content="+1"),
+                ReactionRecord(reaction_id=402, content="heart"),
+            )
+        }
+    )
+    flaky_recorder = _FlakySignalRecorder(delegate=repository, fails_for_reaction_ids={402})
+
+    # Must not raise — a single reaction's failure is isolated inside the
+    # job's own per-comment loop, never propagated as a whole-job failure.
+    await run_memory_reaction_poll_job(
+        repo_id=str(repo_id),
+        pr_number=1,
+        installation_id=_INSTALLATION_ID,
+        repo_full_name=_REPO_FULL_NAME,
+        reaction_fetcher=fetcher,
+        signal_recorder=flaky_recorder,
+        dedup_store=repository,
+        max_comments_per_poll=50,
+    )
+
+    entries = await _memory_entries_for_comment(session_factory, comment_id=8004)
+    assert {entry.raw_signal_detail["reaction_id"] for entry in entries} == {401}
 
 
 @pytest.mark.asyncio

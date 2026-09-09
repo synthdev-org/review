@@ -721,11 +721,12 @@ async def test_memory_reaction_poll_job_fatal_failure_marks_job_failed(
     migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A whole-job-fatal failure (the fake `ReactionFetcher` raising
-    unconditionally, standing in for a real token-exchange failure) has no
-    dedicated exception type for this job kind — it surfaces via
-    `run_dispatch_loop`'s own generic bug-resilience handling, marking the
-    job `FAILED` with the "unhandled exception" log line, not a job-type-
-    specific one.
+    unconditionally, standing in for a real token-exchange failure) is
+    wrapped as `MemoryReactionPollJobFailedError` and caught by
+    `_run_claimed_job`'s own typed-exception handling — the same "job
+    failed" path `PipelineFailedError`/`IndexingJobFailedError` already get
+    — marking the job `FAILED`, never falling through to the generic
+    dispatch-loop "unhandled exception" bug-resilience log line.
     """
     _reenable_dispatch_logger()
 
@@ -755,8 +756,9 @@ async def test_memory_reaction_poll_job_fatal_failure_marks_job_failed(
             await _wait_for_status(migrated_engine, job_id, JobStatus.FAILED)
 
     assert any(
-        "unhandled exception in dispatch loop" in record.getMessage()
+        record.getMessage() == "job failed"
         and getattr(record, "job_id", None) == str(job_id)
+        and getattr(record, "job_type", None) == JobType.MEMORY_REACTION_POLL.value
         for record in caplog.records
     )
 

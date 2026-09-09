@@ -472,6 +472,50 @@ async def test_post_review_persists_provenance_for_correlated_comments(
 
 
 @respx.mock
+async def test_post_review_two_findings_with_identical_body_both_get_provenance(
+    test_rsa_private_key_pem: str,
+) -> None:
+    """Two distinct `Finding`s that render an identical `(file, line, body)`
+    tuple (e.g. two rule passes producing the same severity/message/rule_id/
+    source at the same line) must each still get their own
+    `PostedComment` correlated — regression test for the bug a review pass
+    found: `_record_provenance`'s `submitted` map used to be keyed by
+    `(file, line, body)` holding a single `Finding`, so the second finding's
+    entry silently overwrote the first's, and only one of the two echoed-
+    back comments was ever recorded (misattributing the other comment's
+    provenance to the wrong finding, or dropping it outright).
+    """
+    _mock_token_exchange()
+    _mock_reviews_post()
+
+    findings = [
+        _finding(file="app.py", line=10, message="secret", rule_id="rule-a", context_ref_ids=(1,)),
+        _finding(file="app.py", line=10, message="secret", rule_id="rule-a", context_ref_ids=(2,)),
+    ]
+    assert posting_module._finding_body(findings[0]) == posting_module._finding_body(findings[1])
+    body = posting_module._finding_body(findings[0])
+    comments_response = [
+        {"id": 1001, "path": "app.py", "line": 10, "body": body},
+        {"id": 1002, "path": "app.py", "line": 10, "body": body},
+    ]
+    _mock_review_comments(comments_response)
+
+    recorder = _FakeProvenanceRecorder()
+    await _publisher(test_rsa_private_key_pem, provenance_recorder=recorder).post_review(
+        installation_id=_INSTALLATION_ID,
+        repo_full_name=_OWNER_REPO,
+        repo_id=_REPO_ID,
+        pr_number=_PR_NUMBER,
+        head_sha=_HEAD_SHA,
+        findings=findings,
+    )
+
+    assert len(recorder.calls) == 1
+    _, _, _, comments = recorder.calls[0]
+    assert {c.comment_id for c in comments} == {1001, 1002}
+
+
+@respx.mock
 async def test_post_review_unmatched_comment_is_skipped_logged_and_counted(
     test_rsa_private_key_pem: str, caplog: pytest.LogCaptureFixture
 ) -> None:

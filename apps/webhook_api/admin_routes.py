@@ -49,7 +49,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, SecretStr
@@ -114,6 +114,27 @@ class _DeleteMemoryEntryResponse(BaseModel):
 
     deleted: bool
     entry_id: str
+
+
+def _entry_id_not_found_or_invalid(entry_id: str, exc: Exception) -> NoReturn:
+    """Shared translation for the `MemoryEntryNotFoundError` -> 404 /
+    `MemoryStoreError` -> 400 pair every entry-id-scoped route below
+    (approve/reject/delete) needs — the exact same two-exception mapping
+    was previously duplicated verbatim in each route's own try/except.
+
+    Raises (rather than returns) so it can preserve each branch's original
+    exception-chaining behavior itself: the 404 case intentionally suppresses
+    the internal `MemoryEntryNotFoundError` from the traceback (`from None`
+    — nothing about "which repository lookup failed" belongs in a 404's
+    chain), while the 400 case still chains `from exc` so the originating
+    `MemoryStoreError` remains visible for debugging. A single
+    `raise ... from exc` at every call site would flatten that distinction.
+    """
+    if isinstance(exc, MemoryEntryNotFoundError):
+        raise HTTPException(status_code=404, detail=f"memory entry {entry_id!r} not found") from None
+    if isinstance(exc, MemoryStoreError):
+        raise HTTPException(status_code=400, detail=f"invalid entry_id: {exc.detail}") from exc
+    raise exc
 
 
 def create_admin_router(
@@ -186,14 +207,8 @@ def create_admin_router(
         if payload.entry_type == "dismissed_finding":
             try:
                 posted_comment = await posted_comment_reader.get_posted_comment(entry_id=entry_id)
-            except MemoryEntryNotFoundError:
-                raise HTTPException(
-                    status_code=404, detail=f"memory entry {entry_id!r} not found"
-                ) from None
-            except MemoryStoreError as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"invalid entry_id: {exc.detail}"
-                ) from exc
+            except (MemoryEntryNotFoundError, MemoryStoreError) as exc:
+                _entry_id_not_found_or_invalid(entry_id, exc)
             fingerprint_text = build_finding_fingerprint(
                 file=posted_comment.file,
                 rule_id=posted_comment.rule_id,
@@ -214,12 +229,8 @@ def create_admin_router(
                 entry_type=payload.entry_type,
                 embedding=embedding,
             )
-        except MemoryEntryNotFoundError:
-            raise HTTPException(
-                status_code=404, detail=f"memory entry {entry_id!r} not found"
-            ) from None
-        except MemoryStoreError as exc:
-            raise HTTPException(status_code=400, detail=f"invalid entry_id: {exc.detail}") from exc
+        except (MemoryEntryNotFoundError, MemoryStoreError) as exc:
+            _entry_id_not_found_or_invalid(entry_id, exc)
 
         logger.info(
             "memory entry approved",
@@ -240,12 +251,8 @@ def create_admin_router(
             entry = await repository.set_status(
                 entry_id=entry_id, status="rejected", entry_type=None, embedding=None
             )
-        except MemoryEntryNotFoundError:
-            raise HTTPException(
-                status_code=404, detail=f"memory entry {entry_id!r} not found"
-            ) from None
-        except MemoryStoreError as exc:
-            raise HTTPException(status_code=400, detail=f"invalid entry_id: {exc.detail}") from exc
+        except (MemoryEntryNotFoundError, MemoryStoreError) as exc:
+            _entry_id_not_found_or_invalid(entry_id, exc)
 
         logger.info("memory entry rejected", extra={"entry_id": entry_id, "action": "reject"})
         return entry
@@ -265,12 +272,8 @@ def create_admin_router(
 
         try:
             await repository.delete_entry(entry_id=entry_id)
-        except MemoryEntryNotFoundError:
-            raise HTTPException(
-                status_code=404, detail=f"memory entry {entry_id!r} not found"
-            ) from None
-        except MemoryStoreError as exc:
-            raise HTTPException(status_code=400, detail=f"invalid entry_id: {exc.detail}") from exc
+        except (MemoryEntryNotFoundError, MemoryStoreError) as exc:
+            _entry_id_not_found_or_invalid(entry_id, exc)
 
         logger.info("memory entry deleted", extra={"entry_id": entry_id, "action": "delete"})
         return _DeleteMemoryEntryResponse(deleted=True, entry_id=entry_id)

@@ -86,6 +86,20 @@ _MEMORY_REACTION_POLL_TRIGGERS: frozenset[tuple[str, str]] = _ENQUEUE_REVIEW_TRI
 }
 
 
+def _matches(event_type: str, action: str | None, table: frozenset[tuple[str, str]]) -> bool:
+    """Shared ``action is None -> no match`` / ``(event_type, action) in
+    table`` body every single-table trigger function below (each answering
+    its own independent question against its own trigger table) otherwise
+    repeats verbatim. ``is_index_trigger`` only routes its ``pull_request``
+    branch through this — its ``push`` branch is a structurally different
+    check (comparing ``ref`` to ``default_branch``, no table at all), so
+    the function as a whole still isn't a single flat membership check.
+    """
+    if action is None:
+        return False
+    return (event_type, action) in table
+
+
 def is_enqueue_trigger(event_type: str, action: str | None) -> bool:
     """Whether this ``(event_type, action)`` pair should enqueue a review.
 
@@ -97,9 +111,7 @@ def is_enqueue_trigger(event_type: str, action: str | None) -> bool:
     enqueue" by default — the same default this function applies to a
     ``None`` action.
     """
-    if action is None:
-        return False
-    return (event_type, action) in _ENQUEUE_REVIEW_TRIGGERS
+    return _matches(event_type, action, _ENQUEUE_REVIEW_TRIGGERS)
 
 
 def is_index_trigger(
@@ -138,9 +150,7 @@ def is_index_trigger(
             return False
         return ref == f"refs/heads/{default_branch}"
     if event_type == "pull_request":
-        if action is None:
-            return False
-        return (event_type, action) in _ENQUEUE_INDEX_PULL_REQUEST_TRIGGERS
+        return _matches(event_type, action, _ENQUEUE_INDEX_PULL_REQUEST_TRIGGERS)
     return False
 
 
@@ -160,9 +170,7 @@ def is_memory_capture_trigger(event_type: str, action: str | None) -> bool:
     Pure, no-I/O logic per ADR-0005, tested at Unit tier
     (``adapter/github/test_triggers.py``) alongside its two siblings.
     """
-    if action is None:
-        return False
-    return (event_type, action) in _MEMORY_CAPTURE_TRIGGERS
+    return _matches(event_type, action, _MEMORY_CAPTURE_TRIGGERS)
 
 
 def is_memory_reaction_poll_trigger(event_type: str, action: str | None) -> bool:
@@ -186,6 +194,4 @@ def is_memory_reaction_poll_trigger(event_type: str, action: str | None) -> bool
     Pure, no-I/O logic per ADR-0005, tested at Unit tier
     (``adapter/github/test_triggers.py``) alongside its three siblings.
     """
-    if action is None:
-        return False
-    return (event_type, action) in _MEMORY_REACTION_POLL_TRIGGERS
+    return _matches(event_type, action, _MEMORY_REACTION_POLL_TRIGGERS)

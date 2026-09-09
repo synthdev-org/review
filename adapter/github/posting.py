@@ -285,17 +285,31 @@ class GitHubFindingsPublisher:
             )
             return
 
-        submitted: dict[tuple[str, int | None, str], Finding] = {
-            (finding.file, finding.line, _finding_body(finding)): finding
-            for finding in line_findings
-        }
+        # A list per key, not a single `Finding`: two distinct findings can
+        # legitimately render an identical `(file, line, body)` tuple (e.g.
+        # two rules producing the same severity/message/source/citation on
+        # the same line). A single-value dict would let the second finding
+        # silently overwrite the first in the comprehension below, so both
+        # of GitHub's echoed-back comments for that line would incorrectly
+        # correlate to only the later finding — losing the first finding's
+        # provenance and mis-attributing a `dismissed_finding` approval on
+        # its comment to the wrong finding's fingerprint. Matching one
+        # comment per submission in submission order (GitHub echoes review
+        # comments back in the order they were submitted) keeps duplicates
+        # correctly disambiguated.
+        submitted: dict[tuple[str, int | None, str], list[Finding]] = {}
+        for finding in line_findings:
+            key = (finding.file, finding.line, _finding_body(finding))
+            submitted.setdefault(key, []).append(finding)
+
         matched: list[PostedComment] = []
         unmatched_count = 0
         for raw_comment in response.json():
             key = (raw_comment.get("path"), raw_comment.get("line"), raw_comment.get("body"))
-            finding = submitted.get(key)
+            candidates = submitted.get(key)
+            matched_finding = candidates.pop(0) if candidates else None
             comment_id = raw_comment.get("id")
-            if finding is None or comment_id is None:
+            if matched_finding is None or comment_id is None:
                 unmatched_count += 1
                 logger.warning(
                     "posting: a posted review comment did not correlate to any submitted finding",
@@ -305,10 +319,10 @@ class GitHubFindingsPublisher:
             matched.append(
                 PostedComment(
                     comment_id=comment_id,
-                    file=finding.file,
-                    line=finding.line,
-                    rule_id=finding.rule_id,
-                    message=finding.message,
+                    file=matched_finding.file,
+                    line=matched_finding.line,
+                    rule_id=matched_finding.rule_id,
+                    message=matched_finding.message,
                 )
             )
 

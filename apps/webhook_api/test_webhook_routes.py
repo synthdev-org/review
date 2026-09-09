@@ -1557,6 +1557,41 @@ async def test_thread_resolution_matches_any_comment_id_in_the_thread(
 
 
 @pytest.mark.asyncio
+async def test_thread_resolution_records_every_matching_comment_in_the_thread(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """A single resolved/unresolved thread can carry more than one of the
+    platform's own posted findings (e.g. two separate review passes
+    attaching comments to the same line/thread) — every id in
+    `thread.comments` that correlates to a `posted_finding_comment` row
+    must get its own `thread_resolution` signal, not just the first match.
+    """
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False))
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/thread-double-repo", installation_id=910
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4011)
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4012)
+
+        body = _review_thread_payload(
+            action="resolved",
+            repo_full_name="acme/thread-double-repo",
+            installation_id=910,
+            comment_ids=[4011, 4012],  # both are platform-posted comments
+        )
+
+        response = _post(
+            client, body, event_type="pull_request_review_thread", delivery_id="thread-double-1"
+        )
+
+    assert response.status_code == 200
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert {entry.posted_finding_comment_id for entry in entries} == {4011, 4012}
+
+
+@pytest.mark.asyncio
 async def test_thread_resolution_with_no_matching_comment_is_accepted_but_not_captured(
     migrated_engine: AsyncEngine,
 ) -> None:
@@ -1779,3 +1814,55 @@ async def test_capture_ceiling_exceeded_is_accepted_but_not_persisted(
     assert any(
         getattr(record, "reason", None) == "capture_ceiling_exceeded" for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_non_reply_comments_do_not_consume_the_capture_ceiling(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """A fresh top-level review comment (not a reply, `in_reply_to_id` is
+    absent) is never a capture candidate at all — it must not burn the
+    per-repo daily ceiling that's meant to bound genuine capture attempts.
+    With the ceiling set to 1, any number of non-reply comments must not
+    prevent a real reply that follows from being captured.
+    """
+    with _build_client(
+        dsn=str(migrated_engine.url.render_as_string(hide_password=False)),
+        memory_capture_ceiling_per_repo_per_day=1,
+    ) as client:
+        repo_id = await _provision_repo(
+            client, migrated_engine, repo_full_name="acme/non-reply-ceiling-repo", installation_id=911
+        )
+        await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4013)
+
+        for i in range(3):
+            non_reply_body = _review_comment_payload(
+                repo_full_name="acme/non-reply-ceiling-repo",
+                installation_id=911,
+                comment_id=6000 + i,
+                in_reply_to_id=None,
+                body=f"an ordinary top-level review comment {i}",
+            )
+            response = _post(
+                client,
+                non_reply_body,
+                event_type="pull_request_review_comment",
+                delivery_id=f"non-reply-{i}",
+            )
+            assert response.status_code == 200
+
+        reply_body = _review_comment_payload(
+            repo_full_name="acme/non-reply-ceiling-repo",
+            installation_id=911,
+            comment_id=6100,
+            in_reply_to_id=4013,
+            body="a genuine reply, still within the ceiling",
+        )
+        reply_response = _post(
+            client, reply_body, event_type="pull_request_review_comment", delivery_id="non-reply-reply"
+        )
+
+    assert reply_response.status_code == 200
+    entries = await _fetch_memory_entries(migrated_engine)
+    assert len(entries) == 1
+    assert entries[0].posted_finding_comment_id == 4013
