@@ -38,6 +38,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from adapter.storage.conftest import migrated_engine, pgvector_container  # noqa: F401
+from adapter.telemetry.conftest import reset_otel_global_providers  # noqa: F401
 
 
 def _generate_test_rsa_private_key_pem() -> str:

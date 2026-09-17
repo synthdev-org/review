@@ -35,6 +35,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Literal
 
 import pytest
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
 
 from adapter.llm.litellm_client import LiteLLMClient
 from findings.models import Finding
@@ -47,6 +51,40 @@ from review.step import StepContext
 from review.verification import VerificationResponseParseError, VerificationStep
 
 # --- Shared fixtures/helpers -------------------------------------------------
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> Iterator[InMemoryMetricReader]:
+    """Registers a real, in-memory-backed ``MeterProvider`` as the global
+    one — see ``adapter/telemetry/test_heartbeat.py``'s identical fixture
+    docstring for why this is needed for ``review.verification``'s
+    module-level counters (created once, at import time) to be observable
+    by this test's own reader via OTel's proxy-instrument migration."""
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-test"}), metric_readers=[reader]
+    )
+    metrics.set_meter_provider(provider)
+    yield reader
+    provider.shutdown()
+
+
+def _counter_value_and_attributes(
+    reader: InMemoryMetricReader, metric_name: str
+) -> tuple[float, dict[str, object]]:
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != metric_name:
+                    continue
+                assert isinstance(metric.data, Sum)
+                (data_point,) = metric.data.data_points
+                return data_point.value, dict(data_point.attributes or {})
+    raise AssertionError(f"{metric_name} was not recorded")
 
 
 @pytest.fixture(autouse=True)
@@ -536,3 +574,95 @@ async def test_diff_one_byte_over_ceiling_is_truncated_and_logs_warning(
     assert "x" * 1_000 not in sent_user_message
     warnings = [r for r in caplog.records if "diff truncated" in r.message]
     assert len(warnings) == 1
+
+
+# --- US5: verification funnel metrics (docs/specs/spec-observability.md) ----
+
+
+@pytest.mark.asyncio
+async def test_us5_verification_funnel_counters_match_the_batch_judgment_log_line(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """US5: Given the verification step judges a batch, When it completes,
+    Then ``review.verification.judged_total``/``rejected_total``/
+    ``unmatched_total`` are recorded with the same counts as the existing
+    "batch judgment completed" log line — two candidates judged, one
+    rejected for an out-of-range/unmatched verdict, none matched for that
+    one, mirroring ``test_unmatched_index_finding_is_rejected_not_silently_verified``."""
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = _verification_step(llm_client=llm_client)
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0), _llm_finding(1)]
+    )
+
+    await step.run(upstream_output, _context())
+
+    judged, _ = _counter_value_and_attributes(
+        in_memory_metric_reader, "review.verification.judged_total"
+    )
+    rejected, _ = _counter_value_and_attributes(
+        in_memory_metric_reader, "review.verification.rejected_total"
+    )
+    unmatched, _ = _counter_value_and_attributes(
+        in_memory_metric_reader, "review.verification.unmatched_total"
+    )
+    assert judged == 2
+    assert rejected == 1
+    assert unmatched == 1
+
+
+@pytest.mark.asyncio
+async def test_us5_verification_funnel_counters_carry_no_attributes(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """Privacy/Compliance + cardinality NFR: none of the three funnel
+    counters carry any attribute — in particular never a finding's own
+    ``message`` or other free text, only the bare counts."""
+    llm_client = _FakeLLMClient(
+        response_content=_verdicts_response_json(
+            [_passing_verdict(0), _failing_verdict(1, actionable=False)]
+        )
+    )
+    step = _verification_step(llm_client=llm_client)
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0), _llm_finding(1)]
+    )
+
+    await step.run(upstream_output, _context())
+
+    for metric_name in (
+        "review.verification.judged_total",
+        "review.verification.rejected_total",
+        "review.verification.unmatched_total",
+    ):
+        _, attributes = _counter_value_and_attributes(in_memory_metric_reader, metric_name)
+        assert attributes == {}
+
+
+@pytest.mark.asyncio
+async def test_us5_verification_funnel_counters_not_recorded_when_no_llm_findings(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """Given zero ``source="llm"`` findings (US-V3's second scenario), no
+    LLM Gateway call is made and no "batch judgment completed" log line is
+    emitted either — the funnel counters must not be recorded at all in
+    that path, matching "recorded at the same point as the existing log
+    line"."""
+    llm_client = _FakeLLMClient()
+    step = _verification_step(llm_client=llm_client)
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_static_finding()]
+    )
+
+    await step.run(upstream_output, _context())
+
+    metrics_data = in_memory_metric_reader.get_metrics_data()
+    recorded_names = {
+        metric.name
+        for resource_metrics in (metrics_data.resource_metrics if metrics_data else [])
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+    }
+    assert "review.verification.judged_total" not in recorded_names
+    assert "review.verification.rejected_total" not in recorded_names
+    assert "review.verification.unmatched_total" not in recorded_names

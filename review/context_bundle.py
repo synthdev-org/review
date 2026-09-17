@@ -491,5 +491,13 @@ def assemble_context_bundle(
         "similarity_matches_dropped": similarity_dropped,
         "oversized_items_dropped": oversized_dropped,
         "budget_truncated_dropped": truncated_dropped,
+        # The final surviving total this function's own truncation pass
+        # already computed (`total_bytes` above) — returned so
+        # `ContextBuilderStep.run`'s own observability log/metric doesn't
+        # have to re-serialize every surviving item a second time just to
+        # recompute the identical value (`serialized_item_size` measures
+        # the exact same `_serialized_size(...)` per item, minus `id`,
+        # which neither measure includes).
+        "context_bundle_total_bytes": total_bytes,
     }
     return ContextBundle(items=items), dropped_counts

@@ -15,6 +15,14 @@ Per ``docs/rules/testing.md``'s middle tier: ``indexing/test_pipeline.py``
 ``migrated_engine``/``pgvector_container`` are imported from
 ``adapter/storage/conftest.py`` (not redefined here), the same reuse
 pattern ``apps/webhook_api/conftest.py`` already established.
+
+``reset_otel_global_providers`` is imported from
+``adapter/telemetry/conftest.py`` for the same reason
+``review/conftest.py`` already imports it — US9's
+``indexing/test_pipeline_telemetry.py`` needs it to register a real,
+in-memory-backed ``TracerProvider``/``MeterProvider`` per test, and a
+fixture is only discoverable by pytest across this whole package if it's
+imported here, not redefined per test file.
 """
 
 from __future__ import annotations
@@ -22,6 +30,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from adapter.storage.conftest import migrated_engine, pgvector_container  # noqa: F401
+from adapter.telemetry.conftest import reset_otel_global_providers  # noqa: F401
 from indexing.embedding import EmbeddingClient, EmbeddingError, EmbeddingVector
 from indexing.tree import RepoTreeEntry, RepoTreeFetcher, RepoTreeTruncatedError
 

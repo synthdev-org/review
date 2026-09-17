@@ -35,6 +35,7 @@ binary) tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import socket
@@ -46,7 +47,11 @@ from typing import cast
 
 import httpx
 import pytest
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.trace import TracerProvider
 
+import adapter.telemetry.heartbeat as heartbeat_module
 import apps.worker.main as worker_main
 from adapter.analyzers.gitleaks import GitleaksTextRedactor
 from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
@@ -55,6 +60,7 @@ from adapter.github.posting import GitHubFindingsPublisher
 from adapter.github.tree import GitHubTreeFetcher
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.queue import JobQueueRepository
+from adapter.telemetry.sdk import init_telemetry
 from apps.worker.main import main
 from apps.worker.settings import WorkerSettings
 from findings.redact import NoOpTextRedactor, TextRedactor
@@ -939,3 +945,158 @@ def test_step_configuration_valid_log_includes_resolved_depends_on(
         "verification": "review_generation",
         "output": "verification",
     }
+
+
+# --- docs/specs/spec-observability.md's Unit A: US10 (no-op default) and
+# US14 (heartbeat) ---------------------------------------------------------
+
+
+async def _noop_heartbeat_loop(*, interval_seconds: float = 30.0) -> None:
+    """Fast-completing fake substituted for `run_heartbeat_loop` — mirrors
+    `_noop_dispatch_loop_forever`'s own role above: `main()` gathers both
+    loops together when telemetry is enabled, and this repo's `main()` has
+    no graceful-shutdown seam of its own (a real process only stops via a
+    signal, which cancels everything `asyncio.run()` is still running) —
+    so a unit test needs both gathered coroutines to actually return for
+    `main()` to return at all.
+    """
+    return None
+
+
+def test_main_is_a_telemetry_noop_when_otlp_endpoint_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracer_provider_before = trace.get_tracer_provider()
+    meter_provider_before = metrics.get_meter_provider()
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    # US10: no SDK/exporter constructed at all — the global providers are
+    # untouched, proven by identity.
+    assert trace.get_tracer_provider() is tracer_provider_before
+    assert metrics.get_meter_provider() is meter_provider_before
+
+
+@pytest.mark.usefixtures("reset_otel_global_providers")
+def test_main_starts_heartbeat_loop_when_otlp_endpoint_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heartbeat_calls: list[float] = []
+    heartbeat_started = asyncio.Event()
+
+    async def _recording_heartbeat_loop(*, interval_seconds: float = 30.0) -> None:
+        heartbeat_calls.append(interval_seconds)
+        heartbeat_started.set()
+
+    async def _dispatch_loop_forever_after_heartbeat_starts(
+        job_queue: JobQueueRepository,
+        registry: StepRegistry,
+        indexing_deps: IndexingJobDependencies,
+        settings: WorkerSettings,
+        worker_id: str,
+        http_client: httpx.AsyncClient,
+    ) -> None:
+        # The heartbeat task (a plain `asyncio.create_task`, per
+        # `apps/worker/main.py`'s own docstring) only actually starts
+        # running once this coroutine yields control back to the event
+        # loop — in real operation, `run_dispatch_loop`'s own first
+        # `await job_queue.claim_next(...)` (real I/O) always does that
+        # well before `run_heartbeat_loop` could be starved of a turn;
+        # this fake reproduces that yield deterministically (waiting for
+        # the heartbeat fake's own signal) instead of racing the
+        # scheduler on a fake that returns with no real suspension point
+        # at all.
+        await heartbeat_started.wait()
+        await http_client.aclose()
+
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(
+        worker_main, "_run_dispatch_loop_forever", _dispatch_loop_forever_after_heartbeat_starts
+    )
+    monkeypatch.setattr(heartbeat_module, "run_heartbeat_loop", _recording_heartbeat_loop)
+
+    try:
+        main()  # must not raise SystemExit, must not hang
+    finally:
+        tracer_provider = trace.get_tracer_provider()
+        meter_provider = metrics.get_meter_provider()
+        assert isinstance(tracer_provider, TracerProvider)
+        assert isinstance(meter_provider, MeterProvider)
+        tracer_provider.shutdown()
+        meter_provider.shutdown()
+
+    assert len(heartbeat_calls) == 1
+
+
+@pytest.mark.usefixtures("reset_otel_global_providers")
+@pytest.mark.asyncio
+async def test_amain_propagates_dispatch_loop_exception_unwrapped_and_cancels_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The heartbeat task now runs as a plain `asyncio.create_task`,
+    cancelled in a `finally` block around awaiting the dispatch loop — not
+    `asyncio.TaskGroup` — specifically so a failing dispatch loop's own
+    exception propagates out of `_amain` completely unwrapped (no
+    `ExceptionGroup`/`BaseExceptionGroup`, no unwrap helper needed), and so
+    the heartbeat task is reliably cancelled rather than left running.
+    """
+    heartbeat_started = asyncio.Event()
+    heartbeat_cancelled = asyncio.Event()
+
+    async def _long_running_heartbeat_loop(*, interval_seconds: float = 30.0) -> None:
+        heartbeat_started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            raise
+
+    async def _failing_dispatch_loop_forever(
+        job_queue: JobQueueRepository,
+        registry: StepRegistry,
+        indexing_deps: IndexingJobDependencies,
+        settings: WorkerSettings,
+        worker_id: str,
+        http_client: httpx.AsyncClient,
+    ) -> None:
+        # Wait for the heartbeat task to actually start running before
+        # raising — see `test_main_starts_heartbeat_loop_when_otlp_endpoint_set`'s
+        # identical fake for why this determinism matters instead of
+        # racing the scheduler.
+        await heartbeat_started.wait()
+        await http_client.aclose()
+        raise RuntimeError("dispatch loop exploded")
+
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _failing_dispatch_loop_forever)
+    monkeypatch.setattr(heartbeat_module, "run_heartbeat_loop", _long_running_heartbeat_loop)
+
+    settings = WorkerSettings()
+    logger = logging.getLogger(__name__)
+    client = _FakeLLMClient()
+    telemetry_enabled = init_telemetry(
+        otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        service_name="review-worker-test",
+        otlp_headers=None,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="dispatch loop exploded") as excinfo:
+            await worker_main._amain(settings, logger, client, telemetry_enabled=telemetry_enabled)
+        assert not isinstance(excinfo.value, BaseExceptionGroup)
+    finally:
+        tracer_provider = trace.get_tracer_provider()
+        meter_provider = metrics.get_meter_provider()
+        assert isinstance(tracer_provider, TracerProvider)
+        assert isinstance(meter_provider, MeterProvider)
+        tracer_provider.shutdown()
+        meter_provider.shutdown()
+
+    assert heartbeat_cancelled.is_set()

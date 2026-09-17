@@ -44,6 +44,7 @@ from dataclasses import dataclass
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
+from opentelemetry import metrics
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -52,6 +53,7 @@ from adapter.github.signature import verify_webhook_signature
 from adapter.github.triggers import is_enqueue_trigger, is_index_trigger
 from adapter.storage.models import JobType
 from adapter.storage.queue import JobQueueRepository
+from adapter.telemetry.sdk import suppress_telemetry_errors
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
 from tenancy.resolution import ResolutionResult, TenancyStore, WebhookEvent, resolve_installation
 
@@ -63,9 +65,40 @@ _RATE_LIMITED_REASONS = frozenset({"rate_limited", "index_rate_limited"})
 
 logger = logging.getLogger(__name__)
 
+# US8 (docs/specs/spec-observability.md's METRIC & SPAN CATALOG) — imports
+# the OTel API directly, same style as `adapter/storage/queue.py` and
+# `adapter/telemetry/heartbeat.py`. `reason` is the same bounded-cardinality
+# literal already passed to `logger.warning("webhook rejected", ...)` below
+# — never payload/body content, per the spec's Privacy NFR. Meter name is
+# the catalog's mandated "review.webhook" literal, not `__name__` — this
+# module's own dotted path (`apps.webhook_api.webhook_routes`) wouldn't
+# match it.
+meter = metrics.get_meter("review.webhook")
+_rejected_counter = meter.create_counter(
+    "review.webhook.rejected_total", description="Webhook deliveries rejected, by reason."
+)
+
 _SIGNATURE_HEADER = "x-hub-signature-256"
 _DELIVERY_HEADER = "x-github-delivery"
 _EVENT_TYPE_HEADER = "x-github-event"
+
+
+def _reject_webhook(reason: str) -> None:
+    """Logs the rejection and records it against ``_rejected_counter`` —
+    one call per rejection site instead of a hand-copied log-then-count
+    pair, so the log's ``reason`` and the metric's ``reason`` tag can never
+    drift apart. The counter recording is best-effort — a
+    telemetry-recording failure here must never suppress the caller's own
+    ``raise HTTPException(...)`` for a genuine rejection, which would
+    otherwise surface to GitHub as an unhandled 500 instead of the intended
+    4xx."""
+    logger.warning("webhook rejected", extra={"reason": reason})
+    with suppress_telemetry_errors(
+        logger,
+        "webhook rejection telemetry recording failed (rejection unaffected)",
+        reason=reason,
+    ):
+        _rejected_counter.add(1, {"reason": reason})
 
 
 class _BodyTooLargeError(Exception):
@@ -290,6 +323,12 @@ async def _run_in_transaction[T](
     ``_handle_matched_triggers`` and the trigger-not-matched route branch
     need, per the plan's Phase 1 "Transaction boundary" section.
 
+    Returns just ``result`` — neither caller needs ``should_commit`` back
+    (``_handle_matched_triggers`` computes it purely to decide whether to
+    commit here and has no further use for it once this call returns; the
+    trigger-not-matched branch's ``work`` always commits), so it isn't
+    part of this function's own return value.
+
     A mid-request failure (Postgres blip, an ``enqueue()`` exception) rolls
     the whole transaction back — so GitHub's own retry of that same
     delivery is processed cleanly from scratch rather than some of this
@@ -460,7 +499,16 @@ async def _handle_matched_triggers(
                 limiter.release(key, reserved_token)
         return (result, outcomes), should_commit
 
-    return await _run_in_transaction(session_factory, event=event, work=_work)
+    result, outcomes = await _run_in_transaction(session_factory, event=event, work=_work)
+    # Nothing to record here: `JobQueueRepository.enqueue()` itself
+    # registers a one-shot `after_commit` hook on this shared session for
+    # every candidate it enqueues above (see that method's own docstring),
+    # so telemetry for every candidate that actually committed is already
+    # recorded by the time `_run_in_transaction` returns — and, since that
+    # hook only fires on a real commit, a rate-limited pass that rolled the
+    # whole transaction back (`should_commit=False`) correctly records
+    # nothing for any candidate, sibling successes included.
+    return result, outcomes
 
 
 def create_webhook_router(
@@ -498,13 +546,13 @@ def create_webhook_router(
     async def receive_github_webhook(request: Request) -> JSONResponse:
         client_key = request.client.host if request.client else "unknown"
         if not rate_limiter.allow(client_key):
-            logger.warning("webhook rejected", extra={"reason": "rate_limited"})
+            _reject_webhook("rate_limited")
             raise HTTPException(status_code=429, detail="rate limit exceeded")
 
         try:
             body = await _read_body_within_limit(request, max_bytes=max_body_bytes)
         except _BodyTooLargeError:
-            logger.warning("webhook rejected", extra={"reason": "body_too_large"})
+            _reject_webhook("body_too_large")
             raise HTTPException(status_code=413, detail="request body too large") from None
 
         signature_header = request.headers.get(_SIGNATURE_HEADER)
@@ -514,19 +562,19 @@ def create_webhook_router(
             secret=webhook_secret.get_secret_value(),
         ):
             reason = "missing_signature" if not signature_header else "invalid_signature"
-            logger.warning("webhook rejected", extra={"reason": reason})
+            _reject_webhook(reason)
             raise HTTPException(status_code=401, detail="invalid webhook signature")
 
         try:
             raw_payload = json.loads(body)
         except json.JSONDecodeError:
-            logger.warning("webhook rejected", extra={"reason": "malformed_json"})
+            _reject_webhook("malformed_json")
             raise HTTPException(status_code=422, detail="malformed JSON payload") from None
 
         try:
             envelope = GitHubWebhookEnvelope.model_validate(raw_payload)
         except ValidationError:
-            logger.warning("webhook rejected", extra={"reason": "invalid_payload_shape"})
+            _reject_webhook("invalid_payload_shape")
             raise HTTPException(
                 status_code=422, detail="payload missing a valid installation id"
             ) from None

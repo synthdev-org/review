@@ -11,16 +11,28 @@ already corrected once during that plan's own review and would otherwise
 regress silently. Uses `create_app` directly (not the module-level `app`)
 so each test controls the setting under test without mutating process
 environment variables, mirroring `apps/worker/test_main.py`'s convention.
+
+The US10/US14 tests below (docs/specs/spec-observability.md's Unit A) use
+the same `create_app`-direct pattern: `create_app` is this app's own
+composition root, so it's the one seam that lets a test prove
+`otel_exporter_otlp_endpoint` genuinely gates both `init_telemetry` and
+the lifespan's heartbeat task, in isolation from the real process's own
+module-level settings/app construction.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest
 from fastapi.testclient import TestClient
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.trace import TracerProvider
 from pydantic import SecretStr
 
+import adapter.telemetry.heartbeat as heartbeat_module
 from apps.webhook_api.main import app, create_app
 from apps.webhook_api.settings import WebhookAPISettings
 
@@ -92,3 +104,72 @@ def test_enqueue_rate_limiter_active_logs_info_once(caplog: pytest.LogCaptureFix
         for r in caplog.records
         if r.levelname == "WARNING" and "review-enqueue rate limiting" in r.getMessage()
     ]
+
+
+# --- docs/specs/spec-observability.md's Unit A: US10 (no-op default) and
+# US14 (heartbeat) ---------------------------------------------------------
+
+
+def test_create_app_is_a_telemetry_noop_when_otlp_endpoint_unset() -> None:
+    tracer_provider_before = trace.get_tracer_provider()
+    meter_provider_before = metrics.get_meter_provider()
+    settings = _settings()  # otel_exporter_otlp_endpoint defaults to None
+
+    create_app(settings)
+
+    # US10: no SDK/exporter constructed at all — the global providers are
+    # untouched, proven by identity, not merely by absence of an error.
+    assert trace.get_tracer_provider() is tracer_provider_before
+    assert metrics.get_meter_provider() is meter_provider_before
+
+
+def test_lifespan_does_not_start_heartbeat_when_otlp_endpoint_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heartbeat_started = False
+
+    async def _spy_run_heartbeat_loop(*, interval_seconds: float = 30.0) -> None:
+        nonlocal heartbeat_started
+        heartbeat_started = True
+
+    monkeypatch.setattr(heartbeat_module, "run_heartbeat_loop", _spy_run_heartbeat_loop)
+    settings = _settings()
+
+    test_app = create_app(settings)
+    with TestClient(test_app):
+        pass
+
+    assert heartbeat_started is False
+
+
+@pytest.mark.usefixtures("reset_otel_global_providers")
+def test_lifespan_starts_and_cleanly_cancels_heartbeat_when_otlp_endpoint_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heartbeat_started = False
+    heartbeat_cancelled = False
+
+    async def _spy_run_heartbeat_loop(*, interval_seconds: float = 30.0) -> None:
+        nonlocal heartbeat_started, heartbeat_cancelled
+        heartbeat_started = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            heartbeat_cancelled = True
+            raise
+
+    monkeypatch.setattr(heartbeat_module, "run_heartbeat_loop", _spy_run_heartbeat_loop)
+    settings = _settings(otel_exporter_otlp_endpoint="http://127.0.0.1:4317")
+
+    test_app = create_app(settings)
+    try:
+        with TestClient(test_app):
+            assert heartbeat_started is True
+        assert heartbeat_cancelled is True
+    finally:
+        tracer_provider = trace.get_tracer_provider()
+        meter_provider = metrics.get_meter_provider()
+        assert isinstance(tracer_provider, TracerProvider)
+        assert isinstance(meter_provider, MeterProvider)
+        tracer_provider.shutdown()
+        meter_provider.shutdown()

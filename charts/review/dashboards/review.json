@@ -1,0 +1,775 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "A Prometheus datasource scraping the OTel Collector that review's OTEL_EXPORTER_OTLP_ENDPOINT points at (see docs/specs/spec-observability.md).",
+      "type": "datasource",
+      "pluginId": "prometheus"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    }
+  ],
+  "id": null,
+  "uid": "review-observability",
+  "title": "review — Pipeline, Queue & LLM Observability",
+  "description": "Canonical operator dashboard for review (docs/specs/spec-observability.md, US11). Every panel query is checked against the instrumented metric catalog by scripts/check-dashboard-metrics.py (US13) — do not rename a metric in code without updating this file, and vice versa. Metric names below use Prometheus's underscore form, verified against a real OTel Collector/Prometheus/Grafana stack by tests/e2e/test_observability.py (Unit F), not just the naive translation: dots become underscores (review.pipeline.step.duration_ms -> review_pipeline_step_duration_ms), resource attribute service.name becomes the Prometheus 'job' label ('review-webhook-api' / 'review-worker'), a monotonic counter whose name already contains the word 'total' outside its mandatory trailing _total suffix has that extra occurrence dropped (review.prefilter.total_files_total -> review_prefilter_files_total, not review_prefilter_total_files_total), and a histogram declared with unit=\"ms\" gets the unit's full Prometheus-convention word appended even though the metric's own name already ends in the short code _ms (review.pipeline.step.duration_ms -> review_pipeline_step_duration_ms_milliseconds, not review_pipeline_step_duration_ms) — see scripts/check-dashboard-metrics.py's own docstring for the full reasoning behind both of those two exceptions to the naive rule.",
+  "tags": [
+    "review",
+    "observability"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Health at a glance",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Heartbeat: webhook_api (last seen)",
+      "description": "US14: time since the last review.process.heartbeat_total sample for the webhook_api entrypoint. Goes stale (red) past 60s (2x the 30s heartbeat interval) — the signal that distinguishes telemetry outage from a quiet system.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - timestamp(sum(review_process_heartbeat_total{job=\"review-webhook-api\"}))",
+          "legendFormat": "webhook_api"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Heartbeat: worker (last seen)",
+      "description": "US14: time since the last review.process.heartbeat_total sample for the worker entrypoint. Goes stale (red) past 60s.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - timestamp(sum(review_process_heartbeat_total{job=\"review-worker\"}))",
+          "legendFormat": "worker"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 60
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Queue depth",
+      "description": "US1: jobs enqueued but not yet claimed — sum(review_queue_enqueued_total) - sum(review_queue_claimed_total). A derived gauge, not a separately-emitted metric.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(review_queue_enqueued_total) - sum(review_queue_claimed_total)",
+          "legendFormat": "queue depth"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Job failure rate",
+      "description": "US1: fraction of completed jobs (apps/worker/dispatch.py mark_done/mark_failed) whose outcome was 'failed', over a 5m window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_queue_completed_total{outcome=\"failed\"}[5m])) / sum(rate(review_queue_completed_total[5m]))",
+          "legendFormat": "failure rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.05
+              },
+              {
+                "color": "red",
+                "value": 0.2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Webhook rejection rate",
+      "description": "US8: apps/webhook_api/webhook_routes.py rejections per second, all reasons combined, over a 5m window.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_webhook_rejected_total[5m]))",
+          "legendFormat": "rejections/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Pipeline performance",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "panels": []
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Per-stage duration (p95)",
+      "description": "US2: review.pipeline.step.duration_ms histogram, p95 latency per macro pipeline step (prefilter, static-analysis, context-builder, review-generation, verification, output). Prometheus name carries a _milliseconds suffix on top of the metric's own _ms — see this dashboard's own top-level description.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_pipeline_step_duration_ms_milliseconds_bucket[5m])) by (le, step_name))",
+          "legendFormat": "{{step_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "LLM token usage by stage/model",
+      "description": "US3: review.llm.tokens_total, tokens/sec by stage, model, and token_type (prompt/completion/total).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_llm_tokens_total[5m])) by (stage, model, token_type)",
+          "legendFormat": "{{stage}} / {{model}} / {{token_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Quality & value signal",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Findings by severity × source",
+      "description": "US4: review.findings.count_total, findings/sec at the merge_findings() call site, sliced by severity and source.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_findings_count_total[5m])) by (severity, source)",
+          "legendFormat": "{{severity}} / {{source}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Verification kill rate",
+      "description": "US5: review.verification.rejected_total / review.verification.judged_total — fraction of LLM-sourced findings the verification step rejects.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_verification_rejected_total[5m])) / sum(rate(review_verification_judged_total[5m]))",
+          "legendFormat": "kill rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Context Builder contribution rate",
+      "description": "US6: review.context_builder.outcome_total, fraction of runs whose real outcome literal is 'ok' (as opposed to 'degraded_empty'/'degraded_error') — verified against the literal the code actually assigns, not the PRD prose's 'success' paraphrase.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_context_builder_outcome_total{outcome=\"ok\"}[5m])) / sum(rate(review_context_builder_outcome_total[5m]))",
+          "legendFormat": "ok rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Prefilter funnel",
+      "description": "US7: review.prefilter's five-count funnel (total -> pattern-filtered -> ceiling-dropped x2 -> final), rate/sec. Not in the PRD's four named top-level rows but included per Scope's 'covering every metric above' requirement. review.prefilter.total_files_total's own Prometheus name drops the redundant 'total' infix (review_prefilter_files_total, not review_prefilter_total_files_total) — see this dashboard's own top-level description.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 18
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_prefilter_files_total[5m]))",
+          "legendFormat": "total files"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_prefilter_passed_pattern_filter_total[5m]))",
+          "legendFormat": "passed pattern filter"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(review_prefilter_dropped_by_materialization_ceiling_total[5m]))",
+          "legendFormat": "dropped: materialization ceiling"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(review_prefilter_dropped_by_aggregate_bytes_ceiling_total[5m]))",
+          "legendFormat": "dropped: aggregate bytes ceiling"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(review_prefilter_final_file_count_total[5m]))",
+          "legendFormat": "final file count"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "Indexing job health (Should-have, Unit D)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "panels": []
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Indexing files processed/skipped/failed",
+      "description": "US9: review.indexing.files_{processed,skipped,failed}_total, rate/sec, recorded at run_indexing_job's completion (indexing/pipeline.py).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_indexing_files_processed_total[5m]))",
+          "legendFormat": "processed"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_indexing_files_skipped_total[5m]))",
+          "legendFormat": "skipped"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(review_indexing_files_failed_total[5m]))",
+          "legendFormat": "failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Indexing chunks/edges created",
+      "description": "US9: review.indexing.chunks_created_total and review.indexing.edges_created_total, rate/sec.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_indexing_chunks_created_total[5m]))",
+          "legendFormat": "chunks created"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_indexing_edges_created_total[5m]))",
+          "legendFormat": "edges created"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Indexing job duration (p95)",
+      "description": "US9: review.indexing.duration_ms histogram, p95 wall-clock duration of one indexing job. Prometheus name carries a _milliseconds suffix on top of the metric's own _ms — see this dashboard's own top-level description.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 27
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_indexing_duration_ms_milliseconds_bucket[5m])) by (le))",
+          "legendFormat": "p95 duration"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Verification funnel (judged / rejected / unmatched)",
+      "description": "US5: review.verification.{judged,rejected,unmatched}_total, rate/sec — the full verification funnel the Scope section requires alongside the id-12 kill-rate ratio; the ratio alone never surfaces a high unmatched_count (e.g. a malformed judge response leaving most findings unmatched rather than judged/rejected).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 35
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_verification_judged_total[5m]))",
+          "legendFormat": "judged"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_verification_rejected_total[5m]))",
+          "legendFormat": "rejected"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(review_verification_unmatched_total[5m]))",
+          "legendFormat": "unmatched"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Queue wait, job duration & retries (US1)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Queue wait time (p95)",
+      "description": "US1: enqueue-to-claim latency — histogram_quantile(0.95, review_queue_wait_seconds) — the 'wait time' half of US1's 'queue depth, wait time, duration, and retry/failure counts' requirement that had no panel despite the metric already being recorded by adapter/storage/queue.py.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_queue_wait_seconds_bucket[5m])) by (le))",
+          "legendFormat": "wait p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Job duration (p95)",
+      "description": "US1: wall-clock time from claim to terminal DONE/FAILED status — histogram_quantile(0.95, review_job_duration_seconds) — the 'duration' half of US1's requirement, recorded by apps/worker/dispatch.py but previously not dashboarded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 44
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_job_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "duration p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Claim attempts (p95)",
+      "description": "US1: ClaimedJob.attempts at claim time (review_queue_job_attempts) — the real existing 'retry/failure counts' signal (adapter/storage/queue.py's own docstring notes this isn't a full reclaim/retry mechanism yet), previously recorded but not dashboarded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 44
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_queue_job_attempts_bucket[5m])) by (le))",
+          "legendFormat": "attempts p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

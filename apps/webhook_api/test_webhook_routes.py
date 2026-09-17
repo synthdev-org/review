@@ -27,10 +27,15 @@ import hmac
 import json
 import logging
 import uuid
+from collections.abc import Iterator
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
 from pydantic import SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -309,6 +314,149 @@ def test_rejected_webhook_log_never_contains_raw_payload_body(
     assert response.status_code == 401
     assert marker not in caplog.text
     assert any("webhook rejected" in record.getMessage() for record in caplog.records)
+
+
+# --- US8 (docs/specs/spec-observability.md's METRIC & SPAN CATALOG):
+# `review.webhook.rejected_total`, one `.add(1, {"reason": ...})` per
+# rejection reason, recorded at the exact same call site as the
+# `logger.warning("webhook rejected", ...)` lines exercised above. Uses
+# OTel's own in-memory metric reader (no I/O beyond the same in-process
+# TestClient calls every other test in this file already makes) — see
+# `review/test_output_telemetry.py` for the identical fixture pattern. ---
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> Iterator[InMemoryMetricReader]:
+    """Registers a real `MeterProvider` backed by `InMemoryMetricReader` as
+    the global one, so `webhook_routes.py`'s module-level `meter`/counter
+    (created once, at import time) picks it up via OTel's proxy-instrument
+    migration mechanism — see `review/test_output_telemetry.py`'s identical
+    fixture docstring.
+    """
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-webhook-api-test"}),
+        metric_readers=[reader],
+    )
+    metrics.set_meter_provider(provider)
+    yield reader
+    provider.shutdown()
+
+
+def _rejected_total_points(reader: InMemoryMetricReader) -> list[tuple[float, dict[str, object]]]:
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+    points: list[tuple[float, dict[str, object]]] = []
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != "review.webhook.rejected_total":
+                    continue
+                assert isinstance(metric.data, Sum)
+                for data_point in metric.data.data_points:
+                    points.append((data_point.value, dict(data_point.attributes or {})))
+    return points
+
+
+def _rejected_count_for(reader: InMemoryMetricReader, reason: str) -> int:
+    by_reason = {attrs.get("reason"): value for value, attrs in _rejected_total_points(reader)}
+    return int(by_reason.get(reason, 0))
+
+
+def test_rate_limited_rejection_increments_rejected_total(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    client = _build_client(rate_limit_max_requests=1)
+    body = _payload()
+    headers = {"X-Hub-Signature-256": "sha256=deadbeef"}
+    client.post(_URL, content=body, headers=headers)
+
+    response = client.post(_URL, content=body, headers=headers)
+
+    assert response.status_code == 429
+    assert _rejected_count_for(in_memory_metric_reader, "rate_limited") == 1
+
+
+def test_body_too_large_rejection_increments_rejected_total(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    client = _build_client(max_body_bytes=10)
+    body = _payload()
+    assert len(body) > 10
+
+    response = client.post(_URL, content=body, headers={"X-Hub-Signature-256": "sha256=deadbeef"})
+
+    assert response.status_code == 413
+    assert _rejected_count_for(in_memory_metric_reader, "body_too_large") == 1
+
+
+def test_missing_signature_rejection_increments_rejected_total(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    client = _build_client()
+
+    response = client.post(_URL, content=_payload())
+
+    assert response.status_code == 401
+    assert _rejected_count_for(in_memory_metric_reader, "missing_signature") == 1
+
+
+def test_invalid_signature_rejection_increments_rejected_total(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    client = _build_client()
+    body = _payload()
+
+    response = client.post(_URL, content=body, headers={"X-Hub-Signature-256": "sha256=deadbeef"})
+
+    assert response.status_code == 401
+    assert _rejected_count_for(in_memory_metric_reader, "invalid_signature") == 1
+
+
+def test_malformed_json_rejection_increments_rejected_total(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    client = _build_client()
+    body = b"this is not json"
+
+    response = _post(client, body, event_type=None)
+
+    assert 400 <= response.status_code < 500
+    assert _rejected_count_for(in_memory_metric_reader, "malformed_json") == 1
+
+
+def test_invalid_payload_shape_rejection_increments_rejected_total(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """Regression test: `invalid_payload_shape` is the one rejection reason
+    that was missing its `_rejected_counter.add(...)` call alongside the
+    `logger.warning(...)` it already shipped with."""
+    client = _build_client()
+    body = json.dumps({"action": "opened"}).encode("utf-8")
+
+    response = _post(client, body, event_type=None)
+
+    assert 400 <= response.status_code < 500
+    assert _rejected_count_for(in_memory_metric_reader, "invalid_payload_shape") == 1
+
+
+def test_rejected_total_attributes_are_bounded_and_privacy_safe(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """Per this spec's hard privacy requirement: attribute values are never
+    payload/body content — only the closed `reason` vocabulary already
+    passed to the co-located `logger.warning(...)` call."""
+    client = _build_client()
+
+    client.post(_URL, content=_payload())
+
+    points = _rejected_total_points(in_memory_metric_reader)
+    assert len(points) == 1
+    _, attrs = points[0]
+    assert set(attrs.keys()) == {"reason"}
+    assert attrs == {"reason": "missing_signature"}
 
 
 # --- Installation/Org/Repo resolution + idempotent enqueue (Phase 1, real Postgres) ---

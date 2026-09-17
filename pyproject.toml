@@ -75,6 +75,22 @@ dependencies = [
     # version that drops or optionalizes that transitive pull doesn't
     # silently break the worker at startup.
     "python-dotenv>=1.0,<2",
+    # docs/specs/spec-observability.md's Unit A: OTel SDK/exporter wiring
+    # at both composition roots (Rollout & Release Safety, "New
+    # dependencies"). `opentelemetry-api` is the vendor-neutral,
+    # no-op-by-default interface domain code imports directly (the same
+    # precedent `logging` already sets — see that spec's "Resolved
+    # decisions"); `opentelemetry-sdk` provides the real
+    # TracerProvider/MeterProvider construction confined to
+    # apps/webhook_api/main.py and apps/worker/main.py (architecture.md's
+    # composition-root rule); `opentelemetry-exporter-otlp-proto-grpc` is
+    # the OTLP transport, chosen as OTel's own default and the transport
+    # that pairs cleanly with the standard OTel Collector's default
+    # receiver (a build-time choice between gRPC/HTTP variants, not a
+    # product decision per that spec's Rollout section).
+    "opentelemetry-api>=1.27,<2",
+    "opentelemetry-sdk>=1.27,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
 ]
 
 [dependency-groups]
@@ -180,6 +196,20 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "adapter.storage.migrations.versions.*"
 ignore_errors = true
+
+# grpcio (the `grpc` package, a transitive dependency of this phase's
+# `opentelemetry-exporter-otlp-proto-grpc` — see pyproject.toml's own
+# dependency comment) ships no inline type hints/py.typed marker and no
+# third-party stub package is installed — the same "no stubs beyond what's
+# bundled" gap the uvicorn/fastembed/asyncpg overrides above already
+# document, now for `adapter/telemetry/test_telemetry_integration.py`'s
+# real local OTLP gRPC receiver (the only place in this repo that imports
+# `grpc` directly; `adapter/telemetry/sdk.py` itself only ever goes
+# through the already-typed `opentelemetry.exporter.otlp.proto.grpc.*`
+# wrapper modules).
+[[tool.mypy.overrides]]
+module = "grpc.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 markers = [

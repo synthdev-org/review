@@ -29,6 +29,16 @@ jobs:
       - name: mypy --strict
         run: uv run mypy --strict .
 
+      # US13 (docs/specs/spec-observability.md): fails the build if the
+      # shipped Grafana dashboard (charts/review/dashboards/review.json)
+      # references a metric name the instrumented code no longer emits, so
+      # a future metric rename can't silently break it. Runs directly
+      # (not via pytest) against this checked-out repo's own uv/Python —
+      # this job doesn't need the Docker-only local/agent execution rule,
+      # per that spec's Unit E deliverable #4.
+      - name: Dashboard/metric drift guard
+        run: uv run python scripts/check-dashboard-metrics.py
+
   test:
     name: Unit tests
     runs-on: ubuntu-latest

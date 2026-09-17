@@ -380,7 +380,12 @@ entirely outside the product's supported configuration contract.)
   committed to the MVP release, not a fast-follow (the Memory
   approve/reject/delete surface scoped by design goal 9 is its first
   concrete screen) — but whether SSO/OIDC ships in that same MVP or follows
-  shortly after is still open.
+  shortly after is still open. Whether this product joins the cross-product
+  identity broker is separately resolved (yes, in principle — see
+  `platform/docs/adr/0005-cross-product-identity-broker.md`'s 2026-09-10
+  amendment): this product has no local login/user-identity model at all
+  yet (no `user` table, no login code), which is the real prerequisite this
+  bullet is blocked on, not just SSO timing.
 - Exact schema for per-team rules/config and for Memory entries specifically
   — column-level design for status/provenance/approver/timestamps (design
   goal 9), and how a dismissal turns into the similarity-check signal design

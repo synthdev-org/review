@@ -98,10 +98,12 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
+
+from adapter.telemetry.sdk import OtelSettingsMixin
 
 
-class WorkerSettings(BaseSettings):
+class WorkerSettings(OtelSettingsMixin):
     """Bootstrap settings for the Worker process.
 
     `environment` has no default on purpose: an entrypoint that silently
@@ -304,6 +306,11 @@ class WorkerSettings(BaseSettings):
     # scope; an operator opts into dry-run explicitly to validate a fresh
     # deployment before trusting it with real writes.
     dry_run: bool = False
+
+    # --- Observability (docs/specs/spec-observability.md's Unit A) ---
+    # `otel_exporter_otlp_endpoint`/`otel_exporter_otlp_headers` come from
+    # `OtelSettingsMixin` above — shared with `WebhookAPISettings` so the
+    # two entrypoints can't silently diverge on this pair's declaration.
 
     @model_validator(mode="after")
     def _stuck_job_warning_threshold_covers_worst_case_chain(self) -> WorkerSettings:

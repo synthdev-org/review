@@ -18,6 +18,7 @@ def test_claimed_job_from_row_maps_every_field() -> None:
     job_id = uuid.uuid4()
     org_id = uuid.uuid4()
     repo_id = uuid.uuid4()
+    created_at = datetime.now(UTC)
     claimed_at = datetime.now(UTC)
     row = JobQueueRow(
         id=job_id,
@@ -29,6 +30,7 @@ def test_claimed_job_from_row_maps_every_field() -> None:
         attempts=1,
         claimed_by="worker-1",
         claimed_at=claimed_at,
+        created_at=created_at,
     )
 
     claimed = claimed_job_from_row(row)
@@ -43,6 +45,7 @@ def test_claimed_job_from_row_maps_every_field() -> None:
         attempts=1,
         claimed_by="worker-1",
         claimed_at=claimed_at,
+        created_at=created_at,
     )
 
 
@@ -58,6 +61,7 @@ def test_claimed_job_from_row_handles_unscoped_job() -> None:
         attempts=0,
         claimed_by=None,
         claimed_at=None,
+        created_at=datetime.now(UTC),
     )
 
     claimed = claimed_job_from_row(row)

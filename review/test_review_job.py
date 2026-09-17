@@ -30,6 +30,14 @@ this file with US-V7: the same US8 mechanism (a raising fake `LLMClient`),
 now injected at the `verification` step's own call site instead of
 `review_generation`'s, proving the real, wired six-step chain's fatality
 boundary holds for `verification` too.
+
+docs/specs/spec-observability.md's Unit B extends this file with
+US2's own acceptance case, added as a genuinely Unit-tier test (fakes, no
+Postgres/GitHub, an in-memory OTel span exporter) — this file now straddles
+both tiers, so ``@pytest.mark.integration`` is applied per-test to every
+pre-existing case above rather than via a module-level ``pytestmark``,
+exactly matching ``review/test_static_analysis_step.py``'s own established
+convention for a file that straddles tiers.
 """
 
 from __future__ import annotations
@@ -38,7 +46,8 @@ import asyncio
 import contextlib
 import json
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +56,11 @@ import pytest
 import respx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from adapter.analyzers.gitleaks import GitleaksAnalyzer
@@ -55,6 +69,9 @@ from adapter.github.posting import GitHubFindingsPublisher
 from adapter.storage.engine import create_session_factory
 from adapter.storage.models import JobQueueRow, JobStatus, JobType
 from adapter.storage.queue import JobQueueRepository
+from adapter.telemetry.conftest import (
+    reset_otel_global_providers as _reset_otel_global_providers,  # noqa: F401
+)
 from apps.worker.dispatch import run_dispatch_loop
 from findings.models import Finding
 from findings.redact import NoOpTextRedactor
@@ -64,15 +81,14 @@ from ingestion.diff import Diff, DiffFetcher, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMUnreachableError
 from llmgateway.models import CompletionRequest, CompletionResponse
+from review import pipeline as pipeline_module
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
 from review.review_generation import ReviewGenerationStep
 from review.static_analysis import StaticAnalysisStep
-from review.step import Step
+from review.step import JobIdentity, Step, StepContext
 from review.verification import VerificationStep
-
-pytestmark = pytest.mark.integration
 
 _TESTDATA_DIR = Path(__file__).parent / "testdata"
 _OWNER_REPO = "acme/widgets"
@@ -365,6 +381,7 @@ async def _wait_for_status(
 
 
 @respx.mock
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_us8_llm_gateway_failure_marks_job_failed_and_posts_failure_check_run(
     migrated_engine: AsyncEngine, test_rsa_private_key_pem: str
@@ -411,6 +428,7 @@ async def test_us8_llm_gateway_failure_marks_job_failed_and_posts_failure_check_
 
 
 @respx.mock
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_us9_one_analyzer_failure_stays_isolated_review_still_completes(
     migrated_engine: AsyncEngine, test_rsa_private_key_pem: str
@@ -463,6 +481,7 @@ async def test_us9_one_analyzer_failure_stays_isolated_review_still_completes(
 
 
 @respx.mock
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_review_generation_disabled_falls_back_to_static_analysis_only_output(
     migrated_engine: AsyncEngine, test_rsa_private_key_pem: str
@@ -528,6 +547,7 @@ async def test_review_generation_disabled_falls_back_to_static_analysis_only_out
 
 
 @respx.mock
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_us_v7_verification_gateway_failure_marks_job_failed_and_posts_failure_check_run(
     migrated_engine: AsyncEngine, test_rsa_private_key_pem: str
@@ -583,3 +603,124 @@ async def test_us_v7_verification_gateway_failure_marks_job_failed_and_posts_fai
 
     payload = json.loads(check_run_route.calls.last.request.content)
     assert payload["conclusion"] == "failure"
+
+
+# ============================================================================
+# US2 (docs/specs/spec-observability.md, Unit B): a review job produces one
+# trace with a root span and a child span per macro step, correct
+# duration/outcome attributes — per this spec's own Testing table, which
+# names this file specifically for US2, at Unit tier (fakes, an in-memory
+# OTel span exporter, no Postgres/GitHub — see this file's own extended
+# docstring above for why this one case sits alongside the file's other,
+# Integration-tier ones). Not re-proving
+# `review/test_step_registry.py`'s own exhaustive per-outcome (disabled/
+# failed/timeout) span/histogram coverage — this is specifically the
+# "a review job" acceptance case the Testing table names.
+# ============================================================================
+
+
+@dataclass
+class _FakeMacroStep:
+    """A minimal fake satisfying `review.step.Step`, named after this
+    plan's own real macro steps — standing in for them here since this
+    case's own concern is the trace shape `StepRegistry` produces around a
+    review job's steps, not re-proving each real macro step's own
+    already-tested behavior (`review/test_prefilter_step.py` etc.)."""
+
+    name: str
+    depends_on: tuple[str, ...] = ()
+    error: Exception | None = field(default=None)
+
+    async def run(self, input: Any, context: StepContext) -> Any:
+        if self.error is not None:
+            raise self.error
+        return {"produced_by": self.name}
+
+
+@pytest.fixture
+def in_memory_span_exporter(
+    reset_otel_global_providers: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[InMemorySpanExporter]:
+    """Registers a real `TracerProvider` backed by `InMemorySpanExporter` as
+    the *global* one — required for `review.pipeline`'s module-level
+    `tracer` (created once, at import time) to pick this test's provider up.
+
+    Unlike `MeterProvider`'s own proxy-instrument migration (see
+    `adapter/telemetry/test_heartbeat.py`'s identical fixture docstring),
+    the installed `opentelemetry-api`'s own `ProxyTracer` caches its
+    resolved real `Tracer` permanently on first use — no per-set-provider
+    re-migration callback the way `ProxyMeter` has (see
+    `review/test_step_registry.py`'s identical fixture docstring for the
+    full explanation). This fixture resets that cache directly so every
+    test using it gets a fresh migration, not just the first one in the
+    process."""
+    monkeypatch.setattr(pipeline_module.tracer, "_real_tracer", None, raising=False)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(resource=Resource.create({"service.name": "review-test"}))
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    otel_trace.set_tracer_provider(provider)
+    yield exporter
+    provider.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_job_produces_one_trace_with_a_child_span_per_macro_step(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    """US2's own Given/When/Then, proven directly: Given `StepRegistry`
+    already computes `duration_ms`/`StepOutcome` per step, When a review
+    job runs, Then one trace exists with a root span for the job and one
+    child span per macro step, each carrying that step's duration and
+    outcome as span attributes."""
+    seed = JobIdentity(
+        org_id="org-1",
+        repo_id="repo-2",
+        installation_id=_INSTALLATION_ID,
+        repo_full_name=_OWNER_REPO,
+        pr_number=_PR_NUMBER,
+        head_sha=_HEAD_SHA,
+    )
+    macro_step_names = ("prefilter", "static_analysis", "review_generation")
+    prefilter = _FakeMacroStep(name="prefilter")
+    static_analysis = _FakeMacroStep(name="static_analysis", depends_on=("prefilter",))
+    review_generation = _FakeMacroStep(name="review_generation", depends_on=("static_analysis",))
+    registry = StepRegistry(
+        [prefilter, static_analysis, review_generation],
+        enabled=dict.fromkeys(macro_step_names, True),
+        timeouts=dict.fromkeys(macro_step_names, 5.0),
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    await registry.run(seed_input=seed, context=StepContext(job_id="job-us2"))
+
+    spans = in_memory_span_exporter.get_finished_spans()
+    by_name = {span.name: span for span in spans}
+    assert set(by_name) == {"review.job.run"} | {f"review.step.{name}" for name in macro_step_names}
+
+    root = by_name["review.job.run"]
+    # Privacy/Compliance NFR: the root span's attribute set is exactly this
+    # fixed allowlist — job/org/repo IDs only, never source/diff/free text.
+    assert dict(root.attributes or {}) == {
+        "review.job.id": "job-us2",
+        "review.job.org_id": "org-1",
+        "review.job.repo_id": "repo-2",
+    }
+
+    for step_name in macro_step_names:
+        child = by_name[f"review.step.{step_name}"]
+        # Every child span is nested under the one root span, not a
+        # sibling trace of its own.
+        assert child.parent is not None
+        assert child.parent.span_id == root.context.span_id
+        attrs = dict(child.attributes or {})
+        # Privacy/Compliance NFR: exactly this fixed allowlist.
+        assert set(attrs) == {
+            "review.step.name",
+            "review.step.status",
+            "review.step.duration_ms",
+        }
+        assert attrs["review.step.name"] == step_name
+        assert attrs["review.step.status"] == "success"
+        assert isinstance(attrs["review.step.duration_ms"], int)
+        assert attrs["review.step.duration_ms"] >= 0

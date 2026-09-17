@@ -28,6 +28,11 @@ class ClaimedJob(BaseModel):
     attempts: int
     claimed_by: str | None
     claimed_at: datetime | None
+    created_at: datetime
+    """When the row was inserted (``JobQueueRow.created_at``) — added for
+    US1 (docs/specs/spec-observability.md) so callers can compute
+    enqueue-to-claim wait time (``claimed_at - created_at``) without a
+    second query; a narrow, justified schema addition, not scope creep."""
 
 
 def claimed_job_from_row(row: JobQueueRow) -> ClaimedJob:
@@ -48,4 +53,5 @@ def claimed_job_from_row(row: JobQueueRow) -> ClaimedJob:
         attempts=row.attempts,
         claimed_by=row.claimed_by,
         claimed_at=row.claimed_at,
+        created_at=row.created_at,
     )

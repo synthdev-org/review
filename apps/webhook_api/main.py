@@ -32,17 +32,38 @@ enqueue rate limiter (``index_enqueue_rate_limiter``, `INDEX`-specific,
 also optionally ``None`` per the same ``0``-disables-it sentinel) and the
 ``indexing_enabled`` kill switch, both passed down explicitly into the
 webhook router the same way every other Phase 1 setting already is.
+
+docs/specs/spec-observability.md's Unit A adds this entrypoint's OTel
+wiring: ``adapter.telemetry.sdk.init_telemetry`` is called once, inside
+``create_app`` (this app's own composition-root factory — keeping
+``create_app`` the one seam a test controls, per this module's own
+"testable the way it is today" contract, rather than only at bare module
+scope where a test couldn't reach it via arbitrary settings), and a
+``lifespan`` async context manager (FastAPI's modern replacement for the
+deprecated ``@app.on_event``) starts US14's heartbeat loop as a background
+task on startup and cancels it cleanly on shutdown — but only when
+``settings.otel_exporter_otlp_endpoint`` is set (US10's no-op default
+means no heartbeat either: nothing was initialized for it to report
+against).
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from fastapi import FastAPI
 
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.queue import JobQueueRepository
 from adapter.storage.tenancy import PostgresTenancyStore
+from adapter.telemetry.heartbeat import heartbeat_task_scope
+from adapter.telemetry.sdk import (
+    init_telemetry,
+    resolve_otlp_headers,
+    shutdown_telemetry,
+)
 from apps.webhook_api.logging_config import configure_logging
 from apps.webhook_api.manifest_routes import create_manifest_router
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
@@ -115,9 +136,45 @@ def _build_index_enqueue_rate_limiter(settings: WebhookAPISettings) -> InMemoryR
     )
 
 
+def _build_lifespan(
+    *, telemetry_enabled: bool
+) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
+    """Builds this app's ``lifespan`` async context manager, gated on
+    whether ``init_telemetry`` actually constructed an SDK/exporter for
+    this app (``telemetry_enabled``, computed once by ``create_app``
+    below from ``settings.otel_exporter_otlp_endpoint``). Only starts
+    US14's heartbeat loop when telemetry is genuinely configured — the
+    no-op default (US10) runs zero background tasks, matching today's
+    exact behavior.
+
+    A plain factory function (not a nested closure inline in
+    ``create_app``) purely to keep its own return type — an async context
+    manager factory, not a simple value — out of ``create_app``'s body.
+    """
+
+    @asynccontextmanager
+    async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            async with heartbeat_task_scope(telemetry_enabled):
+                yield
+        finally:
+            if telemetry_enabled:
+                await shutdown_telemetry()
+
+    return _lifespan
+
+
 def create_app(settings: WebhookAPISettings) -> FastAPI:
     """Build the Webhook API's FastAPI application from parsed settings."""
-    app = FastAPI(title="review webhook_api")
+    telemetry_enabled = init_telemetry(
+        otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        service_name="review-webhook-api",
+        otlp_headers=resolve_otlp_headers(settings.otel_exporter_otlp_headers),
+    )
+
+    app = FastAPI(
+        title="review webhook_api", lifespan=_build_lifespan(telemetry_enabled=telemetry_enabled)
+    )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

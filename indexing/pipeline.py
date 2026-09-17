@@ -106,10 +106,14 @@ import asyncio
 import logging
 import time
 import uuid
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 
+from opentelemetry import metrics, trace
 from pydantic import BaseModel, ConfigDict
 
+from indexing._telemetry import start_span as _shared_start_span
+from indexing._telemetry import suppress_telemetry_errors
 from indexing.chunk import ChunkLanguage, ChunkParseError, chunk_file, language_for_path
 from indexing.embedding import EmbeddingClient, EmbeddingError
 from indexing.graph import GraphExtractionError, extract_graph
@@ -124,6 +128,70 @@ from indexing.tree import (
 )
 
 logger = logging.getLogger(__name__)
+
+# US9 (docs/specs/spec-observability.md's METRIC & SPAN CATALOG) — the OTel
+# *API* import above, the same `tracer = trace.get_tracer(__name__)` /
+# `meter = metrics.get_meter(__name__)` style already established across
+# this codebase (adapter/telemetry/heartbeat.py, review/pipeline.py,
+# review/context_builder.py) for importing OTel directly into domain code
+# (mirroring how `logging.getLogger(__name__)` is already imported
+# directly, per the spec's "Resolved decisions" — no `typing.Protocol`
+# telemetry indirection). Unlike `review/pipeline.py` (whose module is
+# itself literally named `review.pipeline`, so `__name__` already equals
+# the catalog's tracer/meter name), this module is `indexing.pipeline` —
+# `__name__` would be `"indexing.pipeline"`, not the catalog's
+# `"review.indexing"`, so the catalog name is passed explicitly, the same
+# `metrics.get_meter("review.context_builder")` shape
+# `review/context_builder.py` already uses for an identical reason.
+# `get_tracer`/`get_meter` both return no-op proxies until a composition
+# root (`apps/webhook_api/main.py`/`apps/worker/main.py`, Unit A) registers
+# a real TracerProvider/MeterProvider — this module never constructs
+# SDK/exporter infra itself.
+tracer = trace.get_tracer("review.indexing")
+meter = metrics.get_meter("review.indexing")
+
+# Catalog names, verbatim (US9) — recorded once, at `run_indexing_job`'s
+# completion, where `IndexingResult` is built. No attributes: the catalog
+# gives no attribute list for these five instruments (unlike, e.g., US1's
+# `{job_type}` or US4's `{severity, source}`), so none are invented here —
+# a job-level aggregate count per completed job, not sliced further.
+_files_processed_counter = meter.create_counter(
+    "review.indexing.files_processed_total",
+    description="Files successfully processed by an indexing job — chunked/embedded/upserted "
+    "(added or modified files) or removed from the index (deleted files).",
+)
+_files_skipped_counter = meter.create_counter(
+    "review.indexing.files_skipped_total",
+    description="Files skipped by an indexing job (unsupported, ceiling-dropped, or no content).",
+)
+_files_failed_counter = meter.create_counter(
+    "review.indexing.files_failed_total",
+    description="Files that failed an isolated per-file stage during an indexing job.",
+)
+_chunks_created_counter = meter.create_counter(
+    "review.indexing.chunks_created_total",
+    description="Chunks created by an indexing job.",
+)
+_edges_created_counter = meter.create_counter(
+    "review.indexing.edges_created_total",
+    description="Call/import graph edges created by an indexing job.",
+)
+_duration_histogram = meter.create_histogram(
+    "review.indexing.duration_ms",
+    unit="ms",
+    description="Wall-clock duration of one indexing job, in milliseconds.",
+)
+
+
+def _start_span(name: str) -> AbstractContextManager[trace.Span]:
+    """This module's ``tracer`` bound into the shared
+    ``indexing._telemetry.start_span`` helper — see that function's
+    docstring for why the ``record_exception=False``/
+    ``set_status_on_exception=False`` pair is centralized there instead of
+    redefined per call site.
+    """
+    return _shared_start_span(tracer, name)
+
 
 # Carried forward from spec-indexing.md's own Non-Functional Requirements
 # ("Cost ceilings ... recommended starting defaults, tuned during
@@ -548,198 +616,266 @@ async def run_indexing_job(
     failure, which is isolated per US10 and reflected only in the returned
     ``IndexingResult.files_failed`` count and this job's own completion log
     line.
+
+    Wrapped in a root span, ``"review.indexing.job.run"`` (US9, catalog
+    verbatim) — one per call, tagged with ``review.indexing.job.id``/
+    ``review.indexing.repo.id``/``review.indexing.org.id`` (IDs only, per
+    the Privacy/Compliance NFR's fixed allowlist — never a file path, a
+    diff, or an exception's own text). Each real stage boundary this
+    function's own body already has — file-set resolution, the bulk
+    content fetch, the per-file added/modified loop, the removed-file
+    delete loop, and the (conditional) cursor advance — gets its own child
+    span, ``"review.indexing.stage.{name}"``. Deliberately **not** one span
+    per per-file sub-stage (chunk/graph/embed/upsert, this module's own
+    ``_process_one_added_or_modified_file``): a job can touch up to
+    ``FULL_RUN_FILE_CEILING`` (20,000) files, and a span per sub-stage per
+    file would multiply that by four, working against the Performance
+    NFR's own hot-path-overhead ceiling for no query this PRD's shipped
+    dashboard needs — the five job-level counters below already give
+    per-stage-outcome visibility (files processed/skipped/failed,
+    chunks/edges created) without per-file span volume. ``record_exception``/
+    ``set_status_on_exception`` are disabled on every span here, the same
+    Privacy/Compliance reason ``review.pipeline``'s own root/child spans
+    disable them (a caught exception's ``str()`` — which can carry
+    attacker-controlled ``file_path``/error detail — must never become span
+    data).
+
+    Records the five US9 job-completion counters/histogram (module-level
+    ``_files_processed_counter`` etc.) at the same point ``IndexingResult``
+    is built, from that same result's own fields — never attributed
+    (the catalog gives no attribute list for these instruments, unlike,
+    e.g., US1's ``{job_type}``), so this is one job-level data point per
+    counter per job run.
     """
     started = time.monotonic()
     parsed = IndexingJobPayload.model_validate(payload)
 
-    try:
-        file_set = await _resolve_file_set(parsed, deps)
-    except (RepoTreeTruncatedError, RepoTreeFetchError, IndexingRepositoryError) as exc:
-        logger.error(
-            "index job: file-set resolution failed",
+    with _start_span("review.indexing.job.run") as root_span:
+        with suppress_telemetry_errors(
+            logger,
+            "root span attribute recording failed (indexing job unaffected)",
+            job_id=job_id,
+        ):
+            root_span.set_attribute("review.indexing.job.id", job_id)
+            root_span.set_attribute("review.indexing.repo.id", str(parsed.repo_id))
+            root_span.set_attribute("review.indexing.org.id", str(parsed.org_id))
+
+        with _start_span("review.indexing.stage.resolve_file_set"):
+            try:
+                file_set = await _resolve_file_set(parsed, deps)
+            except (RepoTreeTruncatedError, RepoTreeFetchError, IndexingRepositoryError) as exc:
+                logger.error(
+                    "index job: file-set resolution failed",
+                    extra={
+                        "job_id": job_id,
+                        "repo_id": str(parsed.repo_id),
+                        "pr_number": parsed.pr_number,
+                        "commit_sha": parsed.commit_sha,
+                        "error": str(exc),
+                    },
+                )
+                raise IndexingJobFailedError(detail=str(exc)) from exc
+
+        added_or_modified = _apply_cost_ceilings(
+            file_set.added_or_modified,
+            file_set.tree_by_path,
+            full_run=file_set.used_full_tree_fallback,
+            job_id=job_id,
+        )
+        files_skipped = len(file_set.added_or_modified) - len(added_or_modified)
+
+        entries = [
+            file_set.tree_by_path[path]
+            for path in added_or_modified
+            if path in file_set.tree_by_path
+        ]
+        # Paths absent from tree_by_path are counted in files_skipped by the
+        # per-file loop below (its own `entry is None` branch) — do not also
+        # count them here, or they are double-counted.
+
+        content_by_path: dict[str, bytes] = {}
+        content_fetch_error: RepoTreeContentFetchError | None = None
+        if entries:
+            with _start_span("review.indexing.stage.fetch_content"):
+                try:
+                    content_by_path = await deps.tree_fetcher.fetch_content(
+                        installation_id=parsed.installation_id,
+                        repo_full_name=parsed.repo_full_name,
+                        paths_with_blob_sha=entries,
+                    )
+                except RepoTreeContentFetchError as exc:
+                    # `fetch_content` fails the *whole* batch rather than a
+                    # silently partial result (see `RepoTreeContentFetchError`'s
+                    # own docstring for why — deliberately never a silently
+                    # skipped/empty file, e.g. an oversized blob that could hide a
+                    # vulnerable pattern from this platform's own indexing
+                    # coverage). Caught here, loudly, as a per-file *failure* for
+                    # every path in this batch (never folded into the quiet
+                    # `files_skipped` count below) — so one bad file in a large
+                    # push doesn't leave the whole job, and every other file in
+                    # it, permanently stuck: the cursor still advances past this
+                    # push, and the next push's delta no longer carries these
+                    # paths unless they change again.
+                    content_fetch_error = exc
+                    logger.error(
+                        "index job: batch content fetch failed",
+                        extra={
+                            "job_id": job_id,
+                            "repo_id": str(parsed.repo_id),
+                            "path_count": len(entries),
+                            "error": str(exc),
+                        },
+                    )
+
+        files_processed = 0
+        files_failed = 0
+        chunks_created = 0
+        edges_created = 0
+
+        with _start_span("review.indexing.stage.process_files"):
+            for path in added_or_modified:
+                entry = file_set.tree_by_path.get(path)
+                if entry is None:
+                    files_skipped += 1
+                    continue
+                if entry.mode in (_SYMLINK_MODE, _SUBMODULE_MODE):
+                    # A path can flip from a regular file to a symlink/submodule
+                    # between pushes — any chunk/graph rows indexed from when it
+                    # *was* a regular file must be cleaned up here (idempotent:
+                    # a no-op delete for a path that was never a regular file), or
+                    # they persist indefinitely, since no other loop ever revisits
+                    # a path that isn't in `file_set.removed`.
+                    try:
+                        await deps.index_repository.delete_file(
+                            repo_id=parsed.repo_id, pr_number=parsed.pr_number, file_path=path
+                        )
+                    except IndexingRepositoryError as exc:
+                        files_failed += 1
+                        _log_stage_failure(
+                            job_id=job_id, file_path=path, language=None, stage="delete", error=exc
+                        )
+                        continue
+                    files_skipped += 1
+                    continue
+                content = content_by_path.get(path)
+                if content is None:
+                    if content_fetch_error is not None:
+                        files_failed += 1
+                        _log_stage_failure(
+                            job_id=job_id,
+                            file_path=path,
+                            language=None,
+                            stage="fetch_content",
+                            error=content_fetch_error,
+                        )
+                    else:
+                        files_skipped += 1
+                        logger.info(
+                            "index job: file skipped (no content available)",
+                            extra={"job_id": job_id, "file_path": path},
+                        )
+                    continue
+
+                language = language_for_path(path)
+                if (
+                    language is None
+                ):  # pragma: no cover - defensive; prefilter already guarantees this
+                    files_skipped += 1
+                    continue
+
+                outcome = await _process_one_added_or_modified_file(
+                    path, language, content, parsed=parsed, deps=deps, job_id=job_id
+                )
+                if outcome is None:
+                    files_failed += 1
+                    continue
+
+                chunk_count, edge_count = outcome
+                chunks_created += chunk_count
+                edges_created += edge_count
+                files_processed += 1
+
+        with _start_span("review.indexing.stage.delete_removed_files"):
+            for path in file_set.removed:
+                try:
+                    await deps.index_repository.delete_file(
+                        repo_id=parsed.repo_id, pr_number=parsed.pr_number, file_path=path
+                    )
+                except IndexingRepositoryError as exc:
+                    _log_stage_failure(
+                        job_id=job_id, file_path=path, language=None, stage="delete", error=exc
+                    )
+                    files_failed += 1
+                    continue
+                files_processed += 1
+
+        if parsed.pr_number == 0:
+            with _start_span("review.indexing.stage.advance_cursor"):
+                try:
+                    await deps.commit_tracker.set_last_indexed_commit(
+                        repo_id=parsed.repo_id, commit_sha=parsed.commit_sha
+                    )
+                except IndexingRepositoryError as exc:
+                    logger.error(
+                        "index job: failed to advance last-indexed-commit cursor",
+                        extra={"job_id": job_id, "repo_id": str(parsed.repo_id), "error": str(exc)},
+                    )
+                    raise IndexingJobFailedError(detail=str(exc)) from exc
+
+        duration_seconds = time.monotonic() - started
+        result = IndexingResult(
+            job_id=job_id,
+            repo_id=parsed.repo_id,
+            pr_number=parsed.pr_number,
+            commit_sha=parsed.commit_sha,
+            used_full_tree_fallback=file_set.used_full_tree_fallback,
+            files_processed=files_processed,
+            files_skipped=files_skipped,
+            files_failed=files_failed,
+            chunks_created=chunks_created,
+            edges_created=edges_created,
+            duration_seconds=duration_seconds,
+        )
+
+        # Guarded: the job itself already completed successfully by this
+        # point (`result` is fully built), so a metrics-recording failure
+        # must never propagate as an unhandled exception out of this
+        # function — apps/worker/dispatch.py has no distinct handling for
+        # that and would mark an otherwise-successful job FAILED.
+        with suppress_telemetry_errors(
+            logger,
+            "index job: US9 completion metrics recording failed (job outcome unaffected)",
+            job_id=job_id,
+            repo_id=str(parsed.repo_id),
+        ):
+            _files_processed_counter.add(result.files_processed)
+            _files_skipped_counter.add(result.files_skipped)
+            _files_failed_counter.add(result.files_failed)
+            _chunks_created_counter.add(result.chunks_created)
+            _edges_created_counter.add(result.edges_created)
+            _duration_histogram.record(result.duration_seconds * 1000)
+
+        ratio_exceeded = files_failed > 0 and (
+            files_processed == 0
+            or (files_failed / files_processed) > FAILURE_RATIO_WARNING_THRESHOLD
+        )
+        log_fn = logger.warning if ratio_exceeded else logger.info
+        log_fn(
+            "index job completed",
             extra={
                 "job_id": job_id,
+                "org_id": str(parsed.org_id),
                 "repo_id": str(parsed.repo_id),
                 "pr_number": parsed.pr_number,
                 "commit_sha": parsed.commit_sha,
-                "error": str(exc),
+                "used_full_tree_fallback": file_set.used_full_tree_fallback,
+                "files_processed": files_processed,
+                "files_skipped": files_skipped,
+                "files_failed": files_failed,
+                "chunks_created": chunks_created,
+                "edges_created": edges_created,
+                "duration_seconds": duration_seconds,
             },
         )
-        raise IndexingJobFailedError(detail=str(exc)) from exc
 
-    added_or_modified = _apply_cost_ceilings(
-        file_set.added_or_modified,
-        file_set.tree_by_path,
-        full_run=file_set.used_full_tree_fallback,
-        job_id=job_id,
-    )
-    files_skipped = len(file_set.added_or_modified) - len(added_or_modified)
-
-    entries = [
-        file_set.tree_by_path[path] for path in added_or_modified if path in file_set.tree_by_path
-    ]
-    # Paths absent from tree_by_path are counted in files_skipped by the
-    # per-file loop below (its own `entry is None` branch) — do not also
-    # count them here, or they are double-counted.
-
-    content_by_path: dict[str, bytes] = {}
-    content_fetch_error: RepoTreeContentFetchError | None = None
-    if entries:
-        try:
-            content_by_path = await deps.tree_fetcher.fetch_content(
-                installation_id=parsed.installation_id,
-                repo_full_name=parsed.repo_full_name,
-                paths_with_blob_sha=entries,
-            )
-        except RepoTreeContentFetchError as exc:
-            # `fetch_content` fails the *whole* batch rather than a
-            # silently partial result (see `RepoTreeContentFetchError`'s
-            # own docstring for why — deliberately never a silently
-            # skipped/empty file, e.g. an oversized blob that could hide a
-            # vulnerable pattern from this platform's own indexing
-            # coverage). Caught here, loudly, as a per-file *failure* for
-            # every path in this batch (never folded into the quiet
-            # `files_skipped` count below) — so one bad file in a large
-            # push doesn't leave the whole job, and every other file in
-            # it, permanently stuck: the cursor still advances past this
-            # push, and the next push's delta no longer carries these
-            # paths unless they change again.
-            content_fetch_error = exc
-            logger.error(
-                "index job: batch content fetch failed",
-                extra={
-                    "job_id": job_id,
-                    "repo_id": str(parsed.repo_id),
-                    "path_count": len(entries),
-                    "error": str(exc),
-                },
-            )
-
-    files_processed = 0
-    files_failed = 0
-    chunks_created = 0
-    edges_created = 0
-
-    for path in added_or_modified:
-        entry = file_set.tree_by_path.get(path)
-        if entry is None:
-            files_skipped += 1
-            continue
-        if entry.mode in (_SYMLINK_MODE, _SUBMODULE_MODE):
-            # A path can flip from a regular file to a symlink/submodule
-            # between pushes — any chunk/graph rows indexed from when it
-            # *was* a regular file must be cleaned up here (idempotent:
-            # a no-op delete for a path that was never a regular file), or
-            # they persist indefinitely, since no other loop ever revisits
-            # a path that isn't in `file_set.removed`.
-            try:
-                await deps.index_repository.delete_file(
-                    repo_id=parsed.repo_id, pr_number=parsed.pr_number, file_path=path
-                )
-            except IndexingRepositoryError as exc:
-                files_failed += 1
-                _log_stage_failure(
-                    job_id=job_id, file_path=path, language=None, stage="delete", error=exc
-                )
-                continue
-            files_skipped += 1
-            continue
-        content = content_by_path.get(path)
-        if content is None:
-            if content_fetch_error is not None:
-                files_failed += 1
-                _log_stage_failure(
-                    job_id=job_id,
-                    file_path=path,
-                    language=None,
-                    stage="fetch_content",
-                    error=content_fetch_error,
-                )
-            else:
-                files_skipped += 1
-                logger.info(
-                    "index job: file skipped (no content available)",
-                    extra={"job_id": job_id, "file_path": path},
-                )
-            continue
-
-        language = language_for_path(path)
-        if language is None:  # pragma: no cover - defensive; prefilter already guarantees this
-            files_skipped += 1
-            continue
-
-        outcome = await _process_one_added_or_modified_file(
-            path, language, content, parsed=parsed, deps=deps, job_id=job_id
-        )
-        if outcome is None:
-            files_failed += 1
-            continue
-
-        chunk_count, edge_count = outcome
-        chunks_created += chunk_count
-        edges_created += edge_count
-        files_processed += 1
-
-    for path in file_set.removed:
-        try:
-            await deps.index_repository.delete_file(
-                repo_id=parsed.repo_id, pr_number=parsed.pr_number, file_path=path
-            )
-        except IndexingRepositoryError as exc:
-            _log_stage_failure(
-                job_id=job_id, file_path=path, language=None, stage="delete", error=exc
-            )
-            files_failed += 1
-            continue
-        files_processed += 1
-
-    if parsed.pr_number == 0:
-        try:
-            await deps.commit_tracker.set_last_indexed_commit(
-                repo_id=parsed.repo_id, commit_sha=parsed.commit_sha
-            )
-        except IndexingRepositoryError as exc:
-            logger.error(
-                "index job: failed to advance last-indexed-commit cursor",
-                extra={"job_id": job_id, "repo_id": str(parsed.repo_id), "error": str(exc)},
-            )
-            raise IndexingJobFailedError(detail=str(exc)) from exc
-
-    duration_seconds = time.monotonic() - started
-    result = IndexingResult(
-        job_id=job_id,
-        repo_id=parsed.repo_id,
-        pr_number=parsed.pr_number,
-        commit_sha=parsed.commit_sha,
-        used_full_tree_fallback=file_set.used_full_tree_fallback,
-        files_processed=files_processed,
-        files_skipped=files_skipped,
-        files_failed=files_failed,
-        chunks_created=chunks_created,
-        edges_created=edges_created,
-        duration_seconds=duration_seconds,
-    )
-
-    ratio_exceeded = files_failed > 0 and (
-        files_processed == 0 or (files_failed / files_processed) > FAILURE_RATIO_WARNING_THRESHOLD
-    )
-    log_fn = logger.warning if ratio_exceeded else logger.info
-    log_fn(
-        "index job completed",
-        extra={
-            "job_id": job_id,
-            "org_id": str(parsed.org_id),
-            "repo_id": str(parsed.repo_id),
-            "pr_number": parsed.pr_number,
-            "commit_sha": parsed.commit_sha,
-            "used_full_tree_fallback": file_set.used_full_tree_fallback,
-            "files_processed": files_processed,
-            "files_skipped": files_skipped,
-            "files_failed": files_failed,
-            "chunks_created": chunks_created,
-            "edges_created": edges_created,
-            "duration_seconds": duration_seconds,
-        },
-    )
-
-    return result
+        return result

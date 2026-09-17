@@ -292,6 +292,37 @@ def test_github_fields_default_per_the_plan(monkeypatch: pytest.MonkeyPatch) -> 
     assert settings.github_retry_max_attempts == 3
 
 
+def test_empty_otel_endpoint_env_value_is_treated_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """See WebhookAPISettings' identical test (same reasoning): the
+    `observability` Compose profile's bare `OTEL_EXPORTER_OTLP_ENDPOINT:`
+    pass-through still forwards a present-but-empty `.env` value (exactly
+    what `.env.example` ships) as `""`, not absent — without the field
+    validator this proves, that would silently break US10's
+    no-op-by-default contract.
+    """
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.otel_exporter_otlp_endpoint is None
+    assert settings.otel_exporter_otlp_headers is None
+
+
+def test_non_empty_otel_endpoint_env_value_still_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.otel_exporter_otlp_endpoint == "http://otel-collector:4317"
+
+
 def test_github_app_private_key_never_appears_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
 

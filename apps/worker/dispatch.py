@@ -64,15 +64,112 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
+from typing import Literal
+
+from opentelemetry import metrics
 
 from adapter.storage.models import JobType
 from adapter.storage.queue import JobQueueRepository
 from adapter.storage.schemas import ClaimedJob
+from adapter.telemetry.sdk import clamp_clock_skew_duration_seconds, suppress_telemetry_errors
 from indexing.pipeline import IndexingJobDependencies, IndexingJobFailedError, run_indexing_job
 from review.pipeline import PipelineFailedError, StepRegistry
 from review.step import StepContext
 
 logger = logging.getLogger(__name__)
+
+# US1 (docs/specs/spec-observability.md's METRIC & SPAN CATALOG) — imports
+# the OTel API directly, same style as `adapter/storage/queue.py` and
+# `adapter/telemetry/heartbeat.py`. Attributes are bounded-cardinality tags
+# only (`job_type`, `outcome`), never job payload content. Meter name is the
+# catalog's mandated "review.queue" literal (shared with
+# `adapter/storage/queue.py`), not `__name__` — this module's own dotted
+# path (`apps.worker.dispatch`) wouldn't match it.
+meter = metrics.get_meter("review.queue")
+
+_completed_counter = meter.create_counter(
+    "review.queue.completed_total", description="Jobs that reached a terminal DONE/FAILED status."
+)
+_job_duration_histogram = meter.create_histogram(
+    "review.job.duration_seconds",
+    unit="s",
+    description="Wall-clock time from claim to terminal DONE/FAILED status.",
+)
+
+# The only two terminal outcomes `_record_job_completion` is ever called
+# with (see its three call sites below) — a `Literal` alias rather than a
+# bare `str` so a typo (e.g. `"faild"`) is caught by the strict type
+# checker instead of silently creating a new, uncounted metric series on
+# `_completed_counter`/`_job_duration_histogram`.
+_JobOutcome = Literal["done", "failed"]
+
+
+def _record_job_completion(job: ClaimedJob, *, outcome: _JobOutcome) -> None:
+    """Records US1's completion counter/duration histogram for ``job`` —
+    called from every path that reaches a terminal DONE/FAILED status
+    (the normal `_run_claimed_job` success/`PipelineFailedError`/
+    `IndexingJobFailedError` paths, and `run_dispatch_loop`'s own
+    bug-resilience `mark_failed` path), so every terminal transition is
+    counted exactly once regardless of which path produced it.
+
+    Guarded end-to-end: every caller here has already committed the job's
+    real DONE/FAILED transition (``job_queue.mark_done``/``mark_failed``)
+    before calling this. A telemetry-recording exception must never
+    escape and be mistaken by a caller for that real transition having
+    failed — e.g. ``_run_claimed_job``'s own ``except (PipelineFailedError,
+    IndexingJobFailedError)`` block would otherwise let such an exception
+    propagate past its own ``return``, straight into
+    ``run_dispatch_loop``'s catch-all, which would then call
+    ``mark_failed``/this function a second time for the same job.
+    """
+    with suppress_telemetry_errors(
+        logger,
+        "job completion metrics recording failed (job's terminal status unaffected)",
+        job_id=str(job.id),
+        job_type=job.job_type.value,
+        outcome=outcome,
+    ):
+        attributes = {"job_type": job.job_type.value, "outcome": outcome}
+        _completed_counter.add(1, attributes)
+        if job.claimed_at is not None:
+            # `claimed_at` and this `datetime.now(UTC)` are both this
+            # worker process's own clock, read at two different points in
+            # time (see `adapter/storage/queue.py`'s `claim_next`, which
+            # sets `claimed_at = datetime.now(UTC)`) — a clock step
+            # (e.g. an NTP correction) between the two reads can still
+            # make the naive difference negative, so this needs clamping
+            # the same as `clamp_clock_skew_duration_seconds`'s own
+            # docstring describes for the cross-clock case.
+            duration_seconds = clamp_clock_skew_duration_seconds(
+                (datetime.now(UTC) - job.claimed_at).total_seconds()
+            )
+            _job_duration_histogram.record(duration_seconds, attributes)
+
+
+async def _mark_terminal_and_record(
+    job_queue: JobQueueRepository, job: ClaimedJob, *, outcome: _JobOutcome
+) -> bool:
+    """Mark ``job`` DONE/FAILED (``job_queue.mark_done``/``mark_failed``,
+    selected by ``outcome``) and record its completion telemetry via
+    `_record_job_completion` — but only when the transition actually
+    happened. All three call sites below (`_run_claimed_job`'s success and
+    failure paths, `run_dispatch_loop`'s own bug-resilience catch-all) need
+    the exact same "only count it if this call is the one that actually
+    moved CLAIMED -> DONE/FAILED" guard, so it lives here once rather than
+    being repeated at each site — see `_record_job_completion`'s own
+    docstring for why a job must never be double-counted.
+
+    Returns whether this call performed the transition, so callers can
+    still include it in their own "job done"/"job failed" log line.
+    """
+    if outcome == "done":
+        transitioned = await job_queue.mark_done(job.id)
+    else:
+        transitioned = await job_queue.mark_failed(job.id)
+    if transitioned:
+        _record_job_completion(job, outcome=outcome)
+    return transitioned
 
 
 async def _dispatch_claimed_job(
@@ -155,15 +252,27 @@ async def _run_claimed_job(
     try:
         task.result()
     except (PipelineFailedError, IndexingJobFailedError) as exc:
-        await job_queue.mark_failed(job.id)
+        transitioned = await _mark_terminal_and_record(job_queue, job, outcome="failed")
         logger.error(
             "job failed",
-            extra={"job_id": str(job.id), "job_type": job.job_type.value, "error": str(exc)},
+            extra={
+                "job_id": str(job.id),
+                "job_type": job.job_type.value,
+                "error": str(exc),
+                "transitioned": transitioned,
+            },
         )
         return
 
-    await job_queue.mark_done(job.id)
-    logger.info("job done", extra={"job_id": str(job.id), "job_type": job.job_type.value})
+    transitioned = await _mark_terminal_and_record(job_queue, job, outcome="done")
+    logger.info(
+        "job done",
+        extra={
+            "job_id": str(job.id),
+            "job_type": job.job_type.value,
+            "transitioned": transitioned,
+        },
+    )
 
 
 async def run_dispatch_loop(
@@ -213,4 +322,11 @@ async def run_dispatch_loop(
                 "marking job FAILED",
                 extra={"job_id": str(job.id), "job_type": job.job_type.value, "error": str(exc)},
             )
-            await job_queue.mark_failed(job.id)
+            # `_mark_terminal_and_record` only records completion telemetry
+            # when this call actually transitioned the row — e.g. if the bug
+            # that landed us here happened after `_run_claimed_job` had
+            # already called `mark_done`/`mark_failed` (and its own
+            # completion metric) for this job, this is a no-op transition
+            # and must not double-record the same job's completion under a
+            # second outcome.
+            await _mark_terminal_and_record(job_queue, job, outcome="failed")

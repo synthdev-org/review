@@ -20,18 +20,25 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import socket
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import Histogram, InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from adapter.storage.engine import create_session_factory
 from adapter.storage.indexing_repository import IndexingRepository
 from adapter.storage.models import JobQueueRow, JobStatus, JobType, Org, Repo
 from adapter.storage.queue import JobQueueRepository
+from adapter.telemetry.sdk import init_telemetry
 from apps.worker.dispatch import run_dispatch_loop
 from indexing.conftest import FakeEmbeddingClient, FakeRepoTreeFetcher
 from indexing.pipeline import IndexingJobDependencies
@@ -598,3 +605,215 @@ async def test_earlier_step_failure_still_invokes_terminal_output_step(
     failure_input = terminal.calls[0]
     assert isinstance(failure_input, StepFailureInfo)
     assert failure_input.failed_step_name == "fake_step"
+
+
+# --- docs/specs/spec-observability.md's Unit A: Reliability NFR (exporter
+# unavailability must never fail/slow/block a job) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_job_still_completes_when_otlp_collector_is_unreachable(
+    migrated_engine: AsyncEngine,
+    reset_otel_global_providers: None,
+) -> None:
+    """The "job still completes" half of US14's own named highest-risk
+    failure mode — `adapter/telemetry/test_telemetry_integration.py`
+    proves the lower-level guarantee (recording/flushing against a dead
+    receiver never raises or blocks `adapter.telemetry.sdk` itself); this
+    test proves it holds all the way up through a real dispatch loop: a
+    directly-enqueued job still reaches `DONE` on its usual schedule even
+    though `init_telemetry` was pointed at an OTLP endpoint nothing is
+    listening on.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        unreachable_port = sock.getsockname()[1]
+    init_telemetry(
+        otlp_endpoint=f"http://127.0.0.1:{unreachable_port}",
+        service_name="review-worker-test",
+    )
+    try:
+        session_factory = create_session_factory(migrated_engine)
+        job_queue = JobQueueRepository(session_factory)
+        job_id = await job_queue.enqueue(JobType.REVIEW, {"pr_number": 1})
+
+        async with _running_dispatch_loop(
+            job_queue=job_queue, review_registry=_registry(_SucceedingStep())
+        ):
+            await _wait_for_status(migrated_engine, job_id, JobStatus.DONE)
+    finally:
+        tracer_provider = trace.get_tracer_provider()
+        meter_provider = metrics.get_meter_provider()
+        assert isinstance(tracer_provider, TracerProvider)
+        assert isinstance(meter_provider, MeterProvider)
+        tracer_provider.shutdown()
+        meter_provider.shutdown()
+
+
+# --- US1 (docs/specs/spec-observability.md's METRIC & SPAN CATALOG):
+# `review.queue.completed_total` / `review.job.duration_seconds`, recorded
+# by `_record_job_completion` on every terminal DONE/FAILED transition.
+# Uses OTel's own in-memory metric reader — see
+# `review/test_output_telemetry.py`'s identical fixture pattern. ----------
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> Iterator[InMemoryMetricReader]:
+    """Registers a real `MeterProvider` backed by `InMemoryMetricReader` as
+    the global one, so `apps.worker.dispatch`'s module-level `meter`/
+    counter/histogram (created once, at import time) pick it up via OTel's
+    proxy-instrument migration mechanism."""
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-worker-test"}), metric_readers=[reader]
+    )
+    metrics.set_meter_provider(provider)
+    yield reader
+    provider.shutdown()
+
+
+def _sum_points(
+    reader: InMemoryMetricReader, metric_name: str
+) -> list[tuple[float, dict[str, object]]]:
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+    points: list[tuple[float, dict[str, object]]] = []
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != metric_name:
+                    continue
+                assert isinstance(metric.data, Sum)
+                for data_point in metric.data.data_points:
+                    points.append((data_point.value, dict(data_point.attributes or {})))
+    return points
+
+
+def _histogram_points(
+    reader: InMemoryMetricReader, metric_name: str
+) -> list[tuple[int, float, dict[str, object]]]:
+    """Returns `(count, sum, attributes)` per recorded data point."""
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+    points: list[tuple[int, float, dict[str, object]]] = []
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != metric_name:
+                    continue
+                assert isinstance(metric.data, Histogram)
+                for data_point in metric.data.data_points:
+                    attrs: dict[str, object] = dict(data_point.attributes or {})
+                    points.append((data_point.count, data_point.sum, attrs))
+    return points
+
+
+@pytest.mark.asyncio
+async def test_successful_job_records_completed_total_and_duration_done(
+    migrated_engine: AsyncEngine,
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    session_factory = create_session_factory(migrated_engine)
+    job_queue = JobQueueRepository(session_factory)
+    job_id = await job_queue.enqueue(JobType.REVIEW, {"pr_number": 1})
+
+    async with _running_dispatch_loop(
+        job_queue=job_queue, review_registry=_registry(_SucceedingStep())
+    ):
+        await _wait_for_status(migrated_engine, job_id, JobStatus.DONE)
+
+    completed_points = _sum_points(in_memory_metric_reader, "review.queue.completed_total")
+    assert completed_points == [(1, {"job_type": "review", "outcome": "done"})]
+
+    duration_points = _histogram_points(in_memory_metric_reader, "review.job.duration_seconds")
+    assert len(duration_points) == 1
+    count, total, attrs = duration_points[0]
+    assert count == 1
+    assert total >= 0.0
+    assert attrs == {"job_type": "review", "outcome": "done"}
+
+
+@pytest.mark.asyncio
+async def test_failed_pipeline_job_records_completed_total_and_duration_failed(
+    migrated_engine: AsyncEngine,
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    session_factory = create_session_factory(migrated_engine)
+    job_queue = JobQueueRepository(session_factory)
+    job_id = await job_queue.enqueue(JobType.REVIEW, {"pr_number": 1})
+
+    async with _running_dispatch_loop(
+        job_queue=job_queue, review_registry=_registry(_RaisingStep())
+    ):
+        await _wait_for_status(migrated_engine, job_id, JobStatus.FAILED)
+
+    completed_points = _sum_points(in_memory_metric_reader, "review.queue.completed_total")
+    assert completed_points == [(1, {"job_type": "review", "outcome": "failed"})]
+
+    duration_points = _histogram_points(in_memory_metric_reader, "review.job.duration_seconds")
+    assert len(duration_points) == 1
+    count, total, attrs = duration_points[0]
+    assert count == 1
+    assert total >= 0.0
+    assert attrs == {"job_type": "review", "outcome": "failed"}
+
+
+@pytest.mark.asyncio
+async def test_unhandled_loop_exception_also_records_completed_total_as_failed(
+    migrated_engine: AsyncEngine,
+    in_memory_metric_reader: InMemoryMetricReader,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`run_dispatch_loop`'s own bug-resilience path (an exception escaping
+    `_run_claimed_job` entirely, not a normal `PipelineFailedError`) is the
+    other call site of `_record_job_completion` — proves it's covered too,
+    not just the two paths inside `_run_claimed_job` itself."""
+    session_factory = create_session_factory(migrated_engine)
+    job_queue = JobQueueRepository(session_factory)
+    registry = _registry(_SucceedingStep())
+
+    async def _raise_directly(self: StepRegistry, seed_input: Any, context: StepContext) -> Any:
+        raise RuntimeError("simulated bug in the dispatch loop's own call, not the pipeline")
+
+    monkeypatch.setattr(StepRegistry, "run", _raise_directly)
+    job_id = await job_queue.enqueue(JobType.REVIEW, {"pr_number": 1})
+
+    async with _running_dispatch_loop(job_queue=job_queue, review_registry=registry):
+        await _wait_for_status(migrated_engine, job_id, JobStatus.FAILED)
+
+    completed_points = _sum_points(in_memory_metric_reader, "review.queue.completed_total")
+    assert completed_points == [(1, {"job_type": "review", "outcome": "failed"})]
+
+
+@pytest.mark.asyncio
+async def test_job_completion_metric_attributes_are_bounded_and_privacy_safe(
+    migrated_engine: AsyncEngine,
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """Per this spec's hard privacy requirement: attribute values are never
+    job payload content — only the bounded `job_type`/`outcome`
+    vocabulary."""
+    session_factory = create_session_factory(migrated_engine)
+    job_queue = JobQueueRepository(session_factory)
+    job_id = await job_queue.enqueue(
+        JobType.REVIEW, {"pr_number": 1, "secret": "definitely-not-a-metric-label"}
+    )
+
+    async with _running_dispatch_loop(
+        job_queue=job_queue, review_registry=_registry(_SucceedingStep())
+    ):
+        await _wait_for_status(migrated_engine, job_id, JobStatus.DONE)
+
+    for _value, attrs in _sum_points(in_memory_metric_reader, "review.queue.completed_total"):
+        assert set(attrs.keys()) == {"job_type", "outcome"}
+        assert attrs["job_type"] in {"review", "index"}
+        assert attrs["outcome"] in {"done", "failed"}
+
+    for _count, _total, attrs in _histogram_points(
+        in_memory_metric_reader, "review.job.duration_seconds"
+    ):
+        assert set(attrs.keys()) == {"job_type", "outcome"}
+        assert attrs["job_type"] in {"review", "index"}
+        assert attrs["outcome"] in {"done", "failed"}

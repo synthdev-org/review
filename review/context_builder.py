@@ -70,6 +70,7 @@ import time
 from collections.abc import Sequence
 from typing import Any, Protocol
 
+from opentelemetry import metrics
 from pydantic import BaseModel, ConfigDict, Field
 
 from findings.models import Finding
@@ -82,18 +83,48 @@ from indexing.tree import (
     RepoTreeTruncatedError,
 )
 from ingestion.diff import Diff, DiffContentMalformedError, DiffContentUnavailableError, DiffFetcher
+from review._telemetry import suppress_telemetry_errors
 from review.context_bundle import (
     MAX_CALLER_EDGES_PER_SYMBOL,
     MAX_SIMILARITY_MATCHES_PER_CHUNK,
     ContextBundle,
     assemble_context_bundle,
-    serialized_item_size,
 )
 from review.context_symbols import fetch_diff_content, resolve_changed_symbols
 from review.diff_prompt import render_diff
 from review.step import JobIdentity, Step, StepContext
 
 logger = logging.getLogger(__name__)
+
+# US6 (docs/specs/spec-observability.md's METRIC & SPAN CATALOG) — the OTel
+# *API* import above, mirroring how `logging.getLogger(__name__)` is already
+# imported directly in this module (see spec's "Resolved decisions" for why
+# no `typing.Protocol` telemetry indirection exists). `metrics.get_meter`
+# returns a proxy that safely no-ops until a composition root
+# (`apps/webhook_api/main.py`/`apps/worker/main.py`, Unit A) registers a
+# real `MeterProvider` — this module never constructs SDK/exporter infra
+# itself. Meter/metric names are the catalog's literal strings, not this
+# module's `__name__`.
+meter = metrics.get_meter("review.context_builder")
+
+_outcome_counter = meter.create_counter(
+    "review.context_builder.outcome_total",
+    description="Context Builder step outcomes, tagged by outcome.",
+)
+_duration_histogram = meter.create_histogram(
+    "review.context_builder.duration_ms",
+    unit="ms",
+    description="Context Builder step wall-clock duration.",
+)
+_item_count_histogram = meter.create_histogram(
+    "review.context_builder.item_count",
+    description="Number of items in the assembled context bundle.",
+)
+_bytes_histogram = meter.create_histogram(
+    "review.context_builder.bytes",
+    unit="By",
+    description="Total serialized byte size of the assembled context bundle.",
+)
 
 
 class ContextQueryError(Exception):
@@ -514,6 +545,12 @@ class ContextBuilderStep:
                 outcome = "degraded_empty"
 
         duration_ms = int((time.monotonic() - start) * 1000)
+        item_count = len(bundle.items)
+        # Sourced from `stats` (assemble_context_bundle's own already-computed
+        # truncation total) rather than re-serializing every surviving item a
+        # second time — 0 on the error/empty paths above, where `bundle` is a
+        # fresh, empty `ContextBundle` and `stats` was never populated.
+        total_bytes = stats.get("context_bundle_total_bytes", 0)
         log_extra: dict[str, Any] = {
             "job_id": job_id,
             "org_id": parsed.org_id,
@@ -523,11 +560,25 @@ class ContextBuilderStep:
             "outcome": outcome,
             "duration_ms": duration_ms,
             "base_sha_missing": parsed.base_sha is None,
-            "context_bundle_item_count": len(bundle.items),
-            "context_bundle_total_bytes": sum(serialized_item_size(item) for item in bundle.items),
+            "context_bundle_item_count": item_count,
+            "context_bundle_total_bytes": total_bytes,
             **stats,
             **error_extra,
         }
+
+        # US6 — recorded at the same point as the log line above, using the
+        # real `outcome` literal ("ok" / "degraded_empty" / "degraded_error")
+        # this method itself assigns, never a free-text value (Privacy NFR).
+        metric_attributes = {"outcome": outcome}
+        with suppress_telemetry_errors(
+            logger,
+            "context builder telemetry recording failed (context bundle unaffected)",
+            job_id=job_id,
+        ):
+            _outcome_counter.add(1, metric_attributes)
+            _duration_histogram.record(duration_ms, metric_attributes)
+            _item_count_histogram.record(item_count, metric_attributes)
+            _bytes_histogram.record(total_bytes, metric_attributes)
 
         if outcome == "degraded_error":
             logger.warning("context_builder degraded", extra=log_extra)

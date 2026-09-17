@@ -5,6 +5,13 @@ in this package runs against a real Postgres via `testcontainers-python`,
 never sqlite-in-memory or a mock — pgvector's presence/index behavior isn't
 something a substitute engine can stand in for. This needs Docker socket
 access on whatever host/container runs `pytest -m integration`.
+
+`reset_otel_global_providers` (re-exported from `adapter.telemetry.conftest`)
+is imported here too, mirroring `apps/webhook_api/conftest.py`'s and
+`apps/worker/conftest.py`'s identical re-export — US1's
+`adapter/storage/test_queue_telemetry.py` needs it to register an
+in-memory `MeterProvider` for `adapter.storage.queue`'s module-level meter
+to pick up, per docs/specs/spec-observability.md's METRIC & SPAN CATALOG.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.community.postgres import PostgresContainer
 
 from adapter.storage.engine import create_storage_engine
+from adapter.telemetry.conftest import reset_otel_global_providers  # noqa: F401
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _ALEMBIC_INI = os.path.join(_REPO_ROOT, "alembic.ini")

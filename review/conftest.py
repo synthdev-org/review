@@ -9,3 +9,4 @@ drives a real Postgres-backed job queue end to end.
 """
 
 from adapter.storage.conftest import migrated_engine, pgvector_container  # noqa: F401
+from adapter.telemetry.conftest import reset_otel_global_providers  # noqa: F401

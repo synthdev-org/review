@@ -29,6 +29,7 @@ that same fixture machinery rather than a second, near-duplicate copy.
 import os
 
 from adapter.storage.conftest import migrated_engine, pgvector_container  # noqa: F401
+from adapter.telemetry.conftest import reset_otel_global_providers  # noqa: F401
 
 os.environ.setdefault("REVIEW_WEBHOOK_API_ENVIRONMENT", "development")
 os.environ.setdefault("REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET", "conftest-default-webhook-secret")

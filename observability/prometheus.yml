@@ -1,0 +1,26 @@
+# Prometheus config for the `observability` Compose profile (Unit F).
+#
+# Scrape interval: 15s, per docs/specs/spec-observability.md's US12 own
+# stated 2-minute bound math — the OTel SDK's default periodic metric
+# export interval is 60s, so a 15s scrape interval gives at least one full
+# export-then-scrape cycle inside that 2-minute window with margin, not an
+# arbitrary number.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: otel-collector
+    # The OTel Collector's own `prometheus` exporter already sets a `job`
+    # label per sample from each service's `service.name` resource
+    # attribute (`review-webhook-api` / `review-worker` — see
+    # otel-collector-config.yaml's own comment), which the dashboard JSON's
+    # panel queries filter on directly (`job="review-webhook-api"`).
+    # Without `honor_labels: true`, Prometheus's default behavior
+    # overwrites that with this scrape config's own `job_name`
+    # ("otel-collector") and renames the real one to `exported_job` —
+    # silently breaking every job-filtered panel. `honor_labels: true`
+    # keeps the target's own labels as the source of truth instead.
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]

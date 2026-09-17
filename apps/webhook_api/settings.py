@@ -20,10 +20,12 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
+
+from adapter.telemetry.sdk import OtelSettingsMixin
 
 
-class WebhookAPISettings(BaseSettings):
+class WebhookAPISettings(OtelSettingsMixin):
     """Bootstrap settings for the Webhook API process.
 
     Required fields have no default on purpose: an entrypoint that silently
@@ -110,6 +112,11 @@ class WebhookAPISettings(BaseSettings):
     setup_state_ttl_seconds: float = 600.0
     github_api_base_url: str = "https://api.github.com"
     github_api_timeout_seconds: float = 10.0
+
+    # --- Observability (docs/specs/spec-observability.md's Unit A) ---
+    # `otel_exporter_otlp_endpoint`/`otel_exporter_otlp_headers` come from
+    # `OtelSettingsMixin` above — shared with `WorkerSettings` so the two
+    # entrypoints can't silently diverge on this pair's declaration.
 
     @model_validator(mode="after")
     def _require_setup_state_secret_when_setup_mode_enabled(self) -> WebhookAPISettings:

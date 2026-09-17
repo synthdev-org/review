@@ -85,9 +85,19 @@ from llmgateway.client import LLMClient
 from review.context_bundle import ContextBundle, render_context_bundle_section
 from review.diff_prompt import INERT_REFERENCE_DATA_FRAMING, render_and_truncate_diff
 from review.llm_response import build_completion_request, parse_llm_json_envelope
+from review.llm_telemetry import record_llm_token_usage
 from review.step import JobIdentity, Step, StepContext, job_identity_fields
 
 logger = logging.getLogger(__name__)
+
+# This step's own fixed pipeline-stage name, per docs/specs/spec-observability.md's
+# METRIC & SPAN CATALOG US3 entry ({stage: "review-generation", ...}) — a
+# closed-set label value, never free text, matching the Scale NFR's
+# cardinality bound. Passed to review.llm_telemetry.record_llm_token_usage,
+# which owns the shared "review.llm" meter/counter every LLM-calling stage
+# records against.
+_PIPELINE_STAGE_NAME = "review-generation"
+
 
 # Combined across every `source: "llm"` finding a single completion returns —
 # a real code review has no legitimate reason to produce hundreds of
@@ -427,6 +437,10 @@ class ReviewGenerationStep:
             ),
         )
         response = await self._llm_client.complete(request, timeout=self._timeout)
+        if response.usage is not None:
+            record_llm_token_usage(
+                response.usage, model=response.model, stage=_PIPELINE_STAGE_NAME, logger=logger
+            )
         llm_findings = _parse_llm_findings(response.content, job_id=context.job_id)
 
         # Sorted by severity (stable, so same-severity findings keep the
