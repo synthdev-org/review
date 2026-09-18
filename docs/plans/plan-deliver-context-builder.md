@@ -228,7 +228,8 @@ Context Builder step + `llm_review` wiring, and citation rendering in posted
 findings.
 
 **Out of scope** — the spec's own out-of-scope list applies unchanged:
-knowhow's MCP augmentation (Phase 7), Memory/dismissed-finding suppression
+the external product-knowledge MCP augmentation, knowhow as its reference
+implementation (Phase 7), Memory/dismissed-finding suppression
 (Phase 4), a structurally separate verification pass (Phase 3), multi-hop
 blast radius, PR-delta graph overlay, precise per-language symbol
 resolution, query result caching, a BYO embedding endpoint, and languages

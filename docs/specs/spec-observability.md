@@ -87,7 +87,7 @@ infrastructure, not a metered feature.
   SDK/exporter is installed at all — zero overhead, zero connection
   attempts, zero log noise — matching the "optional, never a dependency"
   pattern [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md)
-  already established for knowhow augmentation.
+  already established for optional external product-knowledge augmentation.
 - **An optional local demo path**: a new `observability` Docker Compose
   profile bundling an OTel Collector, Prometheus, and Grafana (pre-loaded
   with the shipped dashboard) — opt-in via `docker compose --profile
@@ -330,7 +330,8 @@ aspirational design.
   failure, timeout) must never fail, slow, or retry-block a review or
   indexing job. This is the same "optional, never a dependency" contract
   [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md)
-  established for knowhow — OTel's own exporter failure handling
+  established for external product-knowledge augmentation — OTel's own
+  exporter failure handling
   (fire-and-forget, drop-and-log) is relied on rather than reimplemented.
   US14's heartbeat is what makes this failure mode detectable rather than
   just safely ignored.

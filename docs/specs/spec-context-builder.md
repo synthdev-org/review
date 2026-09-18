@@ -175,11 +175,15 @@ this spec's non-functional requirements bound that added load.
 
 ### Out of scope (deferred to a later spec or roadmap phase)
 
-- **Knowhow's MCP augmentation call** (`knowhow_search`/`knowhow_fetch`/
-  `knowhow_related`). Per the roadmap, this is Phase 7, entirely separate
-  from Phase 2's own code-derived context — this spec's Context Builder
-  produces only code-derived context; the knowhow call-out is a distinct,
-  later addition to the same step.
+- **The external product-knowledge MCP augmentation call** against review's
+  own vendor-neutral contract (`product_knowledge_search`/
+  `product_knowledge_fetch`/`product_knowledge_related`; knowhow is the
+  contract's reference implementation — see
+  [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md)). Per
+  the roadmap, this is Phase 7, entirely separate from Phase 2's own
+  code-derived context — this spec's Context Builder produces only
+  code-derived context; the provider call-out is a distinct, later
+  addition to the same step.
 - **Memory / dismissed-finding suppression / learned rules.** Phase 4. This
   spec's context bundle contains only code retrieved from the index, never
   anything from the (not-yet-built) Memory store.

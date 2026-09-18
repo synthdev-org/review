@@ -1,8 +1,20 @@
-# ADR: Review owns its own code indexing; knowhow augments via MCP with product knowledge
+# ADR: Review owns its own code indexing; external product-knowledge providers augment via review's own MCP contract, knowhow first
 
 ## Status
 
 ACCEPTED
+
+**Amended 2026-09-17**: generalized from a knowhow-specific integration to a
+review-owned, vendor-neutral MCP contract that any RAG/product-knowledge
+provider can implement. This amends the original decision in place rather
+than superseding it with a new ADR number — nothing has shipped against the
+original knowhow-specific framing (Phase 7 in
+[`roadmap.md`](../roadmap.md) hasn't started; no code references knowhow's
+tool names), so there is no shipped behavior this amendment invalidates. The
+substance of the original decision (review owns code indexing outright,
+external augmentation is optional and non-code-scoped, results stay
+distinctly labeled) is unchanged; what changes is that the integration
+contract is now review's own, not knowhow's.
 
 ## RACI
 
@@ -15,154 +27,249 @@ ACCEPTED
 Review keeps the indexing/RAG pipeline described in
 [`c4-architecture.md`](../reference/c4-architecture.md): its own AST-aware
 chunker, its own embeddings, its own call/import graph, kept incrementally
-fresh on every push, stored in review's own Postgres/pgvector. Knowhow (a
-separate, self-hostable multi-source RAG knowledge base — Confluence, Slack,
-GitHub, tickets) is not review's indexing backbone. Instead, review's
-Context Builder makes an additional, optional call to knowhow's MCP tools
-(`knowhow_search`/`knowhow_fetch`/`knowhow_related`) — the same external
-interface knowhow's own first-party clients already use — to pull in
-**non-code product knowledge** and fuse it into the context bundle handed to
-the LLM alongside review's own code-derived context. Review and knowhow stay
-fully separate products: separate repos, separate deployables, separate
-release cadences. Any integration happens over knowhow's network API, never
-a shared database schema, and never an in-process library import (review is
+fresh on every push, stored in review's own Postgres/pgvector. External
+product-knowledge sources (Confluence, Slack, tickets, and similar
+non-code content) are not review's indexing backbone. Instead, review's
+Context Builder makes an additional, optional MCP client call against
+**review's own vendor-neutral tool contract** — `product_knowledge_search` /
+`product_knowledge_fetch` / `product_knowledge_related` (see "The contract"
+below) — to pull in non-code product knowledge and fuse it into the context
+bundle handed to the LLM alongside review's own code-derived context. Any
+MCP server that implements this contract can be configured as the provider
+for a given org/repo; review's Context Builder code has no knowledge of, or
+dependency on, which product sits behind the endpoint.
+
+**knowhow** (a separate, self-hostable multi-source RAG knowledge base —
+Confluence, Slack, GitHub, tickets) is the contract's reference and first
+implementation, and remains the only implementation that exists today. It
+gets no special-cased code path: it is configured the same way any future
+provider would be, by pointing review's per-org/repo config at an MCP
+endpoint that speaks the contract. Review and knowhow stay fully separate
+products regardless: separate repos, separate deployables, separate release
+cadences. Any integration happens over the configured MCP endpoint, never a
+shared database schema, and never an in-process library import (review is
 Python per [ADR-0002](0002-implement-in-python.md); knowhow is TypeScript —
-no in-process path exists between them regardless of preference).
+no in-process path exists between them regardless of preference, and
+wouldn't be desirable even if it did, since it would defeat the
+provider-agnostic point of this decision).
 
 ## Context
 
 Knowhow already builds a general-purpose, multi-source RAG pipeline well —
 AST-ish chunking, local embeddings, hybrid vector+FTS search, an entity
 graph, cross-encoder reranking, all on Postgres/pgvector/Apache AGE. The
-question this ADR resolves: how much of that should review reuse versus
-build itself, given the goal of selling review as a separate, optional
-module alongside knowhow.
+original question this ADR resolved: how much of that should review reuse
+versus build itself, given the goal of selling review as a separate,
+optional module alongside knowhow. That question, and its answer (below),
+are unchanged by this amendment.
 
-Using knowhow as review's *entire* indexing base was considered and
-rejected. Four issues, all specific to code review's quality bar and
-freshness needs, made that shape unworkable:
+A second question surfaced once Phase 6/7 planning made clear this would
+ship as real, customer-facing config, not just an internal integration:
+**should the thing a customer configures be "a knowhow endpoint," or "a
+product-knowledge provider endpoint that happens to default to knowhow"?**
+The former bakes a specific vendor's product into review's config schema,
+job payloads, and Context Builder code — a customer who runs a different
+internal RAG system, or a competitor's product, would have no path to the
+same augmentation feature short of that system pretending to be knowhow.
+The latter costs almost nothing extra: MCP is already the transport
+(decided below, unchanged), so the only new work is defining review's tool
+names and payload shapes as review's own contract instead of adopting
+knowhow's, and labeling results by the configured provider's name rather
+than hardcoding "knowhow" in citation text. Given review is being built and
+sold as a genuine, standalone competitor to CodeRabbit/Qodo/Greptile (not a
+knowhow add-on — see `AGENTS.md`), locking its one optional-augmentation
+feature to a single named vendor was an unforced product constraint, not a
+technical necessity.
 
-1. **Chunking ceiling.** Knowhow's code connector uses a documented
-   line-pattern heuristic, not a real AST parser — a reasonable trade-off
-   for general-purpose knowledge, but below the bar code review needs. The
-   research survey (`research-current-art.md` §2.1) treats real AST-aware
-   chunking as necessary for the field's highest-leverage technique, not
-   optional polish.
-2. **Graph shape mismatch.** Knowhow's graph is built for general
-   entity/relationship navigation across docs, Slack, and tickets — not for
-   the query code review depends on most: "what calls this function whose
-   signature just changed" (the "blast radius" technique, §2.1). Generic
-   graph traversal doesn't substitute for a review-purpose-built call/import
-   graph.
+This is not new abstraction for its own sake — per `architecture.md`'s
+simplicity rule ("no interface, abstraction, or generic without a second
+real implementation already in view"), the bar this amendment clears is
+that **the contract itself**, not a second Python implementation, is the
+abstraction boundary. MCP already made the transport swappable; this
+amendment only removes the one place review's own naming coupled that
+transport-level swappability to a specific vendor's tool names. No new
+Python interface, adapter class, or plugin registry is introduced — see
+"Decision" below.
+
+The four issues that ruled out knowhow (or any RAG system) as review's
+*entire* indexing base are unchanged and still apply to *any* provider, not
+just knowhow:
+
+1. **Chunking ceiling.** A general-purpose RAG system's code connector
+   optimizes for broad applicability, not the AST-aware chunking fidelity
+   code review's quality bar needs (research survey `research-current-art.md`
+   §2.1).
+2. **Graph shape mismatch.** A general-purpose entity/relationship graph
+   doesn't substitute for a review-purpose-built call/import graph answering
+   "what calls this function whose signature just changed" (§2.1).
 3. **Freshness/SLA mismatch.** A PR review needs the index current as of the
-   exact commit under review, ideally within seconds of push — a materially
-   tighter SLA than general knowledge sync cadence.
+   exact commit under review, within seconds of push — tighter than any
+   general knowledge sync cadence.
 4. **Roadmap dependency.** Code-indexing fidelity would become subject to
-   knowhow's own priorities (breadth across knowledge sources), which
-   review's team doesn't independently control.
+   an external product's own priorities, which review's team doesn't
+   independently control — true of knowhow specifically, and of any other
+   provider a customer might point review at instead.
 
-None of these four issues apply to the *non-code* knowledge knowhow already
-covers well — Confluence pages, Slack threads, tickets. A design doc being a
-day stale is tolerable in a way a stale code index isn't; review has no
-code-review-specific reason to want different chunking for a Confluence page
-than knowhow's general-purpose approach already gives it; and review has no
-reason to build its own Confluence/Slack connectors when knowhow's already
-exist. Splitting responsibility along this line — code indexing stays with
-review, non-code product knowledge comes from knowhow — captures the reuse
-win for the part of the problem that was never review's differentiator,
-without capping review's core capability on someone else's roadmap.
+None of these four issues apply to the *non-code* knowledge a general RAG
+system already covers well — Confluence pages, Slack threads, tickets.
+Splitting responsibility along this line — code indexing stays with review,
+non-code product knowledge comes from an external, swappable provider —
+captures the reuse win for the part of the problem that was never review's
+differentiator, without capping review's core capability on any one
+provider's roadmap, knowhow's included.
 
 ## Options considered
 
-| Option | Code-review quality control | Freshness fit | Reuses knowhow | Runtime dependency |
+| Option | Code-review quality control | Freshness fit | Vendor lock-in | Runtime dependency |
 | --- | --- | --- | --- | --- |
-| **Knowhow as full indexing base** | Weak — capped by knowhow's general-purpose chunking/graph choices, outside review's control | Mismatched — general knowledge sync cadence, not per-push SLA | Maximal | Hard — review non-functional without knowhow |
-| **Fully self-contained** (no knowhow integration) | Strong — review controls its entire quality bar | Strong — review's own index is inherently fresh | None — duplicates Confluence/Slack/ticket connectors from scratch | None |
-| **Split responsibility** (review owns code, knowhow augments non-code) | Strong for code (review's own pipeline); appropriate for non-code (knowhow's existing connectors) | Code stays per-push fresh; non-code inherits knowhow's cadence, which fits that content type | Partial — exactly the slice that was never review's differentiator | Soft — review fully functions without knowhow, richer with it | **Accept** |
+| **External provider as full indexing base** | Weak — capped by that provider's general-purpose chunking/graph choices, outside review's control | Mismatched — general knowledge sync cadence, not per-push SLA | N/A (rejected on quality grounds regardless of vendor) | Hard — review non-functional without it |
+| **Fully self-contained** (no external augmentation) | Strong — review controls its entire quality bar | Strong — review's own index is inherently fresh | None | None — but duplicates Confluence/Slack/ticket connectors from scratch |
+| **Split responsibility, knowhow-specific contract** (original 2026 decision) | Strong for code; appropriate for non-code | Code stays per-push fresh; non-code inherits provider cadence | High — config schema, job payloads, and citation text all name knowhow specifically; a different provider has no supported path in | Soft — review functions without it, richer with it |
+| **Split responsibility, review-owned vendor-neutral contract** (this decision) | Strong for code; appropriate for non-code | Same as above | None — any MCP server implementing review's contract plugs in; knowhow is the reference implementation, not a special case | Soft — review functions without it, richer with it | **Accept** |
 
 ## Decision
 
 1. **Review's own indexing pipeline** — AST-based chunking, embeddings, and
    a call/import graph, built and kept incrementally fresh by the Indexing
    job type, stored in review's own Postgres/pgvector — is review's primary,
-   always-available source of context. It never depends on knowhow being
-   present or reachable.
-2. **Knowhow is an optional augmentation**, wired into the Context Builder
-   step of the review-job pipeline as an additional MCP client call
-   (`knowhow_search`/`knowhow_fetch`/`knowhow_related`), scoped to non-code
-   product knowledge — Confluence, Slack, tickets, and any other source
-   knowhow connects. A knowhow endpoint + credential, configured per
-   org/repo alongside the rest of review's day-two config, determines
-   whether this call happens at all; its absence is a normal, fully
-   supported deployment state.
-3. **Context fusion**: results from review's own code-derived context and
-   knowhow's product-knowledge results are assembled into one context bundle
-   for the review-generation LLM call as distinct, clearly labeled sources
-   (e.g. "from the codebase" vs. "from product knowledge") rather than
-   merged/reranked into one undifferentiated list — the two carry different
-   trust/freshness characteristics, and both the LLM and any human reading a
-   finding's citation should be able to tell them apart.
+   always-available source of context. It never depends on any external
+   provider being present or reachable. (Unchanged from the original
+   decision.)
+2. **External product-knowledge augmentation is optional**, wired into the
+   Context Builder step of the review-job pipeline as an additional MCP
+   client call against **review's own tool contract** (see "The contract"
+   below), scoped to non-code product knowledge — Confluence, Slack,
+   tickets, and any other source a configured provider connects. A
+   provider endpoint + credential + display label, configured per org/repo
+   alongside the rest of review's day-two config, determines whether this
+   call happens at all and which provider serves it; its absence is a
+   normal, fully supported deployment state.
+3. **The contract** is a small, versioned MCP tool spec review defines and
+   owns, independent of any one provider's own API:
+   - `product_knowledge_search(query, top_k) -> [{id, snippet, source_type,
+     url, score}]`
+   - `product_knowledge_fetch(id) -> {content, source_type, url,
+     updated_at}`
+   - `product_knowledge_related(id, top_k) -> [{id, snippet, source_type,
+     url, score}]`
+   - Contract version is negotiated at connection time (an MCP server
+     declares the contract version(s) it implements); review's Context
+     Builder refuses to call a provider whose declared version it doesn't
+     recognize, and treats that the same as "no provider configured" (see
+     Consequence below) rather than failing the review.
+   - This is a wire-level contract only — no Python interface or adapter
+     class per provider is introduced. One generic MCP client, config-driven
+     by endpoint/credential, is sufficient (the same shape as the LLM
+     Gateway: one LiteLLM-backed client, many providers reachable through
+     it via config, not one adapter class per LLM vendor).
+4. **knowhow implements this contract as its reference implementation.**
+   knowhow's MCP server exposes `product_knowledge_search` /
+   `product_knowledge_fetch` / `product_knowledge_related` (internally
+   whatever knowhow's own search/fetch/related primitives already are,
+   adapted to this shape) so that pointing review at a knowhow deployment
+   works out of the box. Nothing about knowhow is privileged in review's
+   code, config schema, or job payloads beyond being the provider the
+   reference implementation and default docs/examples use.
+5. **Context fusion**: results from review's own code-derived context and
+   the configured provider's product-knowledge results are assembled into
+   one context bundle for the review-generation LLM call as distinct,
+   clearly labeled sources — labeled by the provider's configured display
+   name (e.g. "from the codebase" vs. "from product knowledge (knowhow)"),
+   never merged/reranked into one undifferentiated list. (Unchanged in
+   substance from the original decision; only the label is now
+   provider-driven rather than hardcoded.)
 
 ## Consequences
 
 **Easier / positive:**
 * Code-review quality stays fully in review's control — own chunker, own
-  graph, own freshness SLA — with no dependency on knowhow's roadmap for
-  review's core capability.
-* Review has no hard runtime dependency on knowhow. It ships and functions
-  standalone; the "optional module" framing describes the augmentation
-  feature itself, not review's basic operation.
+  graph, own freshness SLA — with no dependency on any external provider's
+  roadmap for review's core capability.
+* Review has no hard runtime dependency on any product-knowledge provider.
+  It ships and functions standalone; the "optional module" framing describes
+  the augmentation feature itself, not review's basic operation.
 * Still captures a real, appropriately-scoped reuse win: no need to build
-  Confluence/Slack/ticket connectors or cross-source retrieval.
-* Licensing/upsell story is literal: knowhow connectivity is a config toggle
-  that unlocks a genuinely additive capability, a natural "buy knowhow too
-  and reviews get better" pitch.
+  Confluence/Slack/ticket connectors or cross-source retrieval — for
+  whichever provider a customer already runs.
+* No vendor lock-in on the one optional-augmentation feature: a customer
+  running a different internal RAG system, or a future competing product,
+  has a real, supported path to the same capability by implementing one
+  small MCP contract — not a reason to fork review or wait on a
+  knowhow-specific integration.
+* Licensing/upsell story is still literal and arguably stronger: knowhow
+  connectivity remains a config toggle that unlocks a genuinely additive
+  capability ("buy knowhow too and reviews get better"), but the pitch no
+  longer depends on review having hardcoded a competitor out.
 * The self-hosted trust/simplicity story (one product, one Postgres, two
   container images) is preserved for customers who only run review; it only
   extends to a second product's footprint for customers who opt into the
-  augmentation.
+  augmentation, regardless of which product that is.
 
 **Harder / trade-offs:**
 * Review keeps the full engineering cost of its own indexing pipeline
   (chunker, embedder, graph, incremental reindex) — no reuse savings apply
-  to the code-indexing slice, only to the non-code augmentation.
-* Two heterogeneous retrieval results (review's own ranked candidates,
-  knowhow's MCP search results) need a real fusion/presentation design in
+  to the code-indexing slice, only to the non-code augmentation. (Unchanged.)
+* Two heterogeneous retrieval results (review's own ranked candidates, the
+  provider's MCP search results) need a real fusion/presentation design in
   the Context Builder, and must stay distinguishable per the Decision above
-  rather than being silently blended.
-* Knowhow-sourced content carries its own freshness cadence and its own
-  indexing-time enrichment (knowhow's LLM calls generating
-  summaries/propositions/entities) that review doesn't control or
-  independently verify — the citation-labeling requirement is a mitigation,
-  not a full fix.
-* Knowhow's MCP tool contract is an inter-product API review depends on for
-  the augmentation feature — its versioning/deprecation guarantees should be
-  confirmed before shipping this as a supported feature.
-* Tenancy mapping between review's org/repo/team model and knowhow's tenant
-  model is a real integration detail: how review's config resolves the
-  correct knowhow tenant for a given org.
+  rather than being silently blended. (Unchanged.)
+* Review now owns defining and versioning its own contract — previously an
+  open question was "confirm knowhow's MCP contract versioning/deprecation
+  policy"; now review must set and maintain that policy itself, for a
+  contract other parties (starting with knowhow, potentially others later)
+  depend on. This is more upfront design work than adopting an existing
+  API, in exchange for not being coupled to it.
+* A third-party MCP server claiming to implement the contract might do so
+  incorrectly or incompletely (e.g. `product_knowledge_related` returning
+  unrelated results, or `source_type`/`url` fields populated inconsistently)
+  with no way for review to verify conformance beyond runtime behavior —
+  see "Open questions."
+* Provider-sourced content carries its own freshness cadence and its own
+  indexing-time enrichment that review doesn't control or independently
+  verify — the citation-labeling requirement is a mitigation, not a full
+  fix. (Unchanged from the original decision, now stated generically.)
+* Tenancy mapping between review's org/repo/team model and a given
+  provider's own tenant model is a real integration detail per provider,
+  not solved once for knowhow specifically.
 
 ## Open questions
 
 * Exact UX/prompt design for presenting dual-sourced context to the
-  review-generation LLM call, and how citations back to knowhow-sourced
-  content should render in a posted PR comment.
+  review-generation LLM call, and how citations back to provider-sourced
+  content should render in a posted PR comment, including how the
+  provider's display name is surfaced.
 * Whether review's per-team Memory store (learnings, dismissed-finding
-  filtering) stays entirely review-owned, or also feeds knowhow's
-  `fact_context` layer so other knowhow surfaces benefit from it too.
-* Knowhow's MCP contract versioning/deprecation policy.
+  filtering) stays entirely review-owned, or also feeds back into a
+  configured provider's own knowledge layer (e.g. knowhow's
+  `fact_context`) so other surfaces of that provider benefit too — this is
+  now a per-provider integration question, not something review can assume
+  generically.
+* **Review's own contract versioning/deprecation policy** — how a new
+  contract version is introduced without breaking existing provider
+  configurations, and how long an old version stays supported. This
+  replaces the original open question about knowhow's own policy; review
+  now owns this decision instead of inheriting it.
+* Whether a lightweight conformance check (a test harness review ships that
+  any provider implementer, including knowhow, can run against their MCP
+  server) is worth building before this ships as a supported feature, given
+  review has no other way to verify a third-party implementation behaves
+  correctly.
 
 ## Related
 
 * [`docs/reference/c4-architecture.md`](../reference/c4-architecture.md) —
-  review's indexing pipeline as designed, reaffirmed here unchanged; needs a
-  small addition documenting the optional knowhow augmentation call in the
-  Context Builder step.
+  review's indexing pipeline as designed, reaffirmed here unchanged; needs
+  the optional augmentation call in the Context Builder step documented in
+  provider-agnostic terms.
+* [`docs/roadmap.md`](../roadmap.md) — Phase 7, which delivers this
+  contract and its reference (knowhow) configuration.
 * [`docs/adr/0001-self-hosted-kubernetes-deployment.md`](0001-self-hosted-kubernetes-deployment.md)
   — the self-hosted trust/simplicity story this decision preserves for
   review-only deployments.
 * [`docs/adr/0002-implement-in-python.md`](0002-implement-in-python.md) —
-  the language boundary that rules out in-process reuse of knowhow's code.
+  the language boundary that rules out in-process reuse of any TypeScript
+  provider's code, knowhow included.
 * [`docs/research/research-current-art.md`](../research/research-current-art.md)
   §2.1 — the AST-chunking and call-graph "blast radius" findings that
-  motivated keeping code indexing under review's own control.
+  motivated keeping code indexing under review's own control regardless of
+  which external provider, if any, is configured.

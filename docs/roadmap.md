@@ -143,19 +143,29 @@ consequences and `c4-architecture.md`'s "Open questions."*
 
 ---
 
-## Phase 7 — Optional knowhow augmentation
+## Phase 7 — Optional external product-knowledge augmentation
 
 Per [ADR-0003](adr/0003-knowhow-product-knowledge-augmentation.md) — entirely
-optional, review is fully functional with none of this configured.
+optional, review is fully functional with none of this configured, and not
+locked to any single provider.
 
-- Context Builder's additional MCP client call
-  (`knowhow_search`/`knowhow_fetch`/`knowhow_related`).
-- Context fusion: knowhow results kept as a distinct, labeled source
-  alongside review's own code-derived context.
-- Per-org/repo knowhow endpoint + credential configuration.
+- Define and version review's own product-knowledge MCP contract
+  (`product_knowledge_search`/`product_knowledge_fetch`/
+  `product_knowledge_related`).
+- Context Builder's additional MCP client call against a configured
+  provider's endpoint.
+- Context fusion: the configured provider's results kept as a distinct,
+  labeled source (labeled by provider display name) alongside review's own
+  code-derived context.
+- Per-org/repo provider endpoint + credential + display-label configuration.
+- knowhow ships as the contract's reference implementation — the first, and
+  for now only, provider — but is configured through the same generic path
+  any future provider would use, with no knowhow-specific code in the
+  Context Builder.
 
-*Open: exact context-fusion/citation UX, and knowhow's MCP contract
-versioning/deprecation policy — both flagged in ADR-0003 and
+*Open: exact context-fusion/citation UX, review's own contract
+versioning/deprecation policy, and whether a conformance test harness is
+worth shipping for third-party implementers — all flagged in ADR-0003 and
 `c4-architecture.md`.*
 
 ---
