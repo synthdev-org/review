@@ -1,6 +1,7 @@
 .git
 docs
 .venv
+.venv-docker
 venv
 __pycache__
 *.pyc

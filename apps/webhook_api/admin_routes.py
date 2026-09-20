@@ -131,7 +131,9 @@ def _entry_id_not_found_or_invalid(entry_id: str, exc: Exception) -> NoReturn:
     `raise ... from exc` at every call site would flatten that distinction.
     """
     if isinstance(exc, MemoryEntryNotFoundError):
-        raise HTTPException(status_code=404, detail=f"memory entry {entry_id!r} not found") from None
+        raise HTTPException(
+            status_code=404, detail=f"memory entry {entry_id!r} not found"
+        ) from None
     if isinstance(exc, MemoryStoreError):
         raise HTTPException(status_code=400, detail=f"invalid entry_id: {exc.detail}") from exc
     raise exc

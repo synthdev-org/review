@@ -1831,7 +1831,10 @@ async def test_non_reply_comments_do_not_consume_the_capture_ceiling(
         memory_capture_ceiling_per_repo_per_day=1,
     ) as client:
         repo_id = await _provision_repo(
-            client, migrated_engine, repo_full_name="acme/non-reply-ceiling-repo", installation_id=911
+            client,
+            migrated_engine,
+            repo_full_name="acme/non-reply-ceiling-repo",
+            installation_id=911,
         )
         await _seed_posted_comment(migrated_engine, repo_id=repo_id, comment_id=4013)
 
@@ -1859,7 +1862,10 @@ async def test_non_reply_comments_do_not_consume_the_capture_ceiling(
             body="a genuine reply, still within the ceiling",
         )
         reply_response = _post(
-            client, reply_body, event_type="pull_request_review_comment", delivery_id="non-reply-reply"
+            client,
+            reply_body,
+            event_type="pull_request_review_comment",
+            delivery_id="non-reply-reply",
         )
 
     assert reply_response.status_code == 200
