@@ -21,21 +21,34 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from adapter.storage.engine import create_session_factory
 from adapter.storage.indexing_repository import IndexingRepository
-from adapter.storage.models import JobQueueRow, JobStatus, JobType, Org, Repo
+from adapter.storage.memory_repository import PostgresMemoryRepository
+from adapter.storage.models import (
+    JobQueueRow,
+    JobStatus,
+    JobType,
+    MemoryEntryRow,
+    Org,
+    PostedFindingCommentRow,
+    Repo,
+)
 from adapter.storage.queue import JobQueueRepository
 from apps.worker.dispatch import run_dispatch_loop
 from indexing.conftest import FakeEmbeddingClient, FakeRepoTreeFetcher
 from indexing.pipeline import IndexingJobDependencies
 from indexing.repository import IndexCommitTracker, IndexRepository
+from memory.models import ReactionRecord
+from memory.reaction_poll import MemoryReactionPollJobDependencies
+from memory.store import ReactionFetcher
 from review.pipeline import FailurePolicy, StepFailureInfo, StepRegistry
 from review.step import StepContext
 
@@ -83,6 +96,53 @@ def _default_indexing_deps() -> IndexingJobDependencies:
         embedding_client=FakeEmbeddingClient(),
         index_repository=null_repo,
         commit_tracker=null_repo,
+    )
+
+
+@dataclass
+class _NullMemoryReactionPollDeps:
+    """A trivial `ReactionFetcher`/`MemorySignalRecorder`/`ReactionDedupStore`
+    stand-in for tests in this file that dispatch no `MEMORY_REACTION_POLL`
+    job at all (every test below except the dedicated ones further down) —
+    mirrors `_NullIndexRepository`'s own docstring/purpose exactly: never
+    touches Postgres, just satisfies each Protocol's own type."""
+
+    async def fetch_reactions(self, **kwargs: object) -> dict[int, tuple[ReactionRecord, ...]]:
+        raise AssertionError("_NullMemoryReactionPollDeps.fetch_reactions should never be called")
+
+    async def record_comment_provenance(self, **kwargs: object) -> None:
+        raise AssertionError(
+            "_NullMemoryReactionPollDeps.record_comment_provenance should never be called"
+        )
+
+    async def record_signal(self, **kwargs: object) -> bool:
+        raise AssertionError("_NullMemoryReactionPollDeps.record_signal should never be called")
+
+    async def recent_comment_ids(self, **kwargs: object) -> tuple[int, ...]:
+        raise AssertionError(
+            "_NullMemoryReactionPollDeps.recent_comment_ids should never be called"
+        )
+
+    async def filter_new(self, **kwargs: object) -> tuple[int, ...]:
+        raise AssertionError("_NullMemoryReactionPollDeps.filter_new should never be called")
+
+
+___: type[ReactionFetcher] = _NullMemoryReactionPollDeps
+
+
+def _default_memory_reaction_poll_deps() -> MemoryReactionPollJobDependencies:
+    """The `MemoryReactionPollJobDependencies` every `REVIEW`/`INDEX`-focused
+    test below passes — none of these tests dispatch a
+    `MEMORY_REACTION_POLL` job, so this never needs to do real work.
+    Dedicated `MEMORY_REACTION_POLL` tests further down build a real
+    `PostgresMemoryRepository`-backed one against `migrated_engine` instead.
+    """
+    null_deps = _NullMemoryReactionPollDeps()
+    return MemoryReactionPollJobDependencies(
+        reaction_fetcher=null_deps,
+        signal_recorder=null_deps,
+        dedup_store=null_deps,
+        max_comments_per_poll=50,
     )
 
 
@@ -178,6 +238,7 @@ async def _running_dispatch_loop(
     job_queue: JobQueueRepository,
     review_registry: StepRegistry,
     indexing_deps: IndexingJobDependencies | None = None,
+    memory_reaction_poll_deps: MemoryReactionPollJobDependencies | None = None,
     poll_interval_seconds: float = _POLL_INTERVAL_SECONDS,
     stuck_job_warning_threshold_seconds: float = 30.0,
     worker_id: str = _WORKER_ID,
@@ -187,15 +248,22 @@ async def _running_dispatch_loop(
     on its own (see its own docstring), so every test needs this to observe
     its effects and still let the test process exit cleanly.
 
-    `indexing_deps` defaults to `_default_indexing_deps()` (never touches
-    Postgres) for every `REVIEW`-focused caller below; dedicated INDEX-job
-    tests pass a real one built against `migrated_engine`.
+    `indexing_deps`/`memory_reaction_poll_deps` default to
+    `_default_indexing_deps()`/`_default_memory_reaction_poll_deps()` (never
+    touch Postgres) for every `REVIEW`-focused caller below; dedicated
+    INDEX-job/`MEMORY_REACTION_POLL`-job tests each pass a real one built
+    against `migrated_engine`.
     """
     task: asyncio.Task[None] = asyncio.create_task(
         run_dispatch_loop(
             job_queue=job_queue,
             review_registry=review_registry,
             indexing_deps=indexing_deps if indexing_deps is not None else _default_indexing_deps(),
+            memory_reaction_poll_deps=(
+                memory_reaction_poll_deps
+                if memory_reaction_poll_deps is not None
+                else _default_memory_reaction_poll_deps()
+            ),
             worker_id=worker_id,
             poll_interval_seconds=poll_interval_seconds,
             stuck_job_warning_threshold_seconds=stuck_job_warning_threshold_seconds,
@@ -522,6 +590,176 @@ async def test_index_job_fatal_failure_marks_job_failed(
     )
     assert not any(
         "unhandled exception in dispatch loop" in record.getMessage() for record in caplog.records
+    )
+
+
+# --- MEMORY_REACTION_POLL job dispatch (docs/plans/plan-deliver-memory.md's --
+# --- Phase 4 section, Unit D, US-M3) -----------------------------------------
+
+
+@dataclass
+class _FakeReactionFetcher:
+    """A `ReactionFetcher` fake returning a fixed, per-comment-id set of
+    reactions — records every call it receives so tests can assert on the
+    exact `comment_ids` this job actually polled."""
+
+    reactions_by_comment: dict[int, tuple[ReactionRecord, ...]] = field(default_factory=dict)
+    calls: list[tuple[int, str, tuple[int, ...]]] = field(default_factory=list)
+
+    async def fetch_reactions(
+        self, *, installation_id: int, repo_full_name: str, comment_ids: Sequence[int]
+    ) -> dict[int, tuple[ReactionRecord, ...]]:
+        self.calls.append((installation_id, repo_full_name, tuple(comment_ids)))
+        return {
+            comment_id: self.reactions_by_comment.get(comment_id, ()) for comment_id in comment_ids
+        }
+
+
+____: type[ReactionFetcher] = _FakeReactionFetcher
+
+
+@dataclass
+class _RaisingReactionFetcher:
+    """A `ReactionFetcher` fake standing in for a whole-job-fatal failure
+    (e.g. the installation token exchange itself failing, before any
+    per-comment fetch even starts) — `memory/reaction_poll.py` has no
+    dedicated whole-job-failure exception type of its own (see that
+    module's own docstring), so this should surface via
+    `apps/worker/dispatch.py`'s generic bug-resilience handling, the same as
+    any other unanticipated bug in the loop."""
+
+    async def fetch_reactions(self, **kwargs: object) -> dict[int, tuple[ReactionRecord, ...]]:
+        raise RuntimeError("boom: fake reaction fetcher always fails")
+
+
+def _memory_reaction_poll_payload(*, repo_id: uuid.UUID, pr_number: int = 7) -> dict[str, object]:
+    return {
+        "org_id": str(uuid.uuid4()),
+        "repo_id": str(repo_id),
+        "installation_id": 1,
+        "repo_full_name": "acme/widgets",
+        "pr_number": pr_number,
+    }
+
+
+async def _seed_posted_comment(
+    session_factory: async_sessionmaker[Any], *, repo_id: uuid.UUID, comment_id: int, pr_number: int
+) -> None:
+    async with session_factory() as session, session.begin():
+        session.add(
+            PostedFindingCommentRow(
+                id=comment_id,
+                repo_id=repo_id,
+                pr_number=pr_number,
+                commit_sha="a" * 40,
+                finding_file="app/main.py",
+                finding_line=10,
+                finding_rule_id="no-secrets",
+                finding_message="a secret was found",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_reaction_poll_job_captures_a_new_reaction_and_marks_done(
+    migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A `MEMORY_REACTION_POLL` job runs through
+    `memory.reaction_poll.run_memory_reaction_poll_job` for real, against a
+    real `PostgresMemoryRepository`/Postgres — proving the dispatch-loop
+    wiring, not just that `dispatch.py` compiles against the new job type.
+    """
+    _reenable_dispatch_logger()
+
+    session_factory = create_session_factory(migrated_engine)
+    job_queue = JobQueueRepository(session_factory)
+    repo_id = await _provision_repo(session_factory)
+    await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=7001, pr_number=7)
+
+    memory_repository = PostgresMemoryRepository(session_factory)
+    reaction_fetcher = _FakeReactionFetcher(
+        reactions_by_comment={7001: (ReactionRecord(reaction_id=1, content="+1"),)}
+    )
+    memory_reaction_poll_deps = MemoryReactionPollJobDependencies(
+        reaction_fetcher=reaction_fetcher,
+        signal_recorder=memory_repository,
+        dedup_store=memory_repository,
+        max_comments_per_poll=50,
+    )
+
+    job_id = await job_queue.enqueue(
+        JobType.MEMORY_REACTION_POLL, _memory_reaction_poll_payload(repo_id=repo_id)
+    )
+
+    with caplog.at_level("INFO"):
+        async with _running_dispatch_loop(
+            job_queue=job_queue,
+            review_registry=_registry(_SucceedingStep()),
+            memory_reaction_poll_deps=memory_reaction_poll_deps,
+        ):
+            await _wait_for_status(migrated_engine, job_id, JobStatus.DONE)
+
+    assert reaction_fetcher.calls == [(1, "acme/widgets", (7001,))]
+
+    async with session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(MemoryEntryRow).where(MemoryEntryRow.posted_finding_comment_id == 7001)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].raw_signal_type == "reaction"
+    assert rows[0].raw_signal_detail == {"reaction_id": 1, "content": "+1"}
+
+
+@pytest.mark.asyncio
+async def test_memory_reaction_poll_job_fatal_failure_marks_job_failed(
+    migrated_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A whole-job-fatal failure (the fake `ReactionFetcher` raising
+    unconditionally, standing in for a real token-exchange failure) is
+    wrapped as `MemoryReactionPollJobFailedError` and caught by
+    `_run_claimed_job`'s own typed-exception handling — the same "job
+    failed" path `PipelineFailedError`/`IndexingJobFailedError` already get
+    — marking the job `FAILED`, never falling through to the generic
+    dispatch-loop "unhandled exception" bug-resilience log line.
+    """
+    _reenable_dispatch_logger()
+
+    session_factory = create_session_factory(migrated_engine)
+    job_queue = JobQueueRepository(session_factory)
+    repo_id = await _provision_repo(session_factory)
+    await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=7002, pr_number=8)
+
+    memory_repository = PostgresMemoryRepository(session_factory)
+    memory_reaction_poll_deps = MemoryReactionPollJobDependencies(
+        reaction_fetcher=_RaisingReactionFetcher(),
+        signal_recorder=memory_repository,
+        dedup_store=memory_repository,
+        max_comments_per_poll=50,
+    )
+
+    job_id = await job_queue.enqueue(
+        JobType.MEMORY_REACTION_POLL, _memory_reaction_poll_payload(repo_id=repo_id, pr_number=8)
+    )
+
+    with caplog.at_level("ERROR"):
+        async with _running_dispatch_loop(
+            job_queue=job_queue,
+            review_registry=_registry(_SucceedingStep()),
+            memory_reaction_poll_deps=memory_reaction_poll_deps,
+        ):
+            await _wait_for_status(migrated_engine, job_id, JobStatus.FAILED)
+
+    assert any(
+        record.getMessage() == "job failed"
+        and getattr(record, "job_id", None) == str(job_id)
+        and getattr(record, "job_type", None) == JobType.MEMORY_REACTION_POLL.value
+        for record in caplog.records
     )
 
 

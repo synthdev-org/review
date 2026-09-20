@@ -87,13 +87,26 @@ class FindingsPublisher(Protocol):
         *,
         installation_id: int,
         repo_full_name: str,
+        repo_id: str,
         pr_number: int,
+        head_sha: str,
         findings: list[Finding],
     ) -> None:
         """Post one batched PR review carrying every inline comment in a
         single call, per both PRDs' NFR batching decision. Never called
         with an empty ``findings`` list (see this module's own docstring's
-        "zero-finding review" note)."""
+        "zero-finding review" note).
+
+        ``repo_id``/``head_sha`` — added by
+        ``docs/plans/plan-deliver-memory.md``'s Phase 2 section (US-M11) —
+        are this platform's own domain repo id and the PR's commit sha at
+        posting time, needed by the concrete implementation
+        (``adapter/github/posting.py``) to persist a
+        ``posted_finding_comment`` provenance row per posted comment.
+        ``head_sha`` was already threaded through this step's own
+        ``FindingsOutputInput`` (used two lines later for
+        ``post_check_run``); ``repo_id`` likewise (``FindingsOutputInput.repo_id``)
+        — both zero-new-plumbing, same-file changes."""
         ...
 
     async def post_check_run(
@@ -279,7 +292,9 @@ class FindingsOutputStep:
             await self._publisher.post_review(
                 installation_id=parsed.installation_id,
                 repo_full_name=parsed.repo_full_name,
+                repo_id=parsed.repo_id,
                 pr_number=parsed.pr_number,
+                head_sha=parsed.head_sha,
                 findings=findings,
             )
 

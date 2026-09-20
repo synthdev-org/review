@@ -152,6 +152,17 @@ def _build_app_manifest(*, base_url: str, name: str) -> dict[str, object]:
     permissions/events to receive PR/push webhooks and (later) post check
     runs/comments; later roadmap phases extend permissions as the review
     pipeline needs more, which requires no change to this flow's plumbing.
+
+    ``docs/plans/plan-deliver-memory.md``'s Phase 7 section (Unit G) adds
+    ``"pull_request_review_comment"``/``"pull_request_review_thread"`` —
+    Phase 3's reply/thread-resolution capture and Phase 4's reaction
+    polling have both been safe to run without these subscriptions since
+    they shipped; this is what actually activates them for a GitHub App
+    that re-consents. ``"issue_comment"`` is deliberately **not** added,
+    per that plan's Assumption 3: an ``issue_comment`` event can never
+    correlate back to a specific posted finding comment (only
+    ``pull_request_review_comment``'s ``in_reply_to_id`` can), so
+    subscribing to it would only add unused webhook volume.
     """
     trimmed_base_url = base_url.rstrip("/")
     return {
@@ -166,7 +177,12 @@ def _build_app_manifest(*, base_url: str, name: str) -> dict[str, object]:
             "pull_requests": "write",
             "metadata": "read",
         },
-        "default_events": ["pull_request", "push"],
+        "default_events": [
+            "pull_request",
+            "push",
+            "pull_request_review_comment",
+            "pull_request_review_thread",
+        ],
     }
 
 

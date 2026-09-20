@@ -58,6 +58,17 @@ webhookApi:
   githubApi:
     baseUrl: https://api.github.com
     timeoutSeconds: 10
+  # GitHub App auth for the synchronous reaction-fetch path
+  # (docs/plans/plan-deliver-memory.md's Phase 4, Unit D, US-M3's second
+  # `Given/When/Then` branch) — the same App identity as `worker.github`
+  # below (`appId` is public-ish, not sensitive, same reasoning as
+  # `worker.github.appId`'s own comment; the private key is the shared
+  # top-level `github.appPrivateKey` credential field both Deployments
+  # reference).
+  github:
+    appId: ""
+    retryMaxAttempts: 3
+  memoryReactionPollMaxCommentsPerPoll: 50
   resources: {}
 
 worker:
@@ -121,7 +132,9 @@ github:
   # default, like database.url.value below): the Worker's own fail-fast
   # startup check (validate_private_key) refuses to boot with an unset or
   # unusable value rather than posting nothing and failing silently
-  # mid-review.
+  # mid-review. Shared by both Deployments (worker and, as of
+  # plan-deliver-memory.md's Phase 4, webhook-api's own synchronous
+  # reaction-fetch path) — the same GitHub App identity, one Secret key.
   appPrivateKey:
     value: ""
     existingSecret:
@@ -131,6 +144,19 @@ github:
 llm:
   apiKey:
     value: "not-needed"
+    existingSecret:
+      name: ""
+      key: ""
+
+# Admin API auth (docs/plans/plan-deliver-memory.md's Phase 5, Unit E,
+# Assumption 7) — mirrors WebhookAPISettings' own `admin_api_key: SecretStr`
+# required-no-default field: the admin router registers unconditionally
+# and enforces this key per-request (US-M10), so an unset value leaves
+# webhook-api unable to boot, the same "no safe default" posture as
+# `github.appPrivateKey` above.
+adminApi:
+  apiKey:
+    value: ""
     existingSecret:
       name: ""
       key: ""

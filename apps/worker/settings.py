@@ -295,6 +295,41 @@ class WorkerSettings(BaseSettings):
     # local filesystem path, no network call at inference time.
     embedding_model_path: str = "/app/models/all-MiniLM-L6-v2"
 
+    # --- Memory reaction polling (docs/plans/plan-deliver-memory.md's
+    # Phase 4 section, Unit D, US-M3) ---
+    # Bounds worst-case GitHub API call volume per poll independent of how
+    # many pushes or findings a PR has accumulated over its lifetime — a
+    # concrete ceiling, not unbounded fan-out, per the plan's own "bounded
+    # cost, not just bounded per-job" design. A PR with more posted comments
+    # than this ceiling simply never has its oldest comments' reactions
+    # polled again on a later poll; an accepted, logged gap rather than a
+    # cost curve that grows without bound against the installation's shared
+    # GitHub API rate limit.
+    memory_reaction_poll_max_comments_per_poll: int = 50
+
+    # --- Memory-based suppression (docs/plans/plan-deliver-memory.md's
+    # Phase 6 section, Unit F, US-M6/US-M7/US-M9/US-M12) ---
+    # Plain `WorkerSettings` fields, not part of `review.config.StepEnablement`/
+    # `StepTimeouts` (Assumption 6) — unlike the seven macro steps,
+    # similarity suppression isn't a `depends_on`-resolved pipeline stage;
+    # it's an internal behavior toggle inside the already-registered
+    # `verification` step, read directly by `apps/worker/main.py`'s
+    # `_build_review_registry` and passed to `VerificationStep`'s
+    # constructor, the same way `llm_max_diff_bytes` already reaches
+    # `ReviewGenerationStep` without going through `StepEnablement`.
+    # Default `True` — the operational rollback lever (US-M12) is turning
+    # this *off*, not opting into it; capture (Phases 2-4) and the admin API
+    # (Phase 5) keep running regardless of this flag.
+    memory_suppression_enabled: bool = True
+    # `memory_similarity_threshold`/`memory_decay_half_life_days` are
+    # tunable bootstrap config, not hardcoded constants, per
+    # `spec-memory.md`'s own "Resolved decisions" #1 ("tunable later without
+    # a schema change... a config value, not a structural one"). `0.90`/
+    # `180.0` match the spec's own US-M9 acceptance case and "Resolved
+    # decisions" defaults exactly.
+    memory_similarity_threshold: float = 0.90
+    memory_decay_half_life_days: float = 180.0
+
     # --- Findings-merge-and-output step (Phase 7, review/output.py) ---
     # A single bootstrap-config kill-switch: when set, the full pipeline
     # still runs (including this step's own merge/redaction-consuming

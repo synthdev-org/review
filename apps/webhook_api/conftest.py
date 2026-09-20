@@ -4,13 +4,25 @@
 needs a module-level `app` object for uvicorn to discover as
 `apps.webhook_api.main:app`), so any test module that imports it needs
 `REVIEW_WEBHOOK_API_ENVIRONMENT`, `REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET`
-(Phase 4), and (Phase 1) the bare `REVIEW_DATABASE_URL` set before that
-import happens — all required fields with no default (see settings.py).
+(Phase 4), `REVIEW_WEBHOOK_API_GITHUB_APP_ID`/`REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY`
+(plan-deliver-memory.md's Phase 4 — the synchronous reaction-fetch path
+needs its own installation-token exchange capability),
+`REVIEW_WEBHOOK_API_ADMIN_API_KEY` (plan-deliver-memory.md's Phase 5 —
+the admin API's own required, no-default credential, Assumption 7), and
+(Phase 1) the bare `REVIEW_DATABASE_URL` set before that import happens —
+all required fields with no default (see settings.py). The private-key placeholder below
+is a syntactically-arbitrary string, not a real PEM: fine for module import
+(`WebhookAPISettings` never parses it eagerly, only `GitHubInstallationTokenProvider`
+does, at actual call time), but any test that exercises the real
+synchronous-fetch path builds its own `WebhookAPISettings` with a real
+generated key (`test_rsa_private_key_pem`-shaped) instead of relying on
+this placeholder.
 pytest imports `conftest.py` before collecting sibling test modules in this
 directory, so setting defaults here (only if not already set) covers every
 test file in this package without each one repeating it. Tests that need a
 *specific* secret/settings value (e.g. to compute a matching webhook
-signature, or a real testcontainers Postgres DSN) construct their own
+signature, a real testcontainers Postgres DSN, or the admin API's own
+`admin_api_key`) construct their own
 `WebhookAPISettings(...)` directly instead of relying on these process-wide
 defaults. The `REVIEW_DATABASE_URL` default below is a syntactically valid
 but unreachable DSN — safe at import time only because
@@ -32,6 +44,11 @@ from adapter.storage.conftest import migrated_engine, pgvector_container  # noqa
 
 os.environ.setdefault("REVIEW_WEBHOOK_API_ENVIRONMENT", "development")
 os.environ.setdefault("REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET", "conftest-default-webhook-secret")
+os.environ.setdefault("REVIEW_WEBHOOK_API_GITHUB_APP_ID", "1")
+os.environ.setdefault(
+    "REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY", "conftest-default-placeholder-key"
+)
 os.environ.setdefault(
     "REVIEW_DATABASE_URL", "postgresql+asyncpg://unused:unused@localhost:5432/unused"
 )
+os.environ.setdefault("REVIEW_WEBHOOK_API_ADMIN_API_KEY", "conftest-default-admin-api-key")

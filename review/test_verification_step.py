@@ -29,22 +29,40 @@ import json
 import logging
 import socket
 import threading
-from collections.abc import Callable, Iterator
+import uuid
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Literal
 
 import pytest
+import pytest_asyncio
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
 from adapter.llm.litellm_client import LiteLLMClient
+from adapter.storage.engine import create_session_factory
+from adapter.storage.memory_repository import PostgresMemoryRepository
+from adapter.storage.models import Org, PostedFindingCommentRow, Repo
+from apps.webhook_api.main import create_app
+from apps.webhook_api.settings import WebhookAPISettings
 from findings.models import Finding
+from indexing.embedding import EmbeddingVector
 from ingestion.diff import Diff, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
+from memory.fingerprint import build_finding_fingerprint
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
 from review.step import StepContext
-from review.verification import VerificationResponseParseError, VerificationStep
+from review.verification import (
+    MemorySuppressionConfig,
+    VerificationResponseParseError,
+    VerificationStep,
+)
 
 # --- Shared fixtures/helpers -------------------------------------------------
 
@@ -536,3 +554,574 @@ async def test_diff_one_byte_over_ceiling_is_truncated_and_logs_warning(
     assert "x" * 1_000 not in sent_user_message
     warnings = [r for r in caplog.records if "diff truncated" in r.message]
     assert len(warnings) == 1
+
+
+# =============================================================================
+# Memory-based similarity suppression (US-M6/US-M7/US-M9/US-M12), per
+# docs/plans/plan-deliver-memory.md's Phase 6 section (Unit F). Unit-tier
+# cases (fake `EmbeddingClient`/`DismissedFindingMatcher`, no real I/O) cover
+# the pre-check's own filtering logic directly, per testing.md's "new domain
+# logic a story touches still needs unit tests — necessary, not sufficient."
+# The `@pytest.mark.integration` contract tests at the bottom of this section
+# are the tests that actually satisfy US-M6/US-M7/US-M12's Given/When/Then
+# against the real boundary this phase's own Acceptance line requires: a
+# real, approved `dismissed_finding` row (via the real Phase 5 admin API,
+# not a hand-seeded fixture) and a real ONNX embedding client/Postgres
+# `DismissedFindingMatcher`, not fakes.
+# =============================================================================
+
+
+@dataclass
+class _FakeEmbeddingClient:
+    """A fake `indexing.embedding.EmbeddingClient` — one fixed vector per
+    fingerprint text, keyed by exact string match (falling back to
+    `default_vector` for anything else), so a test can control which
+    candidate finding's embedding the fake `DismissedFindingMatcher` below
+    reports a match for. Keeps these Unit-tier cases pure, with no real
+    ONNX inference."""
+
+    vectors_by_text: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    default_vector: tuple[float, ...] = (0.0, 0.0, 0.0)
+    calls: list[list[str]] = field(default_factory=list)
+
+    def embed(self, texts: Sequence[str]) -> tuple[EmbeddingVector, ...]:
+        self.calls.append(list(texts))
+        result: list[EmbeddingVector] = []
+        for text in texts:
+            values = self.vectors_by_text.get(text, self.default_vector)
+            result.append(EmbeddingVector(values=values, dimension=len(values)))
+        return tuple(result)
+
+
+@dataclass
+class _FakeDismissedFindingMatcher:
+    """A fake `memory.store.DismissedFindingMatcher` — a fixed similarity
+    per embedding, keyed by exact tuple match (falling back to
+    `default_similarity` for anything else), driving US-M6/US-M7's
+    above/below-threshold branches without a real Postgres query."""
+
+    similarity_by_embedding: dict[tuple[float, ...], float] = field(default_factory=dict)
+    default_similarity: float | None = None
+    calls: list[tuple[float, ...]] = field(default_factory=list)
+
+    async def best_effective_similarity(
+        self, *, repo_id: str, embedding: tuple[float, ...], half_life_days: float, now: datetime
+    ) -> float | None:
+        self.calls.append(embedding)
+        return self.similarity_by_embedding.get(embedding, self.default_similarity)
+
+
+class _UnusedEmbeddingClient:
+    """Raises if called at all — proves US-M12's "no similarity comparison
+    is attempted" claim, not merely that its result would be ignored."""
+
+    def embed(self, texts: Sequence[str]) -> tuple[EmbeddingVector, ...]:
+        raise AssertionError("embed should never be called when memory suppression is disabled")
+
+
+class _UnusedDismissedFindingMatcher:
+    async def best_effective_similarity(
+        self, *, repo_id: str, embedding: tuple[float, ...], half_life_days: float, now: datetime
+    ) -> float | None:
+        raise AssertionError(
+            "best_effective_similarity should never be called when memory suppression is disabled"
+        )
+
+
+def _memory_suppression(
+    *,
+    matcher: _FakeDismissedFindingMatcher | _UnusedDismissedFindingMatcher,
+    embedding_client: _FakeEmbeddingClient | _UnusedEmbeddingClient,
+    threshold: float = 0.90,
+    enabled: bool = True,
+) -> MemorySuppressionConfig:
+    return MemorySuppressionConfig(
+        memory_matcher=matcher,
+        embedding_client=embedding_client,
+        similarity_threshold=threshold,
+        decay_half_life_days=180.0,
+        enabled=enabled,
+    )
+
+
+@pytest.mark.asyncio
+async def test_us_m6_finding_above_threshold_is_suppressed_before_the_rubric_call() -> None:
+    """US-M6 (first scenario): a candidate finding whose embedding matches
+    an approved, repo-scoped `dismissed_finding` entry above threshold is
+    excluded before the rubric batch is built, and never reaches the LLM
+    Gateway at all."""
+    matcher = _FakeDismissedFindingMatcher(default_similarity=0.95)
+    embedding_client = _FakeEmbeddingClient()
+    llm_client = _FakeLLMClient()
+    step = VerificationStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=_memory_suppression(matcher=matcher, embedding_client=embedding_client),
+    )
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0)]
+    )
+
+    output = await step.run(upstream_output, _context())
+
+    assert output.findings == []
+    assert llm_client.calls == []
+    assert len(matcher.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_us_m6_zero_approved_entries_lets_finding_proceed_to_rubric() -> None:
+    """US-M6 (second scenario): zero approved `dismissed_finding` entries
+    for this repo (the matcher's own `None` "no match" result) means no
+    finding is suppressed, and every candidate proceeds to the rubric call
+    exactly as before this phase."""
+    matcher = _FakeDismissedFindingMatcher(default_similarity=None)
+    embedding_client = _FakeEmbeddingClient()
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = VerificationStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=_memory_suppression(matcher=matcher, embedding_client=embedding_client),
+    )
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0)]
+    )
+
+    output = await step.run(upstream_output, _context())
+
+    assert [f.file for f in output.findings] == ["file0.py"]
+    assert len(llm_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_us_m6_suppressed_finding_never_appears_in_the_rubric_request_payload() -> None:
+    """A stronger form of US-M6's exclusion claim: with two candidates, one
+    matching (suppressed) and one not, the suppressed finding's own message
+    never reaches the LLM Gateway request at all — the survivor is
+    re-indexed to 0 in the request the rubric actually receives."""
+    fingerprint0 = build_finding_fingerprint(file="file0.py", rule_id=None, message="llm finding 0")
+    fingerprint1 = build_finding_fingerprint(file="file1.py", rule_id=None, message="llm finding 1")
+    embedding_client = _FakeEmbeddingClient(
+        vectors_by_text={fingerprint0: (1.0, 0.0), fingerprint1: (0.0, 1.0)}
+    )
+    matcher = _FakeDismissedFindingMatcher(
+        similarity_by_embedding={(1.0, 0.0): 0.95}, default_similarity=0.10
+    )
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = VerificationStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=_memory_suppression(matcher=matcher, embedding_client=embedding_client),
+    )
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0), _llm_finding(1)]
+    )
+
+    output = await step.run(upstream_output, _context())
+
+    assert [f.file for f in output.findings] == ["file1.py"]
+    sent_user_message = llm_client.calls[0].messages[-1].content
+    assert "llm finding 0" not in sent_user_message
+    assert "llm finding 1" in sent_user_message
+
+
+@pytest.mark.asyncio
+async def test_us_m7_finding_below_threshold_proceeds_through_rubric_unchanged() -> None:
+    """US-M7: a candidate finding whose best similarity match is below
+    threshold proceeds through the existing rubric-based LLM call
+    byte-for-byte, exactly as `spec-verification-pipeline.md` already
+    specifies."""
+    matcher = _FakeDismissedFindingMatcher(default_similarity=0.10)
+    embedding_client = _FakeEmbeddingClient()
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = VerificationStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=_memory_suppression(matcher=matcher, embedding_client=embedding_client),
+    )
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0)]
+    )
+
+    output = await step.run(upstream_output, _context())
+
+    assert len(output.findings) == 1
+    assert output.findings[0].verification_status == "verified"
+    assert len(llm_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_us_m12_suppression_disabled_never_calls_matcher_or_embedding_client() -> None:
+    """US-M12 (first scenario): `memory_suppression_enabled=false` means no
+    similarity comparison is attempted regardless of how many approved
+    entries exist — proven here by wiring fakes that raise if called at
+    all, not merely fakes whose result would be ignored."""
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = VerificationStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=_memory_suppression(
+            matcher=_UnusedDismissedFindingMatcher(),
+            embedding_client=_UnusedEmbeddingClient(),
+            enabled=False,
+        ),
+    )
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0)]
+    )
+
+    output = await step.run(upstream_output, _context())
+
+    assert len(output.findings) == 1
+    assert output.findings[0].verification_status == "verified"
+
+
+@pytest.mark.asyncio
+async def test_us_m12_suppression_disabled_output_matches_no_suppression_configured_at_all() -> (
+    None
+):
+    """US-M12, the exact-equivalence form: a step constructed with
+    suppression disabled produces the identical output a step constructed
+    with `memory_suppression=None` entirely (this phase's own pre-existing
+    default) would — byte-for-byte restored, even with a matching entry
+    present (the fake matcher below would report a match if it were ever
+    called, which it never is)."""
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0)]
+    )
+    response_content = _verdicts_response_json([_passing_verdict(0)])
+
+    baseline_step = _verification_step(llm_client=_FakeLLMClient(response_content=response_content))
+    baseline_output = await baseline_step.run(upstream_output, _context())
+
+    disabled_step = VerificationStep(
+        _FakeLLMClient(response_content=response_content),
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=_memory_suppression(
+            matcher=_FakeDismissedFindingMatcher(default_similarity=0.99),
+            embedding_client=_FakeEmbeddingClient(),
+            enabled=False,
+        ),
+    )
+    disabled_output = await disabled_step.run(upstream_output, _context())
+
+    assert baseline_output.findings == disabled_output.findings
+
+
+# --- Unit E -> Unit F contract: real admin approve, then real suppression ---
+
+_REAL_MODEL_PATH = "/app/models/all-MiniLM-L6-v2"
+_CONTRACT_ADMIN_KEY = "verification-contract-test-admin-key"
+
+
+def _admin_client(*, dsn: str) -> TestClient:
+    settings = WebhookAPISettings(
+        environment="development",
+        database_url=SecretStr(dsn),
+        github_webhook_secret=SecretStr("unused-webhook-secret"),
+        github_app_id=1,
+        github_app_private_key=SecretStr("unused-placeholder-key"),
+        admin_api_key=SecretStr(_CONTRACT_ADMIN_KEY),
+        _env_file=None,
+    )
+    return TestClient(create_app(settings))
+
+
+@pytest_asyncio.fixture
+async def contract_session_factory(migrated_engine: AsyncEngine) -> async_sessionmaker[Any]:
+    return create_session_factory(migrated_engine)
+
+
+@pytest_asyncio.fixture
+async def contract_repo_id(contract_session_factory: async_sessionmaker[Any]) -> uuid.UUID:
+    async with contract_session_factory() as session, session.begin():
+        org = Org(name="acme", slug=f"acme-{uuid.uuid4().hex}")
+        session.add(org)
+        await session.flush()
+        repo = Repo(org_id=org.id, name="widgets", full_name=f"acme/widgets-{uuid.uuid4().hex}")
+        session.add(repo)
+        await session.flush()
+        return repo.id
+
+
+@pytest.fixture(scope="module")
+def contract_embedding_client() -> LocalONNXEmbeddingClient:
+    return LocalONNXEmbeddingClient(model_path=_REAL_MODEL_PATH)
+
+
+async def _approve_dismissed_finding_entry(
+    *,
+    session_factory: async_sessionmaker[Any],
+    dsn: str,
+    repo_id: uuid.UUID,
+    posted_finding_comment_id: int,
+    pr_number: int,
+    finding_file: str,
+    finding_line: int,
+    finding_rule_id: str,
+    finding_message: str,
+) -> PostgresMemoryRepository:
+    """Shared setup for the Unit E -> Unit F contract tests below: records a
+    signal against a real `posted_finding_comment` row, then approves the
+    resulting pending entry via the real admin API (Phase 5's actual HTTP
+    route, not a direct repository call) so the returned repository's
+    `dismissed_finding` table holds a real, embedded, approved row —
+    matching this phase's own "no hand-seeded fixture" Acceptance
+    criterion for every contract test in this section, not just the first
+    one."""
+    async with session_factory() as session, session.begin():
+        session.add(
+            PostedFindingCommentRow(
+                id=posted_finding_comment_id,
+                repo_id=repo_id,
+                pr_number=pr_number,
+                commit_sha="b" * 40,
+                finding_file=finding_file,
+                finding_line=finding_line,
+                finding_rule_id=finding_rule_id,
+                finding_message=finding_message,
+            )
+        )
+
+    repository = PostgresMemoryRepository(session_factory)
+    recorded = await repository.record_signal(
+        posted_finding_comment_id=posted_finding_comment_id,
+        raw_signal_type="reaction",
+        raw_signal_detail={"emoji": "+1"},
+        github_comment_id=None,
+    )
+    assert recorded is True
+    entries, _ = await repository.list_entries(
+        org_id=None,
+        repo_id=str(repo_id),
+        team_id=None,
+        status="pending",
+        limit=10,
+        offset=0,
+    )
+    entry_id = next(
+        e.id for e in entries if e.posted_finding_comment_id == posted_finding_comment_id
+    )
+
+    with _admin_client(dsn=dsn) as client:
+        response = client.post(
+            f"/admin/memory-entries/{entry_id}/approve",
+            json={"entry_type": "dismissed_finding"},
+            headers={"Authorization": f"Bearer {_CONTRACT_ADMIN_KEY}"},
+        )
+    assert response.status_code == 200
+    approved_body = response.json()
+    assert approved_body["status"] == "approved"
+    assert approved_body["embedding"] is not None
+
+    return repository
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_unit_e_to_unit_f_contract_real_admin_approve_then_real_suppression(
+    migrated_engine: AsyncEngine,
+    contract_session_factory: async_sessionmaker[Any],
+    contract_repo_id: uuid.UUID,
+    contract_embedding_client: LocalONNXEmbeddingClient,
+) -> None:
+    """The real Unit E -> Unit F contract, per this phase's own Acceptance
+    criterion: approve a pending entry via the real admin API (Phase 5's
+    actual HTTP route, not a direct repository call), confirm a real
+    embedding was written, then run `VerificationStep` against that same
+    real row and confirm the match fires — no hand-seeded fixture, proving
+    Phase 5 must functionally precede Phase 6 in production, not merely in
+    the plan's own phase numbering."""
+    finding_file = "app/payments/charge.py"
+    finding_rule_id = "no-hardcoded-retry"
+    finding_message = "this retry loop has no backoff and will hammer the payment API"
+    dsn = str(migrated_engine.url.render_as_string(hide_password=False))
+
+    repository = await _approve_dismissed_finding_entry(
+        session_factory=contract_session_factory,
+        dsn=dsn,
+        repo_id=contract_repo_id,
+        posted_finding_comment_id=990001,
+        pr_number=11,
+        finding_file=finding_file,
+        finding_line=42,
+        finding_rule_id=finding_rule_id,
+        finding_message=finding_message,
+    )
+
+    llm_client = _FakeLLMClient()  # never called if the match fires as expected
+    step = VerificationStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=MemorySuppressionConfig(
+            memory_matcher=repository,
+            embedding_client=contract_embedding_client,
+            similarity_threshold=0.90,
+            decay_half_life_days=180.0,
+            enabled=True,
+        ),
+    )
+    matching_finding = Finding(
+        file=finding_file,
+        line=42,
+        severity="medium",
+        message=finding_message,
+        source="llm",
+        rule_id=finding_rule_id,
+    )
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(),
+        findings=[matching_finding],
+        repo_id=str(contract_repo_id),
+    )
+
+    output = await step.run(upstream_output, _context())
+
+    assert output.findings == []
+    assert llm_client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_us_m7_contract_non_matching_finding_proceeds_through_rubric_against_real_db(
+    migrated_engine: AsyncEngine,
+    contract_session_factory: async_sessionmaker[Any],
+    contract_repo_id: uuid.UUID,
+    contract_embedding_client: LocalONNXEmbeddingClient,
+) -> None:
+    """US-M7, proved against the real boundary this phase's own Acceptance
+    line requires (not the Unit-tier fake above): with a real, approved
+    `dismissed_finding` entry present for this repo, a candidate finding
+    whose real ONNX embedding is semantically unrelated to it falls below
+    `similarity_threshold` and proceeds through the rubric LLM call
+    unchanged — proving the real query, not a fake matcher, correctly lets
+    a non-match through rather than suppressing everything indiscriminately."""
+    dsn = str(migrated_engine.url.render_as_string(hide_password=False))
+
+    repository = await _approve_dismissed_finding_entry(
+        session_factory=contract_session_factory,
+        dsn=dsn,
+        repo_id=contract_repo_id,
+        posted_finding_comment_id=990002,
+        pr_number=12,
+        finding_file="app/payments/charge.py",
+        finding_line=42,
+        finding_rule_id="no-hardcoded-retry",
+        finding_message="this retry loop has no backoff and will hammer the payment API",
+    )
+
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = VerificationStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=MemorySuppressionConfig(
+            memory_matcher=repository,
+            embedding_client=contract_embedding_client,
+            similarity_threshold=0.90,
+            decay_half_life_days=180.0,
+            enabled=True,
+        ),
+    )
+    non_matching_finding = Finding(
+        file="frontend/src/components/DatePicker.tsx",
+        line=17,
+        severity="low",
+        message="the imported date-formatting helper is unused and can be removed",
+        source="llm",
+        rule_id="no-unused-import",
+    )
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(),
+        findings=[non_matching_finding],
+        repo_id=str(contract_repo_id),
+    )
+
+    output = await step.run(upstream_output, _context())
+
+    assert len(output.findings) == 1
+    assert output.findings[0].verification_status == "verified"
+    assert len(llm_client.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_us_m12_contract_suppression_disabled_restores_prior_behavior_against_real_db(
+    migrated_engine: AsyncEngine,
+    contract_session_factory: async_sessionmaker[Any],
+    contract_repo_id: uuid.UUID,
+    contract_embedding_client: LocalONNXEmbeddingClient,
+) -> None:
+    """US-M12, proved against the real boundary: with a real, approved
+    `dismissed_finding` entry present that *would* match the candidate
+    finding byte-for-byte (same file/rule_id/message fingerprint the
+    contract test above proves fires a real match), `enabled=False`
+    restores exactly the no-suppression behavior — the finding still
+    proceeds through the rubric — proving the disable lever genuinely
+    bypasses the real matcher/embedding-client boundary rather than merely
+    being untested against it."""
+    finding_file = "app/payments/charge.py"
+    finding_rule_id = "no-hardcoded-retry"
+    finding_message = "this retry loop has no backoff and will hammer the payment API"
+    dsn = str(migrated_engine.url.render_as_string(hide_password=False))
+
+    repository = await _approve_dismissed_finding_entry(
+        session_factory=contract_session_factory,
+        dsn=dsn,
+        repo_id=contract_repo_id,
+        posted_finding_comment_id=990003,
+        pr_number=13,
+        finding_file=finding_file,
+        finding_line=42,
+        finding_rule_id=finding_rule_id,
+        finding_message=finding_message,
+    )
+
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = VerificationStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        memory_suppression=MemorySuppressionConfig(
+            memory_matcher=repository,
+            embedding_client=contract_embedding_client,
+            similarity_threshold=0.90,
+            decay_half_life_days=180.0,
+            enabled=False,
+        ),
+    )
+    matching_finding = Finding(
+        file=finding_file,
+        line=42,
+        severity="medium",
+        message=finding_message,
+        source="llm",
+        rule_id=finding_rule_id,
+    )
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(),
+        findings=[matching_finding],
+        repo_id=str(contract_repo_id),
+    )
+
+    output = await step.run(upstream_output, _context())
+
+    assert len(output.findings) == 1
+    assert output.findings[0].verification_status == "verified"
+    assert len(llm_client.calls) == 1

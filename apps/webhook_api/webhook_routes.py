@@ -20,6 +20,16 @@ kind that matched this event — a `pull_request opened`/`synchronize`
 delivery can therefore enqueue both a `REVIEW` and an `INDEX` job from the
 same request, sharing one transaction.
 
+``docs/plans/plan-deliver-memory.md``'s Phase 4 section (Unit D, US-M3) adds
+a fourth, independent trigger kind (`MEMORY_REACTION_POLL`) to the same
+`_JobCandidate`/`_handle_matched_triggers` fan-out: a `pull_request`
+event whose action is `opened`/`synchronize`/`reopened`/`closed` also
+enqueues a `MEMORY_REACTION_POLL` job from the same shared transaction —
+unconditionally, with no kill switch or rate limiter of its own (Assumption
+4), so it always accompanies `REVIEW`'s own trigger set plus `closed`
+(US-M3's second `Given/When/Then` branch, which `REVIEW`/`INDEX` never
+trigger on).
+
 Rejection order matches the plan and Security review precisely: rate limit
 (cheapest — no body read needed) -> body size limit (enforced while
 streaming, before the full body is ever buffered) -> signature verification
@@ -47,12 +57,25 @@ from fastapi.responses import JSONResponse
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from adapter.github.schemas import GitHubWebhookEnvelope, PushCommit
+from adapter.github.schemas import (
+    GitHubWebhookEnvelope,
+    PullRequestReviewCommentWebhookEnvelope,
+    PullRequestReviewThreadWebhookEnvelope,
+    PushCommit,
+)
 from adapter.github.signature import verify_webhook_signature
-from adapter.github.triggers import is_enqueue_trigger, is_index_trigger
+from adapter.github.triggers import (
+    is_enqueue_trigger,
+    is_index_trigger,
+    is_memory_capture_trigger,
+    is_memory_reaction_poll_trigger,
+)
 from adapter.storage.models import JobType
 from adapter.storage.queue import JobQueueRepository
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
+from findings.redact import TextRedactor
+from memory.reaction_poll import run_memory_reaction_poll_job
+from memory.store import MemorySignalRecorder, MemoryStoreError, ReactionDedupStore, ReactionFetcher
 from tenancy.resolution import ResolutionResult, TenancyStore, WebhookEvent, resolve_installation
 
 # Skipped-reason values a rate-limited candidate can carry (used by the
@@ -182,6 +205,24 @@ def _review_enqueue_payload(
         # missing-required-field rejection the way `pr_number`/`head_sha`
         # above are).
         "base_sha": event.base_sha,
+    }
+
+
+def _memory_reaction_poll_payload(
+    event: WebhookEvent, result: ResolutionResult
+) -> dict[str, object] | None:
+    """Build the `MEMORY_REACTION_POLL` job payload
+    (``docs/plans/plan-deliver-memory.md``'s Phase 4 section, Unit D), or
+    `None` when `event` is missing the one field this job type cannot run
+    without — mirrors `_review_enqueue_payload`'s own shape, but needs only
+    `pr_number` (no `head_sha`/`commit_sha`: this job polls reactions on
+    already-posted comments, it never fetches a diff).
+    """
+    if event.pr_number is None:
+        return None
+    return {
+        **_base_job_identity_fields(event, result),
+        "pr_number": event.pr_number,
     }
 
 
@@ -463,6 +504,266 @@ async def _handle_matched_triggers(
     return await _run_in_transaction(session_factory, event=event, work=_work)
 
 
+# Every outcome `_handle_memory_capture` can return, per its own docstring —
+# `create_webhook_router`'s route handler's own info-level summary log line
+# maps `capture_reason` through this dict rather than an if/elif chain that
+# would re-derive the same enumeration at a second call site. `"captured"`/
+# `"capture_failed"` get their own distinct wording; the two routine,
+# expected non-events share one, so a genuine failure never reads as an
+# unremarkable no-op at the info level (see that log line's own comment).
+_MEMORY_CAPTURE_LOG_MESSAGES: dict[str, str] = {
+    "captured": "memory capture accepted",
+    "capture_failed": "memory capture accepted; capture attempt failed",
+    "not_a_platform_comment": "memory capture accepted; not captured",
+    "capture_ceiling_exceeded": "memory capture accepted; not captured",
+}
+
+
+async def _handle_memory_capture(
+    *,
+    raw_payload: object,
+    event_type: str,
+    action: str | None,
+    repo_id: uuid.UUID,
+    provenance_recorder: MemorySignalRecorder,
+    text_redactor: TextRedactor,
+    capture_ceiling_limiter: InMemoryRateLimiter,
+) -> str:
+    """Attempt to capture a reply/thread-resolution raw signal for a
+    webhook event already confirmed to match ``is_memory_capture_trigger``
+    (``adapter/github/triggers.py``), per
+    ``docs/plans/plan-deliver-memory.md``'s Phase 3 section (Unit C,
+    US-M1/US-M2).
+
+    Deliberately outside ``_handle_matched_triggers``'s own job-queue
+    transaction (per the plan's own design): this writes directly to
+    ``memory_entry``, never enqueues a job, and relies on
+    ``MemorySignalRecorder.record_signal``'s own ``ON CONFLICT DO NOTHING``
+    upsert for redelivery-safety rather than the job-queue path's
+    delivery-id guard.
+
+    Returns the outcome reason for the caller's own accepted-but-not-
+    enqueued-style log line: ``"captured"``, ``"not_a_platform_comment"``
+    (the webhook comment/thread this signal is about isn't one the
+    platform posted, or isn't a reply to one — including a malformed
+    envelope, treated the same as "no match" rather than a 4xx, per this
+    route's "every non-enqueuing outcome is still accepted" posture),
+    ``"capture_ceiling_exceeded"`` (the per-repo daily cap — see
+    ``apps/webhook_api/settings.py``'s ``memory_capture_ceiling_per_repo_per_day``),
+    or ``"capture_failed"`` (a genuine Postgres-level failure — logged at
+    ``error`` and swallowed here, never failing the webhook response
+    itself, the same "a secondary write-path concern" posture Phase 2's own
+    provenance capture already establishes for `GitHubFindingsPublisher.post_review`).
+    For a ``pull_request_review_thread`` event with more than one correlating
+    comment id, each id is its own capture attempt (its own ceiling check,
+    its own isolated ``MemoryStoreError``) — ``"captured"`` is returned if
+    *any* candidate succeeded (even if a later one then hit the ceiling or
+    failed), so a partial per-thread outcome is never reported as a total
+    failure/rejection.
+    """
+
+    def _ceiling_exceeded() -> bool:
+        # Shared by both branches below: the ceiling bounds actual capture
+        # attempts (and the Postgres lookup/write each one costs), not the
+        # volume of unrelated webhook deliveries a repo happens to receive,
+        # so each branch only calls this once it has a genuine capture
+        # candidate in hand.
+        if capture_ceiling_limiter.allow(str(repo_id)):
+            return False
+        logger.warning(
+            "memory capture rejected",
+            extra={"repo_id": str(repo_id), "reason": "capture_ceiling_exceeded"},
+        )
+        return True
+
+    try:
+        if event_type == "pull_request_review_comment":
+            comment_envelope = PullRequestReviewCommentWebhookEnvelope.model_validate(raw_payload)
+            in_reply_to_id = comment_envelope.comment.in_reply_to_id
+            if in_reply_to_id is None:
+                # A fresh top-level review comment, not a reply — Assumption
+                # 3, never captured. Checked before the ceiling: an ordinary
+                # (non-reply) review comment isn't a capture candidate at
+                # all, so it must not consume the per-repo daily quota meant
+                # to bound genuine capture attempts.
+                return "not_a_platform_comment"
+
+            if _ceiling_exceeded():
+                return "capture_ceiling_exceeded"
+
+            redacted_body = await text_redactor.redact(comment_envelope.comment.body)
+            found = await provenance_recorder.record_signal(
+                posted_finding_comment_id=in_reply_to_id,
+                raw_signal_type="reply",
+                raw_signal_detail={"body": redacted_body},
+                github_comment_id=comment_envelope.comment.id,
+            )
+            return "captured" if found else "not_a_platform_comment"
+
+        # pull_request_review_thread — "resolved" or "unresolved".
+        thread_envelope = PullRequestReviewThreadWebhookEnvelope.model_validate(raw_payload)
+        comment_ids = [comment.id for comment in thread_envelope.thread.comments]
+        if not comment_ids:
+            return "not_a_platform_comment"
+
+        resolved = action == "resolved"
+        # The thread event's own comment id, per `MemoryEntryRow.github_comment_id`'s
+        # own docstring — the most recent comment in the thread (the last
+        # entry GitHub's own `thread.comments` array carries), independent
+        # of which id among them turns out to correlate to a
+        # `posted_finding_comment` row below.
+        thread_github_comment_id = comment_ids[-1]
+        # Record against every candidate id that correlates to a
+        # `posted_finding_comment` row, not just the first — a single
+        # resolved/unresolved thread can contain more than one of the
+        # platform's own posted findings (e.g. two separate review passes
+        # attaching comments to the same line/thread), and each still needs
+        # its own `thread_resolution` signal.
+        #
+        # The ceiling is checked once per candidate here, not once for the
+        # whole thread — each iteration is its own Postgres lookup/write,
+        # exactly what the ceiling bounds (see `_ceiling_exceeded`'s own
+        # comment), so a thread with several correlating comments must
+        # consume several units of the daily cap, not one. A candidate's own
+        # `MemoryStoreError` is isolated to that candidate rather than
+        # aborting the loop, so one transient failure doesn't discard
+        # signals already durably recorded for earlier candidates in this
+        # same thread.
+        # A single `outcome` set in priority order as candidates are
+        # processed — "captured" (any candidate succeeded) outranks
+        # "capture_failed" (a candidate's own `MemoryStoreError`), which
+        # outranks "capture_ceiling_exceeded" (nothing succeeded or failed
+        # before the ceiling stopped the loop), which outranks the
+        # "not_a_platform_comment" baseline (nothing correlated at all).
+        # Each `if outcome == ...`/`if outcome != ...` guard below only ever
+        # *raises* the outcome's priority, never lowers it.
+        outcome = "not_a_platform_comment"
+        for candidate_id in comment_ids:
+            if _ceiling_exceeded():
+                if outcome == "not_a_platform_comment":
+                    outcome = "capture_ceiling_exceeded"
+                break
+            try:
+                found = await provenance_recorder.record_signal(
+                    posted_finding_comment_id=candidate_id,
+                    raw_signal_type="thread_resolution",
+                    raw_signal_detail={"resolved": resolved},
+                    github_comment_id=thread_github_comment_id,
+                )
+            except MemoryStoreError as exc:
+                if outcome != "captured":
+                    outcome = "capture_failed"
+                logger.error(
+                    "memory capture failed for one thread candidate; continuing with the rest",
+                    extra={
+                        "repo_id": str(repo_id),
+                        "event_type": event_type,
+                        "posted_finding_comment_id": candidate_id,
+                    },
+                    exc_info=exc,
+                )
+                continue
+            if found:
+                outcome = "captured"
+        return outcome
+    except ValidationError:
+        logger.warning(
+            "memory capture rejected",
+            extra={"repo_id": str(repo_id), "reason": "invalid_payload_shape"},
+        )
+        return "not_a_platform_comment"
+    except MemoryStoreError as exc:
+        logger.error(
+            "memory capture failed",
+            extra={"repo_id": str(repo_id), "event_type": event_type},
+            exc_info=exc,
+        )
+        return "capture_failed"
+
+
+async def _run_synchronous_reaction_poll(
+    *,
+    event: WebhookEvent,
+    result: ResolutionResult,
+    reaction_fetcher: ReactionFetcher,
+    signal_recorder: MemorySignalRecorder,
+    dedup_store: ReactionDedupStore,
+    max_comments_per_poll: int,
+) -> str:
+    """US-M3's second `Given/When/Then` branch (``spec-memory.md`` lines
+    273-275): runs the same reaction-fetch-and-capture logic
+    ``memory.reaction_poll.run_memory_reaction_poll_job`` performs for a
+    `MEMORY_REACTION_POLL` job, but synchronously and inline — called by the
+    route handler for a `pull_request closed` event, before it returns its
+    HTTP response. Enqueuing this as an async job like every other trigger
+    this route handles would only satisfy the spec's *first*
+    `Given/When/Then` branch ("a later push enqueues a new REVIEW job"),
+    never this one's literal "the same reaction fetch runs once for that PR
+    before the webhook handler returns" requirement.
+
+    ``event.pr_number is None`` mirrors ``_memory_reaction_poll_payload``'s
+    own guard — nothing to poll without a PR number, returns
+    ``"missing_required_fields"`` rather than attempting the call.
+
+    A genuine whole-job failure (a Postgres-level error, or the
+    installation-token exchange itself failing before any per-comment fetch
+    even starts — see ``run_memory_reaction_poll_job``'s own docstring,
+    which raises ``MemoryReactionPollJobFailedError`` for exactly this case)
+    is logged at ``error`` and swallowed here, never failing the webhook
+    response itself — the same "a secondary write-path concern, not this
+    route's own trust boundary" posture ``_handle_memory_capture`` above
+    already establishes for its own Postgres writes. A single comment's own
+    reaction fetch failing is already tolerated inside
+    ``GitHubReactionFetcher`` itself, and a single reaction's own
+    ``record_signal`` failure is isolated and logged inside
+    ``run_memory_reaction_poll_job``'s own per-comment loop — neither
+    ordinarily reaches this function as an exception at all.
+
+    The catch below is still bare ``except Exception``, not narrowed to
+    ``MemoryReactionPollJobFailedError`` — deliberately: this function's own
+    "never failing the webhook response itself" promise is unconditional,
+    not scoped to Postgres/GitHub failures alone. A genuine bug inside this
+    secondary write path (a ``TypeError``/``KeyError`` from a code defect,
+    not just an anticipated infra failure) must not be allowed to take down
+    a GitHub-facing webhook response any more than an anticipated one would
+    — the same "belt-and-braces, every failure mode, not just the
+    anticipated ones" posture ``adapter/github/posting.py``'s own
+    ``post_review`` already establishes for its own terminal-step provenance
+    capture (see that module's docstring's "Provenance persistence"
+    section). Narrowing this to a specific exception type would trade a
+    known, accepted risk (a genuinely unanticipated bug here fails silently
+    instead of loudly) for a worse one (a bug in a secondary, best-effort
+    signal-capture path takes down the primary webhook response GitHub is
+    waiting on).
+    """
+    if event.pr_number is None:
+        return "missing_required_fields"
+
+    try:
+        await run_memory_reaction_poll_job(
+            repo_id=str(result.repo_id),
+            pr_number=event.pr_number,
+            installation_id=event.installation_id,
+            repo_full_name=event.repo_full_name,
+            reaction_fetcher=reaction_fetcher,
+            signal_recorder=signal_recorder,
+            dedup_store=dedup_store,
+            max_comments_per_poll=max_comments_per_poll,
+        )
+    except Exception as exc:
+        logger.error(
+            "synchronous memory reaction poll failed",
+            extra={
+                "repo_id": str(result.repo_id),
+                "pr_number": event.pr_number,
+                "installation_id": event.installation_id,
+            },
+            exc_info=exc,
+        )
+        return "reaction_poll_failed"
+    return "reaction_poll_completed"
+
+
 def create_webhook_router(
     *,
     webhook_secret: SecretStr,
@@ -474,6 +775,12 @@ def create_webhook_router(
     enqueue_rate_limiter: InMemoryRateLimiter | None,
     indexing_enabled: bool,
     index_enqueue_rate_limiter: InMemoryRateLimiter | None,
+    provenance_recorder: MemorySignalRecorder,
+    text_redactor: TextRedactor,
+    memory_capture_ceiling_limiter: InMemoryRateLimiter,
+    reaction_fetcher: ReactionFetcher,
+    reaction_dedup_store: ReactionDedupStore,
+    memory_reaction_poll_max_comments_per_poll: int,
 ) -> APIRouter:
     """Build the webhook receiver router.
 
@@ -491,6 +798,25 @@ def create_webhook_router(
     ``is_index_trigger`` itself never reads it (see that function's own
     docstring); only this route decides whether a syntactic index-trigger
     match actually gets to attempt an enqueue.
+
+    ``provenance_recorder``/``text_redactor``/``memory_capture_ceiling_limiter``
+    (``docs/plans/plan-deliver-memory.md``'s Phase 3, Unit C) back this
+    route's memory-capture handling (see ``_handle_memory_capture`` above) —
+    always registered, unlike the enqueue rate limiters, since capture has
+    no ``0``-disables-it sentinel of its own (US-M12: only suppression, a
+    later phase's own kill switch, is independently disable-able).
+
+    ``reaction_fetcher``/``reaction_dedup_store``/``memory_reaction_poll_max_comments_per_poll``
+    (Phase 4, Unit D) back US-M3's second ``Given/When/Then`` branch: a
+    `pull_request` `closed` event runs the same reaction-fetch-and-capture
+    logic a `MEMORY_REACTION_POLL` job runs (``memory/reaction_poll.py``'s
+    ``run_memory_reaction_poll_job``), but synchronously, in this request,
+    before the handler returns — see ``_run_synchronous_reaction_poll``
+    below. ``reaction_dedup_store`` is the same ``PostgresMemoryRepository``
+    instance as ``provenance_recorder`` (Assumption 8: one concrete class
+    implements both ``MemorySignalRecorder`` and ``ReactionDedupStore``),
+    typed and named separately here to match each Protocol role
+    ``run_memory_reaction_poll_job`` itself declares.
     """
     router = APIRouter()
 
@@ -598,6 +924,35 @@ def create_webhook_router(
                     )
                 )
 
+        # US-M3's second `Given/When/Then` branch (spec-memory.md lines
+        # 273-275) requires a `pull_request closed` event's reaction fetch
+        # to run "before the webhook handler returns" — enqueuing a
+        # `MEMORY_REACTION_POLL` job for the Worker to pick up later would
+        # not satisfy that (an indeterminate delay, not "before the handler
+        # returns"). `closed` is therefore handled synchronously below
+        # (`_run_synchronous_reaction_poll`), never as an async job
+        # candidate here — unlike `opened`/`synchronize`/`reopened` (US-M3's
+        # first branch, "a later push"), which stay the async job the
+        # Worker's own dispatch loop already handles.
+        is_reaction_poll_close_trigger = event_type == "pull_request" and event.action == "closed"
+        if is_memory_reaction_poll_trigger(event_type, event.action) and not (
+            is_reaction_poll_close_trigger
+        ):
+            # docs/plans/plan-deliver-memory.md's Phase 4 section (Unit D,
+            # Assumption 4): no kill switch, no rate limiter of its own —
+            # this job type does no LLM/expensive work, so `rate_limiter=None`
+            # (the same shape the "indexing disabled" candidate above already
+            # uses), unconditionally attempted whenever the trigger matches.
+            candidates.append(
+                _JobCandidate(
+                    job_type=JobType.MEMORY_REACTION_POLL,
+                    payload_builder=lambda result: _memory_reaction_poll_payload(event, result),
+                    missing_fields_reason="missing_required_fields",
+                    rate_limiter=None,
+                    rate_limited_reason="memory_reaction_poll_rate_limited",
+                )
+            )
+
         outcomes: list[tuple[JobType | None, uuid.UUID | None, str | None]]
         if candidates:
             result, matched_outcomes = await _handle_matched_triggers(
@@ -638,6 +993,87 @@ def create_webhook_router(
                     "skipped_reason": skipped_reason,
                 },
             )
+
+        # US-M3's second `Given/When/Then` branch (Phase 4, Unit D) — runs
+        # after `result` is resolved above (via either branch: `candidates`
+        # is always empty for a `closed` action, since `is_enqueue_trigger`/
+        # `is_index_trigger` never match it, so this always goes through the
+        # plain `resolve_installation` path), and before this handler
+        # returns its HTTP response below, per the spec's own literal
+        # wording — see `_run_synchronous_reaction_poll`'s own docstring.
+        if is_reaction_poll_close_trigger:
+            reaction_poll_reason = await _run_synchronous_reaction_poll(
+                event=event,
+                result=result,
+                reaction_fetcher=reaction_fetcher,
+                signal_recorder=provenance_recorder,
+                dedup_store=reaction_dedup_store,
+                max_comments_per_poll=memory_reaction_poll_max_comments_per_poll,
+            )
+            logger.info(
+                "synchronous memory reaction poll"
+                if reaction_poll_reason == "reaction_poll_completed"
+                else "synchronous memory reaction poll; not completed",
+                extra={
+                    "installation_id": event.installation_id,
+                    "org_id": str(result.org_id),
+                    "repo_id": str(result.repo_id),
+                    "pr_number": event.pr_number,
+                    "delivery_id": event.delivery_id,
+                    "reason": reaction_poll_reason,
+                },
+            )
+
+        # Memory capture (docs/plans/plan-deliver-memory.md's Phase 3
+        # section, Unit C) — deliberately independent of the `candidates`/
+        # `_handle_matched_triggers` fan-out above: `is_enqueue_trigger`/
+        # `is_index_trigger` never match a `pull_request_review_comment`/
+        # `pull_request_review_thread` event (different event types
+        # entirely), so `candidates` is always empty here and `result` was
+        # already resolved via the plain `resolve_installation` branch
+        # above — reused, not re-resolved a second time.
+        if is_memory_capture_trigger(event_type, event.action):
+            capture_reason = await _handle_memory_capture(
+                raw_payload=raw_payload,
+                event_type=event_type,
+                action=event.action,
+                repo_id=result.repo_id,
+                provenance_recorder=provenance_recorder,
+                text_redactor=text_redactor,
+                capture_ceiling_limiter=memory_capture_ceiling_limiter,
+            )
+            # A genuine `MemoryStoreError` is already logged at `error` with
+            # `exc_info` inside `_handle_memory_capture` itself — this line
+            # is a per-request summary, not the only signal a failure
+            # produced. It still must not describe `capture_failed` with the
+            # same "accepted; not captured" wording used for routine,
+            # expected non-events (`not_a_platform_comment`,
+            # `capture_ceiling_exceeded`) — someone scanning info-level
+            # messages alone (not `extra.reason`, not the error-level log
+            # above) would otherwise see a real Postgres-level failure as an
+            # unremarkable no-op. One dict, keyed by every outcome
+            # `_handle_memory_capture` can return, rather than an if/elif
+            # chain re-deriving that same enumeration at a second call site.
+            capture_log_message = _MEMORY_CAPTURE_LOG_MESSAGES.get(
+                capture_reason, "memory capture accepted; not captured"
+            )
+            logger.info(
+                capture_log_message,
+                extra={
+                    "installation_id": event.installation_id,
+                    "org_id": str(result.org_id),
+                    "repo_id": str(result.repo_id),
+                    "delivery_id": event.delivery_id,
+                    "event_type": event_type,
+                    "raw_signal_type": (
+                        "reply"
+                        if event_type == "pull_request_review_comment"
+                        else "thread_resolution"
+                    ),
+                    "reason": capture_reason,
+                },
+            )
+
         return JSONResponse({"status": "accepted"}, status_code=200)
 
     return router

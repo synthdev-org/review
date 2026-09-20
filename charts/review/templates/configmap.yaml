@@ -21,6 +21,14 @@ data:
   REVIEW_WEBHOOK_API_SETUP_STATE_TTL_SECONDS: {{ .Values.webhookApi.setupStateTtlSeconds | quote }}
   REVIEW_WEBHOOK_API_GITHUB_API_BASE_URL: {{ .Values.webhookApi.githubApi.baseUrl | quote }}
   REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS: {{ .Values.webhookApi.githubApi.timeoutSeconds | quote }}
+  # GitHub App auth for the synchronous reaction-fetch path
+  # (docs/plans/plan-deliver-memory.md's Phase 4, Unit D, US-M3). `appId` is
+  # public-ish, not sensitive (same reasoning as REVIEW_WORKER_GITHUB_APP_ID
+  # below) — the private key is rendered via templates/secret.yaml instead
+  # (deployment-webhook-api.yaml's own credentialEnvVar entry).
+  REVIEW_WEBHOOK_API_GITHUB_APP_ID: {{ .Values.webhookApi.github.appId | quote }}
+  REVIEW_WEBHOOK_API_GITHUB_RETRY_MAX_ATTEMPTS: {{ .Values.webhookApi.github.retryMaxAttempts | quote }}
+  REVIEW_WEBHOOK_API_MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL: {{ .Values.webhookApi.memoryReactionPollMaxCommentsPerPoll | quote }}
 
   # --- Worker (apps/worker/settings.py) ---
   REVIEW_WORKER_ENVIRONMENT: {{ .Values.worker.environment | quote }}

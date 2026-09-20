@@ -32,6 +32,34 @@ enqueue rate limiter (``index_enqueue_rate_limiter``, `INDEX`-specific,
 also optionally ``None`` per the same ``0``-disables-it sentinel) and the
 ``indexing_enabled`` kill switch, both passed down explicitly into the
 webhook router the same way every other Phase 1 setting already is.
+
+``docs/plans/plan-deliver-memory.md``'s Phase 3 (Unit C) adds this
+entrypoint's first ``findings.redact.TextRedactor`` and
+``adapter/storage/memory_repository.py``'s ``PostgresMemoryRepository``
+(reused from the same ``session_factory`` every other storage adapter here
+already shares) — both wired into the webhook router's own memory-capture
+handling, alongside a per-repo daily capture-ceiling ``InMemoryRateLimiter``.
+
+``docs/plans/plan-deliver-memory.md``'s Phase 4 (Unit D, US-M3) adds this
+entrypoint's first outbound GitHub REST API caller other than the manifest
+flow: a ``GitHubInstallationTokenProvider``/``GitHubReactionFetcher`` pair
+(``_build_reaction_fetcher``), needed because US-M3's second
+``Given/When/Then`` branch requires a PR-closed event's reaction fetch to
+run synchronously, before the webhook handler returns — not queued for the
+Worker to pick up later, unlike every other job type this entrypoint
+enqueues.
+
+``docs/plans/plan-deliver-memory.md``'s Phase 5 (Unit E) adds the Memory
+admin API (``apps/webhook_api/admin_routes.py``) — registered
+**unconditionally**, unlike the ``SETUP_MODE``-gated manifest router,
+since there's no "off by default" state for a credential-gated surface the
+way there is for the one-time App-setup flow (Assumption 7). It also adds
+this entrypoint's first ``adapter.embedding.local_onnx.LocalONNXEmbeddingClient``
+(the approve route's embedding-compute path, US-M4) — wired with the same
+fail-fast startup check ``apps/worker/main.py``'s
+``_check_embedding_model_startup`` already establishes
+(``adapter.embedding.startup_check.check_embedding_model_loaded``, reused,
+not a second copy).
 """
 
 from __future__ import annotations
@@ -40,16 +68,33 @@ import logging
 
 from fastapi import FastAPI
 
+from adapter.analyzers.gitleaks import GitleaksTextRedactor
+from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
+from adapter.embedding.startup_check import check_embedding_model_loaded
+from adapter.github.auth import GitHubInstallationTokenProvider
+from adapter.github.reactions import GitHubReactionFetcher
 from adapter.storage.engine import create_session_factory, create_storage_engine
+from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
 from adapter.storage.tenancy import PostgresTenancyStore
+from apps.webhook_api.admin_routes import create_admin_router
 from apps.webhook_api.logging_config import configure_logging
 from apps.webhook_api.manifest_routes import create_manifest_router
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
 from apps.webhook_api.settings import WebhookAPISettings
 from apps.webhook_api.webhook_routes import create_webhook_router
+from findings.redact import NoOpTextRedactor, TextRedactor
+from indexing.embedding import EmbeddingError
 
 logger = logging.getLogger(__name__)
+
+# One rolling day, in seconds — the window
+# `memory_capture_ceiling_per_repo_per_day` (Phase 3, Unit C) is measured
+# over. A plain constant, not a settings field itself: the *ceiling count*
+# is operator-tunable; the window it applies over is this feature's own
+# fixed shape, the same way `_build_enqueue_rate_limiter`'s `window_seconds=60.0`
+# below is hardcoded rather than separately configurable.
+_MEMORY_CAPTURE_CEILING_WINDOW_SECONDS = 86_400.0
 
 
 def _build_enqueue_rate_limiter(settings: WebhookAPISettings) -> InMemoryRateLimiter | None:
@@ -115,6 +160,110 @@ def _build_index_enqueue_rate_limiter(settings: WebhookAPISettings) -> InMemoryR
     )
 
 
+def _build_text_redactor(settings: WebhookAPISettings, logger: logging.Logger) -> TextRedactor:
+    """Wires `findings.redact.TextRedactor` conditionally on
+    `secret_redaction_enabled` alone — this entrypoint's first `TextRedactor`
+    consumer (`apps/worker/main.py`'s own `_build_text_redactor` was
+    previously the only one), reusing the same `GitleaksTextRedactor`/
+    `NoOpTextRedactor` wiring choice rather than a second implementation.
+    `True` (the shipped default) wires the real, Gitleaks-backed
+    implementation; `False` wires a no-op passthrough and logs a one-time
+    `warning` at startup, not per-request — the reduced protection is
+    visible, not silent.
+    """
+    if settings.secret_redaction_enabled:
+        return GitleaksTextRedactor()
+
+    logger.warning(
+        "secret redaction is disabled",
+        extra={"secret_redaction_enabled": False},
+    )
+    return NoOpTextRedactor()
+
+
+def _build_reaction_fetcher(settings: WebhookAPISettings) -> GitHubReactionFetcher:
+    """Wire the Memory domain's `ReactionFetcher` Protocol to its
+    GitHub-backed implementation, per `docs/plans/plan-deliver-memory.md`'s
+    Phase 4 section (Unit D, US-M3) — this entrypoint's own instance,
+    distinct from `apps/worker/main.py`'s, since US-M3's second
+    `Given/When/Then` branch (a `pull_request closed` event) requires the
+    reaction fetch to run synchronously inside this process, before the
+    webhook handler returns, not queued for the Worker to pick up later.
+
+    `client=None` (unlike the Worker's own shared, long-lived
+    `httpx.AsyncClient`): this route calls GitHub's API rarely (once per
+    `closed` event, not per job in a tight dispatch loop), so
+    `adapter/github/http.py`'s `client_context` opening/tearing down a
+    throwaway client per call is an acceptable trade-off here, and avoids
+    this entrypoint needing its own FastAPI lifespan-managed client
+    lifecycle for what would otherwise be its only consumer.
+    """
+    token_provider = GitHubInstallationTokenProvider(
+        app_id=settings.github_app_id,
+        private_key_pem=settings.github_app_private_key.get_secret_value(),
+        github_api_base_url=settings.github_api_base_url,
+        timeout=settings.github_api_timeout_seconds,
+        max_retry_attempts=settings.github_retry_max_attempts,
+    )
+    return GitHubReactionFetcher(
+        token_provider=token_provider,
+        github_api_base_url=settings.github_api_base_url,
+        timeout=settings.github_api_timeout_seconds,
+        max_retry_attempts=settings.github_retry_max_attempts,
+    )
+
+
+def _build_embedding_client(settings: WebhookAPISettings) -> LocalONNXEmbeddingClient:
+    """Wire the admin API's own `indexing.embedding.EmbeddingClient`
+    Protocol to its local ONNX-backed implementation, per
+    `docs/plans/plan-deliver-memory.md`'s Phase 5 section (Unit E, US-M4) —
+    this entrypoint's first use of it (`apps/worker/main.py`'s
+    `_build_embedding_client` was previously the only composition root
+    building one). Same `settings.embedding_model_path` default/shape as
+    that function's own docstring.
+    """
+    return LocalONNXEmbeddingClient(model_path=settings.embedding_model_path)
+
+
+def _check_embedding_model_startup(
+    client: LocalONNXEmbeddingClient, settings: WebhookAPISettings, logger: logging.Logger
+) -> None:
+    """Run the local embedding model's startup load/inference check and
+    raise `SystemExit(1)` if it fails — the same fail-fast pattern
+    `apps/worker/main.py`'s own `_check_embedding_model_startup` already
+    establishes, reused via `adapter.embedding.startup_check
+    .check_embedding_model_loaded` rather than a second copy of this
+    check's own logic. A missing/corrupted baked model artifact fails
+    loudly here, at Webhook API boot, rather than silently on the first
+    real admin `approve` call's own `embed` stage.
+    """
+    try:
+        check_embedding_model_loaded(client)
+    except EmbeddingError as exc:
+        logger.error(
+            "local embedding model is not usable at startup; exiting",
+            extra={"embedding_model_path": settings.embedding_model_path, "error": str(exc)},
+        )
+        raise SystemExit(1) from exc
+
+    logger.info(
+        "local embedding model loaded",
+        extra={"embedding_model_path": settings.embedding_model_path},
+    )
+
+
+def _build_memory_capture_ceiling_limiter(settings: WebhookAPISettings) -> InMemoryRateLimiter:
+    """Per-repo daily cap on Memory capture writes (Phase 3, Unit C) — see
+    `apps/webhook_api/settings.py`'s `memory_capture_ceiling_per_repo_per_day`
+    for why this has no `0`-disables-it sentinel unlike the enqueue rate
+    limiters above.
+    """
+    return InMemoryRateLimiter(
+        max_requests=settings.memory_capture_ceiling_per_repo_per_day,
+        window_seconds=_MEMORY_CAPTURE_CEILING_WINDOW_SECONDS,
+    )
+
+
 def create_app(settings: WebhookAPISettings) -> FastAPI:
     """Build the Webhook API's FastAPI application from parsed settings."""
     app = FastAPI(title="review webhook_api")
@@ -130,6 +279,22 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
     job_queue = JobQueueRepository(session_factory)
     enqueue_rate_limiter = _build_enqueue_rate_limiter(settings)
     index_enqueue_rate_limiter = _build_index_enqueue_rate_limiter(settings)
+    # Memory capture (docs/plans/plan-deliver-memory.md's Phase 3 section,
+    # Unit C): the same `PostgresMemoryRepository`/`session_factory` shape
+    # `apps/worker/main.py` already builds for Phase 2's provenance
+    # recording (Assumption 8 — one concrete class implements every Memory
+    # Protocol, constructed once per entrypoint from that entrypoint's own
+    # session factory).
+    memory_repository = PostgresMemoryRepository(session_factory)
+    text_redactor = _build_text_redactor(settings, logger)
+    memory_capture_ceiling_limiter = _build_memory_capture_ceiling_limiter(settings)
+    # US-M3's second `Given/When/Then` branch (Phase 4, Unit D): a
+    # `pull_request closed` event's reaction fetch runs synchronously in
+    # this route, so this entrypoint needs its own `ReactionFetcher` —
+    # `memory_repository` above already implements `ReactionDedupStore`
+    # (Assumption 8, the same instance also serving `MemorySignalRecorder`
+    # for Phase 3's capture handling above).
+    reaction_fetcher = _build_reaction_fetcher(settings)
 
     if not settings.indexing_enabled:
         logger.warning(
@@ -153,6 +318,14 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
             enqueue_rate_limiter=enqueue_rate_limiter,
             indexing_enabled=settings.indexing_enabled,
             index_enqueue_rate_limiter=index_enqueue_rate_limiter,
+            provenance_recorder=memory_repository,
+            text_redactor=text_redactor,
+            memory_capture_ceiling_limiter=memory_capture_ceiling_limiter,
+            reaction_fetcher=reaction_fetcher,
+            reaction_dedup_store=memory_repository,
+            memory_reaction_poll_max_comments_per_poll=(
+                settings.memory_reaction_poll_max_comments_per_poll
+            ),
         )
     )
 
@@ -171,6 +344,26 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
         logger.info("setup_mode enabled; manifest/callback routes registered")
     else:
         logger.info("setup_mode disabled; manifest/callback routes not registered")
+
+    # Memory admin API (docs/plans/plan-deliver-memory.md's Phase 5 section,
+    # Unit E) — registered unconditionally (Assumption 7), reusing the same
+    # `memory_repository` instance built above (it already implements both
+    # `MemoryAdminRepository` and the separate, single-method
+    # `PostedCommentReader`, per Assumption 8). `embedding_client`'s
+    # startup check runs synchronously, once, before `create_app` returns —
+    # the same "runs exactly once, before the dispatch loop starts" fail-
+    # fast timing `apps/worker/main.py`'s own equivalent check uses.
+    embedding_client = _build_embedding_client(settings)
+    _check_embedding_model_startup(embedding_client, settings, logger)
+    app.include_router(
+        create_admin_router(
+            admin_api_key=settings.admin_api_key,
+            repository=memory_repository,
+            posted_comment_reader=memory_repository,
+            embedding_client=embedding_client,
+        )
+    )
+    logger.info("admin API routes registered")
 
     return app
 

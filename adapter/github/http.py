@@ -94,6 +94,23 @@ _BACKOFF_BASE_SECONDS = 1.0
 _PERMANENT_ERROR_STATUS_CODES = frozenset({401, 403, 404})
 _RATE_LIMIT_STATUS_CODE = 429
 
+# The shared concurrency bound every ``adapter.github`` module's own
+# per-item GitHub API fan-out uses, per
+# ``docs/plans/plan-deliver-memory.md``'s Phase 4 section (Unit D):
+# previously duplicated as an independent ``10`` in both
+# ``adapter/github/diff.py``'s ``_DEFAULT_BLOB_FETCH_CONCURRENCY`` and
+# ``findings/redact.py``'s ``_MAX_CONCURRENT_REDACTIONS`` — extracted here so
+# ``diff.py`` and this phase's own ``adapter/github/reactions.py`` import one
+# shared constant instead of perpetuating the duplication with a third
+# independent ``10``. **Not** imported by ``findings/redact.py``, despite
+# that module sharing the same value: ``findings`` is a domain package
+# (``docs/rules/architecture.md``'s "domain never imports entrypoint or
+# adapter code" rule), so it keeps its own local ``_MAX_CONCURRENT_REDACTIONS``
+# constant — a deliberate, documented deviation from the plan's literal "all
+# three call sites import it" text, since the alternative would cross a
+# package boundary the project's own mandatory architecture rules forbid.
+DEFAULT_FAN_OUT_CONCURRENCY = 10
+
 
 def auth_headers(token: SecretStr) -> dict[str, str]:
     """The ``Authorization``/``Accept`` headers every ``adapter.github``

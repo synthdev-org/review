@@ -155,6 +155,36 @@ def test_new_verification_pipeline_step_fields_are_overridable_from_env(
     assert settings.verification_step_timeout_seconds == 45
 
 
+def test_memory_suppression_fields_default_per_the_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs/plans/plan-deliver-memory.md's Phase 6 section (Assumption 6) —
+    similarity-suppression's own bootstrap-config fields, read directly by
+    `_build_review_registry` rather than going through `StepEnablement`."""
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.memory_suppression_enabled is True
+    assert settings.memory_similarity_threshold == 0.90
+    assert settings.memory_decay_half_life_days == 180.0
+
+
+def test_memory_suppression_fields_are_overridable_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_MEMORY_SUPPRESSION_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_MEMORY_SIMILARITY_THRESHOLD", "0.75")
+    monkeypatch.setenv("REVIEW_WORKER_MEMORY_DECAY_HALF_LIFE_DAYS", "90")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.memory_suppression_enabled is False
+    assert settings.memory_similarity_threshold == 0.75
+    assert settings.memory_decay_half_life_days == 90.0
+
+
 # --- US-F7: an all-disabled step configuration is caught at startup --------
 #
 # Per the plan's Phase 2 section, this predicate operates at the

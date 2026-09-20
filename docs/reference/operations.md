@@ -69,3 +69,41 @@ private key is not usable at startup; exiting" (a malformed/truncated key,
 caught by this phase's own fail-fast RS256 signing validation) or a
 `pydantic` field-required error naming `github_app_id`/`github_app_private_key`
 (unset entirely) before assuming a deeper problem.
+
+## Upgrading to a release with Memory (`plan-deliver-memory.md`)? Existing GitHub App installations need to re-consent
+
+`plan-deliver-memory.md`'s Phase 7 section adds two new webhook event
+subscriptions to the GitHub App manifest —
+`"pull_request_review_comment"` and `"pull_request_review_thread"` — on
+top of the already-subscribed `"pull_request"`/`"push"`. These activate
+Phase 3's reply/thread-resolution capture and Phase 4's reaction polling,
+both of which have been safe to run without these subscriptions since they
+shipped (their handlers simply never receive the new event types until
+this happens).
+
+**This is a manifest-only change — it does not, by itself, change what any
+already-installed GitHub App instance receives.** GitHub does not push
+updated event subscriptions to an existing installation automatically: an
+operator must re-approve the App's updated permissions on GitHub's own
+"Install App"/"App settings" UI (Settings → GitHub Apps → the App →
+"Permissions & events", or the org-level equivalent for an
+organization-owned installation) before replies, thread-resolution
+capture, or reaction polling start actually receiving data. Until an
+operator does this:
+
+- Phases 1–6's code keeps running completely unaffected — provenance
+  recording, the admin API, and similarity-based suppression all continue
+  to work exactly as before.
+- Reaction polling (Phase 4) still partially works, since it reuses the
+  already-subscribed `pull_request` event rather than a new subscription.
+- Replies and thread-resolution capture (Phase 3, US-M1/US-M2) simply
+  receive no events — not an error state, just no new data.
+
+Re-consenting is itself a reversible, operator-initiated action: declining
+the updated permissions (or re-consenting and later reverting) leaves
+Phases 1–6 running unaffected either way. `"issue_comment"` is
+deliberately **not** part of this subscription change — an `issue_comment`
+event can never correlate back to a specific posted finding comment (only
+`pull_request_review_comment`'s `in_reply_to_id` can), so subscribing to
+it would only add unused webhook volume with no corresponding capture
+capability.
