@@ -159,8 +159,7 @@ context — see Level 2 and
 │  │ Webhook API              │  FastAPI service. Verifies GitHub webhook        │
 │  │ (stateless, scales        │  signature, resolves the installation/org/repo,  │
 │  │  horizontally)             │  enqueues a review or reindex job. Also serves   │
-│  │                             │  the GitHub App callback + minimal admin/config │
-│  │                             │  endpoints.                                      │
+│  │                             │  the GitHub App callback.                       │
 │  └───────────┬─────────────────┘                                                │
 │              │ enqueues                                                         │
 │              ▼                                                                  │
@@ -190,6 +189,18 @@ context — see Level 2 and
 │  └────────────────────────────────────────────────────────────────┘               │
 │              │ reads/writes                                                     │
 │              ▼                                                                  │
+│  ┌───────────────────────┐                                                     │
+│  │ Admin API                 │  FastAPI service, standalone from Webhook API   │
+│  │ (stateless, scales         │  and Worker — own image/Deployment, per        │
+│  │  horizontally, reads/       │  ADR-0001's 2026-09-20 amendment. Local       │
+│  │  writes Postgres directly,  │  login, org/repo/team config, Memory          │
+│  │  no job queue involved)     │  approve/reject/delete (moved here from       │
+│  │                              │  Webhook API), model routing, admin-stats    │
+│  │                              │  dashboard, free-tier usage disclosure       │
+│  │                              │  (design goal 9).                            │
+│  └───────────┬──────────────────┘                                              │
+│              │ reads/writes                                                     │
+│              ▼                                                                  │
 │  ┌───────────────────────────────────────────────────────────────┐            │
 │  │ Postgres + pgvector                    (the one stateful dependency)          │
 │  │  — repo index (AST chunks, embeddings, call/import graph)                     │
@@ -209,11 +220,15 @@ context — see Level 2 and
 
 **Reading this diagram:**
 
-- **Two deployable components, not five.** Webhook API and Worker are the only
-  two container images to build, scan, and patch — indexing and review are
-  both job types the same Worker pool handles, dispatched by job type, rather
-  than separate services. Fewer images is fewer things for an enterprise
-  security team to have to approve and for us to operate.
+- **Three deployable components, not five.** Webhook API, Worker, and the
+  Admin API (`apps/admin_api`, added by
+  [ADR-0001](../adr/0001-self-hosted-kubernetes-deployment.md)'s
+  2026-09-20 amendment and `docs/specs/spec-admin-gui.md`, standalone from
+  the Webhook API per an enterprise deployment requirement) are the only
+  three container images to build, scan, and patch — indexing and review
+  are both job types the same Worker pool handles, dispatched by job type,
+  rather than separate services. Fewer images is fewer things for an
+  enterprise security team to have to approve and for us to operate.
 - **No broker beyond Postgres.** The job queue lives in the same Postgres
   instance as everything else (`SKIP LOCKED`-style claiming), rather than
   requiring the customer to also stand up Redis or Kafka. This can move behind

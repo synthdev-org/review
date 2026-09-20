@@ -4,6 +4,17 @@
 
 ACCEPTED
 
+Amended 2026-09-20: the "two container images" packaging in the Options
+table and Consequences below is updated to three — `docs/specs/spec-admin-gui.md`
+(Phase 5) makes the Admin UI its own standalone deployable entrypoint
+(`apps/admin_api`), not a screen served from the Webhook API. This is the
+"real requirement" `docs/rules/architecture.md`'s "no separate admin-UI
+service until forced" line already anticipated — an enterprise deployment
+requirement for the Admin UI to scale, restart, and fail independently of
+the review pipeline. Updated in place rather than superseded by a new ADR,
+since the underlying decision (self-hosted, customer-run infrastructure)
+is unchanged; only the image count it commits to has grown.
+
 ## RACI
 
 | Who | Role | RACI |
@@ -66,7 +77,7 @@ customer runs themselves.
 | --- | --- | --- | --- | --- |
 | **Zero-infrastructure CLI** (prior design) | Excellent — nothing to trust, nothing runs continuously | None | No — no durable, shared, queryable store exists in this design | Reject — cannot deliver the two requirements driving this decision |
 | **Vendor-hosted SaaS** (we run it, multi-tenant) | Weak for an enterprise sale — customer's proprietary code and review history sits in infrastructure we operate, same trust posture as CodeRabbit/Qodo today | High — we own uptime, backups, security, compliance (SOC2 etc.), multi-tenant isolation, for every customer at once | Yes | Reject for now — the stronger enterprise trust story is "your code never leaves your infrastructure"; revisit as an *additional*, not exclusive, offering once the self-hosted core is proven |
-| **Self-hosted only** — customer runs Kubernetes (prod, via Helm) and Docker Compose (dev, same images) | Strong — customer's own infrastructure, own data, own network boundary | Shifts to the customer, but bounded: two container images, one stateful dependency (Postgres) | Yes — a real, persistent, customer-owned database is exactly what both requirements need | **Accept** |
+| **Self-hosted only** — customer runs Kubernetes (prod, via Helm) and Docker Compose (dev, same images) | Strong — customer's own infrastructure, own data, own network boundary | Shifts to the customer, but bounded: three container images (Webhook API, Worker, Admin UI, per the 2026-09-20 amendment), one stateful dependency (Postgres) | Yes — a real, persistent, customer-owned database is exactly what both requirements need | **Accept** |
 
 ## Decision
 
@@ -99,10 +110,11 @@ product is proven, but it is not a dependency of this decision.
   we never touch the customer's LLM spend either.
 
 **Harder / trade-offs:**
-* The customer must run and operate Postgres, the Webhook API, and the
-  Worker themselves — Helm chart quality (upgrades, health probes,
-  resource defaults, observability hooks) directly determines how painful
-  that is, and is now a first-class product surface, not an afterthought.
+* The customer must run and operate Postgres, the Webhook API, the
+  Worker, and (per the 2026-09-20 amendment) the Admin UI themselves —
+  Helm chart quality (upgrades, health probes, resource defaults,
+  observability hooks) directly determines how painful that is, and is
+  now a first-class product surface, not an afterthought.
 * We lose direct visibility into production behavior across customers
   (no shared logs/metrics unless the customer opts to forward them) —
   support and debugging depend more on what the customer can report and
@@ -117,6 +129,9 @@ product is proven, but it is not a dependency of this decision.
 
 ## Related
 
+* [`docs/specs/spec-admin-gui.md`](../specs/spec-admin-gui.md) — Phase 5's
+  Admin UI PRD, the source of the 2026-09-20 amendment (third deployable
+  image, standalone from the Webhook API).
 * [`docs/reference/c4-architecture.md`](../reference/c4-architecture.md) — the
   full architecture this decision shapes.
 * [`docs/adr/0002-implement-in-python.md`](0002-implement-in-python.md) —
