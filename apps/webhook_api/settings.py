@@ -101,6 +101,36 @@ class WebhookAPISettings(OtelSettingsMixin):
     # `review_enqueue_rate_limit_per_minute`'s own `0` sentinel.
     index_enqueue_rate_limit_per_minute: int = 5
 
+    # --- Memory capture (docs/plans/plan-deliver-memory.md's Phase 3
+    # section, Unit C) ---
+    # Reply-text redaction before persistence, per that phase's own scope
+    # bullet — mirrors `apps/worker/settings.py`'s `WorkerSettings.secret_redaction_enabled`
+    # field name/default exactly (the same "reused, not reinvented" wiring
+    # choice `apps/webhook_api/main.py`'s new `TextRedactor` dependency
+    # makes; this entrypoint's first consumer of that Protocol).
+    secret_redaction_enabled: bool = True
+
+    # Per-repo capture ceiling (a real gap Phase 3's own plan review pass
+    # found): any GitHub account able to comment/react on a public repo's
+    # PR can generate valid, signed webhook deliveries that each attempt to
+    # create a `pending` `memory_entry` row — not a privileged permission.
+    # Reuses the same `InMemoryRateLimiter` shape
+    # `review_enqueue_rate_limit_per_minute` already establishes for a
+    # materially identical shape of problem, but over a rolling day rather
+    # than a minute. Deliberately placed here (`WebhookAPISettings`), not
+    # `WorkerSettings` as `docs/plans/plan-deliver-memory.md`'s own prose
+    # literally names it — a documented correction, not an oversight: the
+    # capture write this ceiling guards
+    # (`apps/webhook_api/webhook_routes.py`) runs entirely inside the
+    # Webhook API entrypoint, never the Worker, and `WorkerSettings` has no
+    # way to reach a config value into a different process's own
+    # composition root. No `0`-disables-it sentinel, unlike the enqueue
+    # rate limits above — capture has no "off" state of its own per US-M12
+    # (only suppression, a later phase's own kill switch, is independently
+    # disable-able); a deployment that genuinely wants no ceiling can set
+    # this to a very large number instead.
+    memory_capture_ceiling_per_repo_per_day: int = 500
+
     # --- App manifest/callback setup flow (apps/webhook_api/manifest_routes.py) ---
     # Off by default, per the plan's Phase 4 section ("both ... routes are
     # ... gated behind an explicit SETUP_MODE config flag, off by default")
@@ -117,6 +147,51 @@ class WebhookAPISettings(OtelSettingsMixin):
     # `otel_exporter_otlp_endpoint`/`otel_exporter_otlp_headers` come from
     # `OtelSettingsMixin` above — shared with `WorkerSettings` so the two
     # entrypoints can't silently diverge on this pair's declaration.
+
+    # --- GitHub App auth / synchronous reaction fetch (Phase 4 of
+    # plan-deliver-memory.md, Unit D, US-M3's second `Given/When/Then`
+    # branch) ---
+    # US-M3 requires the reaction fetch for a `pull_request closed` event
+    # to run "before the webhook handler returns" — not merely enqueued for
+    # the Worker to pick up later (unlike the "later push" branch, which
+    # stays an async `MEMORY_REACTION_POLL` job). That means this
+    # entrypoint, not just the Worker, needs its own installation-token
+    # exchange capability. Required, no default, same fail-fast posture as
+    # `apps/worker/settings.py`'s own `github_app_id`/`github_app_private_key`
+    # fields (JWT signing cannot function without them) — reusing
+    # `github_api_base_url`/`github_api_timeout_seconds` above rather than a
+    # second pair of fields for the same GitHub REST API.
+    github_app_id: int
+    github_app_private_key: SecretStr
+    # Same "retries beyond the first attempt" lever
+    # `apps/worker/settings.py`'s own field of the same name already
+    # documents.
+    github_retry_max_attempts: int = 3
+    # Same ceiling/reasoning as `apps/worker/settings.py`'s own field of the
+    # same name (Assumption/"bounded cost, not just bounded per-job" design)
+    # — this entrypoint's own copy, since the synchronous `closed`-trigger
+    # poll runs here, not in the Worker.
+    memory_reaction_poll_max_comments_per_poll: int = 50
+
+    # --- Admin API (docs/plans/plan-deliver-memory.md's Phase 5 section,
+    # Unit E, US-M4/US-M5/US-M8/US-M10) ---
+    # Required, no default (Assumption 7) — mirrors `github_webhook_secret`'s
+    # own "no safe default, dangerous to silently default" pattern, not
+    # `setup_state_secret`'s conditionally-required one: the admin router
+    # registers unconditionally (see `apps/webhook_api/main.py`), enforcing
+    # auth per-request via a Bearer-token dependency, rather than being
+    # registration-gated the way `SETUP_MODE` gates the manifest flow —
+    # there is no "off by default" state for the admin API the way there is
+    # for the one-time setup flow.
+    admin_api_key: SecretStr
+
+    # This entrypoint's own `LocalONNXEmbeddingClient` instance (the admin
+    # API's approve route, US-M4, is its first consumer outside the
+    # Worker's own job pipeline) — same on-disk, Dockerfile-baked model
+    # path/default as `apps/worker/settings.py`'s `embedding_model_path`
+    # field, per that file's own docstring for why this is a filesystem
+    # path, never a network location or a per-entrypoint override.
+    embedding_model_path: str = "/app/models/all-MiniLM-L6-v2"
 
     @model_validator(mode="after")
     def _require_setup_state_secret_when_setup_mode_enabled(self) -> WebhookAPISettings:

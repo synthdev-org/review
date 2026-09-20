@@ -18,7 +18,7 @@ Exception: pass`... Never swallow or log-and-continue silently." The
 observability work's `suppress_telemetry_errors` context manager
 (`adapter/telemetry/sdk.py`, with bounded-context-local copies in
 `review/_telemetry.py` and `indexing/_telemetry.py`, per
-[ADR-0009](0009-otel-api-imported-directly-in-domain-packages.md)'s
+[ADR-0011](0011-otel-api-imported-directly-in-domain-packages.md)'s
 domain/adapter import boundary) catches `except Exception:`, logs a
 warning with `exc_info=True`, and does not re-raise — a "log-and-continue"
 shape. This is a deliberate deviation, not an oversight;
@@ -58,7 +58,7 @@ exception with no trace at all).
 ## Decision
 
 `suppress_telemetry_errors` (and its bounded-context-local copies,
-per ADR-0009's domain-import boundary) may catch `except Exception:`,
+per ADR-0011's domain-import boundary) may catch `except Exception:`,
 log at `warning` level with `exc_info=True`, and continue without
 re-raising, when and only when the wrapped block **records** a
 metric/span/trace for an operation that has already durably succeeded
@@ -75,7 +75,7 @@ that uses one of these three (`adapter/storage/queue.py`,
 `apps/worker/dispatch.py`, and the `review`/`indexing` pipeline
 instrumentation sites). Extended per future instrumentation site as new
 call sites land, not re-litigated per case, the same way ADR-0006 and
-ADR-0009 extend their own scope lists.
+ADR-0011 extend their own scope lists.
 
 **One named exception to "the wrapped block is the recording call
 only":** `adapter/telemetry/heartbeat.py::run_heartbeat_loop` wraps its
@@ -125,6 +125,6 @@ against this ADR's general convention.
 - [`docs/specs/spec-observability.md`](../specs/spec-observability.md) —
   the PRD whose Reliability NFR ("telemetry recording must never affect
   the real outcome it's reporting on") this ADR formalizes.
-- [`docs/adr/0009-otel-api-imported-directly-in-domain-packages.md`](0009-otel-api-imported-directly-in-domain-packages.md) —
+- [`docs/adr/0011-otel-api-imported-directly-in-domain-packages.md`](0011-otel-api-imported-directly-in-domain-packages.md) —
   the sibling ADR explaining why this same shape exists as three
   bounded-context-local copies rather than one shared function.

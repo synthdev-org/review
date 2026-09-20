@@ -13,7 +13,7 @@ pipeline-stage-unaware, per that same instruction.
 Imports only the OTel API (``opentelemetry.metrics``), the same
 ``meter = metrics.get_meter(...)`` style established across this codebase —
 no SDK/exporter construction here, that stays exclusively at the composition
-root, per ADR-0009.
+root, per ADR-0011.
 """
 
 from __future__ import annotations

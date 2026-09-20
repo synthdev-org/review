@@ -41,6 +41,7 @@ import logging
 import socket
 import threading
 from collections.abc import Iterator
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import cast
@@ -59,6 +60,7 @@ from adapter.github.diff import GitHubDiffFetcher
 from adapter.github.posting import GitHubFindingsPublisher
 from adapter.github.tree import GitHubTreeFetcher
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
+from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
 from adapter.telemetry.sdk import init_telemetry
 from apps.worker.main import main
@@ -71,6 +73,7 @@ from indexing.tree import RepoTreeEntry
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
+from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.config import StepEnablement, StepTimeouts
 from review.context_builder import CallerHit
 from review.pipeline import StepRegistry
@@ -100,6 +103,7 @@ async def _noop_dispatch_loop_forever(
     job_queue: JobQueueRepository,
     registry: StepRegistry,
     indexing_deps: IndexingJobDependencies,
+    memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
@@ -388,6 +392,7 @@ def _capture_redactor(
         llm_client: LLMClient,
         publisher: GitHubFindingsPublisher,
         settings: WorkerSettings,
+        memory_matcher: PostgresMemoryRepository,
     ) -> StepRegistry:
         captured.append(redactor)
         return original(
@@ -402,6 +407,7 @@ def _capture_redactor(
             llm_client,
             publisher,
             settings,
+            memory_matcher,
         )
 
     monkeypatch.setattr(worker_main, "_build_review_registry", _capturing)
@@ -544,6 +550,20 @@ class _UnusedEmbeddingClient:
         raise AssertionError("embed should never be called for an empty diff")
 
 
+class _UnusedMemoryMatcher:
+    """Never actually called in this test's fixture (an empty diff produces
+    zero findings, so ``verification``'s own memory-suppression pre-check
+    never runs — its own early-return for zero candidate findings, per
+    ``review/verification.py``'s ``VerificationStep.run``, skips it
+    entirely) — same shape as ``_UnusedGraphQuery``/``_UnusedSimilarityQuery``/
+    ``_UnusedEmbeddingClient`` above."""
+
+    async def best_effective_similarity(
+        self, *, repo_id: str, embedding: tuple[float, ...], half_life_days: float, now: datetime
+    ) -> float | None:
+        raise AssertionError("best_effective_similarity should never be called for an empty diff")
+
+
 class _NoOpGitleaksAnalyzer:
     async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[object]:
         return []
@@ -561,7 +581,14 @@ class _EmptyFindingsLLMClient:
 
 class _NoOpPublisher:
     async def post_review(
-        self, *, installation_id: int, repo_full_name: str, pr_number: int, findings: list[object]
+        self,
+        *,
+        installation_id: int,
+        repo_full_name: str,
+        repo_id: str,
+        pr_number: int,
+        head_sha: str,
+        findings: list[object],
     ) -> None:
         raise AssertionError("post_review should never be called for zero findings")
 
@@ -639,6 +666,7 @@ async def test_all_four_context_builder_enablement_combinations_complete_success
         _EmptyFindingsLLMClient(),
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
     )
 
     context_builder_step = registry._by_name["context_builder"]
@@ -711,6 +739,7 @@ async def test_context_builder_enabled_but_review_generation_disabled_skips_cont
         _EmptyFindingsLLMClient(),
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
     )
 
     statuses = await _run_review_registry(registry)
@@ -760,6 +789,7 @@ async def test_context_builder_disabled_produces_byte_for_byte_phase_1_review_ge
         _RecordingLLMClient(),
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
     )
 
     intent_summary_step = registry._by_name["intent_summary"]
@@ -922,6 +952,49 @@ def test_verification_default_enabled_logs_no_disabled_warning(
     assert not [p for p in payloads if "verification is disabled" in p["message"]]
 
 
+# --- Phase 6 (memory plan): memory_suppression_enabled=False -----------------
+#
+# Mirrors the `verification_enabled=False` test pair immediately above,
+# exactly — per US-M12's own "visible, not silent" deviation-from-default
+# requirement.
+
+
+def test_memory_suppression_disabled_logs_warning_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_MEMORY_SUPPRESSION_ENABLED", "false")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    matching = [
+        p
+        for p in payloads
+        if p["message"] == "memory suppression is disabled: no similarity-based pre-check will run "
+        "before the rubric call"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["level"] == "WARNING"
+
+
+def test_memory_suppression_default_enabled_logs_no_disabled_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    assert not [p for p in payloads if "memory suppression is disabled" in p["message"]]
+
+
 # --- Phase 5 (verification pipeline plan): resolved depends_on in startup log
 
 
@@ -996,6 +1069,7 @@ def test_main_starts_heartbeat_loop_when_otlp_endpoint_set(
         job_queue: JobQueueRepository,
         registry: StepRegistry,
         indexing_deps: IndexingJobDependencies,
+        memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
         settings: WorkerSettings,
         worker_id: str,
         http_client: httpx.AsyncClient,
@@ -1061,6 +1135,7 @@ async def test_amain_propagates_dispatch_loop_exception_unwrapped_and_cancels_he
         job_queue: JobQueueRepository,
         registry: StepRegistry,
         indexing_deps: IndexingJobDependencies,
+        memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
         settings: WorkerSettings,
         worker_id: str,
         http_client: httpx.AsyncClient,

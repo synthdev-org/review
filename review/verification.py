@@ -37,21 +37,57 @@ already redacted.
 
 Zero infra imports beyond ``llmgateway`` (per architecture.md's
 domain-package rule) — this module binds ``llmgateway.client.LLMClient``,
-not ``adapter.llm`` directly.
+not ``adapter.llm`` directly. The same holds for the Memory-suppression
+pre-check below (``docs/plans/plan-deliver-memory.md``'s Phase 6 section,
+Unit F): this module binds ``indexing.embedding.EmbeddingClient`` and
+``memory.store.DismissedFindingMatcher`` — both domain-defined Protocols —
+never ``adapter.embedding``/``adapter.storage`` directly.
+
+**Similarity-based suppression (US-M6/US-M7/US-M9/US-M12), a deterministic
+pre-check before the rubric LLM call.** When ``memory_suppression`` is
+configured and enabled, every candidate (``source == "llm"``) finding's
+fingerprint (``memory.fingerprint.build_finding_fingerprint`` — the same
+``file``/``rule_id``/``message`` composition the admin API's own approve
+route embeds a ``dismissed_finding`` entry from, per that module's own
+docstring on why this has to be the *same* function) is embedded and
+compared, via ``memory.store.DismissedFindingMatcher.best_effective_similarity``,
+against approved, repo-scoped ``dismissed_finding`` Memory entries, weighted
+by each entry's own ranking-time decay (``memory.decay.effective_similarity``,
+applied inside the matcher implementation, not here). A finding whose best
+match exceeds ``memory_suppression.similarity_threshold`` is excluded from
+this step's output *before* the rubric batch is even built — no LLM Gateway
+call is ever spent on it (US-M6). A finding with no match, or whose best
+match falls below threshold, proceeds through the rubric exactly as it did
+before this phase (US-M7). ``memory_suppression=None`` (the default) or
+``memory_suppression.enabled=False`` skips this pre-check entirely — no
+embedding call, no matcher call, byte-for-byte the prior behavior, the
+operational rollback lever US-M12 requires. A failure inside the pre-check
+(the embedding call or the matcher's own Postgres query) is never caught
+here — it propagates as this step's own fatal failure, the same
+``FailurePolicy.FATAL`` posture every other failure in this step already
+gets, per ``spec-memory.md``'s own "never a silent skip-and-continue that
+would let an unsuppressed finding through on a broken check" Error-state
+design.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from opentelemetry import metrics
 from pydantic import BaseModel, ConfigDict, Field
 
 from findings.models import Finding
+from indexing.embedding import EmbeddingClient
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
+from memory.fingerprint import build_finding_fingerprint
+from memory.store import DismissedFindingMatcher
 from review._telemetry import suppress_telemetry_errors
 from review.context_bundle import ContextBundle, render_context_bundle_section
 from review.diff_prompt import render_and_truncate_diff
@@ -296,6 +332,28 @@ def _passes_rubric(verdict: _VerificationVerdictItem) -> bool:
     return all(getattr(verdict, criterion) for criterion in _RUBRIC_CRITERIA)
 
 
+@dataclass(frozen=True)
+class MemorySuppressionConfig:
+    """The four mutually-dependent fields US-M6/US-M7/US-M9/US-M12's
+    similarity-suppression pre-check needs, grouped into one parameter
+    rather than four independent ones on ``VerificationStep.__init__`` —
+    per ``docs/plans/plan-deliver-memory.md``'s Phase 6 section: ``threshold``/
+    ``decay_half_life_days`` are meaningless without ``memory_matcher``/
+    ``embedding_client`` present together, so bundling them removes the
+    invalid states four independent optional constructor parameters would
+    otherwise allow (e.g. a threshold set with no matcher). There is no
+    construction-time state where one field is present while another is
+    missing — the invalid combination a plan-review pass flagged is
+    structurally unrepresentable here, not merely validated after the fact.
+    """
+
+    memory_matcher: DismissedFindingMatcher
+    embedding_client: EmbeddingClient
+    similarity_threshold: float
+    decay_half_life_days: float
+    enabled: bool
+
+
 class VerificationStep:
     """``review.step.Step`` implementation for US-V3 through US-V6 — see
     this module's own docstring for the full design."""
@@ -310,6 +368,7 @@ class VerificationStep:
         timeout: float,
         max_diff_bytes: int,
         depends_on: str = "review_generation",
+        memory_suppression: MemorySuppressionConfig | None = None,
     ) -> None:
         """``depends_on`` names this step's single upstream dependency —
         ``"review_generation"`` by default, its normal immediate
@@ -324,12 +383,64 @@ class VerificationStep:
         composition root (``apps/worker/main.py``, Phase 5) determines the
         actual value once it knows which upstream steps are enabled for a
         given deployment.
+
+        ``memory_suppression`` (``docs/plans/plan-deliver-memory.md``'s
+        Phase 6 section) is ``None`` by default — suppression off entirely,
+        byte-for-byte this step's behavior before that phase. Every
+        existing unit/integration test constructing a bare
+        ``VerificationStep`` keeps working unchanged, matching every other
+        "absent upstream data degrades gracefully" precedent this codebase
+        already establishes for ``context_bundle``/``intent_summary``.
         """
         self._llm_client = llm_client
         self._model = model
         self._timeout = timeout
         self._max_diff_bytes = max_diff_bytes
+        self._memory_suppression = memory_suppression
         self.depends_on: tuple[str, ...] = (depends_on,)
+
+    @staticmethod
+    async def _suppress_via_memory(
+        llm_findings: list[Finding], *, config: MemorySuppressionConfig, repo_id: str
+    ) -> tuple[list[Finding], int]:
+        """US-M6/US-M7/US-M9's own pre-check — see the module docstring's
+        "Similarity-based suppression" section for the full design. Returns
+        ``(kept_findings, suppressed_count)``. Takes ``config`` explicitly
+        (rather than reading ``self._memory_suppression`` and narrowing away
+        the ``None`` case internally) — the caller (``run()``) only calls
+        this once it has already checked ``self._memory_suppression is not
+        None and .enabled`` (US-M12's own kill switch), so there is nothing
+        left for this method itself to guard against.
+        """
+        fingerprints = [
+            build_finding_fingerprint(
+                file=finding.file, rule_id=finding.rule_id, message=finding.message
+            )
+            for finding in llm_findings
+        ]
+        # `embed` is a plain, synchronous, CPU-bound call (per
+        # `indexing.embedding.EmbeddingClient`'s own docstring) —
+        # `asyncio.to_thread`-wrapped so it never blocks this step's event
+        # loop, the same pattern `review.context_builder.ContextBuilderStep`
+        # already establishes for its own `embed` call.
+        vectors = await asyncio.to_thread(config.embedding_client.embed, fingerprints)
+
+        now = datetime.now(UTC)
+        kept: list[Finding] = []
+        suppressed_count = 0
+        for finding, vector in zip(llm_findings, vectors, strict=True):
+            similarity = await config.memory_matcher.best_effective_similarity(
+                repo_id=repo_id,
+                embedding=vector.values,
+                half_life_days=config.decay_half_life_days,
+                now=now,
+            )
+            if similarity is not None and similarity > config.similarity_threshold:
+                suppressed_count += 1
+                continue
+            kept.append(finding)
+
+        return kept, suppressed_count
 
     async def run(self, input: Any, context: StepContext) -> VerificationOutput:
         # Any (not _VerificationInput) because the registry passes the raw
@@ -343,7 +454,36 @@ class VerificationStep:
         if not llm_findings:
             # US-V3's second scenario: nothing to judge, so no LLM Gateway
             # call is made at all — static/other findings still pass
-            # through unchanged (US-V6).
+            # through unchanged (US-V6). Memory suppression has nothing to
+            # compare against either, so it's never attempted here.
+            return VerificationOutput(
+                findings=other_findings,
+                **_pass_through_job_fields(parsed),
+            )
+
+        memory_suppressed_count = 0
+        if self._memory_suppression is not None and self._memory_suppression.enabled:
+            llm_findings, memory_suppressed_count = await self._suppress_via_memory(
+                llm_findings, config=self._memory_suppression, repo_id=parsed.repo_id
+            )
+
+        if not llm_findings:
+            # Every candidate finding was memory-suppressed before the
+            # rubric call — still logged (memory_suppressed_count, not
+            # silently dropped), even though no LLM Gateway call happens;
+            # static/other findings still pass through unchanged (US-V6).
+            logger.info(
+                "verification: batch judgment completed",
+                extra={
+                    "job_id": context.job_id,
+                    "repo_id": parsed.repo_id,
+                    "judged_count": 0,
+                    "rejected_count": 0,
+                    "unmatched_count": 0,
+                    "memory_suppressed_count": memory_suppressed_count,
+                    **{f"{criterion}_failures": 0 for criterion in _RUBRIC_CRITERIA},
+                },
+            )
             return VerificationOutput(
                 findings=other_findings,
                 **_pass_through_job_fields(parsed),
@@ -413,9 +553,11 @@ class VerificationStep:
             "verification: batch judgment completed",
             extra={
                 "job_id": context.job_id,
+                "repo_id": parsed.repo_id,
                 "judged_count": len(llm_findings),
                 "rejected_count": rejected_count,
                 "unmatched_count": unmatched_count,
+                "memory_suppressed_count": memory_suppressed_count,
                 **{
                     f"{criterion}_failures": count
                     for criterion, count in criterion_failures.items()

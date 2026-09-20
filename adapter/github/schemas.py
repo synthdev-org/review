@@ -152,6 +152,79 @@ class GitHubWebhookEnvelope(BaseModel):
     deleted: bool | None = None
 
 
+class PullRequestReviewComment(BaseModel):
+    """The ``comment`` object on a ``pull_request_review_comment`` webhook
+    event payload — per ``docs/plans/plan-deliver-memory.md``'s Phase 3
+    section (Unit C). Only the three fields Phase 3's capture handler
+    actually reads are modeled, per this module's own "model only what's
+    consumed" discipline: ``id`` (correlated back to a captured reply's own
+    ``memory_entry.github_comment_id``), ``in_reply_to_id`` (correlated
+    against a ``posted_finding_comment`` row — the platform's own comment
+    this is a reply to; ``None`` for a fresh top-level review comment, per
+    the plan's Assumption 3), and ``body`` (redacted before persistence).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    in_reply_to_id: int | None = None
+    body: str
+
+
+class PullRequestReviewCommentWebhookEnvelope(BaseModel):
+    """A ``pull_request_review_comment`` webhook event payload, per the
+    plan's Phase 3 section. ``repository``/``pull_request`` are modeled for
+    payload-shape completeness (every real delivery of this event type
+    carries both) even though this phase's own capture handler sources its
+    ``repo_id``/``pr_number`` from the shared
+    ``GitHubWebhookEnvelope``/``WebhookEvent`` parse that already ran at
+    this route's boundary before this narrower envelope is parsed a second
+    time — see ``apps/webhook_api/webhook_routes.py``'s ``_handle_memory_capture``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    action: str
+    comment: PullRequestReviewComment
+    repository: Repository
+    pull_request: PullRequest
+
+
+class ReviewThreadComment(BaseModel):
+    """One entry of a ``pull_request_review_thread`` event payload's
+    ``thread.comments`` array — only ``id`` is needed (Phase 3's own
+    correlation lookup against ``posted_finding_comment``)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+
+
+class PullRequestReviewThread(BaseModel):
+    """The ``thread`` object on a ``pull_request_review_thread`` webhook
+    event payload."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    comments: list[ReviewThreadComment] = []
+
+
+class PullRequestReviewThreadWebhookEnvelope(BaseModel):
+    """A ``pull_request_review_thread`` webhook event payload (action
+    ``resolved``/``unresolved``), per the plan's Phase 3 section. See
+    ``PullRequestReviewCommentWebhookEnvelope``'s own docstring for why
+    ``repository``/``pull_request`` are modeled but not separately consumed
+    here.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    action: str
+    thread: PullRequestReviewThread
+    repository: Repository
+    pull_request: PullRequest
+
+
 class GitHubAppCredentials(BaseModel):
     """Credentials GitHub returns after exchanging a manifest-flow
     temporary code, per the plan's Phase 4 manifest/callback section.

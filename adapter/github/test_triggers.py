@@ -8,7 +8,12 @@ from __future__ import annotations
 import pytest
 
 import adapter.github.triggers as triggers_module
-from adapter.github.triggers import is_enqueue_trigger, is_index_trigger
+from adapter.github.triggers import (
+    is_enqueue_trigger,
+    is_index_trigger,
+    is_memory_capture_trigger,
+    is_memory_reaction_poll_trigger,
+)
 
 _TRIGGERING_PAIRS = [
     ("pull_request", "opened"),
@@ -109,3 +114,98 @@ def test_a_hypothetical_new_pull_request_index_action_can_be_added_without_touch
     monkeypatch.setattr(triggers_module, "_ENQUEUE_INDEX_PULL_REQUEST_TRIGGERS", extended)
 
     assert is_index_trigger("pull_request", "reopened", None, None) is True
+
+
+# --- is_memory_capture_trigger (plan-deliver-memory.md's Phase 3) ---
+
+_MEMORY_CAPTURE_TRIGGERING_PAIRS = [
+    ("pull_request_review_comment", "created"),
+    ("pull_request_review_thread", "resolved"),
+    ("pull_request_review_thread", "unresolved"),
+]
+
+_MEMORY_CAPTURE_NON_TRIGGERING_PAIRS = [
+    ("pull_request_review_comment", "edited"),
+    ("pull_request_review_comment", "deleted"),
+    ("pull_request_review_thread", "created"),
+    # Assumption 3: `issue_comment` never correlates to a specific posted
+    # finding comment, so it's never a capture trigger even for `created`.
+    ("issue_comment", "created"),
+    ("pull_request", "closed"),
+    ("push", "opened"),
+]
+
+
+@pytest.mark.parametrize(("event_type", "action"), _MEMORY_CAPTURE_TRIGGERING_PAIRS)
+def test_mapped_pairs_trigger_memory_capture(event_type: str, action: str) -> None:
+    assert is_memory_capture_trigger(event_type, action) is True
+
+
+@pytest.mark.parametrize(("event_type", "action"), _MEMORY_CAPTURE_NON_TRIGGERING_PAIRS)
+def test_unmapped_pairs_do_not_trigger_memory_capture(event_type: str, action: str) -> None:
+    assert is_memory_capture_trigger(event_type, action) is False
+
+
+def test_none_action_never_triggers_memory_capture() -> None:
+    assert is_memory_capture_trigger("pull_request_review_comment", None) is False
+    assert is_memory_capture_trigger("pull_request_review_thread", None) is False
+
+
+def test_a_hypothetical_new_memory_capture_trigger_can_be_added_without_touching_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extended = triggers_module._MEMORY_CAPTURE_TRIGGERS | {("issue_comment", "created")}
+    monkeypatch.setattr(triggers_module, "_MEMORY_CAPTURE_TRIGGERS", extended)
+
+    assert is_memory_capture_trigger("issue_comment", "created") is True
+
+
+# --- is_memory_reaction_poll_trigger (plan-deliver-memory.md's Phase 4) ---
+
+_MEMORY_REACTION_POLL_TRIGGERING_PAIRS = [
+    ("pull_request", "opened"),
+    ("pull_request", "synchronize"),
+    ("pull_request", "reopened"),
+    ("pull_request", "closed"),
+]
+
+_MEMORY_REACTION_POLL_NON_TRIGGERING_PAIRS = [
+    ("pull_request", "labeled"),
+    ("pull_request", "edited"),
+    ("push", "opened"),
+    ("issue_comment", "created"),
+    ("pull_request_review_comment", "created"),
+]
+
+
+@pytest.mark.parametrize(("event_type", "action"), _MEMORY_REACTION_POLL_TRIGGERING_PAIRS)
+def test_mapped_pairs_trigger_memory_reaction_poll(event_type: str, action: str) -> None:
+    assert is_memory_reaction_poll_trigger(event_type, action) is True
+
+
+@pytest.mark.parametrize(("event_type", "action"), _MEMORY_REACTION_POLL_NON_TRIGGERING_PAIRS)
+def test_unmapped_pairs_do_not_trigger_memory_reaction_poll(event_type: str, action: str) -> None:
+    assert is_memory_reaction_poll_trigger(event_type, action) is False
+
+
+def test_closed_never_triggers_review_or_index() -> None:
+    """`closed` is unique to the reaction-poll trigger set — it must never
+    also match `is_enqueue_trigger`/`is_index_trigger`, or a PR-closed event
+    would start enqueuing REVIEW/INDEX jobs for a PR nothing is reviewing
+    anymore."""
+    assert is_enqueue_trigger("pull_request", "closed") is False
+    assert is_index_trigger("pull_request", "closed", None, None) is False
+    assert is_memory_reaction_poll_trigger("pull_request", "closed") is True
+
+
+def test_none_action_never_triggers_memory_reaction_poll() -> None:
+    assert is_memory_reaction_poll_trigger("pull_request", None) is False
+
+
+def test_a_hypothetical_new_memory_reaction_poll_trigger_can_be_added_without_touching_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extended = triggers_module._MEMORY_REACTION_POLL_TRIGGERS | {("pull_request", "edited")}
+    monkeypatch.setattr(triggers_module, "_MEMORY_REACTION_POLL_TRIGGERS", extended)
+
+    assert is_memory_reaction_poll_trigger("pull_request", "edited") is True

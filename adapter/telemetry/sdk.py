@@ -190,7 +190,7 @@ def suppress_telemetry_errors(
 
     This deliberately deviates from ``architecture.md``'s "never swallow
     or log-and-continue silently" rule — see
-    ``docs/adr/0010-telemetry-recording-failures-log-and-continue.md`` for
+    ``docs/adr/0012-telemetry-recording-failures-log-and-continue.md`` for
     the formal reasoning and exact scope of the exemption.
 
     Args:
@@ -316,7 +316,7 @@ class OtelSettingsMixin(BaseSettings):
 # `set_tracer_provider`/`set_meter_provider`. This module-level mutable
 # flag is a deliberate, narrow exemption from architecture.md's "no
 # module-level singletons or global mutable state" rule — see
-# docs/adr/0009-otel-api-imported-directly-in-domain-packages.md.
+# docs/adr/0011-otel-api-imported-directly-in-domain-packages.md.
 _TELEMETRY_INITIALIZED_THIS_PROCESS = False
 
 

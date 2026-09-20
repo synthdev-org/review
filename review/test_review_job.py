@@ -81,6 +81,8 @@ from ingestion.diff import Diff, DiffFetcher, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMUnreachableError
 from llmgateway.models import CompletionRequest, CompletionResponse
+from memory.models import ReactionRecord
+from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review import pipeline as pipeline_module
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
@@ -200,14 +202,59 @@ class _SingleFindingLLMClient:
         return CompletionResponse(content=content, model="fake-model")
 
 
-def _mock_github(*, reviews_url: str, check_runs_url: str) -> None:
+def _mock_github(*, reviews_url: str, check_runs_url: str) -> tuple[respx.Route, respx.Route]:
+    """Returns the ``(reviews_route, check_run_route)`` pair every caller
+    below needs a handle to (for its own ``call_count``/``calls.last``
+    assertions) — **the caller must use these returned routes, never
+    re-declare its own via a second ``respx.post(reviews_url)``/
+    ``respx.post(check_runs_url)`` call**: respx resets a route's mocked
+    response the moment ``respx.post(...)`` is called again for the same
+    pattern without a fresh ``.mock(...)``, silently downgrading it to a
+    default empty-200 response. That regressed from harmless to a real
+    `JSONDecodeError` the moment Phase 2 (US-M11) started actually reading
+    the create-review response body (``response.json()["id"]``, for the
+    follow-up provenance-capture GET) — a real bug in this file's own
+    pre-existing pattern that a plain ``call_count``-only assertion had
+    never been able to surface.
+    """
     respx.post(f"{_GITHUB_BASE}/app/installations/{_INSTALLATION_ID}/access_tokens").mock(
         return_value=httpx.Response(
             201, json={"token": "ghs_test_token", "expires_at": "2999-01-01T00:00:00Z"}
         )
     )
-    respx.post(reviews_url).mock(return_value=httpx.Response(200, json={"id": 1}))
-    respx.post(check_runs_url).mock(return_value=httpx.Response(201, json={"id": 1}))
+    reviews_route = respx.post(reviews_url).mock(return_value=httpx.Response(200, json={"id": 1}))
+    check_run_route = respx.post(check_runs_url).mock(
+        return_value=httpx.Response(201, json={"id": 1})
+    )
+    # Phase 2 (US-M11)'s follow-up provenance-capture GET, issued whenever a
+    # posted review has at least one line-attributed finding (US9's and
+    # "review_generation disabled"'s own real Gitleaks findings below) — see
+    # `review/test_findings_output_step.py`'s identical mock's own docstring
+    # for why an empty response is sufficient here: this file's own scope is
+    # the macro-registry's isolation/fatality boundaries, not Phase 2's
+    # correlation logic (`adapter/github/test_posting.py`'s job).
+    respx.get(f"{reviews_url}/1/comments").mock(return_value=httpx.Response(200, json=[]))
+    return reviews_route, check_run_route
+
+
+class _FakeProvenanceRecorder:
+    """A no-op `memory.store.MemorySignalRecorder` fake — see
+    `review/test_findings_output_step.py`'s identical fake's own docstring."""
+
+    async def record_comment_provenance(
+        self, *, repo_id: str, pr_number: int, commit_sha: str, comments: object
+    ) -> None:
+        return None
+
+    async def record_signal(
+        self,
+        *,
+        posted_finding_comment_id: int,
+        raw_signal_type: str,
+        raw_signal_detail: dict[str, object],
+        github_comment_id: int | None,
+    ) -> bool:
+        raise AssertionError("record_signal is not exercised by this test file")
 
 
 def _registry(
@@ -335,6 +382,45 @@ def _null_indexing_deps() -> IndexingJobDependencies:
     )
 
 
+class _NullMemoryReactionPollDeps:
+    """A trivial `ReactionFetcher`/`MemorySignalRecorder`/`ReactionDedupStore`
+    stand-in — this file's own tests dispatch only `REVIEW` jobs, never
+    `MEMORY_REACTION_POLL` (docs/plans/plan-deliver-memory.md's Phase 4
+    section), so `run_dispatch_loop`'s now-required
+    `memory_reaction_poll_deps` argument never needs to do real work here
+    (see `apps/worker/test_dispatch.py`'s identical fake for the dedicated
+    `MEMORY_REACTION_POLL`-job dispatch tests)."""
+
+    async def fetch_reactions(self, **kwargs: object) -> dict[int, tuple[ReactionRecord, ...]]:
+        raise AssertionError("_NullMemoryReactionPollDeps.fetch_reactions should never be called")
+
+    async def record_comment_provenance(self, **kwargs: object) -> None:
+        raise AssertionError(
+            "_NullMemoryReactionPollDeps.record_comment_provenance should never be called"
+        )
+
+    async def record_signal(self, **kwargs: object) -> bool:
+        raise AssertionError("_NullMemoryReactionPollDeps.record_signal should never be called")
+
+    async def recent_comment_ids(self, **kwargs: object) -> tuple[int, ...]:
+        raise AssertionError(
+            "_NullMemoryReactionPollDeps.recent_comment_ids should never be called"
+        )
+
+    async def filter_new(self, **kwargs: object) -> tuple[int, ...]:
+        raise AssertionError("_NullMemoryReactionPollDeps.filter_new should never be called")
+
+
+def _null_memory_reaction_poll_deps() -> MemoryReactionPollJobDependencies:
+    null_deps = _NullMemoryReactionPollDeps()
+    return MemoryReactionPollJobDependencies(
+        reaction_fetcher=null_deps,
+        signal_recorder=null_deps,
+        dedup_store=null_deps,
+        max_comments_per_poll=50,
+    )
+
+
 @contextlib.asynccontextmanager
 async def _running_dispatch_loop(
     *, job_queue: JobQueueRepository, review_registry: StepRegistry
@@ -344,6 +430,7 @@ async def _running_dispatch_loop(
             job_queue=job_queue,
             review_registry=review_registry,
             indexing_deps=_null_indexing_deps(),
+            memory_reaction_poll_deps=_null_memory_reaction_poll_deps(),
             worker_id="test-worker",
             poll_interval_seconds=_POLL_INTERVAL_SECONDS,
             stuck_job_warning_threshold_seconds=30.0,
@@ -395,8 +482,9 @@ async def test_us8_llm_gateway_failure_marks_job_failed_and_posts_failure_check_
     (`review/test_step_registry.py`'s own equivalent unit case)."""
     reviews_url = f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews"
     check_runs_url = f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/check-runs"
-    _mock_github(reviews_url=reviews_url, check_runs_url=check_runs_url)
-    check_run_route = respx.post(check_runs_url)
+    _reviews_route, check_run_route = _mock_github(
+        reviews_url=reviews_url, check_runs_url=check_runs_url
+    )
 
     content = {"planted_secret.py": (_TESTDATA_DIR / "planted_secret.py").read_bytes()}
     token_provider = GitHubInstallationTokenProvider(
@@ -406,7 +494,9 @@ async def test_us8_llm_gateway_failure_marks_job_failed_and_posts_failure_check_
         diff_fetcher=_FakeDiffFetcher(content),
         semgrep=GitleaksAnalyzer(),  # unused: review_generation fails before it matters which
         llm_client=_FailingLLMClient(),
-        publisher=GitHubFindingsPublisher(token_provider=token_provider),
+        publisher=GitHubFindingsPublisher(
+            token_provider=token_provider, provenance_recorder=_FakeProvenanceRecorder()
+        ),
     )
 
     session_factory = create_session_factory(migrated_engine)
@@ -444,9 +534,9 @@ async def test_us9_one_analyzer_failure_stays_isolated_review_still_completes(
     be confused with it."""
     reviews_url = f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews"
     check_runs_url = f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/check-runs"
-    _mock_github(reviews_url=reviews_url, check_runs_url=check_runs_url)
-    reviews_route = respx.post(reviews_url)
-    check_run_route = respx.post(check_runs_url)
+    reviews_route, check_run_route = _mock_github(
+        reviews_url=reviews_url, check_runs_url=check_runs_url
+    )
 
     content = {"planted_secret.py": (_TESTDATA_DIR / "planted_secret.py").read_bytes()}
     token_provider = GitHubInstallationTokenProvider(
@@ -456,7 +546,9 @@ async def test_us9_one_analyzer_failure_stays_isolated_review_still_completes(
         diff_fetcher=_FakeDiffFetcher(content),
         semgrep=_RaisingStaticAnalyzer(),
         llm_client=_EmptyFindingsLLMClient(),
-        publisher=GitHubFindingsPublisher(token_provider=token_provider),
+        publisher=GitHubFindingsPublisher(
+            token_provider=token_provider, provenance_recorder=_FakeProvenanceRecorder()
+        ),
     )
 
     session_factory = create_session_factory(migrated_engine)
@@ -500,9 +592,9 @@ async def test_review_generation_disabled_falls_back_to_static_analysis_only_out
     normally."""
     reviews_url = f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews"
     check_runs_url = f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/check-runs"
-    _mock_github(reviews_url=reviews_url, check_runs_url=check_runs_url)
-    reviews_route = respx.post(reviews_url)
-    check_run_route = respx.post(check_runs_url)
+    reviews_route, check_run_route = _mock_github(
+        reviews_url=reviews_url, check_runs_url=check_runs_url
+    )
 
     content = {"planted_secret.py": (_TESTDATA_DIR / "planted_secret.py").read_bytes()}
     token_provider = GitHubInstallationTokenProvider(
@@ -512,7 +604,9 @@ async def test_review_generation_disabled_falls_back_to_static_analysis_only_out
         diff_fetcher=_FakeDiffFetcher(content),
         semgrep=GitleaksAnalyzer(),
         llm_client=_FailingLLMClient(),
-        publisher=GitHubFindingsPublisher(token_provider=token_provider),
+        publisher=GitHubFindingsPublisher(
+            token_provider=token_provider, provenance_recorder=_FakeProvenanceRecorder()
+        ),
         review_generation_enabled=False,
     )
 
@@ -562,9 +656,9 @@ async def test_us_v7_verification_gateway_failure_marks_job_failed_and_posts_fai
     not only a fake one."""
     reviews_url = f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews"
     check_runs_url = f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/check-runs"
-    _mock_github(reviews_url=reviews_url, check_runs_url=check_runs_url)
-    reviews_route = respx.post(reviews_url)
-    check_run_route = respx.post(check_runs_url)
+    reviews_route, check_run_route = _mock_github(
+        reviews_url=reviews_url, check_runs_url=check_runs_url
+    )
 
     content = {"planted_secret.py": (_TESTDATA_DIR / "planted_secret.py").read_bytes()}
     token_provider = GitHubInstallationTokenProvider(
@@ -583,7 +677,9 @@ async def test_us_v7_verification_gateway_failure_marks_job_failed_and_posts_fai
         # LLMClient.complete() call entirely (US-V3's second scenario) and
         # never reach the failure this test needs to prove.
         llm_client=_SingleFindingLLMClient(),
-        publisher=GitHubFindingsPublisher(token_provider=token_provider),
+        publisher=GitHubFindingsPublisher(
+            token_provider=token_provider, provenance_recorder=_FakeProvenanceRecorder()
+        ),
         verification_llm_client=_FailingLLMClient(),
     )
 

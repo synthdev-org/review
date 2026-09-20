@@ -108,7 +108,7 @@ infrastructure, not a metered feature.
   and Phase 5's Admin UI (not built) — a materially larger, separate piece
   of work if it's ever wanted.
 - **SSO/RBAC-scoped dashboard access** —
-  [`ADR-0008`](../adr/0008-open-core-licensing-sso-and-cross-org-rbac-as-tier-1.md)'s
+  [`ADR-0010`](../adr/0010-open-core-licensing-sso-and-cross-org-rbac-as-tier-1.md)'s
   Tier 1 territory, and not a dependency of this PRD: the shipped dashboard
   lives in the customer's *own* Grafana, which has its own access control
   entirely outside this platform's boundary.
@@ -536,13 +536,13 @@ directly (see "Resolved decisions").
   building a Postgres-backed Admin UI stats screen (would need new
   `review_run`/`finding`/token-usage persistence, none of which exists,
   plus Phase 5's not-yet-built Admin UI and
-  [ADR-0008](../adr/0008-open-core-licensing-sso-and-cross-org-rbac-as-tier-1.md)'s
+  [ADR-0010](../adr/0010-open-core-licensing-sso-and-cross-org-rbac-as-tier-1.md)'s
   local-login prerequisite) and against doing both (materially larger
   scope for marginal v1 benefit). Decided: OTEL-only for v1, matching
   ADR-0001's "customer forwards metrics if they want them" self-hosted
   framing and the "two deployable components, not five" architecture
   rule — zero new deployable component, zero new Postgres schema, zero
-  dependency on Phase 5 or ADR-0008.
+  dependency on Phase 5 or ADR-0010.
 - **OTEL signal scope: metrics + distributed traces, not logs.** The
   existing structured JSON logger stays as-is; OTEL logs would mean
   reworking or dual-running it for no stated need.
@@ -600,7 +600,7 @@ directly (see "Resolved decisions").
 - [`docs/adr/0003-knowhow-product-knowledge-augmentation.md`](../adr/0003-knowhow-product-knowledge-augmentation.md)
   — the "optional, never a dependency" pattern US10's no-op default and
   this PRD's Reliability NFR both reuse.
-- [`docs/adr/0008-open-core-licensing-sso-and-cross-org-rbac-as-tier-1.md`](../adr/0008-open-core-licensing-sso-and-cross-org-rbac-as-tier-1.md)
+- [`docs/adr/0010-open-core-licensing-sso-and-cross-org-rbac-as-tier-1.md`](../adr/0010-open-core-licensing-sso-and-cross-org-rbac-as-tier-1.md)
   (PROPOSED) — confirms admin stats/dashboards are Tier 2 (open, this
   PRD), while SSO/RBAC stay a separate, out-of-scope Tier 1 concern; also
   the source of the local-login prerequisite that made the Admin-UI-screen

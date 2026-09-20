@@ -28,6 +28,10 @@ _EXPECTED_TABLES = {
     "index_chunk",
     "index_graph_node",
     "index_graph_edge",
+    # Phase 1 (Memory delivery plan, Unit A):
+    "posted_finding_comment",
+    "memory_entry",
+    "captured_reaction",
     "alembic_version",
 }
 
@@ -110,6 +114,35 @@ _EXPECTED_COLUMNS = {
         "target_symbol_name",
         "created_at",
     },
+    "posted_finding_comment": {
+        "id",
+        "repo_id",
+        "pr_number",
+        "commit_sha",
+        "finding_file",
+        "finding_line",
+        "finding_rule_id",
+        "finding_message",
+        "created_at",
+    },
+    "memory_entry": {
+        "id",
+        "org_id",
+        "repo_id",
+        "team_id",
+        "entry_type",
+        "status",
+        "raw_signal_type",
+        "raw_signal_detail",
+        "posted_finding_comment_id",
+        "github_comment_id",
+        "embedding",
+        "approved_at",
+        "approved_by",
+        "created_at",
+        "updated_at",
+    },
+    "captured_reaction": {"posted_finding_comment_id", "reaction_id"},
 }
 
 

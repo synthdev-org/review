@@ -6,9 +6,13 @@
 # false — everything else here is a sensible production default, not a
 # hard requirement of this profile's existence.
 #
-# The operator still MUST supply real values for every credential field
-# below (github.webhookSecret, llm.apiKey, database.url, and
-# github.setupStateSecret if setupMode is ever enabled) — either as
+# The operator still MUST supply real values for every credential/required
+# field below (github.webhookSecret, github.appPrivateKey, llm.apiKey,
+# database.url, adminApi.apiKey, github.setupStateSecret if setupMode is
+# ever enabled, and BOTH webhookApi.github.appId and worker.github.appId —
+# each defaults to "" in values.yaml but is parsed as a required int with
+# no default by WebhookAPISettings/WorkerSettings respectively, so leaving
+# either unset crash-loops that Deployment at startup) — either as
 # literals in a private values override file that is never committed, or
 # (preferred for production) via existingSecret references into whatever
 # secret backend already populates this cluster's Secrets. This file

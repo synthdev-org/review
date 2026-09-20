@@ -25,6 +25,18 @@ def test_missing_required_github_webhook_secret_raises(monkeypatch: pytest.Monke
         WebhookAPISettings(_env_file=None)
 
 
+def test_missing_required_admin_api_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """docs/plans/plan-deliver-memory.md's Phase 5 section (Assumption 7) —
+    `admin_api_key` is required with no default, the same "no safe default,
+    dangerous to silently default" posture as `github_webhook_secret`."""
+    monkeypatch.setenv("REVIEW_WEBHOOK_API_ENVIRONMENT", "production")
+    monkeypatch.setenv("REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET", "a-real-webhook-secret")
+    monkeypatch.delenv("REVIEW_WEBHOOK_API_ADMIN_API_KEY", raising=False)
+
+    with pytest.raises(ValidationError):
+        WebhookAPISettings(_env_file=None)
+
+
 def test_minimal_valid_env_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REVIEW_WEBHOOK_API_ENVIRONMENT", "production")
     monkeypatch.setenv("REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET", "a-real-webhook-secret")

@@ -83,7 +83,7 @@ logger = logging.getLogger(__name__)
 # module-level handles (plus the domain-package import above) are a
 # deliberate, scoped exemption from architecture.md's zero-infra-import and
 # no-module-level-singleton rules — see
-# docs/adr/0009-otel-api-imported-directly-in-domain-packages.md.
+# docs/adr/0011-otel-api-imported-directly-in-domain-packages.md.
 tracer = trace.get_tracer(__name__)
 meter = metrics.get_meter(__name__)
 

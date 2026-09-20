@@ -910,9 +910,9 @@ def test_heartbeat_panel_becomes_unresolvable_after_collector_dies(
             heartbeat_before = _query_value(heartbeat_response)
             break
         time.sleep(3)
-    assert (
-        heartbeat_before is not None
-    ), "heartbeat/queue-depth panels never resolved data before the collector-kill phase"
+    assert heartbeat_before is not None, (
+        "heartbeat/queue-depth panels never resolved data before the collector-kill phase"
+    )
     # Healthy precondition: the heartbeat is currently fresh (well under
     # its own 60s staleness threshold), so this test's own "goes stale"
     # assertion below is a real transition, not a pre-existing false

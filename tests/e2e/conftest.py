@@ -131,6 +131,14 @@ def base_compose_env(**overrides: str) -> dict[str, str]:
             # docstring on _generate_test_rsa_private_key_pem.
             "REVIEW_WORKER_GITHUB_APP_ID": "123456",
             "REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY": _TEST_RSA_PRIVATE_KEY_PEM,
+            # Required, no default (docs/plans/plan-deliver-memory.md's
+            # Phase 4, Unit D) — webhook_api's own copy of the same App
+            # identity, needed for its synchronous reaction-fetch path (a
+            # `pull_request closed` event). Reuses the same generated key as
+            # the Worker's above: both processes authenticate as the same
+            # GitHub App in a real deployment.
+            "REVIEW_WEBHOOK_API_GITHUB_APP_ID": "123456",
+            "REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY": _TEST_RSA_PRIVATE_KEY_PEM,
         }
     )
     env.update(overrides)

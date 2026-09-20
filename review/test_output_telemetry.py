@@ -49,7 +49,9 @@ class _FakeFindingsPublisher:
         *,
         installation_id: int,
         repo_full_name: str,
+        repo_id: str,
         pr_number: int,
+        head_sha: str,
         findings: list[Finding],
     ) -> None:
         self.posted_reviews.append(findings)

@@ -14,7 +14,7 @@ both) — see each domain module's own docstring for the full reasoning.
 ``review.pipeline._start_span``/``indexing.pipeline._start_span`` are
 duplicated for the identical reason, one layer up (each closes over its
 own module-level ``tracer`` handle per
-docs/adr/0009-otel-api-imported-directly-in-domain-packages.md).
+docs/adr/0011-otel-api-imported-directly-in-domain-packages.md).
 
 Physical duplication is the architecturally correct shape here, not an
 oversight — but it does mean a future change to either helper's contract

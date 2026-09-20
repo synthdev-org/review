@@ -86,6 +86,16 @@ and bundled into `indexing.pipeline.IndexingJobDependencies`, threaded into
 prior `INDEX`-job stub with a real call into
 `indexing.pipeline.run_indexing_job`.
 
+`docs/plans/plan-deliver-memory.md`'s Phase 4 section (Unit D, US-M3) adds
+this composition root's third and final job-dispatch dependency bundle:
+`adapter.github.reactions.GitHubReactionFetcher` (sharing the same
+`token_provider`/`github_http_client` every other GitHub adapter here
+already shares) and `memory.reaction_poll.MemoryReactionPollJobDependencies`
+(reusing the same `memory_repository` instance Phase 2 already built as
+both its `MemorySignalRecorder` and, this phase, its `ReactionDedupStore`
+role — Assumption 8), threaded into `apps/worker/dispatch.py`'s
+`run_dispatch_loop` alongside `indexing_deps`.
+
 Settings are parsed and logging configured inside `main()`, not at module
 import time, so importing this module (mypy, pytest collection) never
 requires environment variables or performs process-level side effects.
@@ -130,11 +140,13 @@ from adapter.github.auth import GitHubInstallationTokenProvider, validate_privat
 from adapter.github.diff import GitHubDiffFetcher
 from adapter.github.exceptions import GitHubPrivateKeyInvalidError
 from adapter.github.posting import GitHubFindingsPublisher
+from adapter.github.reactions import GitHubReactionFetcher
 from adapter.github.tree import GitHubTreeFetcher
 from adapter.llm.litellm_client import LiteLLMClient
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.indexing_repository import IndexingRepository
+from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
 from adapter.telemetry.heartbeat import heartbeat_task_scope
 from adapter.telemetry.sdk import (
@@ -151,6 +163,7 @@ from indexing.pipeline import IndexingJobDependencies
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMError
 from llmgateway.startup_check import check_llm_reachable
+from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.config import (
     NoViableStepConfigurationError,
     StepEnablement,
@@ -167,7 +180,7 @@ from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
 from review.review_generation import ReviewGenerationStep
 from review.static_analysis import StaticAnalysisStep
-from review.verification import VerificationStep
+from review.verification import MemorySuppressionConfig, VerificationStep
 
 
 def _build_llm_client(settings: WorkerSettings) -> LLMClient:
@@ -338,6 +351,7 @@ def _build_findings_publisher(
     settings: WorkerSettings,
     token_provider: GitHubInstallationTokenProvider,
     http_client: httpx.AsyncClient,
+    provenance_recorder: PostgresMemoryRepository,
 ) -> GitHubFindingsPublisher:
     """Wire the domain-defined `FindingsPublisher` Protocol to its
     GitHub-backed implementation (Phase 7), sharing `token_provider` with
@@ -345,9 +359,16 @@ def _build_findings_publisher(
     `adapter/github/posting.py`'s own "no new auth code, no new config, of
     its own" docstring note. See `_build_token_provider`'s own docstring for
     why `http_client` is shared, not built per-publisher.
+
+    `provenance_recorder` — `docs/plans/plan-deliver-memory.md`'s Phase 2
+    section (US-M11) — is the same `PostgresMemoryRepository` instance
+    `_amain` builds alongside `graph_query`/`similarity_query` (Assumption
+    8: one concrete class, one `session_factory`, no second connection
+    pool).
     """
     return GitHubFindingsPublisher(
         token_provider=token_provider,
+        provenance_recorder=provenance_recorder,
         github_api_base_url=settings.github_api_base_url,
         timeout=settings.github_api_timeout_seconds,
         max_retry_attempts=settings.github_retry_max_attempts,
@@ -373,6 +394,47 @@ def _build_tree_fetcher(
         timeout=settings.github_api_timeout_seconds,
         max_retry_attempts=settings.github_retry_max_attempts,
         client=http_client,
+    )
+
+
+def _build_reaction_fetcher(
+    settings: WorkerSettings,
+    token_provider: GitHubInstallationTokenProvider,
+    http_client: httpx.AsyncClient,
+) -> GitHubReactionFetcher:
+    """Wire the Memory domain's `ReactionFetcher` Protocol to its
+    GitHub-backed implementation (`docs/plans/plan-deliver-memory.md`'s
+    Phase 4 section, Unit D), sharing `token_provider`/`http_client` with
+    every other GitHub adapter here — see `_build_token_provider`'s own
+    docstring for why.
+    """
+    return GitHubReactionFetcher(
+        token_provider=token_provider,
+        github_api_base_url=settings.github_api_base_url,
+        timeout=settings.github_api_timeout_seconds,
+        max_retry_attempts=settings.github_retry_max_attempts,
+        client=http_client,
+    )
+
+
+def _build_memory_reaction_poll_deps(
+    settings: WorkerSettings,
+    reaction_fetcher: GitHubReactionFetcher,
+    memory_repository: PostgresMemoryRepository,
+) -> MemoryReactionPollJobDependencies:
+    """Bundle `MEMORY_REACTION_POLL`'s three Protocol-typed dependencies
+    (`docs/plans/plan-deliver-memory.md`'s Phase 4 section) plus its one
+    plain-config field — `memory_repository` (Assumption 8) implements both
+    `MemorySignalRecorder` and `ReactionDedupStore`, the same instance
+    `_build_findings_publisher`'s own `provenance_recorder` already is, so
+    the same instance is passed for both roles here, mirroring
+    `_build_indexing_deps`'s own precedent.
+    """
+    return MemoryReactionPollJobDependencies(
+        reaction_fetcher=reaction_fetcher,
+        signal_recorder=memory_repository,
+        dedup_store=memory_repository,
+        max_comments_per_poll=settings.memory_reaction_poll_max_comments_per_poll,
     )
 
 
@@ -428,6 +490,27 @@ def _log_verification_disabled_warning(settings: WorkerSettings, logger: logging
         logger.warning(
             "verification is disabled: unverified LLM findings will be posted directly",
             extra={"verification_enabled": False},
+        )
+
+
+def _log_memory_suppression_disabled_warning(
+    settings: WorkerSettings, logger: logging.Logger
+) -> None:
+    """A one-time `warning`-level startup log when `memory_suppression_enabled`
+    is `False` (US-M12, `docs/plans/plan-deliver-memory.md`'s Phase 6
+    section) — mirrors `_log_verification_disabled_warning`'s own shape
+    exactly: the deployment can still boot and run correctly (disabling
+    suppression restores exactly this phase's own prior `VerificationStep`
+    behavior, with zero interaction with capture (Phases 2-4) or the admin
+    API (Phase 5), which keep running regardless), but the deviation from
+    the shipped default — no similarity-based suppression, every candidate
+    finding reaches the rubric call — must be visible, not silent.
+    """
+    if not settings.memory_suppression_enabled:
+        logger.warning(
+            "memory suppression is disabled: no similarity-based pre-check will run "
+            "before the rubric call",
+            extra={"memory_suppression_enabled": False},
         )
 
 
@@ -608,6 +691,7 @@ def _build_review_registry(
     llm_client: LLMClient,
     publisher: GitHubFindingsPublisher,
     settings: WorkerSettings,
+    memory_matcher: PostgresMemoryRepository,
 ) -> StepRegistry:
     """Construct the macro-step registry `REVIEW` jobs dispatch to.
 
@@ -663,6 +747,19 @@ def _build_review_registry(
     same two mappings' own `"gitleaks"`/`"semgrep"` entries for its own
     inner registry — see `review.config.StepEnablement`'s own docstring for
     why this is one shared mapping, not two built separately.
+
+    `docs/plans/plan-deliver-memory.md`'s Phase 6 section (Unit F,
+    Assumption 6) adds `memory_matcher` — `VerificationStep` gets a new
+    `memory_suppression=MemorySuppressionConfig(...)` keyword argument built
+    from it plus the already-built `embedding_client` and three plain
+    `WorkerSettings` fields (`memory_suppression_enabled`/
+    `memory_similarity_threshold`/`memory_decay_half_life_days`) — never
+    `None` when `memory_suppression_enabled` is `True` (else `None`
+    entirely, restoring byte-for-byte the prior `VerificationStep`
+    construction, per US-M12). Unlike the five dynamically-wired steps
+    above, this isn't gated through `enabled_mapping`/`resolved` — it's an
+    internal behavior toggle inside the already-registered `verification`
+    step, not a separate pipeline stage of its own.
     """
     enabled_mapping = enablement.as_mapping()
     timeouts_mapping = timeouts.as_mapping()
@@ -697,6 +794,21 @@ def _build_review_registry(
         "timeout": settings.llm_timeout_seconds,
         "max_diff_bytes": settings.llm_max_diff_bytes,
     }
+
+    # docs/plans/plan-deliver-memory.md's Phase 6 section (Unit F,
+    # Assumption 6) — `None` when `memory_suppression_enabled` is `False`,
+    # restoring exactly this step's pre-Phase-6 construction (US-M12).
+    memory_suppression = (
+        MemorySuppressionConfig(
+            memory_matcher=memory_matcher,
+            embedding_client=embedding_client,
+            similarity_threshold=settings.memory_similarity_threshold,
+            decay_half_life_days=settings.memory_decay_half_life_days,
+            enabled=True,
+        )
+        if settings.memory_suppression_enabled
+        else None
+    )
 
     return StepRegistry(
         steps=[
@@ -739,6 +851,7 @@ def _build_review_registry(
                 llm_client,
                 **llm_step_kwargs,
                 depends_on=resolved["verification"],
+                memory_suppression=memory_suppression,
             ),
             FindingsOutputStep(
                 publisher,
@@ -765,6 +878,7 @@ async def _run_dispatch_loop_forever(
     job_queue: JobQueueRepository,
     registry: StepRegistry,
     indexing_deps: IndexingJobDependencies,
+    memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
@@ -788,6 +902,7 @@ async def _run_dispatch_loop_forever(
             job_queue=job_queue,
             review_registry=registry,
             indexing_deps=indexing_deps,
+            memory_reaction_poll_deps=memory_reaction_poll_deps,
             worker_id=worker_id,
             poll_interval_seconds=settings.poll_interval_seconds,
             stuck_job_warning_threshold_seconds=settings.stuck_job_warning_threshold_seconds,
@@ -860,9 +975,15 @@ async def _run(
     tree_fetcher = _build_tree_fetcher(settings, token_provider, github_http_client)
     redactor = _build_text_redactor(settings, logger)
     _log_verification_disabled_warning(settings, logger)
-    publisher = _build_findings_publisher(settings, token_provider, github_http_client)
+    _log_memory_suppression_disabled_warning(settings, logger)
     # The same database session factory IndexRepository already uses (see
-    # `_build_indexing_deps` below) — no second connection pool.
+    # `_build_indexing_deps` below) — no second connection pool. Built here,
+    # ahead of `publisher`, so `_build_findings_publisher` (Phase 2, US-M11)
+    # can pass it through as `provenance_recorder`.
+    memory_repository = PostgresMemoryRepository(session_factory)
+    publisher = _build_findings_publisher(
+        settings, token_provider, github_http_client, memory_repository
+    )
     graph_query = PostgresGraphQuery(session_factory)
     similarity_query = PostgresSimilarityQuery(session_factory)
     registry = _build_review_registry(
@@ -877,14 +998,28 @@ async def _run(
         client,
         publisher,
         settings,
+        memory_repository,
     )
     index_repository = IndexingRepository(session_factory)
     indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)
+    # docs/plans/plan-deliver-memory.md's Phase 4 section (Unit D) — reuses
+    # `token_provider`/`github_http_client`/`memory_repository`, no second
+    # token cache, no second connection pool.
+    reaction_fetcher = _build_reaction_fetcher(settings, token_provider, github_http_client)
+    memory_reaction_poll_deps = _build_memory_reaction_poll_deps(
+        settings, reaction_fetcher, memory_repository
+    )
     worker_id = _build_worker_id()
 
     logger.info("worker started", extra={"worker_id": worker_id})
     dispatch_loop_forever = _run_dispatch_loop_forever(
-        job_queue, registry, indexing_deps, settings, worker_id, github_http_client
+        job_queue,
+        registry,
+        indexing_deps,
+        memory_reaction_poll_deps,
+        settings,
+        worker_id,
+        github_http_client,
     )
     # The heartbeat task is started only when telemetry is configured,
     # per US10 — see `heartbeat_task_scope`'s own docstring for the

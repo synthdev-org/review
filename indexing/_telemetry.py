@@ -4,7 +4,7 @@ pipeline outcome" shape indexing/pipeline.py's own instrumentation needs.
 
 No infra imports beyond the OTel API itself, per docs/rules/architecture.md's
 domain-package rule — the OTel API import is explicitly permitted in domain
-packages by docs/adr/0009-otel-api-imported-directly-in-domain-packages.md.
+packages by docs/adr/0011-otel-api-imported-directly-in-domain-packages.md.
 Deliberately scoped to this one bounded context rather than a cross-context
 ``adapter/telemetry`` import: domain packages never import adapter code.
 Mirrors ``review/_telemetry.py``'s own copy of this same shape, for the
@@ -45,7 +45,7 @@ def suppress_telemetry_errors(
 
     This deliberately deviates from ``architecture.md``'s "never swallow
     or log-and-continue silently" rule — see
-    ``docs/adr/0010-telemetry-recording-failures-log-and-continue.md`` for
+    ``docs/adr/0012-telemetry-recording-failures-log-and-continue.md`` for
     the formal reasoning and exact scope of the exemption.
 
     Args:

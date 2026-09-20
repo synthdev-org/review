@@ -79,10 +79,10 @@ async def run_heartbeat_loop(*, interval_seconds: float = HEARTBEAT_INTERVAL_SEC
     through unchanged without a separate ``except`` clause.
 
     Wraps ``asyncio.sleep`` too, not just ``.add(1)`` — a deliberate,
-    named exception to ADR-0010's usual "wrapped block is the recording
+    named exception to ADR-0012's usual "wrapped block is the recording
     call only" convention, since this loop's only job is being a liveness
     signal that must never take the process down with it; see
-    ``docs/adr/0010-telemetry-recording-failures-log-and-continue.md``'s
+    ``docs/adr/0012-telemetry-recording-failures-log-and-continue.md``'s
     own scope section for the full reasoning.
 
     Records once immediately, before the first sleep, rather than only
