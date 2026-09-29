@@ -187,6 +187,138 @@ in their own cluster rather than a demo Docker Compose stack.
 
 ---
 
+## Phase 9 — Expanded static-analysis engine coverage
+
+Commercial-parity gap (research §2.2): the Phase 1 static-analysis runner
+shipped with two engines (Gitleaks + Semgrep, per
+[`spec-review-pipeline.md`](specs/spec-review-pipeline.md)) to prove the
+pipeline end-to-end, not as the intended ceiling — commercial tools bundle
+15–50+ per-language engines. This is additive to the same step, not a
+re-architecture, so it depends only on Phase 1's static-analysis runner and
+the pipeline-step framework, and can start any time after Phase 1 without
+waiting on Phases 2–8.
+
+- New analyzer adapters behind the existing static-analysis step, one per
+  language/category the customer base actually needs (e.g. JS/TS lint,
+  Python lint beyond secrets/SAST, Go lint, IaC scanning) — each normalized
+  into the same findings schema Gitleaks/Semgrep already produce, so the
+  findings merger (Phase 3) needs no per-tool special-casing.
+- Respect repo-native tool configs when present (`.eslintrc`, `.golangci.yml`,
+  etc.) rather than a review-owned default ruleset silently overriding them —
+  the pattern CodeRabbit documents (research §2.2).
+- Per-analyzer enable/disable + timeout config, reusing the
+  `*_enabled`/`*_step_timeout_seconds` convention `apps/worker/settings.py`
+  already establishes for `static_analysis_enabled`.
+- Analyzer selection scoped to languages actually detected in the repo —
+  don't invoke irrelevant tools on every push.
+
+*Open (for a future PRD): which languages/tools to prioritize first, ranked
+by customer language mix, not built alphabetically; whether tool
+versions/configs are deployment-pinned or customer-configurable; and how many
+analyzer subprocesses the Worker can run concurrently before this needs its
+own resource-isolation story.*
+
+---
+
+## Phase 10 — Whole-codebase duplication/clone detection
+
+Commercial-parity gap (research §2.2, and the Codacy case study in
+[`research-current-art.md`](research/research-current-art.md)'s Codacy
+profile): Phase 2's embedding-similarity search (`spec-context-builder.md`
+US4) only fires for chunks that actually changed in the current diff — it
+cannot surface duplication that exists purely between two files neither of
+which is in the PR. This is a distinct, deterministic finding-producing step,
+not a Context Builder feature, so it belongs alongside Phase 9's
+static-analysis expansion — but it depends on Phase 2's AST-chunked index
+existing (it reuses that chunk structure rather than parsing separately), so
+it can't start before Phase 2 lands.
+
+- A new deterministic step (same "free layer" pattern as Phase 1) running a
+  token/AST-level clone-detection algorithm across the whole indexed
+  codebase, not scoped to the diff.
+- Runs incrementally off Phase 2's already-incremental indexing job: compute
+  clone candidates only for chunks that changed, compared against the full
+  existing index, rather than a full-repo rescan on every push.
+- Findings surface as a distinct `duplication` category with a location pair
+  (the changed file plus the file(s) it duplicates), kept separate from
+  correctness/security findings in the findings schema.
+- Tunable minimum-clone-size threshold (likely per-language) to avoid
+  flagging trivial boilerplate.
+- Reuses Memory (Phase 4) unmodified: a dismissed duplication finding
+  suppresses similarly-patterned future flags the same way any other
+  dismissed finding does, with no special-casing needed.
+
+*Open (for a future PRD): build vs. adopt an existing OSS clone-detection
+engine (e.g. jscpd, PMD CPD) vs. a custom AST-hash approach reusing Phase 2's
+chunker; whether a clone pair where neither file is in the current diff gets
+surfaced as a PR-time finding at all, or only in a separate scheduled
+"codebase health" report — this decides whether it's a pipeline step or a
+standalone job; and the performance budget for the underlying full-repo
+comparison.*
+
+---
+
+## Phase 11 — Auto-fix / committable suggested-fix generation
+
+Commercial-parity gap (research §3, tool profiles for CodeRabbit/Qodo/Bito/
+DeepSource, all of which generate a one-click-committable fix): nothing in
+Phases 0–8 produces a fix, only a finding. This depends on Phase 3's
+verification pass existing — an unverified auto-generated fix is worse than
+an unverified comment, so this is ordered strictly after verification is
+solid, not before it.
+
+- Findings merger (Phase 3) gains an optional "propose fix" sub-step: for
+  findings above a confidence threshold, a distinct LLM call generates a
+  patch scoped to the finding's file/lines — a separate call, never the same
+  call that produced the finding (design goal 6).
+- The generated fix is validated before ever being shown: syntax-checked, and
+  re-run through the relevant static analyzer/verification rubric against the
+  *patched* code, not just the original — the Copilot Autofix pattern
+  (research §2.2).
+- Delivered as a GitHub "suggested change" (one-click-committable inline
+  suggestion) via the existing GitHub Adapter comment-posting path — no new
+  delivery mechanism.
+- Never auto-applied — always requires the PR author's explicit accept/commit
+  action, per design goal 9's human-validates-before-anything-reshapes-state
+  principle (already applied to Memory).
+- Accepted vs. rejected fixes feed Memory (Phase 4) as `accepted_fix`
+  entries — the schema already reserves this status; nothing populates it
+  until this phase exists.
+
+*Open (for a future PRD): which finding categories are eligible for auto-fix
+first (security/style likely safer than architectural findings); how a
+multi-file fix is represented, since GitHub's native suggestion UI is
+single-hunk only; and the added per-stage model-routing/cost implication of a
+second generation call per eligible finding, which ties into Phase 8's model
+routing tuning.*
+
+---
+
+## Phase 12 — PR-level walkthrough/summary artifact
+
+Commercial-parity gap (research §2.3, CodeRabbit's cohort-ordered walkthrough
+and Sourcery's auto-generated diagrams): Phase 3 already computes an intent
+summary internally to steer review generation, but never exposes it to the
+PR author. This is "expose what Phase 3 already knows" as a customer-facing
+deliverable — a delivery/formatting change, not new architecture — so it can
+land any time after Phase 3, independent of Phases 4–11.
+
+- Post Phase 3's intent-summary step output as a top-level PR
+  comment/walkthrough, ordered logically (e.g. schema → logic → call sites →
+  tests) rather than file-alphabetically.
+- Optional architecture/sequence diagram generation (Mermaid) for PRs above a
+  size/complexity threshold.
+- Reuses the existing GitHub Adapter comment-posting path — one additional
+  comment type, not a new integration.
+- Config toggle per org/repo, following the existing `*_enabled` convention.
+
+*Open (for a future PRD): whether this replaces or supplements the existing
+findings-comment format; the diagram-generation LLM-cost tradeoff on large
+PRs; and whether walkthrough content should also cite Phase 7's
+product-knowledge context (linked specs/tickets) once that phase exists.*
+
+---
+
 ## Deferred, not scheduled
 
 Real, deliberate scope — not forgotten, not designed away — but not on this
@@ -209,6 +341,17 @@ roadmap because nothing above depends on them landing first.
   cost and latency low; these techniques land later, if ever, as an
   explicitly opt-in capability a customer configures, not a change to the
   default indexing path.
+- **Dynamic/runtime verification** (executing PR-supplied code in a sandbox
+  to confirm a bug is real — Greptile's TREX, research §3). Deliberately not
+  pursued for now: the research doc's own CodeRabbit "PwnedRabbit" case study
+  (§3, §6) documents a real sandbox-escape/key-exfiltration incident from
+  exactly this class of feature (running PR-supplied content through
+  execution), and review is a self-hosted product running inside a
+  customer's own cluster with no shared-fleet blast-radius containment
+  ([ADR-0001](adr/0001-self-hosted-kubernetes-deployment.md)) — the risk profile
+  doesn't currently justify the parity gain. Revisit only alongside a
+  dedicated sandboxing/isolation design, not as an incremental add-on to an
+  existing phase.
 
 ---
 
