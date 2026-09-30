@@ -12,3 +12,11 @@ __pycache__
 .env.*
 !.env.example
 mutants/
+
+# Frontend (apps/admin_api/frontend, Phase 8) — the `dev`/`runtime` stages
+# never need the frontend's own node_modules/dist; the Dockerfile's
+# dedicated `frontend-build` stage installs deps and builds dist/ itself
+# from a clean COPY of the frontend source, and only that stage's own
+# dist/ output is copied into `runtime`.
+apps/admin_api/frontend/node_modules/
+apps/admin_api/frontend/dist/

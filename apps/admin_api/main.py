@@ -41,6 +41,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from functools import partial
+from pathlib import Path
 
 from fastapi import FastAPI
 
@@ -68,6 +69,7 @@ from apps.admin_api.auth_routes import create_auth_router
 from apps.admin_api.bootstrap import bootstrap_admin_user
 from apps.admin_api.config_routes import create_config_router
 from apps.admin_api.dependencies import build_require_admin_role, build_require_session
+from apps.admin_api.frontend_routes import create_frontend_router
 from apps.admin_api.logging_config import configure_logging
 from apps.admin_api.memory_routes import create_memory_router
 from apps.admin_api.model_routing_routes import create_model_routing_router
@@ -79,6 +81,15 @@ from indexing.embedding import EmbeddingError
 from llmgateway.routing import FallbackModelRoutingResolver
 
 logger = logging.getLogger(__name__)
+
+# apps/admin_api/frontend/dist — built by the Dockerfile's own
+# `frontend-build` Node stage and copied into the shared `runtime` stage
+# at image-build time (Phase 8, Assumption 9); not present in every
+# environment (see apps/admin_api/frontend_routes.py's own docstring for
+# why that's expected, not fatal). A plain module-level constant, not a
+# settings field — this is a build-time artifact location, never an
+# operator-configurable value.
+_DEFAULT_FRONTEND_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 
 
 def _build_embedding_client(settings: AdminAPISettings) -> LocalONNXEmbeddingClient:
@@ -143,8 +154,17 @@ def _build_lifespan(
     return _lifespan
 
 
-def create_app(settings: AdminAPISettings) -> FastAPI:
-    """Build the Admin API's FastAPI application from parsed settings."""
+def create_app(
+    settings: AdminAPISettings, *, frontend_dist_dir: Path = _DEFAULT_FRONTEND_DIST_DIR
+) -> FastAPI:
+    """Build the Admin API's FastAPI application from parsed settings.
+
+    ``frontend_dist_dir`` defaults to the real, Docker-image-baked build
+    location but is overridable — used by
+    ``apps/admin_api/test_frontend_routes.py`` to point at a fixture
+    directory instead, without needing a real ``npm run build`` in the
+    Python test tier.
+    """
     telemetry_enabled = init_telemetry(
         otlp_endpoint=settings.otel_exporter_otlp_endpoint,
         service_name="review-admin-api",
@@ -316,6 +336,17 @@ def create_app(settings: AdminAPISettings) -> FastAPI:
         create_usage_router(reader=usage_counter_repository, require_session=require_session)
     )
     logger.info("usage routes registered")
+
+    # Frontend (docs/plans/plan-deliver-admin-gui.md's Phase 8 section,
+    # Unit I, Assumption 9) — registered last, deliberately: its catch-all
+    # route must never shadow an already-registered /api/*//healthz route.
+    # `create_frontend_router` returns `None` (logged, not raised) when the
+    # frontend hasn't been built in this environment — see that module's
+    # own docstring.
+    frontend_router = create_frontend_router(frontend_dist_dir)
+    if frontend_router is not None:
+        app.include_router(frontend_router)
+        logger.info("frontend routes registered", extra={"dist_dir": str(frontend_dist_dir)})
 
     return app
 

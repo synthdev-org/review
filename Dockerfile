@@ -69,6 +69,22 @@ RUN set -eu; \
     sha256sum -c model.sha256; \
     rm model.sha256
 
+# --- frontend-build: apps/admin_api's own React + TypeScript + Vite
+# frontend (Phase 8, Unit I, Assumption 9) — built here, in its own Node
+# stage, so neither the `dev` nor `runtime` Python stage ever needs Node
+# installed. Only this stage's own `dist/` output (a handful of static
+# files) is copied into `runtime` below; `node_modules`/source never reach
+# either Python stage. A fresh, dependency-only `npm ci` layer (cached
+# independently of the frontend's own source, mirroring `deps`'s own
+# `uv sync --no-install-project` split above) keeps a source-only change
+# from invalidating the `npm ci` layer.
+FROM node:20-slim AS frontend-build
+WORKDIR /frontend
+COPY apps/admin_api/frontend/package.json apps/admin_api/frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY apps/admin_api/frontend/ ./
+RUN npm run build
+
 # --- dev: full source + dev deps, used to run lint/type-check/test locally
 # and in CI — `docker build --target dev` then `docker run <img> uv run ruff
 # check .` etc. Never pushed/deployed. Gets the same checksum-verified
@@ -100,6 +116,12 @@ COPY tenancy ./tenancy
 COPY adapter ./adapter
 COPY apps ./apps
 COPY pyproject.toml alembic.ini ./
+
+# apps/admin_api's built frontend (Phase 8, Unit I, Assumption 9) —
+# copied in after `COPY apps ./apps` so this overlay wins; `main.py`'s
+# `create_frontend_router` serves it via a catch-all route excluding
+# /api/* and /healthz.
+COPY --from=frontend-build /frontend/dist ./apps/admin_api/frontend/dist
 
 # Non-root container user (Phase 5) — this is the first phase running real
 # subprocesses (Gitleaks, Semgrep) against untrusted (PR-controlled)

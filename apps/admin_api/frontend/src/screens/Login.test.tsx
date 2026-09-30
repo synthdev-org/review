@@ -1,0 +1,90 @@
+// Component tests for the Login screen — loading (submitting), error
+// (invalid credentials / rate-limited), and success (redirect) states, per
+// docs/plans/plan-deliver-admin-gui.md's Phase 8 section.
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ApiError } from "../api/client";
+import { LoginScreen } from "./Login";
+
+const mockUseAuth = vi.fn();
+
+vi.mock("../auth/AuthContext", () => ({
+  useAuth: () => mockUseAuth(),
+}));
+
+function renderLogin() {
+  return render(
+    <MemoryRouter initialEntries={["/login"]}>
+      <LoginScreen />
+    </MemoryRouter>
+  );
+}
+
+describe("LoginScreen", () => {
+  beforeEach(() => {
+    mockUseAuth.mockReset();
+  });
+
+  it("shows a submitting (loading) state while the login request is in flight", async () => {
+    let resolveLogin: () => void = () => {};
+    const loginPromise = new Promise<void>((resolve) => {
+      resolveLogin = resolve;
+    });
+    mockUseAuth.mockReturnValue({
+      status: "unauthenticated",
+      login: vi.fn().mockReturnValue(loginPromise),
+    });
+    renderLogin();
+
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: "hunter2hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    expect(await screen.findByRole("button", { name: /signing in/i })).toBeDisabled();
+    resolveLogin();
+  });
+
+  it("shows a distinct error state on invalid credentials, with no username-existence detail", async () => {
+    mockUseAuth.mockReturnValue({
+      status: "unauthenticated",
+      login: vi.fn().mockRejectedValue(new ApiError(401, "invalid username or password")),
+    });
+    renderLogin();
+
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: "wrong-password" } });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("invalid username or password");
+  });
+
+  it("shows a distinct rate-limit message on 429", async () => {
+    mockUseAuth.mockReturnValue({
+      status: "unauthenticated",
+      login: vi.fn().mockRejectedValue(new ApiError(429, "too many login attempts")),
+    });
+    renderLogin();
+
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: "hunter2hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/too many login attempts/i);
+  });
+
+  it("redirects once the session becomes authenticated (success)", async () => {
+    mockUseAuth.mockReturnValue({ status: "authenticated", login: vi.fn() });
+    render(
+      <MemoryRouter initialEntries={["/login"]}>
+        <LoginScreen />
+        <div data-testid="elsewhere" />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /sign in/i })).not.toBeInTheDocument();
+    });
+  });
+});

@@ -743,6 +743,8 @@ US-A18's (threshold display) pass as integration tests.
 
 ## Phase 8 — Frontend application (Unit I: all screens)
 
+**Status: Done (2026-09-30).**
+
 **Why next:** the first frontend codebase in this repo, establishing the
 baseline visual/interaction language every later screen follows —
 sequenced after every backend phase whose contract it depends on for real

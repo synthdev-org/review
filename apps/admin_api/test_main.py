@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -172,3 +173,67 @@ def test_create_app_exits_non_zero_with_unloadable_embedding_model(
         and record.levelname == "ERROR"
         for record in caplog.records
     )
+
+
+# --- docs/plans/plan-deliver-admin-gui.md's Phase 8 (Unit I): the built
+# frontend, mounted as a catch-all *after* every API router ------------
+
+
+def test_create_app_boots_with_no_frontend_router_when_dist_missing(tmp_path: Path) -> None:
+    """The default `app` object this module's own `uvicorn` entrypoint
+    serves is built exactly this way in every Python test/lint image (the
+    frontend is built in the Dockerfile's own separate Node stage, never
+    inside the Python `dev`/`runtime` stage) — this proves that state boots
+    cleanly with no frontend mounted, rather than only asserting it via
+    `create_frontend_router`'s own unit tests in isolation."""
+    settings = _unreachable_dsn_settings()
+    app = create_app(settings, frontend_dist_dir=tmp_path / "does-not-exist")
+
+    # Deliberately *not* entered as a `with` block (unlike the
+    # bootstrap-focused tests above) — this test only needs routing
+    # behavior, and skipping the lifespan context avoids triggering
+    # `bootstrap_admin_user`'s real Postgres connection attempt against
+    # this test's deliberately unreachable DSN, the same way
+    # `test_healthz_returns_ok` above already does for the module-level
+    # `app` object.
+    client = TestClient(app)
+    response = client.get("/dashboard")
+
+    assert response.status_code == 404
+
+
+def test_create_app_serves_the_frontend_when_dist_present_without_shadowing_api_routes(
+    tmp_path: Path,
+) -> None:
+    """Proves registration order end-to-end against the real composition
+    root (not just frontend_routes.py's own isolated router tests): every
+    API route Phases 1-7 register still resolves correctly with the
+    frontend catch-all mounted, and an unknown client-side route (e.g.
+    `/dashboard`) falls back to the SPA shell rather than a 404."""
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    (dist_dir / "index.html").write_text("<html><body>admin ui shell</body></html>")
+
+    settings = _unreachable_dsn_settings()
+    app = create_app(settings, frontend_dist_dir=dist_dir)
+
+    # Not entered as a `with` block — see the previous test's own comment
+    # on why (avoids triggering bootstrap's real Postgres connection
+    # attempt against this test's deliberately unreachable DSN).
+    client = TestClient(app)
+
+    # A real API route (require_session-gated, no session cookie
+    # supplied) still resolves as an API 401, never the SPA shell.
+    session_response = client.get("/api/v1/auth/session")
+    assert session_response.status_code == 401
+
+    # /healthz still resolves as the liveness probe, never the SPA
+    # shell.
+    healthz_response = client.get("/healthz")
+    assert healthz_response.status_code == 200
+    assert healthz_response.json() == {"status": "ok"}
+
+    # An unknown client-side route falls back to the built frontend.
+    dashboard_response = client.get("/dashboard")
+    assert dashboard_response.status_code == 200
+    assert "admin ui shell" in dashboard_response.text
