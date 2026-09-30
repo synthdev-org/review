@@ -17,8 +17,9 @@ vi.mock("../api/endpoints", () => ({
 }));
 
 let mockIsAdmin = true;
+const handleSessionExpired = vi.fn();
 vi.mock("../auth/AuthContext", () => ({
-  useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: vi.fn() }),
+  useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: (...args: unknown[]) => handleSessionExpired(...args) }),
 }));
 
 const view: ModelRoutingView = {
@@ -34,6 +35,7 @@ describe("ModelRoutingScreen", () => {
   beforeEach(() => {
     getModelRouting.mockReset();
     setModelRouting.mockReset();
+    handleSessionExpired.mockReset();
     mockIsAdmin = true;
   });
 
@@ -73,6 +75,20 @@ describe("ModelRoutingScreen", () => {
     fireEvent.click(saveButton);
     await waitFor(() => expect(setModelRouting).toHaveBeenCalledWith("intent_summary", "gpt-new", null));
     expect(await screen.findByTestId("notice")).toHaveTextContent(/updated intent_summary routing/i);
+  });
+
+  it("Admin: a 401 mid-save (expired/revoked session) routes back to login instead of showing a generic error", async () => {
+    const { ApiError } = await import("../api/client");
+    getModelRouting.mockResolvedValue(view);
+    setModelRouting.mockRejectedValue(new ApiError(401, "session expired"));
+    render(<ModelRoutingScreen />);
+    await screen.findByText("review_generation");
+
+    fireEvent.change(screen.getByLabelText(/model name/i), { target: { value: "gpt-new" } });
+    fireEvent.click(screen.getByRole("button", { name: /save routing/i }));
+
+    await waitFor(() => expect(handleSessionExpired).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("notice")).not.toBeInTheDocument();
   });
 
   it("Viewer: sees the table but no write form", async () => {

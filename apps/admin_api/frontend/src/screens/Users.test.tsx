@@ -20,8 +20,9 @@ vi.mock("../api/endpoints", () => ({
 }));
 
 let mockIsAdmin = true;
+const handleSessionExpired = vi.fn();
 vi.mock("../auth/AuthContext", () => ({
-  useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: vi.fn() }),
+  useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: (...args: unknown[]) => handleSessionExpired(...args) }),
 }));
 
 const activeUser: AdminUser = {
@@ -38,6 +39,7 @@ describe("UsersScreen", () => {
     listUsers.mockReset();
     createUser.mockReset();
     deactivateUser.mockReset();
+    handleSessionExpired.mockReset();
     mockIsAdmin = true;
   });
 
@@ -117,5 +119,35 @@ describe("UsersScreen", () => {
 
     await waitFor(() => expect(deactivateUser).toHaveBeenCalledWith("user-1"));
     expect(await screen.findByTestId("notice")).toHaveTextContent(/user alice deactivated/i);
+  });
+
+  it("Admin: a 401 mid-create (expired/revoked session) routes back to login instead of showing a generic error", async () => {
+    const { ApiError } = await import("../api/client");
+    listUsers.mockResolvedValue([]);
+    createUser.mockRejectedValue(new ApiError(401, "session expired"));
+    render(<UsersScreen />);
+    await screen.findByText(/no users yet/i);
+
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "bob" } });
+    fireEvent.change(screen.getByLabelText(/initial password/i), {
+      target: { value: "a-very-long-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^create user$/i }));
+
+    await waitFor(() => expect(handleSessionExpired).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("notice")).not.toBeInTheDocument();
+  });
+
+  it("Admin: a 401 mid-deactivate (expired/revoked session) routes back to login instead of showing a generic error", async () => {
+    const { ApiError } = await import("../api/client");
+    listUsers.mockResolvedValue([activeUser]);
+    deactivateUser.mockRejectedValue(new ApiError(401, "session expired"));
+    render(<UsersScreen />);
+
+    await screen.findByText("alice");
+    fireEvent.click(screen.getByRole("button", { name: /deactivate/i }));
+
+    await waitFor(() => expect(handleSessionExpired).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("notice")).not.toBeInTheDocument();
   });
 });

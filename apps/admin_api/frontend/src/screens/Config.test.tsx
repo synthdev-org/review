@@ -17,8 +17,9 @@ vi.mock("../api/endpoints", () => ({
 }));
 
 let mockIsAdmin = true;
+const handleSessionExpired = vi.fn();
 vi.mock("../auth/AuthContext", () => ({
-  useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: vi.fn() }),
+  useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: (...args: unknown[]) => handleSessionExpired(...args) }),
 }));
 
 const emptyTree: ConfigTree = { platform_settings: {}, orgs: [] };
@@ -27,6 +28,7 @@ describe("ConfigScreen", () => {
   beforeEach(() => {
     getConfig.mockReset();
     setConfig.mockReset();
+    handleSessionExpired.mockReset();
     mockIsAdmin = true;
   });
 
@@ -69,6 +71,20 @@ describe("ConfigScreen", () => {
       })
     );
     expect(await screen.findByTestId("notice")).toHaveTextContent(/saved memory_suppression_enabled/i);
+  });
+
+  it("Admin: a 401 mid-save (expired/revoked session) routes back to login instead of showing a generic error", async () => {
+    const { ApiError } = await import("../api/client");
+    getConfig.mockResolvedValue(emptyTree);
+    setConfig.mockRejectedValue(new ApiError(401, "session expired"));
+    render(<ConfigScreen />);
+
+    await screen.findByText("Platform-wide");
+    fireEvent.click(screen.getAllByRole("button", { name: /save setting/i })[0]);
+
+    await waitFor(() => expect(handleSessionExpired).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("notice")).not.toBeInTheDocument();
+    expect(screen.queryByText(/save failed/i)).not.toBeInTheDocument();
   });
 
   it("Viewer: sees configuration read-only, no save control", async () => {

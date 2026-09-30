@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 
 import * as api from "../api/endpoints";
-import { ApiError } from "../api/client";
+import { ApiError, isSessionExpiredError } from "../api/client";
 import { Notice } from "../components/Notice";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { useAsyncData } from "../hooks/useAsyncData";
@@ -29,7 +29,7 @@ const ENTRY_TYPES = [
 // "never clickable-but-failing" rule the PRD's Permission-denied UX
 // section states.
 export function MemoryQueueScreen(): JSX.Element {
-  const { isAdmin } = useAuth();
+  const { isAdmin, handleSessionExpired } = useAuth();
   const [statusFilter, setStatusFilter] = useState<MemoryStatus | "">("");
   const [pendingEntryType, setPendingEntryType] = useState<Record<string, string>>({});
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
@@ -49,6 +49,14 @@ export function MemoryQueueScreen(): JSX.Element {
       showSuccess(successMessage);
       reload();
     } catch (error) {
+      // A 401 mid-action (session expired/revoked while this request was in
+      // flight) routes back to login, per the PRD's "session expiring
+      // mid-action returns the user to login" edge case — the same handling
+      // useAsyncData already gives every GET fetch.
+      if (isSessionExpiredError(error)) {
+        handleSessionExpired();
+        return;
+      }
       showError(error instanceof ApiError ? error.detail : "action failed");
     } finally {
       setActionInFlightId(null);

@@ -113,6 +113,38 @@ jobs:
       - name: pytest -m integration
         run: uv run pytest -m integration
 
+  frontend:
+    name: Frontend (typecheck, build, vitest)
+    # apps/admin_api's React/TypeScript/Vite frontend (Phase 8, Unit I) —
+    # its own dependency tree, separate from the Python `uv` project, so it
+    # gets its own job with Node set up rather than piggybacking on the
+    # `test` job above. Runs on every push, same as the Python unit-test
+    # job, per docs/rules/testing.md's CI-gating rule ("Unit: every push")
+    # — this is this tier's CI gate, not e2e.yml (which only builds the
+    # frontend via Docker as part of the full Compose stack and never runs
+    # `npm test`).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/admin_api/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/admin_api/frontend/package-lock.json
+
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+
+      - name: Type check + build
+        run: npm run build
+
+      - name: vitest run
+        run: npm test
+
   helm-lint:
     name: Helm chart lint & template
     # No real cluster involved — the Helm-equivalent of the pyramid's unit

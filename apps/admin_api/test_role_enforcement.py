@@ -17,6 +17,7 @@ cross-cutting dependency with no production call site yet in this phase.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from fastapi import Depends, FastAPI
@@ -119,13 +120,19 @@ def _mount_admin_only_dummy_route(app: FastAPI, *, settings: AdminAPISettings, d
 
 
 def test_require_admin_role_rejects_a_viewer_session_with_403(
-    migrated_engine: AsyncEngine,
+    migrated_engine: AsyncEngine, tmp_path: Path
 ) -> None:
     dsn = str(migrated_engine.url.render_as_string(hide_password=False))
     settings = _settings(dsn=dsn)
     _seed_viewer(dsn)
 
-    app = create_app(settings)
+    # `frontend_dist_dir` pointed at a guaranteed-nonexistent path, per
+    # test_main.py's own convention — without this, `create_app`'s Phase 8
+    # catch-all route silently shadows this module's own test-only
+    # `/__test-only/admin-only` route whenever a real
+    # `apps/admin_api/frontend/dist/` happens to exist on disk (e.g. after
+    # a developer runs `npm run build` locally).
+    app = create_app(settings, frontend_dist_dir=tmp_path / "does-not-exist")
     _mount_admin_only_dummy_route(app, settings=settings, dsn=dsn)
 
     with TestClient(app) as client:
@@ -139,11 +146,15 @@ def test_require_admin_role_rejects_a_viewer_session_with_403(
         assert response.status_code == 403
 
 
-def test_require_admin_role_allows_an_admin_session(migrated_engine: AsyncEngine) -> None:
+def test_require_admin_role_allows_an_admin_session(
+    migrated_engine: AsyncEngine, tmp_path: Path
+) -> None:
     dsn = str(migrated_engine.url.render_as_string(hide_password=False))
     settings = _settings(dsn=dsn)
 
-    app = create_app(settings)
+    # See the previous test's comment on why `frontend_dist_dir` is pinned
+    # to a nonexistent path here.
+    app = create_app(settings, frontend_dist_dir=tmp_path / "does-not-exist")
     _mount_admin_only_dummy_route(app, settings=settings, dsn=dsn)
 
     with TestClient(app) as client:

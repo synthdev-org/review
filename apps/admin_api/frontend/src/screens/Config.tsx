@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 
 import * as api from "../api/endpoints";
-import { ApiError } from "../api/client";
+import { ApiError, isSessionExpiredError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { Notice } from "../components/Notice";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
@@ -21,7 +21,7 @@ interface SettingFormProps {
 // is rejected server-side (422), so this form only ever offers the known
 // set, never a free-text key field.
 function SettingForm({ scope, onSaved }: SettingFormProps): JSX.Element {
-  const { isAdmin } = useAuth();
+  const { isAdmin, handleSessionExpired } = useAuth();
   const [key, setKey] = useState<SettingKey>("memory_suppression_enabled");
   const [enabled, setEnabled] = useState(true);
   const [threshold, setThreshold] = useState<(typeof SEVERITY_OPTIONS)[number]>("medium");
@@ -40,6 +40,10 @@ function SettingForm({ scope, onSaved }: SettingFormProps): JSX.Element {
       await api.setConfig(scope, key, value);
       onSaved(scope, key);
     } catch (submitError) {
+      if (isSessionExpiredError(submitError)) {
+        handleSessionExpired();
+        return;
+      }
       setError(submitError instanceof ApiError ? submitError.detail : "save failed");
     } finally {
       setSaving(false);

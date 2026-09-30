@@ -2,7 +2,7 @@ import type { FormEvent } from "react";
 import { useCallback, useState } from "react";
 
 import * as api from "../api/endpoints";
-import { ApiError } from "../api/client";
+import { ApiError, isSessionExpiredError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { Notice } from "../components/Notice";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
@@ -20,7 +20,7 @@ import type { Role } from "../api/types";
 // trip, matching the PRD's "never clickable-but-failing" rule one step
 // further upstream.
 export function UsersScreen(): JSX.Element {
-  const { isAdmin } = useAuth();
+  const { isAdmin, handleSessionExpired } = useAuth();
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [newRole, setNewRole] = useState<Role>("viewer");
@@ -60,6 +60,10 @@ export function UsersScreen(): JSX.Element {
       setNewRole("viewer");
       reload();
     } catch (error) {
+      if (isSessionExpiredError(error)) {
+        handleSessionExpired();
+        return;
+      }
       setCreateError(error instanceof ApiError ? error.detail : "create failed");
     } finally {
       setCreating(false);
@@ -73,6 +77,10 @@ export function UsersScreen(): JSX.Element {
       showSuccess(`User ${username} deactivated.`);
       reload();
     } catch (error) {
+      if (isSessionExpiredError(error)) {
+        handleSessionExpired();
+        return;
+      }
       showError(error instanceof ApiError ? error.detail : "deactivate failed");
     } finally {
       setDeactivatingId(null);

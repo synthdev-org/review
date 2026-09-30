@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 
 import * as api from "../api/endpoints";
-import { ApiError } from "../api/client";
+import { ApiError, isSessionExpiredError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { Notice } from "../components/Notice";
 import { ErrorState, LoadingState } from "../components/StateViews";
@@ -15,7 +15,7 @@ import { MODEL_ROUTING_STAGES } from "../api/types";
 // is Admin-only (isAdmin gate) — a Viewer sees the table with no edit
 // controls at all.
 export function ModelRoutingScreen(): JSX.Element {
-  const { isAdmin } = useAuth();
+  const { isAdmin, handleSessionExpired } = useAuth();
   const [orgId, setOrgId] = useState("");
   const [formStage, setFormStage] = useState<string>(MODEL_ROUTING_STAGES[0]);
   const [formOrgId, setFormOrgId] = useState("");
@@ -34,6 +34,10 @@ export function ModelRoutingScreen(): JSX.Element {
       setFormModelName("");
       reload();
     } catch (error) {
+      if (isSessionExpiredError(error)) {
+        handleSessionExpired();
+        return;
+      }
       showError(error instanceof ApiError ? error.detail : "save failed");
     } finally {
       setSaving(false);

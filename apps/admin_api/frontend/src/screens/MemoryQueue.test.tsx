@@ -20,8 +20,9 @@ vi.mock("../api/endpoints", () => ({
 }));
 
 let mockIsAdmin = true;
+const handleSessionExpired = vi.fn();
 vi.mock("../auth/AuthContext", () => ({
-  useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: vi.fn() }),
+  useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: (...args: unknown[]) => handleSessionExpired(...args) }),
 }));
 
 const pendingEntry: MemoryEntry = {
@@ -48,6 +49,7 @@ describe("MemoryQueueScreen", () => {
     approveMemoryEntry.mockReset();
     rejectMemoryEntry.mockReset();
     deleteMemoryEntry.mockReset();
+    handleSessionExpired.mockReset();
     mockIsAdmin = true;
   });
 
@@ -94,6 +96,19 @@ describe("MemoryQueueScreen", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /confirm delete/i }));
     await waitFor(() => expect(deleteMemoryEntry).toHaveBeenCalledWith("entry-1"));
+  });
+
+  it("Admin: a 401 mid-action (expired/revoked session) routes back to login instead of showing a generic error", async () => {
+    const { ApiError } = await import("../api/client");
+    listMemoryEntries.mockResolvedValue({ entries: [pendingEntry], total: 1 });
+    approveMemoryEntry.mockRejectedValue(new ApiError(401, "session expired"));
+    render(<MemoryQueueScreen />);
+
+    await screen.findByText("repo-1");
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+
+    await waitFor(() => expect(handleSessionExpired).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("notice")).not.toBeInTheDocument();
   });
 
   it("Viewer: hides every mutating control (not just disables it)", async () => {
