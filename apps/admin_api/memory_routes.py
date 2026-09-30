@@ -49,16 +49,27 @@ unhandled/bare ``500``. A failed embedding computation
 call) is caught the same way and translated to a structured ``500`` (this
 entrypoint's own local model-inference failure, not the caller's fault, so
 not a ``4xx``).
+
+Phase 10 (Unit K, Could-priority, US-A23) adds
+``POST /api/v1/memory-entries/bulk-approve`` and ``.../bulk-reject`` — each
+executes this module's own ``approve_memory_entry``/``reject_memory_entry``
+handler once per selected id (never a new bulk-specific domain method, per
+the plan's own Phase 10 bullet), collecting each id's own success/failure
+into the response rather than rolling back the whole batch on one failure.
+The shared per-item collection logic lives in the module-level
+``_run_bulk_operation`` helper, kept pure (no FastAPI/DB dependency of its
+own beyond the operation it's handed) so it can be unit-tested directly.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Literal, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from adapter.storage.iam import PostgresAuditLogRepository
 from apps.admin_api.dependencies import (
@@ -128,6 +139,43 @@ class _DeleteMemoryEntryResponse(BaseModel):
     entry_id: str
 
 
+class _BulkApproveRequest(BaseModel):
+    """US-A23's first Given/When/Then: one explicit ``entry_type`` applied
+    to every selected id — not a per-id override — mirroring
+    ``_ApproveRequest``'s own "missing/invalid entry_type fails validation
+    before any entry is touched" posture, now for the whole batch rather
+    than one entry."""
+
+    entry_ids: Annotated[tuple[str, ...], Field(min_length=1)]
+    entry_type: _ApproveEntryType
+
+
+class _BulkRejectRequest(BaseModel):
+    """US-A23's second Given/When/Then: reject every selected id, no
+    ``entry_type`` — rejecting always clears any prior classification,
+    exactly like the single-entry reject route."""
+
+    entry_ids: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class _BulkItemResult(BaseModel):
+    """One selected id's own outcome — ``error`` is the same detail string
+    the single-entry route would have returned in its HTTP response body,
+    so a caller sees the identical failure reason either way."""
+
+    entry_id: str
+    success: bool
+    error: str | None = None
+
+
+class _BulkOperationResponse(BaseModel):
+    """US-A23's own "response shape distinguishes [successes and failures]"
+    requirement — one result per requested id, in request order, never a
+    single aggregate success/failure flag for the whole batch."""
+
+    results: tuple[_BulkItemResult, ...]
+
+
 def _entry_id_not_found_or_invalid(entry_id: str, exc: Exception) -> NoReturn:
     """Shared translation for the `MemoryEntryNotFoundError` -> 404 /
     `MemoryStoreError` -> 400 pair every entry-id-scoped route below
@@ -149,6 +197,35 @@ def _entry_id_not_found_or_invalid(entry_id: str, exc: Exception) -> NoReturn:
     if isinstance(exc, MemoryStoreError):
         raise HTTPException(status_code=400, detail=f"invalid entry_id: {exc.detail}") from exc
     raise exc
+
+
+async def _run_bulk_operation(
+    entry_ids: Sequence[str], operation: Callable[[str], Awaitable[object]]
+) -> _BulkOperationResponse:
+    """Phase 10 (US-A23): run ``operation`` once per id in ``entry_ids``,
+    collecting each id's own success/failure into the response rather than
+    letting one id's ``HTTPException`` (e.g. a 404 for an already-deleted
+    id) abort the loop or roll back ids already processed — the plan's own
+    "iterating Phase 3's existing per-entry ... handlers individually ...
+    collecting per-item success/failure ... rather than rolling back the
+    batch on one failure" requirement.
+
+    Deliberately a plain module-level function, not a closure inside
+    ``create_memory_router`` — it needs no dependency of its own beyond the
+    ``operation`` callable it's handed, so it can be unit-tested directly
+    against a fake ``operation`` with no FastAPI app or database involved.
+    Any non-``HTTPException`` raised by ``operation`` is left to propagate
+    (an unexpected error is a real 5xx, not a per-item result to swallow).
+    """
+    results: list[_BulkItemResult] = []
+    for entry_id in entry_ids:
+        try:
+            await operation(entry_id)
+        except HTTPException as exc:
+            results.append(_BulkItemResult(entry_id=entry_id, success=False, error=str(exc.detail)))
+        else:
+            results.append(_BulkItemResult(entry_id=entry_id, success=True, error=None))
+    return _BulkOperationResponse(results=tuple(results))
 
 
 def create_memory_router(
@@ -328,5 +405,41 @@ def create_memory_router(
             extra={"entry_id": entry_id, "action": "delete", "actor": authenticated.user.username},
         )
         return _DeleteMemoryEntryResponse(deleted=True, entry_id=entry_id)
+
+    @router.post("/bulk-approve")
+    async def bulk_approve_memory_entries(
+        payload: _BulkApproveRequest,
+        authenticated: AuthenticatedSession = Depends(require_admin_role),
+    ) -> _BulkOperationResponse:
+        """US-A23's first Given/When/Then: approve every id in
+        ``payload.entry_ids`` with the one ``entry_type`` applied to all of
+        them, by calling this router's own ``approve_memory_entry`` handler
+        once per id — including its own embedding computation where
+        applicable, attributed to this same acting Admin — never a new
+        bulk-specific domain method. A single id's failure (e.g.
+        already-deleted) is collected into that id's own result and never
+        blocks or rolls back the rest of the batch.
+        """
+        return await _run_bulk_operation(
+            payload.entry_ids,
+            lambda entry_id: approve_memory_entry(
+                entry_id, _ApproveRequest(entry_type=payload.entry_type), authenticated
+            ),
+        )
+
+    @router.post("/bulk-reject")
+    async def bulk_reject_memory_entries(
+        payload: _BulkRejectRequest,
+        authenticated: AuthenticatedSession = Depends(require_admin_role),
+    ) -> _BulkOperationResponse:
+        """US-A23's second Given/When/Then: reject every id in
+        ``payload.entry_ids`` by calling this router's own
+        ``reject_memory_entry`` handler once per id — same partial-failure
+        handling as ``bulk_approve_memory_entries``.
+        """
+        return await _run_bulk_operation(
+            payload.entry_ids,
+            lambda entry_id: reject_memory_entry(entry_id, authenticated),
+        )
 
     return router

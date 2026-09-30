@@ -850,6 +850,8 @@ config` validates the new service.
 
 ## Phase 10 — Bulk approve/reject (Unit K, Could: US-A23)
 
+**Status: Done (2026-09-30).**
+
 **Why last:** the plan's only optional unit (no roadmap/ADR commitment
 forces it); depends on Phase 3's migrated Memory routes; nothing later in
 this plan depends on it, so it is safe to cut if time runs out.

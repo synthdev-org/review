@@ -835,3 +835,191 @@ async def test_approve_reject_delete_log_at_info(
     deleted = next(r for r in admin_records if r.getMessage() == "memory entry deleted")
     assert getattr(deleted, "entry_id", None) == delete_entry_id
     assert getattr(deleted, "action", None) == "delete"
+
+
+# --- New cases (Phase 10, Unit K): bulk approve/reject, US-A23 ----------
+
+
+@pytest.mark.asyncio
+async def test_bulk_approve_partial_failure(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+) -> None:
+    """US-A23's first Given/When/Then, including its own "any single
+    entry's failure ... doesn't roll back or block the others" clause: of N
+    selected ids, N-1 are real pending entries and one has already been
+    deleted before the bulk call — all N-1 real entries are approved with
+    the one shared `entry_type`, the pre-deleted id reports its own 404
+    failure, and the response shape distinguishes the two outcomes."""
+    entry_ids = [
+        await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8600 + i)
+        for i in range(3)
+    ]
+    pre_deleted_id = str(uuid.uuid4())
+    all_ids = [*entry_ids, pre_deleted_id]
+
+    with TestClient(create_app(_settings(dsn=_dsn(migrated_engine)))) as client:
+        csrf_token = _login_as_bootstrap_admin(client)
+        response = client.post(
+            "/api/v1/memory-entries/bulk-approve",
+            json={"entry_ids": all_ids, "entry_type": "accepted_fix"},
+            headers={CSRF_HEADER_NAME: csrf_token},
+        )
+
+        listed = client.get("/api/v1/memory-entries", params={"repo_id": str(repo_id)}).json()
+
+    assert response.status_code == 200
+    results = {r["entry_id"]: r for r in response.json()["results"]}
+    assert len(results) == 4
+    for entry_id in entry_ids:
+        assert results[entry_id]["success"] is True
+        assert results[entry_id]["error"] is None
+    assert results[pre_deleted_id]["success"] is False
+    assert pre_deleted_id in results[pre_deleted_id]["error"]
+
+    assert listed["total"] == 3
+    assert all(
+        e["status"] == "approved" and e["entry_type"] == "accepted_fix" for e in listed["entries"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_bulk_reject_partial_failure(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+) -> None:
+    """US-A23's second Given/When/Then: same partial-failure handling as
+    bulk-approve, exercised for reject instead."""
+    entry_ids = [
+        await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8700 + i)
+        for i in range(3)
+    ]
+    pre_deleted_id = str(uuid.uuid4())
+    all_ids = [*entry_ids, pre_deleted_id]
+
+    with TestClient(create_app(_settings(dsn=_dsn(migrated_engine)))) as client:
+        csrf_token = _login_as_bootstrap_admin(client)
+        response = client.post(
+            "/api/v1/memory-entries/bulk-reject",
+            json={"entry_ids": all_ids},
+            headers={CSRF_HEADER_NAME: csrf_token},
+        )
+
+        listed = client.get("/api/v1/memory-entries", params={"repo_id": str(repo_id)}).json()
+
+    assert response.status_code == 200
+    results = {r["entry_id"]: r for r in response.json()["results"]}
+    assert len(results) == 4
+    for entry_id in entry_ids:
+        assert results[entry_id]["success"] is True
+        assert results[entry_id]["error"] is None
+    assert results[pre_deleted_id]["success"] is False
+    assert pre_deleted_id in results[pre_deleted_id]["error"]
+
+    assert listed["total"] == 3
+    assert all(e["status"] == "rejected" for e in listed["entries"])
+
+
+@pytest.mark.asyncio
+async def test_bulk_approve_attributes_each_entry_to_the_acting_admin(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+) -> None:
+    """US-A23's first Given/When/Then requires each selected entry to
+    execute the existing US-A9/US-M4 approve behavior individually,
+    attributed to the acting Admin — same attribution the single-entry
+    route already proves, now checked across a batch."""
+    entry_ids = [
+        await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8800 + i)
+        for i in range(2)
+    ]
+
+    with TestClient(create_app(_settings(dsn=_dsn(migrated_engine)))) as client:
+        csrf_token = _login_as_bootstrap_admin(client)
+        client.post(
+            "/api/v1/memory-entries/bulk-approve",
+            json={"entry_ids": entry_ids, "entry_type": "correction"},
+            headers={CSRF_HEADER_NAME: csrf_token},
+        )
+
+    async def _assert_attribution() -> None:
+        async with session_factory() as session:
+            admin_row = (
+                await session.execute(
+                    select(AdminUserRow).where(AdminUserRow.username == _BOOTSTRAP_USERNAME)
+                )
+            ).scalar_one()
+            audit_rows = (
+                await session.execute(
+                    select(AdminAuditLogRow).where(
+                        AdminAuditLogRow.action == "memory_entry_approved",
+                        AdminAuditLogRow.resource_id.in_(entry_ids),
+                    )
+                )
+            ).scalars()
+            actor_ids = {row.actor_user_id for row in audit_rows}
+            assert actor_ids == {admin_row.id}
+
+    await _assert_attribution()
+
+
+def test_bulk_routes_reject_an_unauthenticated_request(migrated_engine: AsyncEngine) -> None:
+    client = TestClient(create_app(_settings(dsn=_dsn(migrated_engine))))
+
+    approve_response = client.post(
+        "/api/v1/memory-entries/bulk-approve",
+        json={"entry_ids": [str(uuid.uuid4())], "entry_type": "correction"},
+    )
+    reject_response = client.post(
+        "/api/v1/memory-entries/bulk-reject", json={"entry_ids": [str(uuid.uuid4())]}
+    )
+
+    assert approve_response.status_code == 401
+    assert reject_response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_bulk_routes_reject_a_viewer_session(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+) -> None:
+    """US-A5's second clause, extended to the bulk routes: a Viewer session
+    is rejected with 403, same as every other mutating Memory route."""
+    entry_id = await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8900)
+    await _seed_viewer(session_factory)
+
+    with TestClient(create_app(_settings(dsn=_dsn(migrated_engine)))) as client:
+        client.post(
+            "/api/v1/auth/login", json={"username": _VIEWER_USERNAME, "password": _VIEWER_PASSWORD}
+        )
+        viewer_csrf_token = client.cookies[CSRF_COOKIE_NAME]
+
+        approve_response = client.post(
+            "/api/v1/memory-entries/bulk-approve",
+            json={"entry_ids": [entry_id], "entry_type": "correction"},
+            headers={CSRF_HEADER_NAME: viewer_csrf_token},
+        )
+        reject_response = client.post(
+            "/api/v1/memory-entries/bulk-reject",
+            json={"entry_ids": [entry_id]},
+            headers={CSRF_HEADER_NAME: viewer_csrf_token},
+        )
+
+    assert approve_response.status_code == 403
+    assert reject_response.status_code == 403
+
+
+def test_bulk_approve_empty_entry_ids_is_rejected(migrated_engine: AsyncEngine) -> None:
+    with TestClient(create_app(_settings(dsn=_dsn(migrated_engine)))) as client:
+        csrf_token = _login_as_bootstrap_admin(client)
+        response = client.post(
+            "/api/v1/memory-entries/bulk-approve",
+            json={"entry_ids": [], "entry_type": "correction"},
+            headers={CSRF_HEADER_NAME: csrf_token},
+        )
+
+    assert response.status_code == 422
