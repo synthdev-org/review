@@ -332,6 +332,25 @@ class WorkerSettings(OtelSettingsMixin):
     memory_similarity_threshold: float = 0.90
     memory_decay_half_life_days: float = 180.0
 
+    # --- Model routing (docs/plans/plan-deliver-admin-gui.md's Phase 5
+    # section, Unit F, US-A14/US-A15/US-A16, Assumption 3) ---
+    # Mirrors `memory_suppression_enabled`'s exact four-piece pattern: a
+    # plain `WorkerSettings` field with its own rationale docstring (this
+    # comment); a one-time startup `WARNING` log when disabled
+    # (`apps/worker/main.py`'s `_log_model_routing_disabled_warning`);
+    # conditional construction at the composition root (`None` restores
+    # today's exact byte-for-byte behavior — every LLM-calling step uses
+    # `settings.llm_model` directly, zero `ModelRoutingConfig` reads); and
+    # never read directly by step code (`IntentSummaryStep`/
+    # `ReviewGenerationStep`/`VerificationStep` only ever see the
+    # already-built `model_resolver` object, never this flag itself).
+    # Default `True` — the operational rollback lever (US-A16's "no restart
+    # required" is about a routing *config change*, not this kill switch;
+    # see the plan's own "Compatibility & rollout" section) is turning this
+    # *off*, which **does** require a `WorkerSettings` env-var change and a
+    # Worker restart to flip, unlike a routing config change itself.
+    model_routing_config_enabled: bool = True
+
     # --- Findings-merge-and-output step (Phase 7, review/output.py) ---
     # A single bootstrap-config kill-switch: when set, the full pipeline
     # still runs (including this step's own merge/redaction-consuming

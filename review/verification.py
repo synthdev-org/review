@@ -86,6 +86,7 @@ from findings.models import Finding
 from indexing.embedding import EmbeddingClient
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
+from llmgateway.routing import FallbackModelRoutingResolver
 from memory.fingerprint import build_finding_fingerprint
 from memory.store import DismissedFindingMatcher
 from review._telemetry import suppress_telemetry_errors
@@ -369,6 +370,7 @@ class VerificationStep:
         max_diff_bytes: int,
         depends_on: str = "review_generation",
         memory_suppression: MemorySuppressionConfig | None = None,
+        model_resolver: FallbackModelRoutingResolver | None = None,
     ) -> None:
         """``depends_on`` names this step's single upstream dependency —
         ``"review_generation"`` by default, its normal immediate
@@ -391,12 +393,23 @@ class VerificationStep:
         ``VerificationStep`` keeps working unchanged, matching every other
         "absent upstream data degrades gracefully" precedent this codebase
         already establishes for ``context_bundle``/``intent_summary``.
+
+        ``model_resolver`` (``docs/plans/plan-deliver-admin-gui.md``'s
+        Phase 5 section, Unit F, Assumption 3) is ``None`` by default —
+        ``model`` is then used unchanged, byte-for-byte this step's prior
+        behavior. When set, ``run()`` calls
+        ``model_resolver.resolve(self.name, parsed.org_id)`` itself, at
+        dispatch time, instead of using ``model`` — the composition root
+        never reaches into this already-built step to overwrite its own
+        ``model`` field, per ``docs/rules/architecture.md``'s "no stage
+        reaching into another stage's internals" rule.
         """
         self._llm_client = llm_client
         self._model = model
         self._timeout = timeout
         self._max_diff_bytes = max_diff_bytes
         self._memory_suppression = memory_suppression
+        self._model_resolver = model_resolver
         self.depends_on: tuple[str, ...] = (depends_on,)
 
     @staticmethod
@@ -497,8 +510,13 @@ class VerificationStep:
             step_name="verification",
         )
 
+        model = (
+            await self._model_resolver.resolve(self.name, parsed.org_id)
+            if self._model_resolver is not None
+            else self._model
+        )
         request = build_completion_request(
-            self._model,
+            model,
             system_content=_SYSTEM_PROMPT,
             user_content=_build_user_message(truncated_text, llm_findings, parsed.context_bundle),
         )

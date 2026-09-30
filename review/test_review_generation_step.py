@@ -57,6 +57,11 @@ from findings.models import Finding
 from ingestion.diff import Diff, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse, TokenUsage
+from llmgateway.routing import (
+    FallbackModelRoutingResolver,
+    ModelRoutingConfigReader,
+    ModelRoutingConfigRow,
+)
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.diff_prompt import render_diff
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
@@ -208,6 +213,7 @@ def _review_generation_step(
     max_diff_bytes: int = 200_000,
     timeout: float = 5.0,
     model: str = "local-model",
+    model_resolver: FallbackModelRoutingResolver | None = None,
 ) -> ReviewGenerationStep:
     return ReviewGenerationStep(
         llm_client,
@@ -215,6 +221,7 @@ def _review_generation_step(
         model=model,
         timeout=timeout,
         max_diff_bytes=max_diff_bytes,
+        model_resolver=model_resolver,
     )
 
 
@@ -1008,3 +1015,60 @@ async def test_us3_completion_without_usage_records_no_token_metrics(
     await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
 
     assert _llm_token_data_points(in_memory_metric_reader) == []
+
+
+# =============================================================================
+# Model routing (docs/plans/plan-deliver-admin-gui.md's Phase 5 section,
+# Unit F, Assumption 3): model_resolver injection.
+# =============================================================================
+
+
+class _StaticReader:
+    """A ``ModelRoutingConfigReader`` fake returning one fixed row for every
+    call — enough to prove the resolved model (not the constructor's own
+    ``model`` fallback) reaches the completion request."""
+
+    def __init__(self, row: ModelRoutingConfigRow) -> None:
+        self._row = row
+        self.calls: list[tuple[str | None, str]] = []
+
+    async def get(self, *, org_id: str | None, stage: str) -> ModelRoutingConfigRow | None:
+        self.calls.append((org_id, stage))
+        return self._row
+
+
+def _assert_is_reader(reader: object) -> None:
+    assert isinstance(reader, ModelRoutingConfigReader)
+
+
+@pytest.mark.asyncio
+async def test_model_resolver_when_set_resolves_model_at_dispatch_time() -> None:
+    reader = _StaticReader(
+        ModelRoutingConfigRow(org_id="org-1", stage="review_generation", model_name="routed-model")
+    )
+    _assert_is_reader(reader)
+    resolver = FallbackModelRoutingResolver(reader, static_default_model="local-model")
+    llm_client = _FakeLLMClient(response_content=_findings_response_json(0))
+    step = _review_generation_step(
+        llm_client=llm_client, redactor=_RecordingTextRedactor(), model_resolver=resolver
+    )
+
+    await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch(), org_id="org-1"), _context())
+
+    assert len(llm_client.calls) == 1
+    assert llm_client.calls[0].model == "routed-model"
+    assert reader.calls == [("org-1", "review_generation")]
+
+
+@pytest.mark.asyncio
+async def test_model_resolver_absent_uses_constructor_model_unchanged() -> None:
+    """``model_resolver=None`` (the default) restores byte-for-byte this
+    step's prior behavior — ``model`` is used directly, with zero calls to
+    any resolver."""
+    llm_client = _FakeLLMClient(response_content=_findings_response_json(0))
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+
+    await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    assert len(llm_client.calls) == 1
+    assert llm_client.calls[0].model == "local-model"

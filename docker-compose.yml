@@ -212,6 +212,10 @@ services:
       # setting uses.
       REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH: >-
         ${REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH:-/app/models/all-MiniLM-L6-v2}
+      # docs/plans/plan-deliver-admin-gui.md's Phase 5 (Unit F) — model
+      # routing's static-default tier. Same literal default as
+      # REVIEW_WORKER_LLM_MODEL below; keep both in sync.
+      REVIEW_ADMIN_API_LLM_MODEL: ${REVIEW_ADMIN_API_LLM_MODEL:-local-model}
       # See webhook_api's own identical entry above for why this is a bare
       # pass-through (`KEY:`, no `:-` default) rather than
       # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}`.

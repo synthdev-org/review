@@ -146,6 +146,7 @@ from adapter.llm.litellm_client import LiteLLMClient
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.indexing_repository import IndexingRepository
+from adapter.storage.llm_routing import PostgresModelRoutingRepository
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
 from adapter.telemetry.heartbeat import heartbeat_task_scope
@@ -162,6 +163,7 @@ from indexing.embedding import EmbeddingError
 from indexing.pipeline import IndexingJobDependencies
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMError
+from llmgateway.routing import FallbackModelRoutingResolver
 from llmgateway.startup_check import check_llm_reachable
 from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.config import (
@@ -514,6 +516,26 @@ def _log_memory_suppression_disabled_warning(
         )
 
 
+def _log_model_routing_disabled_warning(settings: WorkerSettings, logger: logging.Logger) -> None:
+    """A one-time `warning`-level startup log when `model_routing_config_enabled`
+    is `False` (docs/plans/plan-deliver-admin-gui.md's Phase 5 section, Unit
+    F) — mirrors `_log_memory_suppression_disabled_warning`'s own shape
+    exactly: the deployment can still boot and run correctly (disabling
+    model routing restores exactly this phase's own prior LLM-calling step
+    construction — every step uses `settings.llm_model` directly, zero
+    `ModelRoutingConfig` reads), but the deviation from the shipped default
+    — every org/stage gets the one static default model, regardless of any
+    `ModelRoutingConfig` row an Admin may have written — must be visible,
+    not silent.
+    """
+    if not settings.model_routing_config_enabled:
+        logger.warning(
+            "model routing is disabled: every stage uses the static default model, "
+            "regardless of any ModelRoutingConfig row",
+            extra={"model_routing_config_enabled": False},
+        )
+
+
 _DEPRECATED_SETTINGS_ENV_VARS: tuple[tuple[str, str], ...] = (
     ("REVIEW_WORKER_LLM_REVIEW_ENABLED", "REVIEW_WORKER_REVIEW_GENERATION_ENABLED"),
     (
@@ -692,6 +714,7 @@ def _build_review_registry(
     publisher: GitHubFindingsPublisher,
     settings: WorkerSettings,
     memory_matcher: PostgresMemoryRepository,
+    model_resolver: FallbackModelRoutingResolver | None,
 ) -> StepRegistry:
     """Construct the macro-step registry `REVIEW` jobs dispatch to.
 
@@ -760,6 +783,20 @@ def _build_review_registry(
     above, this isn't gated through `enabled_mapping`/`resolved` — it's an
     internal behavior toggle inside the already-registered `verification`
     step, not a separate pipeline stage of its own.
+
+    `docs/plans/plan-deliver-admin-gui.md`'s Phase 5 section (Unit F,
+    Assumption 3) adds `model_resolver` — passed as a new
+    `model_resolver=` keyword argument to all three LLM-calling steps
+    (`IntentSummaryStep`/`ReviewGenerationStep`/`VerificationStep`),
+    alongside their existing `llm_step_kwargs` (which still includes
+    `model`, now each step's own fallback/default when `model_resolver` is
+    `None`). `None` when `model_routing_config_enabled` is `False`,
+    restoring byte-for-byte each step's pre-Phase-5 construction (every
+    call uses `settings.llm_model` directly). When set, each step resolves
+    its own model at dispatch time inside its own `run()` — this function
+    never overwrites an already-built step's `model` field from the
+    outside, per architecture.md's "no stage reaching into another stage's
+    internals" rule.
     """
     enabled_mapping = enablement.as_mapping()
     timeouts_mapping = timeouts.as_mapping()
@@ -839,17 +876,20 @@ def _build_review_registry(
             IntentSummaryStep(
                 llm_client,
                 **llm_step_kwargs,
+                model_resolver=model_resolver,
                 depends_on=resolved["intent_summary"],
             ),
             ReviewGenerationStep(
                 llm_client,
                 redactor=redactor,
                 **llm_step_kwargs,
+                model_resolver=model_resolver,
                 depends_on=resolved["review_generation"],
             ),
             VerificationStep(
                 llm_client,
                 **llm_step_kwargs,
+                model_resolver=model_resolver,
                 depends_on=resolved["verification"],
                 memory_suppression=memory_suppression,
             ),
@@ -976,6 +1016,25 @@ async def _run(
     redactor = _build_text_redactor(settings, logger)
     _log_verification_disabled_warning(settings, logger)
     _log_memory_suppression_disabled_warning(settings, logger)
+    _log_model_routing_disabled_warning(settings, logger)
+    # docs/plans/plan-deliver-admin-gui.md's Phase 5 section (Unit F,
+    # Assumption 3) — `None` when `model_routing_config_enabled` is
+    # `False`, restoring exactly the pre-Phase-5 construction (every
+    # LLM-calling step uses `settings.llm_model` directly, zero
+    # `ModelRoutingConfig` reads). The same `FallbackModelRoutingResolver`
+    # *class* `apps/admin_api/main.py`'s own composition root also wires
+    # (a separate instance here, sharing the class, never a second
+    # independently-derived fallback chain) — see that module's own
+    # docstring for why this one implementation is shared by name across
+    # both entrypoints.
+    model_routing_repository = PostgresModelRoutingRepository(session_factory)
+    model_routing_resolver = (
+        FallbackModelRoutingResolver(
+            model_routing_repository, static_default_model=settings.llm_model
+        )
+        if settings.model_routing_config_enabled
+        else None
+    )
     # The same database session factory IndexRepository already uses (see
     # `_build_indexing_deps` below) — no second connection pool. Built here,
     # ahead of `publisher`, so `_build_findings_publisher` (Phase 2, US-M11)
@@ -999,6 +1058,7 @@ async def _run(
         publisher,
         settings,
         memory_repository,
+        model_routing_resolver,
     )
     index_repository = IndexingRepository(session_factory)
     indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)

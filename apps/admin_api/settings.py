@@ -87,6 +87,19 @@ class AdminAPISettings(OtelSettingsMixin):
     # material.
     admin_csrf_secret: SecretStr
 
+    # --- Model routing (docs/plans/plan-deliver-admin-gui.md's Phase 5
+    # section, Unit F, US-A14/US-A15, Assumption 3) ---
+    # The static-default tier `llmgateway.routing.FallbackModelRoutingResolver`
+    # falls open to when no `ModelRoutingConfig` row exists for a stage
+    # (US-A14's third source). Same literal default as
+    # `apps/worker/settings.py`'s own `llm_model` field — a separate,
+    # per-entrypoint field (not a shared one) following the exact same
+    # "duplicated literal default, not a shared import" precedent this
+    # entrypoint's own `embedding_model_path` field already establishes
+    # above; an operator running both entrypoints keeps the two env vars in
+    # sync the same way they already do for that field.
+    llm_model: str = "local-model"
+
     # --- Memory admin API (docs/plans/plan-deliver-admin-gui.md's Phase 3
     # section, Unit D, US-A7/US-A8-A11) ---
     # This entrypoint's own `LocalONNXEmbeddingClient` instance — the

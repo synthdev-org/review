@@ -54,6 +54,7 @@ from adapter.storage.iam import (
     PostgresSessionStore,
     PostgresUserRepository,
 )
+from adapter.storage.llm_routing import PostgresModelRoutingRepository
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.tenancy import PostgresSettingRepository
 from adapter.telemetry.heartbeat import heartbeat_task_scope
@@ -68,9 +69,11 @@ from apps.admin_api.config_routes import create_config_router
 from apps.admin_api.dependencies import build_require_admin_role, build_require_session
 from apps.admin_api.logging_config import configure_logging
 from apps.admin_api.memory_routes import create_memory_router
+from apps.admin_api.model_routing_routes import create_model_routing_router
 from apps.admin_api.settings import AdminAPISettings
 from apps.admin_api.user_routes import create_user_router
 from indexing.embedding import EmbeddingError
+from llmgateway.routing import FallbackModelRoutingResolver
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +251,30 @@ def create_app(settings: AdminAPISettings) -> FastAPI:
         )
     )
     logger.info("config routes registered")
+
+    # Model routing (docs/plans/plan-deliver-admin-gui.md's Phase 5
+    # section, Unit F, US-A14/US-A15/US-A16, Assumption 3) — registered
+    # unconditionally, the same "no off-by-default state" posture every
+    # other route module here already takes. `resolver` is the same
+    # `FallbackModelRoutingResolver` *class* `apps/worker/main.py`'s own
+    # composition root wires (a separate instance here, sharing the class,
+    # never a second independently-derived fallback chain) — see that
+    # module's own docstring for why this one implementation is shared by
+    # name across both entrypoints.
+    model_routing_repository = PostgresModelRoutingRepository(session_factory)
+    model_routing_resolver = FallbackModelRoutingResolver(
+        model_routing_repository, static_default_model=settings.llm_model
+    )
+    app.include_router(
+        create_model_routing_router(
+            resolver=model_routing_resolver,
+            repository=model_routing_repository,
+            audit_log_repository=audit_log_repository,
+            require_session=require_session,
+            require_admin_role=require_admin_role,
+        )
+    )
+    logger.info("model routing routes registered")
 
     return app
 

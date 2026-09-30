@@ -550,6 +550,8 @@ scope-precedence.
 
 ## Phase 5 — Model routing: config + Worker read-path (Unit F: US-A14, US-A15, US-A16)
 
+**Status: Done (2026-09-30).**
+
 **Why next:** the plan's highest-risk phase — the only unit touching a
 production-critical hot path (every LLM-calling job dispatch in
 `apps/worker`) — sequenced with Phases 1–4 already proven so its kill

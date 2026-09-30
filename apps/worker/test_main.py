@@ -73,6 +73,7 @@ from indexing.tree import RepoTreeEntry
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
+from llmgateway.routing import FallbackModelRoutingResolver
 from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.config import StepEnablement, StepTimeouts
 from review.context_builder import CallerHit
@@ -393,6 +394,7 @@ def _capture_redactor(
         publisher: GitHubFindingsPublisher,
         settings: WorkerSettings,
         memory_matcher: PostgresMemoryRepository,
+        model_resolver: FallbackModelRoutingResolver | None,
     ) -> StepRegistry:
         captured.append(redactor)
         return original(
@@ -408,6 +410,7 @@ def _capture_redactor(
             publisher,
             settings,
             memory_matcher,
+            model_resolver,
         )
 
     monkeypatch.setattr(worker_main, "_build_review_registry", _capturing)
@@ -667,6 +670,7 @@ async def test_all_four_context_builder_enablement_combinations_complete_success
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
         cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
     )
 
     context_builder_step = registry._by_name["context_builder"]
@@ -740,6 +744,7 @@ async def test_context_builder_enabled_but_review_generation_disabled_skips_cont
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
         cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
     )
 
     statuses = await _run_review_registry(registry)
@@ -790,6 +795,7 @@ async def test_context_builder_disabled_produces_byte_for_byte_phase_1_review_ge
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
         cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
     )
 
     intent_summary_step = registry._by_name["intent_summary"]
@@ -993,6 +999,49 @@ def test_memory_suppression_default_enabled_logs_no_disabled_warning(
     captured = capsys.readouterr()
     payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
     assert not [p for p in payloads if "memory suppression is disabled" in p["message"]]
+
+
+# --- Phase 5 (admin GUI plan): model_routing_config_enabled=False -----------
+#
+# Mirrors the `memory_suppression_enabled=False` test pair immediately
+# above, exactly — per docs/plans/plan-deliver-admin-gui.md's Phase 5
+# section's own "visible, not silent" deviation-from-default requirement.
+
+
+def test_model_routing_disabled_logs_warning_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_MODEL_ROUTING_CONFIG_ENABLED", "false")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    matching = [
+        p
+        for p in payloads
+        if p["message"] == "model routing is disabled: every stage uses the static default "
+        "model, regardless of any ModelRoutingConfig row"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["level"] == "WARNING"
+
+
+def test_model_routing_default_enabled_logs_no_disabled_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    assert not [p for p in payloads if "model routing is disabled" in p["message"]]
 
 
 # --- Phase 5 (verification pipeline plan): resolved depends_on in startup log

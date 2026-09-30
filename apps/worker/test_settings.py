@@ -185,6 +185,29 @@ def test_memory_suppression_fields_are_overridable_from_env(
     assert settings.memory_decay_half_life_days == 90.0
 
 
+def test_model_routing_config_enabled_defaults_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs/plans/plan-deliver-admin-gui.md's Phase 5 section (Unit F) —
+    mirrors `memory_suppression_enabled`'s own default-true shape exactly."""
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.model_routing_config_enabled is True
+
+
+def test_model_routing_config_enabled_is_overridable_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_MODEL_ROUTING_CONFIG_ENABLED", "false")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.model_routing_config_enabled is False
+
+
 # --- US-F7: an all-disabled step configuration is caught at startup --------
 #
 # Per the plan's Phase 2 section, this predicate operates at the
