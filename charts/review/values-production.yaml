@@ -41,3 +41,10 @@ webhookApi:
 worker:
   environment: production
   logLevel: INFO
+
+# Phase 9 — keeps the Admin API's environment/log level in step with the
+# other two entrypoints above; without this override it would silently
+# stay on values.yaml's `development` default in a production install.
+adminApi:
+  environment: production
+  logLevel: INFO

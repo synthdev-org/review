@@ -153,11 +153,133 @@ llm:
 # Memory admin API's shared-token auth used. docs/plans/
 # plan-deliver-admin-gui.md's Phase 3 (Unit D, US-A7) fully retired that
 # credential — the Memory admin API now authenticates via real per-user
-# sessions instead — so this key is intentionally empty here. Phase 9 of
-# that same plan reintroduces a fresh `adminApi:` block (replicaCount/
-# image/service/resources/credentials) for the real `apps/admin_api`
-# Deployment; the two phases don't collide in shape since Phase 3 runs
-# first.
+# sessions instead. This is Phase 9's fresh block for the real
+# `apps/admin_api` Deployment (US-A20) — mirrors `webhookApi:`'s own
+# replicaCount/image/service/resources shape one-for-one, plus its own
+# non-secret settings (mirroring apps/admin_api/settings.py's
+# AdminAPISettings fields one-for-one, REVIEW_ADMIN_API_ env prefix) and
+# its own credential fields (the shared value/existingSecret shape this
+# file's header documents, same as the credential fields below — unlike
+# those, these live inside this block rather than at the top level since
+# only apps/admin_api ever consumes them, per this chart's own
+# single-consumer-vs-shared placement convention).
+adminApi:
+  # Independently toggleable from `ingress.enabled` below (Observability &
+  # rollback) — an operator not ready to run the Admin UI at all can
+  # disable the Deployment/Service themselves, not just external exposure
+  # to them. No equivalent flag exists for `webhookApi:`/`worker:` today
+  # (both render unconditionally) — this is a new, Admin-UI-specific
+  # toggle, not a retrofit of that same convention onto the other two.
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/mystery-digital/review
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    # Matches docker-compose.yml's own admin_api service port (Phase 1) —
+    # also the port apps/admin_api/main.py's uvicorn command below binds.
+    port: 8001
+  environment: development
+  logLevel: INFO
+  # Session cookie (Assumption 7). `false` only ever makes sense for a
+  # plain-HTTP local loopback — every real cluster deployment sits behind
+  # a TLS-terminating Ingress (see the `ingress:` block below).
+  sessionCookieSecure: true
+  sessionIdleTimeoutMinutes: 30
+  # Login rate limiting (Assumption 5) — Postgres-backed, correct across
+  # this Deployment's multiple stateless replicas.
+  loginRateLimit:
+    attempts: 5
+    windowMinutes: 15
+  # Password policy (Assumption 14).
+  minPasswordLength: 12
+  # Model routing's static-default tier (Phase 5, Unit F) — keep in sync
+  # with worker.llm.model above, same reasoning as
+  # apps/admin_api/settings.py's own field-level comment.
+  llmModel: local-model
+  # Memory admin API's embedding client (Phase 3, Unit D) — same
+  # Dockerfile-baked on-disk path every other entrypoint's copy of this
+  # setting uses.
+  embeddingModelPath: /app/models/all-MiniLM-L6-v2
+  # Admin-stats dashboard's Prometheus-reading adapter (Phase 6, Unit G).
+  prometheus:
+    baseUrl: http://prometheus:9090
+    timeoutSeconds: 5
+    retryMaxAttempts: 2
+  resources: {}
+  # --- Credential fields (see this file's header for the shared shape) ---
+  # Bootstrap admin (Assumption 11) — required, no default; the bootstrap
+  # routine (apps/admin_api/bootstrap.py) cannot create the first admin
+  # user without these.
+  bootstrapUsername:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+  bootstrapPassword:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+  # Session-bound CSRF HMAC key (Assumption 13) — required, no default;
+  # without it, admin_api fails to boot.
+  csrfSecret:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+
+# Chart-managed Ingress (US-A21) — new as of Phase 9; the chart had no
+# Ingress template before this phase. Routes to both the Admin UI
+# (`adminApi.service`) and Webhook API (`webhookApi.service`) Services.
+# Independently toggleable from the Deployments/Services themselves: an
+# operator not ready to expose the Admin UI externally can set
+# `ingress.enabled: false` alone, leaving both Services running and
+# reachable in-cluster.
+#
+# TLS: set `tls` using the standard Kubernetes Ingress shape
+# (`[{secretName, hosts}]`) either way —
+#   - existingSecret: point `tls[].secretName` at a Secret your own
+#     secret-backend (Vault, External Secrets Operator, Sealed Secrets, a
+#     cloud Secrets Manager, ...) already populated, mirroring this
+#     chart's other `existingSecret` fields.
+#   - cert-manager: add the issuer annotation via `ingress.annotations`
+#     (e.g. `cert-manager.io/cluster-issuer: letsencrypt-prod`) and
+#     `tls[].secretName` names the Secret cert-manager creates itself.
+# Left empty by default (no TLS) — an operator enabling Ingress for a real
+# deployment is expected to set this explicitly, the same "no unsafe
+# default" posture the credential fields above take.
+ingress:
+  enabled: true
+  className: nginx
+  # Example: an operator can set a rate-limit annotation here as a
+  # network-layer complement to the Admin API's own per-username/
+  # aggregate application-layer login throttling (Assumption 5) — e.g.
+  #   annotations:
+  #     nginx.ingress.kubernetes.io/limit-rps: "5"
+  # Documented as an available option, not a default this chart imposes.
+  annotations: {}
+  hosts:
+    - host: review.example.com
+      paths:
+        # More specific paths first — matches
+        # apps/webhook_api/webhook_routes.py's/manifest_routes.py's actual
+        # route prefixes (`/webhooks/github`, `/setup/*`); everything else
+        # (including `/api/*` and the built frontend's static assets) goes
+        # to the Admin UI, per apps/admin_api/main.py's own catch-all
+        # frontend route.
+        - path: /webhooks
+          pathType: Prefix
+          service: webhook-api
+        - path: /setup
+          pathType: Prefix
+          service: webhook-api
+        - path: /
+          pathType: Prefix
+          service: admin-api
+  tls: []
 
 database:
   # Full REVIEW_DATABASE_URL DSN (postgresql+asyncpg://user:pass@host:port/db).

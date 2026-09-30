@@ -794,6 +794,8 @@ scenario.
 
 ## Phase 9 — Helm chart + docker-compose (Unit J: US-A20, US-A21, US-A22)
 
+**Status: Done (2026-09-30).**
+
 **Why next:** needs a real `apps/admin_api` image and its real `/healthz`
 surface to validate probes against; the chart/compose shape could be
 drafted earlier against a stub per the spec, but placed here so this

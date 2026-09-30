@@ -19,8 +19,19 @@
 #      credential value for any existingSecret-backed field, and that every
 #      Deployment env referencing that field points at the given
 #      existingSecret name/key.
+#   4. (Phase 9) helm template (default values.yaml) — asserts the Admin
+#      UI's Deployment/Service render with liveness/readiness probes and
+#      resources, and that adminApi.enabled: false omits both.
+#   5. (Phase 9) helm template — asserts the Ingress renders routing to
+#      both admin-api and webhook-api backend Services, under both TLS
+#      modes (existingSecret-style literal secretName, and a cert-manager
+#      issuer annotation), and that ingress.enabled: false omits it.
+#   6. (Phase 9) `docker compose config` — validates the admin_api service
+#      block (US-A20's second Given/When/Then) with the required env vars
+#      set, the same way an operator's real .env would.
 #
-# Usage: run from anywhere with `helm` on PATH:
+# Usage: run from anywhere with `helm` on PATH (and `docker compose` on
+# PATH for step 6):
 #   ./charts/review/test-render.sh
 # Exits non-zero on the first failed assertion.
 
@@ -107,6 +118,13 @@ EXISTING_SECRET_OVERRIDES=(
     --set github.appPrivateKey.existingSecret.key=app-private-key
     --set llm.apiKey.existingSecret.name=review-llm-credentials
     --set llm.apiKey.existingSecret.key=api-key
+    # Phase 9 — Admin API's own credential fields (Assumptions 11 and 13).
+    --set adminApi.bootstrapUsername.existingSecret.name=review-admin-credentials
+    --set adminApi.bootstrapUsername.existingSecret.key=bootstrap-username
+    --set adminApi.bootstrapPassword.existingSecret.name=review-admin-credentials
+    --set adminApi.bootstrapPassword.existingSecret.key=bootstrap-password
+    --set adminApi.csrfSecret.existingSecret.name=review-admin-credentials
+    --set adminApi.csrfSecret.existingSecret.key=csrf-secret
 )
 EXISTING_OUT=$(helm template "$RELEASE" "$CHART_DIR" "${EXISTING_SECRET_OVERRIDES[@]}")
 
@@ -134,6 +152,97 @@ assert_contains "$EXISTING_OUT" $'name: review-github-credentials\n             
     "REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY env references the given existingSecret name/key"
 assert_contains "$EXISTING_OUT" $'name: review-llm-credentials\n                  key: api-key' \
     "REVIEW_WORKER_LLM_API_KEY env references the given existingSecret name/key"
+assert_not_contains "$EXISTING_OUT" 'admin-bootstrap-username:' \
+    "admin-bootstrap-username key is absent from this chart's own Secret when existingSecret is used"
+assert_not_contains "$EXISTING_OUT" 'admin-bootstrap-password:' \
+    "admin-bootstrap-password key is absent from this chart's own Secret when existingSecret is used"
+assert_not_contains "$EXISTING_OUT" 'admin-csrf-secret:' \
+    "admin-csrf-secret key is absent from this chart's own Secret when existingSecret is used"
+assert_contains "$EXISTING_OUT" $'name: review-admin-credentials\n                  key: bootstrap-username' \
+    "REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME env references the given existingSecret name/key"
+assert_contains "$EXISTING_OUT" $'name: review-admin-credentials\n                  key: bootstrap-password' \
+    "REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD env references the given existingSecret name/key"
+assert_contains "$EXISTING_OUT" $'name: review-admin-credentials\n                  key: csrf-secret' \
+    "REVIEW_ADMIN_API_ADMIN_CSRF_SECRET env references the given existingSecret name/key"
+
+echo
+echo "=== 4. helm template (default values.yaml): Admin UI Deployment/Service (Phase 9, US-A20/US-A22) ==="
+assert_contains "$DEFAULT_OUT" 'name: review-test-admin-api' \
+    "default render includes the Admin UI Deployment/Service, named distinctly from webhook-api/worker"
+assert_contains "$DEFAULT_OUT" $'app.kubernetes.io/component: admin-api' \
+    "Admin UI resources carry their own component label"
+assert_contains "$DEFAULT_OUT" $'livenessProbe:\n            httpGet:\n              path: /healthz\n              port: http' \
+    "Admin UI Deployment has a livenessProbe against /healthz (Assumption 10)"
+assert_contains "$DEFAULT_OUT" $'readinessProbe:\n            httpGet:\n              path: /healthz\n              port: http' \
+    "Admin UI Deployment has a readinessProbe against /healthz (Assumption 10)"
+# Assumption 10 — probes are new to the Admin UI Deployment only; the
+# other two Deployments must not gain one as a drive-by of this phase.
+# Isolate each Deployment's own rendered block (by its Source comment)
+# rather than grepping $DEFAULT_OUT as a whole, since the bundled
+# postgresql subchart's StatefulSet also has its own (pre-existing,
+# unrelated) probes.
+WORKER_BLOCK=$(awk '/# Source: review\/templates\/deployment-worker.yaml/,/^---$/' <<<"$DEFAULT_OUT")
+WEBHOOK_API_BLOCK=$(awk '/# Source: review\/templates\/deployment-webhook-api.yaml/,/^---$/' <<<"$DEFAULT_OUT")
+assert_not_contains "$WORKER_BLOCK" 'livenessProbe' \
+    "the Worker Deployment is not retroactively given a probe by this phase"
+assert_not_contains "$WEBHOOK_API_BLOCK" 'livenessProbe' \
+    "the Webhook API Deployment is not retroactively given a probe by this phase"
+ADMIN_API_DISABLED_OUT=$(helm template "$RELEASE" "$CHART_DIR" --set adminApi.enabled=false)
+# Ingress still legitimately references the admin-api Service *name* as a
+# backend (its default ingress.hosts[].paths route there regardless), so
+# assert on the component label instead — that only ever renders on the
+# Deployment/Service themselves, never the Ingress.
+assert_not_contains "$ADMIN_API_DISABLED_OUT" 'app.kubernetes.io/component: admin-api' \
+    "adminApi.enabled: false omits the Admin UI Deployment/Service entirely"
+
+echo
+echo "=== 5. helm template: Ingress (Phase 9, US-A21) ==="
+assert_contains "$DEFAULT_OUT" 'kind: Ingress' \
+    "default render includes an Ingress (ingress.enabled: true by default)"
+assert_contains "$DEFAULT_OUT" 'name: review-test-admin-api' \
+    "Ingress default render references the admin-api backend Service"
+assert_contains "$DEFAULT_OUT" 'name: review-test-webhook-api' \
+    "Ingress default render references the webhook-api backend Service"
+INGRESS_TLS_SECRET_OUT=$(helm template "$RELEASE" "$CHART_DIR" \
+    --set 'ingress.tls[0].secretName=review-tls' \
+    --set 'ingress.tls[0].hosts[0]=review.example.com')
+assert_contains "$INGRESS_TLS_SECRET_OUT" 'secretName: review-tls' \
+    "Ingress renders TLS via a literal/existingSecret-style secretName"
+INGRESS_CERT_MANAGER_OUT=$(helm template "$RELEASE" "$CHART_DIR" \
+    --set 'ingress.tls[0].secretName=review-tls-cm' \
+    --set 'ingress.tls[0].hosts[0]=review.example.com' \
+    --set 'ingress.annotations.cert-manager\.io/cluster-issuer=letsencrypt-prod')
+assert_contains "$INGRESS_CERT_MANAGER_OUT" 'cert-manager.io/cluster-issuer: letsencrypt-prod' \
+    "Ingress renders a cert-manager issuer annotation as the second TLS mode"
+assert_contains "$INGRESS_CERT_MANAGER_OUT" 'secretName: review-tls-cm' \
+    "cert-manager mode still declares the Secret name cert-manager will populate"
+INGRESS_DISABLED_OUT=$(helm template "$RELEASE" "$CHART_DIR" --set ingress.enabled=false)
+assert_not_contains "$INGRESS_DISABLED_OUT" 'kind: Ingress' \
+    "ingress.enabled: false omits the Ingress entirely, independent of adminApi.enabled"
+
+echo
+echo "=== 6. docker compose config: admin_api service (Phase 9, US-A20) ==="
+COMPOSE_ROOT="$(cd "$CHART_DIR/../.." && pwd)"
+COMPOSE_OUT=$(
+    cd "$COMPOSE_ROOT" && \
+    REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET=test-webhook-secret \
+    REVIEW_WEBHOOK_API_GITHUB_APP_ID=1 \
+    REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY=test-private-key \
+    REVIEW_WORKER_GITHUB_APP_ID=1 \
+    REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY=test-private-key \
+    REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME=admin \
+    REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD=test-bootstrap-password \
+    REVIEW_ADMIN_API_ADMIN_CSRF_SECRET=test-csrf-secret \
+    docker compose config
+)
+assert_contains "$COMPOSE_OUT" 'admin_api:' \
+    "docker compose config validates the admin_api service block"
+assert_contains "$COMPOSE_OUT" 'apps.admin_api.main:app' \
+    "admin_api service runs its own uvicorn entrypoint, distinct from webhook_api/worker"
+assert_contains "$COMPOSE_OUT" 'target: 8001' \
+    "admin_api service exposes its own port, distinct from webhook_api's 8000"
+assert_contains "$COMPOSE_OUT" "/healthz" \
+    "admin_api service's healthcheck targets the real /healthz surface"
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then
