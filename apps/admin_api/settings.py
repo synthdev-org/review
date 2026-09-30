@@ -110,3 +110,23 @@ class AdminAPISettings(OtelSettingsMixin):
     # `embedding_model_path` field already use — never a network location
     # or a per-entrypoint override.
     embedding_model_path: str = "/app/models/all-MiniLM-L6-v2"
+
+    # --- Admin-stats dashboard (docs/plans/plan-deliver-admin-gui.md's
+    # Phase 6 section, Unit G, US-A17, Assumption 4) ---
+    # Points at the Compose `prometheus` service (docker-compose.yml's
+    # `observability` profile) by default — a safe, non-secret default (the
+    # worst case of it being wrong is a degraded dashboard endpoint, never
+    # a security or pipeline-correctness concern, per this phase's own
+    # "no kill switch needed" Observability & rollback section), unlike
+    # `admin_bootstrap_password`/`admin_csrf_secret` above, which have no
+    # default at all. `prometheus_timeout_seconds`/`prometheus_retry_max_attempts`
+    # mirror `WorkerSettings.github_api_timeout_seconds`/
+    # `github_retry_max_attempts`'s own naming for the same
+    # `adapter/github/http.py`-backed retry/backoff shape (Assumption 4) —
+    # deliberately lower than that GitHub-calling precedent's own 10s/3
+    # defaults: this endpoint serves one read-only dashboard, not a
+    # job-dispatch path, so failing fast (a few seconds, not tens) keeps
+    # `GET /api/v1/stats` from visibly hanging when Prometheus is slow.
+    prometheus_base_url: str = "http://prometheus:9090"
+    prometheus_timeout_seconds: float = 5.0
+    prometheus_retry_max_attempts: int = 2

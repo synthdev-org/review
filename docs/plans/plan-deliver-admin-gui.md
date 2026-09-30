@@ -637,6 +637,8 @@ restart.
 
 ## Phase 6 — Admin-stats dashboard (Unit G: US-A17)
 
+**Status: Done (2026-09-30).**
+
 **Why next:** read-only aggregation against already-emitted OTel/
 Prometheus metrics and existing Postgres counts; no new write path, so
 lower risk than Phase 5, sequenced here since Phase 7's usage counter

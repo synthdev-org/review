@@ -58,6 +58,7 @@ from adapter.storage.llm_routing import PostgresModelRoutingRepository
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.tenancy import PostgresSettingRepository
 from adapter.telemetry.heartbeat import heartbeat_task_scope
+from adapter.telemetry.prometheus_reader import PrometheusMetricsReader
 from adapter.telemetry.sdk import (
     init_telemetry,
     resolve_otlp_headers,
@@ -71,6 +72,7 @@ from apps.admin_api.logging_config import configure_logging
 from apps.admin_api.memory_routes import create_memory_router
 from apps.admin_api.model_routing_routes import create_model_routing_router
 from apps.admin_api.settings import AdminAPISettings
+from apps.admin_api.stats_routes import create_stats_router
 from apps.admin_api.user_routes import create_user_router
 from indexing.embedding import EmbeddingError
 from llmgateway.routing import FallbackModelRoutingResolver
@@ -275,6 +277,27 @@ def create_app(settings: AdminAPISettings) -> FastAPI:
         )
     )
     logger.info("model routing routes registered")
+
+    # Admin-stats dashboard (docs/plans/plan-deliver-admin-gui.md's Phase 6
+    # section, Unit G, US-A17, Assumption 4) — registered unconditionally,
+    # the same "no off-by-default state" posture every other route module
+    # here already takes; this endpoint is itself observability tooling
+    # with no kill switch, per that phase's own Observability & rollback
+    # section. `metrics_querier` is wired to the `MetricsQuerier`-typed
+    # dependency `apps/admin_api/stats_service.py` defines, exclusively at
+    # this composition root — neither `stats_service.py` nor
+    # `adapter/telemetry/prometheus_reader.py` imports the other's
+    # concrete wiring, per `docs/rules/architecture.md`'s
+    # constructor-injection rule.
+    metrics_querier = PrometheusMetricsReader(
+        base_url=settings.prometheus_base_url,
+        timeout_seconds=settings.prometheus_timeout_seconds,
+        retry_max_attempts=settings.prometheus_retry_max_attempts,
+    )
+    app.include_router(
+        create_stats_router(querier=metrics_querier, require_session=require_session)
+    )
+    logger.info("stats routes registered")
 
     return app
 

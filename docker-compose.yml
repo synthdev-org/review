@@ -216,6 +216,14 @@ services:
       # routing's static-default tier. Same literal default as
       # REVIEW_WORKER_LLM_MODEL below; keep both in sync.
       REVIEW_ADMIN_API_LLM_MODEL: ${REVIEW_ADMIN_API_LLM_MODEL:-local-model}
+      # docs/plans/plan-deliver-admin-gui.md's Phase 6 (Unit G) — the
+      # admin-stats dashboard's Prometheus-reading adapter. Defaults to the
+      # `prometheus` service below, which only actually starts under the
+      # `observability` profile (see that block's own header comment); the
+      # dashboard endpoint degrades to a clean 5xx (never a hang) if it's
+      # not running, per that phase's own Observability & rollback section.
+      REVIEW_ADMIN_API_PROMETHEUS_BASE_URL: >-
+        ${REVIEW_ADMIN_API_PROMETHEUS_BASE_URL:-http://prometheus:9090}
       # See webhook_api's own identical entry above for why this is a bare
       # pass-through (`KEY:`, no `:-` default) rather than
       # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}`.
