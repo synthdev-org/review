@@ -517,6 +517,8 @@ tests against the migrated routes.
 
 ## Phase 4 — Org/repo/team configuration (Unit E: US-A12, US-A13)
 
+**Status: Done (2026-09-30).**
+
 **Why next:** first reader/writer logic against `OrgRepoTeamSetting`
 (`adapter/storage/models.py:292-326`), today schema-only ("placeholder
 only — no reader/writer logic exists yet"); depends only on Phase 1.

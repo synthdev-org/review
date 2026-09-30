@@ -55,6 +55,7 @@ from adapter.storage.iam import (
     PostgresUserRepository,
 )
 from adapter.storage.memory_repository import PostgresMemoryRepository
+from adapter.storage.tenancy import PostgresSettingRepository
 from adapter.telemetry.heartbeat import heartbeat_task_scope
 from adapter.telemetry.sdk import (
     init_telemetry,
@@ -63,6 +64,7 @@ from adapter.telemetry.sdk import (
 )
 from apps.admin_api.auth_routes import create_auth_router
 from apps.admin_api.bootstrap import bootstrap_admin_user
+from apps.admin_api.config_routes import create_config_router
 from apps.admin_api.dependencies import build_require_admin_role, build_require_session
 from apps.admin_api.logging_config import configure_logging
 from apps.admin_api.memory_routes import create_memory_router
@@ -231,6 +233,21 @@ def create_app(settings: AdminAPISettings) -> FastAPI:
         )
     )
     logger.info("memory routes registered")
+
+    # Org/repo/team configuration (docs/plans/plan-deliver-admin-gui.md's
+    # Phase 4 section, Unit E, US-A12/US-A13) — registered unconditionally,
+    # the same "no off-by-default state" posture every other route module
+    # here already takes.
+    setting_repository = PostgresSettingRepository(session_factory)
+    app.include_router(
+        create_config_router(
+            repository=setting_repository,
+            audit_log_repository=audit_log_repository,
+            require_session=require_session,
+            require_admin_role=require_admin_role,
+        )
+    )
+    logger.info("config routes registered")
 
     return app
 

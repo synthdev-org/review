@@ -1,25 +1,38 @@
 """adapter.storage.tenancy — the Postgres-backed implementation of
-``tenancy.resolution.TenancyStore``.
+``tenancy.resolution.TenancyStore`` (``PostgresTenancyStore``) and
+``tenancy.settings.SettingRepository`` (``PostgresSettingRepository``,
+``docs/plans/plan-deliver-admin-gui.md``'s Phase 4 section, Unit E).
 
 Per the plan's Phase 1 "Composition-root wiring for storage" section:
 mirrors ``adapter/storage/queue.py``'s ``JobQueueRepository`` own placement
 (one adapter module per storage-backed repository). Wired in only at the
-composition root (``apps/webhook_api/main.py``), matching the
-Protocol-boundary pattern used everywhere else in this plan.
+composition root (``apps/webhook_api/main.py``/``apps/admin_api/main.py``),
+matching the Protocol-boundary pattern used everywhere else in this plan.
 """
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import TypeVar, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from adapter.storage.models import Org, Repo, WebhookDeliveryRow
+from adapter.storage.models import Org, OrgRepoTeamSetting, Repo, Team, WebhookDeliveryRow
 from adapter.storage.unit_of_work import run_in_session
 from tenancy.resolution import OrgRepoIds, split_owner_repo
+from tenancy.settings import (
+    ConfigTree,
+    OrgConfig,
+    ScopeSettings,
+    SettingRow,
+    SettingStoreError,
+    format_scope_descriptor,
+    validate_setting_value,
+)
 
 _T = TypeVar("_T")
 
@@ -156,3 +169,219 @@ class PostgresTenancyStore:
         )
         result = await session.execute(statement)
         return result.first() is not None
+
+
+def _to_setting_row(row: OrgRepoTeamSetting) -> SettingRow:
+    return SettingRow(
+        org_id=str(row.org_id) if row.org_id is not None else None,
+        repo_id=str(row.repo_id) if row.repo_id is not None else None,
+        team_id=str(row.team_id) if row.team_id is not None else None,
+        key=row.key,
+        value=row.value,
+    )
+
+
+def _scope_node(
+    *,
+    entity_id: uuid.UUID,
+    name: str,
+    org_id: uuid.UUID,
+    repo_id: uuid.UUID | None,
+    team_id: uuid.UUID | None,
+    settings_by_scope: dict[
+        tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None], dict[str, dict[str, object]]
+    ],
+) -> ScopeSettings:
+    """Builds one repo/team node for ``GET /api/v1/config``'s response
+    tree — shared by ``PostgresSettingRepository.get_config_tree`` for both
+    its repo and team branches, which otherwise differ only in which of
+    ``repo_id``/``team_id`` is set.
+    """
+    own_settings = settings_by_scope.get((org_id, repo_id, team_id), {})
+    return ScopeSettings(
+        id=str(entity_id),
+        name=name,
+        scope=format_scope_descriptor(
+            org_id=str(org_id),
+            repo_id=str(repo_id) if repo_id is not None else None,
+            team_id=str(team_id) if team_id is not None else None,
+        ),
+        settings=own_settings,
+        using_platform_defaults=not own_settings,
+    )
+
+
+class PostgresSettingRepository:
+    """Implements ``tenancy.settings.SettingRepository`` against the
+    ``org_repo_team_setting`` table, plus read-only joins against
+    ``org``/``repo``/``team`` for ``get_config_tree``'s hierarchy (US-A12),
+    per ``docs/plans/plan-deliver-admin-gui.md``'s Phase 4 section (Unit E).
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def _run[T](self, *, operation: str, fn: Callable[[AsyncSession], Awaitable[T]]) -> T:
+        """Shared open-a-session-then-translate-the-failure wrapper, the
+        same shape ``adapter/storage/memory_repository.py``'s own ``_run``
+        establishes.
+        """
+        try:
+            return await run_in_session(self._session_factory, None, fn)
+        except SQLAlchemyError as exc:
+            raise SettingStoreError(operation=operation, detail=str(exc)) from exc
+
+    async def get_config_tree(self) -> ConfigTree:
+        """US-A12: every org → repo → team, each with its own literal
+        ``OrgRepoTeamSetting`` rows (never resolved/inherited — that's
+        ``tenancy.settings.resolve_setting``'s job, not this read's) and an
+        ``using_platform_defaults`` flag for an empty scope.
+        """
+
+        async def _read(session: AsyncSession) -> ConfigTree:
+            orgs = (await session.execute(select(Org).order_by(Org.name))).scalars().all()
+            repos = (await session.execute(select(Repo).order_by(Repo.name))).scalars().all()
+            teams = (await session.execute(select(Team).order_by(Team.name))).scalars().all()
+            setting_rows = (await session.execute(select(OrgRepoTeamSetting))).scalars().all()
+
+            settings_by_scope: dict[
+                tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None],
+                dict[str, dict[str, object]],
+            ] = {}
+            for setting_row in setting_rows:
+                scope = (setting_row.org_id, setting_row.repo_id, setting_row.team_id)
+                settings_by_scope.setdefault(scope, {})[setting_row.key] = setting_row.value
+
+            repos_by_org: dict[uuid.UUID, list[Repo]] = {}
+            for repo in repos:
+                repos_by_org.setdefault(repo.org_id, []).append(repo)
+            teams_by_org: dict[uuid.UUID, list[Team]] = {}
+            for team in teams:
+                teams_by_org.setdefault(team.org_id, []).append(team)
+
+            org_configs = []
+            for org in orgs:
+                org_settings = settings_by_scope.get((org.id, None, None), {})
+                org_configs.append(
+                    OrgConfig(
+                        id=str(org.id),
+                        name=org.name,
+                        scope=format_scope_descriptor(
+                            org_id=str(org.id), repo_id=None, team_id=None
+                        ),
+                        settings=org_settings,
+                        using_platform_defaults=not org_settings,
+                        repos=tuple(
+                            _scope_node(
+                                entity_id=repo.id,
+                                name=repo.name,
+                                org_id=org.id,
+                                repo_id=repo.id,
+                                team_id=None,
+                                settings_by_scope=settings_by_scope,
+                            )
+                            for repo in repos_by_org.get(org.id, [])
+                        ),
+                        teams=tuple(
+                            _scope_node(
+                                entity_id=team.id,
+                                name=team.name,
+                                org_id=org.id,
+                                repo_id=None,
+                                team_id=team.id,
+                                settings_by_scope=settings_by_scope,
+                            )
+                            for team in teams_by_org.get(org.id, [])
+                        ),
+                    )
+                )
+
+            return ConfigTree(
+                platform_settings=settings_by_scope.get((None, None, None), {}),
+                orgs=tuple(org_configs),
+            )
+
+        return await self._run(operation="get_config_tree", fn=_read)
+
+    async def upsert(
+        self,
+        *,
+        org_id: str | None,
+        repo_id: str | None,
+        team_id: str | None,
+        key: str,
+        value: dict[str, object],
+    ) -> SettingRow:
+        """US-A13: writes/updates ``key``'s value at the exact scope named
+        by ``(org_id, repo_id, team_id)`` — ``value`` is validated against
+        ``tenancy.settings.SETTING_KEY_REGISTRY`` (raising
+        ``tenancy.settings.SettingValidationError``, never silently
+        coerced) before this method ever touches Postgres.
+        """
+        validated_value = validate_setting_value(key, value)
+
+        try:
+            org_uuid = uuid.UUID(org_id) if org_id is not None else None
+            repo_uuid = uuid.UUID(repo_id) if repo_id is not None else None
+            team_uuid = uuid.UUID(team_id) if team_id is not None else None
+        except ValueError as exc:
+            raise SettingStoreError(operation="upsert", detail=str(exc)) from exc
+
+        async def _write(session: AsyncSession) -> OrgRepoTeamSetting:
+            # Postgres (and the SQL standard) treats NULL as distinct from
+            # NULL in a unique constraint, so `uq_setting_scope_key`'s own
+            # (org_id, repo_id, team_id, key) — all three scope columns
+            # nullable — never actually deduplicates a real write: every
+            # platform/org/repo/team-scope write has at least one NULL
+            # scope column, so a native `INSERT ... ON CONFLICT` would
+            # never detect the existing row and would insert a duplicate on
+            # every repeat write instead of updating it. `isnot_distinct_from`
+            # (already used by `PostgresTenancyStore._get_or_create_org_repo`
+            # above for the same NULL-vs-value comparison need) makes this
+            # SELECT treat NULL=NULL as a match, mirroring SQL's own
+            # `IS NOT DISTINCT FROM` operator. `with_for_update()` holds the
+            # row lock for the rest of this transaction so a concurrent
+            # write to the exact same scope+key can't interleave between
+            # this SELECT and the UPDATE/INSERT below — the same
+            # "select, mutate, flush" shape
+            # `adapter/storage/memory_repository.py`'s own `set_status`
+            # already establishes. This does not close the narrower race
+            # where two concurrent writers both see no existing row for a
+            # brand-new scope+key and both INSERT a first one — an
+            # accepted gap for this low-frequency, human-triggered admin
+            # action (never a multi-replica hot path the way
+            # `login_attempt`/`PrivateRepoReviewCount` are), not fixed here
+            # since closing it fully needs a schema change (a functional
+            # unique index, or COALESCE-normalized sentinel columns) this
+            # phase's own plan section names no migration for.
+            scope_match = (
+                (OrgRepoTeamSetting.key == key)
+                & OrgRepoTeamSetting.org_id.isnot_distinct_from(org_uuid)
+                & OrgRepoTeamSetting.repo_id.isnot_distinct_from(repo_uuid)
+                & OrgRepoTeamSetting.team_id.isnot_distinct_from(team_uuid)
+            )
+            existing = (
+                await session.execute(
+                    select(OrgRepoTeamSetting).where(scope_match).with_for_update()
+                )
+            ).scalar_one_or_none()
+
+            if existing is not None:
+                existing.value = validated_value
+                await session.flush()
+                await session.refresh(existing)
+                return existing
+
+            row = OrgRepoTeamSetting(
+                org_id=org_uuid,
+                repo_id=repo_uuid,
+                team_id=team_uuid,
+                key=key,
+                value=validated_value,
+            )
+            session.add(row)
+            await session.flush()
+            return row
+
+        row = await self._run(operation="upsert", fn=_write)
+        return _to_setting_row(row)
