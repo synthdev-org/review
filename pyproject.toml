@@ -164,6 +164,7 @@ known-first-party = [
     "findings",
     "memory",
     "tenancy",
+    "iam",
     "adapter",
     "apps",
 ]
@@ -184,6 +185,7 @@ files = [
     "findings",
     "memory",
     "tenancy",
+    "iam",
     "adapter",
     "apps",
 ]
@@ -247,6 +249,7 @@ testpaths = [
     "findings",
     "memory",
     "tenancy",
+    "iam",
     "adapter",
     "apps",
 ]
@@ -267,6 +270,7 @@ source_paths = [
     "findings",
     "memory",
     "tenancy",
+    "iam",
     "adapter",
     "apps",
 ]

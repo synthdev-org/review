@@ -113,6 +113,7 @@ COPY llmgateway ./llmgateway
 COPY findings ./findings
 COPY memory ./memory
 COPY tenancy ./tenancy
+COPY iam ./iam
 COPY adapter ./adapter
 COPY apps ./apps
 COPY pyproject.toml alembic.ini ./
