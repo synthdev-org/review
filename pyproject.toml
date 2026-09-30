@@ -91,6 +91,13 @@ dependencies = [
     "opentelemetry-api>=1.27,<2",
     "opentelemetry-sdk>=1.27,<2",
     "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
+    # Phase 1 (Admin UI delivery plan, Unit B): Argon2id password hashing
+    # for apps/admin_api's local login (adapter/auth/argon2_hasher.py), per
+    # that plan's Assumption 1/8/14. Nothing in pyproject.toml covered
+    # password hashing before this phase. `argon2-cffi` is the reference
+    # PyPI binding for the Argon2 CLI/reference implementation, the same
+    # library OWASP's own Argon2id guidance names.
+    "argon2-cffi>=23.1,<24",
 ]
 
 [dependency-groups]
@@ -131,6 +138,22 @@ select = [
     "RUF", # ruff-specific rules
 ]
 ignore = []
+
+[tool.ruff.lint.flake8-bugbear]
+# Phase 1 (Admin UI delivery plan, Unit B): apps/admin_api's own
+# require_session/require_admin_role dependencies (apps/admin_api/dependencies.py)
+# are the first place this codebase passes a per-parameter `Depends(...)`
+# call as an argument default — FastAPI's own documented, recommended
+# pattern for a dependency whose *return value* a route body needs (unlike
+# every prior router-level `dependencies=[Depends(...)]` gate in this repo,
+# e.g. apps/webhook_api/admin_routes.py's `_require_admin_key`, which never
+# needed its return value inside a route). B008 (no function calls in
+# argument defaults) exists to catch a mutable-default-argument footgun,
+# not this — FastAPI re-evaluates `Depends(...)` on every request, so this
+# is exempted the same way `flake8-bugbear` itself documents as the
+# standard fix for FastAPI projects, rather than a `# noqa: B008` on every
+# route this pattern recurs in across every later phase.
+extend-immutable-calls = ["fastapi.Depends"]
 
 [tool.ruff.lint.isort]
 known-first-party = [

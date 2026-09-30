@@ -306,6 +306,8 @@ repeated in full here; see the spec's own Scope section.
 
 ## Phase 1 — `apps/admin_api` entrypoint skeleton + local auth (Unit B: US-A1, US-A2, US-A3, US-A5, US-A6)
 
+**Status: Done (2026-09-30).**
+
 **Why first:** every later phase is either a route inside this entrypoint or
 a caller that needs a session to authenticate with; nothing else in this
 plan is testable end-to-end without it.

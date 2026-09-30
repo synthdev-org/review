@@ -174,6 +174,66 @@ services:
       retries: 20
       start_period: 5s
 
+  admin_api:
+    build:
+      context: .
+      target: runtime
+    image: review-app:compose-local
+    command: ["uvicorn", "apps.admin_api.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "${ADMIN_API_PORT:-8001}:8001"
+    environment:
+      REVIEW_ADMIN_API_ENVIRONMENT: ${REVIEW_ADMIN_API_ENVIRONMENT:-development}
+      REVIEW_ADMIN_API_LOG_LEVEL: ${REVIEW_ADMIN_API_LOG_LEVEL:-INFO}
+      # Required, no default (Phase 1) — same shared database every other
+      # entrypoint uses. Same variable name migrate's/webhook_api's/worker's
+      # blocks already inject.
+      REVIEW_DATABASE_URL: >-
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
+      REVIEW_ADMIN_API_SESSION_COOKIE_SECURE: >-
+        ${REVIEW_ADMIN_API_SESSION_COOKIE_SECURE:-false}
+      REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES: >-
+        ${REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES:-30}
+      # Required, no default (Assumption 11) — the bootstrap routine
+      # (apps/admin_api/bootstrap.py) cannot create the first admin user
+      # without them; every environment, including post-bootstrap restarts,
+      # keeps these set (the routine is a no-op past the first run).
+      REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME: >-
+        ${REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME:?set REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME in .env, see .env.example}
+      REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD: >-
+        ${REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD:?set REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD in .env, see .env.example}
+      REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_ATTEMPTS: >-
+        ${REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_ATTEMPTS:-5}
+      REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_WINDOW_MINUTES: >-
+        ${REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_WINDOW_MINUTES:-15}
+      REVIEW_ADMIN_API_MIN_PASSWORD_LENGTH: ${REVIEW_ADMIN_API_MIN_PASSWORD_LENGTH:-12}
+      # Required, no default (Assumption 13) — signs the session-bound CSRF
+      # HMAC cookie; without it, admin_api fails to boot. See .env.example.
+      REVIEW_ADMIN_API_ADMIN_CSRF_SECRET: >-
+        ${REVIEW_ADMIN_API_ADMIN_CSRF_SECRET:?set REVIEW_ADMIN_API_ADMIN_CSRF_SECRET in .env, see .env.example}
+      # See webhook_api's own identical entry above for why this is a bare
+      # pass-through (`KEY:`, no `:-` default) rather than
+      # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}`.
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+      OTEL_EXPORTER_OTLP_HEADERS:
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Same no-curl-in-the-runtime-image reasoning as webhook_api's own
+      # healthcheck above.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; u.urlopen('http://localhost:8001/healthz', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
   worker:
     build:
       context: .
