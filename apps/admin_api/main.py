@@ -56,7 +56,7 @@ from adapter.storage.iam import (
 )
 from adapter.storage.llm_routing import PostgresModelRoutingRepository
 from adapter.storage.memory_repository import PostgresMemoryRepository
-from adapter.storage.tenancy import PostgresSettingRepository
+from adapter.storage.tenancy import PostgresSettingRepository, PostgresUsageCounterRepository
 from adapter.telemetry.heartbeat import heartbeat_task_scope
 from adapter.telemetry.prometheus_reader import PrometheusMetricsReader
 from adapter.telemetry.sdk import (
@@ -73,6 +73,7 @@ from apps.admin_api.memory_routes import create_memory_router
 from apps.admin_api.model_routing_routes import create_model_routing_router
 from apps.admin_api.settings import AdminAPISettings
 from apps.admin_api.stats_routes import create_stats_router
+from apps.admin_api.usage_routes import create_usage_router
 from apps.admin_api.user_routes import create_user_router
 from indexing.embedding import EmbeddingError
 from llmgateway.routing import FallbackModelRoutingResolver
@@ -298,6 +299,23 @@ def create_app(settings: AdminAPISettings) -> FastAPI:
         create_stats_router(querier=metrics_querier, require_session=require_session)
     )
     logger.info("stats routes registered")
+
+    # Free-tier usage counter + disclosure (docs/plans/plan-deliver-admin-gui.md's
+    # Phase 7 section, Unit H, US-A18, Assumption 2) — registered
+    # unconditionally, the same "no off-by-default state" posture every
+    # other route module here already takes; this endpoint is itself
+    # disclosure tooling with no kill switch, per that phase's own
+    # Observability & rollback section. `usage_counter_repository` is the
+    # same `PostgresUsageCounterRepository` *class* `apps/worker/main.py`'s
+    # own composition root wires (a separate instance here, sharing the
+    # class, reading from the same `private_repo_review_count` table the
+    # Worker writes to) — neither entrypoint imports the other's own
+    # composition-root wiring.
+    usage_counter_repository = PostgresUsageCounterRepository(session_factory)
+    app.include_router(
+        create_usage_router(reader=usage_counter_repository, require_session=require_session)
+    )
+    logger.info("usage routes registered")
 
     return app
 

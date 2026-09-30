@@ -149,6 +149,7 @@ from adapter.storage.indexing_repository import IndexingRepository
 from adapter.storage.llm_routing import PostgresModelRoutingRepository
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
+from adapter.storage.tenancy import PostgresUsageCounterRepository
 from adapter.telemetry.heartbeat import heartbeat_task_scope
 from adapter.telemetry.sdk import (
     init_telemetry,
@@ -922,6 +923,7 @@ async def _run_dispatch_loop_forever(
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
+    usage_counter_recorder: PostgresUsageCounterRepository,
 ) -> None:
     """The one seam `main()` exposes for the dispatch loop itself — real in
     production, substituted with a no-op fake in
@@ -936,6 +938,14 @@ async def _run_dispatch_loop_forever(
     coroutine/event-loop it's used from for the loop's entire lifetime,
     regardless of whether the loop returns normally or the process is
     interrupted.
+
+    `usage_counter_recorder` (docs/plans/plan-deliver-admin-gui.md's Phase
+    7 section, Unit H, US-A19) — always a real
+    `PostgresUsageCounterRepository` in production; no kill switch, per
+    that phase's own Observability & rollback section ("this side effect
+    fails soft... a metering bug can never turn into a review-pipeline
+    outage" on its own, so no separate off switch is needed the way
+    `model_routing_config_enabled` needs one).
     """
     try:
         await run_dispatch_loop(
@@ -947,6 +957,7 @@ async def _run_dispatch_loop_forever(
             poll_interval_seconds=settings.poll_interval_seconds,
             stuck_job_warning_threshold_seconds=settings.stuck_job_warning_threshold_seconds,
             dry_run=settings.dry_run,
+            usage_counter_recorder=usage_counter_recorder,
         )
     finally:
         await http_client.aclose()
@@ -1070,6 +1081,11 @@ async def _run(
         settings, reaction_fetcher, memory_repository
     )
     worker_id = _build_worker_id()
+    # docs/plans/plan-deliver-admin-gui.md's Phase 7 section (Unit H,
+    # US-A19) — the same `session_factory` every other storage adapter
+    # here already shares, no second connection pool. Always wired in, no
+    # kill switch (see `_run_dispatch_loop_forever`'s own docstring).
+    usage_counter_recorder = PostgresUsageCounterRepository(session_factory)
 
     logger.info("worker started", extra={"worker_id": worker_id})
     dispatch_loop_forever = _run_dispatch_loop_forever(
@@ -1080,6 +1096,7 @@ async def _run(
         settings,
         worker_id,
         github_http_client,
+        usage_counter_recorder,
     )
     # The heartbeat task is started only when telemetry is configured,
     # per US10 — see `heartbeat_task_scope`'s own docstring for the

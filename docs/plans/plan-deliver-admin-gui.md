@@ -689,6 +689,8 @@ current values for all four named metric categories.
 
 ## Phase 7 — Free-tier usage counter + disclosure (Unit H: US-A18, US-A19)
 
+**Status: Done (2026-09-30).**
+
 **Why next:** genuinely new infrastructure (nothing counts reviews per org
 per day today) needing the Worker's job-completion path as its write
 trigger — the plan's other production-hot-path touch besides Phase 5, but

@@ -1,19 +1,32 @@
 """adapter.storage.tenancy — the Postgres-backed implementation of
-``tenancy.resolution.TenancyStore`` (``PostgresTenancyStore``) and
+``tenancy.resolution.TenancyStore`` (``PostgresTenancyStore``),
 ``tenancy.settings.SettingRepository`` (``PostgresSettingRepository``,
-``docs/plans/plan-deliver-admin-gui.md``'s Phase 4 section, Unit E).
+``docs/plans/plan-deliver-admin-gui.md``'s Phase 4 section, Unit E), and
+``tenancy.usage.UsageCounterRecorder``/``UsageCounterReader``
+(``PostgresUsageCounterRepository``, that plan's Phase 7 section, Unit H).
 
 Per the plan's Phase 1 "Composition-root wiring for storage" section:
 mirrors ``adapter/storage/queue.py``'s ``JobQueueRepository`` own placement
 (one adapter module per storage-backed repository). Wired in only at the
-composition root (``apps/webhook_api/main.py``/``apps/admin_api/main.py``),
-matching the Protocol-boundary pattern used everywhere else in this plan.
+composition root (``apps/webhook_api/main.py``/``apps/admin_api/main.py``/
+``apps/worker/main.py``), matching the Protocol-boundary pattern used
+everywhere else in this plan.
+
+``day_for`` (Phase 7's own pure 04:00-anchored-day helper) lives here
+rather than in the ``tenancy`` domain package, per that phase's own plan
+section wording ("adapter/storage/tenancy.py: ... a pure day_for(now)
+helper"). It does no I/O and needs none for its own unit tests
+(``adapter/storage/test_tenancy.py``) — its placement in this adapter
+module, rather than ``tenancy/usage.py``, is this plan's own stated
+implementation-shape choice, not a claim that a pure function belongs in
+an adapter as a general rule.
 """
 
 from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import date, datetime, timedelta
 from typing import TypeVar, cast
 
 from sqlalchemy import select, update
@@ -21,7 +34,14 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from adapter.storage.models import Org, OrgRepoTeamSetting, Repo, Team, WebhookDeliveryRow
+from adapter.storage.models import (
+    Org,
+    OrgRepoTeamSetting,
+    PrivateRepoReviewCount,
+    Repo,
+    Team,
+    WebhookDeliveryRow,
+)
 from adapter.storage.unit_of_work import run_in_session
 from tenancy.resolution import OrgRepoIds, split_owner_repo
 from tenancy.settings import (
@@ -33,8 +53,28 @@ from tenancy.settings import (
     format_scope_descriptor,
     validate_setting_value,
 )
+from tenancy.usage import UsageCounterStoreError, UsageCountRow
 
 _T = TypeVar("_T")
+
+
+def day_for(now: datetime) -> date:
+    """The 04:00-anchored calendar day ``now`` falls in, per ADR-0008's
+    Decision ("free under 20 private reviews/calendar-day... reset 04:00,
+    not midnight"). A timestamp at or after 04:00 on some date belongs to
+    that date's own day; a timestamp before 04:00 still belongs to the
+    *previous* date's day (it hasn't reset yet). Implemented as a plain
+    4-hour shift before taking the date component, so it works correctly
+    regardless of ``now``'s own tzinfo (callers pass a UTC-aware
+    ``datetime.now(UTC)`` throughout this codebase, per
+    ``docs/rules/architecture.md``'s async/timeout conventions, but this
+    function itself has no UTC-specific logic).
+
+    Boundary cases (unit-tested in ``adapter/storage/test_tenancy.py``,
+    per this phase's own "Tests" section): 03:59 -> the previous date,
+    04:00 -> that exact date, 04:01 -> that date.
+    """
+    return (now - timedelta(hours=4)).date()
 
 
 class PostgresTenancyStore:
@@ -385,3 +425,122 @@ class PostgresSettingRepository:
 
         row = await self._run(operation="upsert", fn=_write)
         return _to_setting_row(row)
+
+
+class PostgresUsageCounterRepository:
+    """Implements ``tenancy.usage.UsageCounterRecorder`` and
+    ``tenancy.usage.UsageCounterReader`` against the
+    ``private_repo_review_count`` table, per
+    ``docs/plans/plan-deliver-admin-gui.md``'s Phase 7 section (Unit H,
+    Assumption 2). One concrete class satisfying two Protocols — the write
+    boundary (``apps/worker/dispatch.py``, US-A19) and read boundary
+    (``apps/admin_api/usage_routes.py``, US-A18) are two separate Protocols
+    only because they have two separate entrypoint consumers, per
+    ADR-0006's multi-entrypoint exemption (see ``tenancy/usage.py``'s own
+    docstring) — there's still only one real storage implementation of
+    either, mirroring ``PostgresSettingRepository``'s own "one adapter
+    class, multiple narrow Protocols satisfied" shape.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def _run(self, *, operation: str, fn: Callable[[AsyncSession], Awaitable[_T]]) -> _T:
+        """Shared open-a-session-then-translate-the-failure wrapper,
+        mirroring ``PostgresSettingRepository``'s/
+        ``PostgresModelRoutingRepository``'s own ``_run`` shape.
+        """
+        try:
+            return await run_in_session(self._session_factory, None, fn)
+        except SQLAlchemyError as exc:
+            raise UsageCounterStoreError(operation=operation, detail=str(exc)) from exc
+
+    async def increment(self, *, installation_id: int, now: datetime) -> None:
+        """US-A19: atomically increments ``installation_id``'s counter for
+        ``now``'s 04:00-anchored calendar day (``day_for``, above) via a
+        native Postgres ``INSERT ... ON CONFLICT (installation_id, day) DO
+        UPDATE count = count + 1`` — safe under concurrent Worker replicas
+        incrementing the same installation/day at once, with no
+        select-then-write race window. Unlike
+        ``PostgresSettingRepository.upsert``'s/
+        ``PostgresModelRoutingRepository.upsert``'s own ``isnot_distinct_
+        from``-based select-lock-then-write shape, neither
+        ``installation_id`` nor ``day`` is ever ``NULL`` here, so a native
+        ``ON CONFLICT`` target already works correctly — no NULL-safe
+        workaround needed (see ``adapter/storage/models.py``'s
+        ``PrivateRepoReviewCount`` docstring).
+        """
+        day = day_for(now)
+
+        async def _write(session: AsyncSession) -> None:
+            insert_statement = pg_insert(PrivateRepoReviewCount).values(
+                installation_id=installation_id, day=day, count=1
+            )
+            await session.execute(
+                insert_statement.on_conflict_do_update(
+                    index_elements=["installation_id", "day"],
+                    set_={"count": PrivateRepoReviewCount.count + 1},
+                )
+            )
+
+        await self._run(operation="increment", fn=_write)
+
+    async def list_current_day_counts(self, *, now: datetime) -> tuple[UsageCountRow, ...]:
+        """US-A18: every installation's count for ``now``'s 04:00-anchored
+        calendar day, each enriched (best-effort) with the connected org's
+        id/name via a join through ``Repo`` — the only table that actually
+        carries ``installation_id`` today (``Org`` itself has none; see
+        ``tenancy/usage.py``'s ``UsageCountRow`` docstring for why this
+        join can legitimately resolve nothing for a given installation).
+        """
+        day = day_for(now)
+
+        async def _read(session: AsyncSession) -> tuple[UsageCountRow, ...]:
+            counts = (
+                (
+                    await session.execute(
+                        select(PrivateRepoReviewCount).where(PrivateRepoReviewCount.day == day)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not counts:
+                return ()
+
+            installation_ids = [row.installation_id for row in counts]
+            org_by_installation: dict[int, tuple[uuid.UUID, str]] = {}
+            repo_org_rows = (
+                await session.execute(
+                    select(Repo.installation_id, Org.id, Org.name)
+                    .join(Org, Org.id == Repo.org_id)
+                    .where(Repo.installation_id.in_(installation_ids))
+                )
+            ).all()
+            for installation_id, org_id, org_name in repo_org_rows:
+                # Multiple repos can share one installation_id (the common
+                # case: one GitHub App installation per connected org, many
+                # repos) — the first match found is kept, `setdefault`
+                # deliberately never overwritten by a later duplicate.
+                org_by_installation.setdefault(installation_id, (org_id, org_name))
+
+            return tuple(
+                UsageCountRow(
+                    installation_id=row.installation_id,
+                    org_id=(
+                        str(org_by_installation[row.installation_id][0])
+                        if row.installation_id in org_by_installation
+                        else None
+                    ),
+                    org_name=(
+                        org_by_installation[row.installation_id][1]
+                        if row.installation_id in org_by_installation
+                        else None
+                    ),
+                    day=row.day,
+                    count=row.count,
+                )
+                for row in counts
+            )
+
+        return await self._run(operation="list_current_day_counts", fn=_read)

@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -784,3 +785,36 @@ class LoginAttemptRow(Base):
     username: Mapped[str] = mapped_column(String(255), nullable=False)
     window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     attempt_count: Mapped[int] = mapped_column(nullable=False, default=1, server_default="1")
+
+
+class PrivateRepoReviewCount(Base):
+    """The free-tier usage counter (plan's Phase 7 section, Unit H,
+    US-A19, Assumption 2) — one row per ``(installation_id, day)``,
+    atomically incremented via ``INSERT ... ON CONFLICT DO UPDATE count =
+    count + 1`` (``adapter/storage/tenancy.py``'s
+    ``PostgresUsageCounterRepository``), the same atomic-upsert pattern
+    ``LoginAttemptRow`` above already uses for the identical structural
+    problem (bounded-window occurrence counting).
+
+    ``day`` is already the 04:00-anchored calendar day (``date_for``/
+    ``day_for``'s output, per ADR-0008's "reset 04:00, not midnight"
+    Decision) by the time it reaches this table — never a raw
+    ``datetime.now()`` — so this column is a plain ``Date``, not a
+    ``DateTime``. Unlike ``OrgRepoTeamSetting``'s/``ModelRoutingConfig``'s
+    scope columns, neither ``installation_id`` nor ``day`` is nullable
+    here, so a native Postgres ``ON CONFLICT (installation_id, day)``
+    target works correctly with no ``isnot_distinct_from`` NULL-handling
+    needed (unlike those two tables' own ``upsert`` methods).
+    """
+
+    __tablename__ = "private_repo_review_count"
+    __table_args__ = (
+        UniqueConstraint(
+            "installation_id", "day", name="uq_private_repo_review_count_installation_day"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    installation_id: Mapped[int] = mapped_column(BigInteger(), nullable=False)
+    day: Mapped[date] = mapped_column(Date(), nullable=False)
+    count: Mapped[int] = mapped_column(nullable=False, default=1, server_default="1")

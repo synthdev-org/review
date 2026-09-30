@@ -33,6 +33,22 @@ class Repository(BaseModel):
     # `default_branch` for that event type, so it stays optional rather than
     # required.
     default_branch: str | None = None
+    # Phase 7 addition (docs/plans/plan-deliver-admin-gui.md's Phase 7
+    # section, Unit H, US-A19) — GitHub's real `repository` object always
+    # carries this field, but it defaults to `False` (never required) so
+    # every pre-Phase-7 test fixture in this codebase that constructs a
+    # `Repository` without it (verified by grep: none currently sets this
+    # key) keeps parsing exactly as before, the same "model only what's
+    # consumed... never reject a well-formed delivery missing it"
+    # discipline `default_branch` above already establishes. Threaded
+    # through `tenancy.resolution.WebhookEvent.repo_private` and into the
+    # `REVIEW` job payload's own `"private"` field
+    # (`apps/webhook_api/webhook_routes.py`'s `_base_job_identity_fields`)
+    # so `apps/worker/dispatch.py` can decide whether a completed `REVIEW`
+    # job counts toward the free-tier usage counter (US-A19's "a REVIEW job
+    # for a public repository... no counter is incremented" clause) without
+    # a second GitHub API round-trip at job-completion time.
+    private: bool = False
 
 
 class PullRequestHead(BaseModel):

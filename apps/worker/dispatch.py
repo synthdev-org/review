@@ -93,6 +93,7 @@ from memory.reaction_poll import (
 )
 from review.pipeline import PipelineFailedError, StepRegistry
 from review.step import StepContext
+from tenancy.usage import UsageCounterRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,19 @@ _job_duration_histogram = meter.create_histogram(
     "review.job.duration_seconds",
     unit="s",
     description="Wall-clock time from claim to terminal DONE/FAILED status.",
+)
+
+# docs/plans/plan-deliver-admin-gui.md's Phase 7 section (Unit H, US-A19) —
+# a separate meter/name (`review.usage_counter`, not `review.queue`) since
+# this signal is about the usage-counter side effect specifically, not
+# generic job-queue throughput.
+_usage_counter_meter = metrics.get_meter("review.usage_counter")
+_usage_counter_increment_failed_counter = _usage_counter_meter.create_counter(
+    "review.usage_counter.increment_failed_total",
+    description="Count of usage-counter increment attempts (on a completed private-repo REVIEW "
+    "job) that failed — an operator-alertable signal for a systemic write-failure pattern (e.g. "
+    "a degraded Postgres path silently undercounting every org), since this side effect fails "
+    "soft (logged, never raised) and so would otherwise be discoverable only by grepping logs.",
 )
 
 # The only two terminal outcomes `_record_job_completion` is ever called
@@ -189,6 +203,65 @@ async def _mark_terminal_and_record(
     return transitioned
 
 
+async def _record_usage_increment(
+    job: ClaimedJob, usage_counter_recorder: UsageCounterRecorder | None
+) -> None:
+    """US-A19: after a ``REVIEW`` job completes successfully, if the repo
+    is private on GitHub (``job.payload["private"]``, threaded through
+    from the webhook envelope's own ``repository.private`` — see
+    ``apps/webhook_api/webhook_routes.py``'s ``_base_job_identity_fields``),
+    increments the free-tier usage counter for that repo's GitHub App
+    installation. Public repos, and jobs with no ``usage_counter_recorder``
+    wired in at all (every pre-Phase-7 test call site in this package,
+    which pass ``None`` and get exactly today's pre-Phase-7 behavior — no
+    increment attempted), are both unconditional no-ops.
+
+    Only called for ``JobType.REVIEW`` jobs, and only once ``_run_claimed_job``
+    has confirmed this call is the one that actually transitioned the job
+    to DONE (mirroring `_mark_terminal_and_record`'s own double-count
+    guard) — never for `INDEX`/`MEMORY_REACTION_POLL` jobs, which have no
+    such payload field to read and no usage semantics of their own.
+
+    **Deliberately fails soft — the one narrow, documented exception to
+    ``docs/rules/architecture.md``'s "never swallow a domain error" rule
+    in this codebase.** A `REVIEW` job that otherwise completed
+    successfully must never be marked FAILED because of this side effect
+    (this phase's own "Observability & rollback" section); justified
+    because ADR-0008 makes this metering side effect explicitly
+    lower-priority than the review job it's attached to. The broad
+    `except Exception` below is intentional, not an oversight — any
+    failure (a malformed/missing `installation_id`, a transient Postgres
+    error inside `increment()`, anything else) is logged at `ERROR` and
+    counted by `review.usage_counter.increment_failed_total` (itself
+    wrapped in `suppress_telemetry_errors` so even a telemetry-recording
+    failure can't escape this function), never re-raised.
+    """
+    if usage_counter_recorder is None:
+        return
+
+    payload = job.payload
+    if not bool(payload.get("private")):
+        return
+
+    installation_id = payload.get("installation_id")
+    now = datetime.now(UTC)
+    try:
+        if not isinstance(installation_id, int):
+            raise TypeError(f"job payload's installation_id is {installation_id!r}, expected int")
+        await usage_counter_recorder.increment(installation_id=installation_id, now=now)
+    except Exception as exc:  # Deliberate fail-soft boundary — see docstring above.
+        logger.error(
+            "usage counter increment failed (REVIEW job's own DONE status unaffected)",
+            extra={"job_id": str(job.id), "error": str(exc)},
+        )
+        with suppress_telemetry_errors(
+            logger,
+            "usage counter increment_failed metric recording failed",
+            job_id=str(job.id),
+        ):
+            _usage_counter_increment_failed_counter.add(1)
+
+
 async def _dispatch_claimed_job(
     job: ClaimedJob,
     *,
@@ -252,6 +325,7 @@ async def _run_claimed_job(
     memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
     stuck_job_warning_threshold_seconds: float,
     dry_run: bool,
+    usage_counter_recorder: UsageCounterRecorder | None = None,
 ) -> None:
     """Run ``job`` to completion — warning (not failing) if it runs past
     ``stuck_job_warning_threshold_seconds`` — and mark it ``DONE``/``FAILED``
@@ -262,6 +336,15 @@ async def _run_claimed_job(
     (a bug in the loop, not a pipeline/job-reported failure) is deliberately
     left uncaught here — the caller (``run_dispatch_loop``) is where that
     distinction is handled, per this module's own docstring.
+
+    ``usage_counter_recorder`` (docs/plans/plan-deliver-admin-gui.md's
+    Phase 7 section, Unit H, US-A19) defaults to ``None`` — restoring
+    exactly today's pre-Phase-7 behavior (no usage-counter increment
+    attempted) — the same "``None`` restores byte-for-byte today's
+    behavior" pattern ``model_resolver``/``dry_run`` already establish
+    elsewhere in this composition-root-to-loop chain; the real composition
+    root (``apps/worker/main.py``) always passes a real
+    ``PostgresUsageCounterRepository`` instance.
     """
     task: asyncio.Task[None] = asyncio.create_task(
         _dispatch_claimed_job(
@@ -315,6 +398,14 @@ async def _run_claimed_job(
             "transitioned": transitioned,
         },
     )
+    # US-A19: only for a REVIEW job this call itself actually transitioned
+    # to DONE (mirroring `_mark_terminal_and_record`'s own "only count it
+    # if this call is the one that moved the status" guard, so a
+    # theoretical double-processing bug can never double-increment the
+    # counter either) — `_record_usage_increment` itself is an
+    # unconditional no-op for a public repo or a `None` recorder.
+    if transitioned and job.job_type == JobType.REVIEW:
+        await _record_usage_increment(job, usage_counter_recorder)
 
 
 async def run_dispatch_loop(
@@ -327,15 +418,22 @@ async def run_dispatch_loop(
     poll_interval_seconds: float,
     stuck_job_warning_threshold_seconds: float,
     dry_run: bool = False,
+    usage_counter_recorder: UsageCounterRecorder | None = None,
 ) -> None:
     """The Worker's main loop — see this module's own docstring for the
     full design. Runs forever; ``apps/worker/main.py`` is the only caller,
     via ``asyncio.run(...)``.
 
-    ``dry_run`` (Phase 7 of the walking-skeleton plan) defaults to
-    ``False`` so every pre-Phase-7 caller (this module's own test suite's
-    fakes) is unaffected; the real composition root always passes
+    ``dry_run`` (Phase 7 of the walking-skeleton plan — an unrelated,
+    earlier "Phase 7," disambiguated the same way this module's own
+    docstring already disambiguates the indexing plan's Phase 7) defaults
+    to ``False`` so every pre-this-feature caller (this module's own test
+    suite's fakes) is unaffected; the real composition root always passes
     ``WorkerSettings.dry_run`` explicitly.
+
+    ``usage_counter_recorder`` (docs/plans/plan-deliver-admin-gui.md's
+    Phase 7 section, Unit H, US-A19) defaults to ``None`` — see
+    ``_run_claimed_job``'s own docstring for why.
     """
     while True:
         try:
@@ -359,6 +457,7 @@ async def run_dispatch_loop(
                 memory_reaction_poll_deps=memory_reaction_poll_deps,
                 stuck_job_warning_threshold_seconds=stuck_job_warning_threshold_seconds,
                 dry_run=dry_run,
+                usage_counter_recorder=usage_counter_recorder,
             )
         except Exception as exc:
             logger.error(

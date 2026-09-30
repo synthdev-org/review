@@ -62,6 +62,7 @@ from adapter.github.tree import GitHubTreeFetcher
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
+from adapter.storage.tenancy import PostgresUsageCounterRepository
 from adapter.telemetry.sdk import init_telemetry
 from apps.worker.main import main
 from apps.worker.settings import WorkerSettings
@@ -108,13 +109,22 @@ async def _noop_dispatch_loop_forever(
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
+    usage_counter_recorder: PostgresUsageCounterRepository,
 ) -> None:
     """The fake substituted for `_run_dispatch_loop_forever` in every test
     below that reaches it — returns immediately instead of looping forever,
     so `main()` returns and the test can make its assertions. Closes
     `http_client` itself, matching the real function's own responsibility,
     so `main()` doesn't leak the real `httpx.AsyncClient` it constructs
-    across these tests."""
+    across these tests.
+
+    `usage_counter_recorder` (docs/plans/plan-deliver-admin-gui.md's Phase
+    7 section, Unit H) is accepted, unused, purely to keep this fake's
+    signature matching the real function's — these composition-root tests
+    only prove `main()` reaches this seam with the right arguments, never
+    this parameter's own behavior (that's `apps/worker/test_usage_counter.py`'s
+    job, against a real `PostgresUsageCounterRepository` and Postgres)."""
+    _ = usage_counter_recorder
     await http_client.aclose()
 
 
@@ -1122,6 +1132,7 @@ def test_main_starts_heartbeat_loop_when_otlp_endpoint_set(
         settings: WorkerSettings,
         worker_id: str,
         http_client: httpx.AsyncClient,
+        usage_counter_recorder: PostgresUsageCounterRepository,
     ) -> None:
         # The heartbeat task (a plain `asyncio.create_task`, per
         # `apps/worker/main.py`'s own docstring) only actually starts
@@ -1188,6 +1199,7 @@ async def test_amain_propagates_dispatch_loop_exception_unwrapped_and_cancels_he
         settings: WorkerSettings,
         worker_id: str,
         http_client: httpx.AsyncClient,
+        usage_counter_recorder: PostgresUsageCounterRepository,
     ) -> None:
         # Wait for the heartbeat task to actually start running before
         # raising — see `test_main_starts_heartbeat_loop_when_otlp_endpoint_set`'s

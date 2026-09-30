@@ -188,6 +188,7 @@ def _build_webhook_event(envelope: GitHubWebhookEnvelope, *, delivery_id: str) -
             if pull_request is not None and pull_request.base is not None
             else None
         ),
+        repo_private=envelope.repository.private,
     )
 
 
@@ -208,12 +209,22 @@ def _base_job_identity_fields(event: WebhookEvent, result: ResolutionResult) -> 
     `GitHubWebhookEnvelope` at this route's own boundary) — closing a gap
     where this field was resolved here but never threaded into the
     payload the Worker actually reads.
+
+    `private` (docs/plans/plan-deliver-admin-gui.md's Phase 7 addition,
+    Unit H, US-A19): sourced from `event.repo_private` the same way
+    `repo_full_name` is, so `apps/worker/dispatch.py` can decide whether a
+    completed `REVIEW` job counts toward the free-tier usage counter
+    without a second GitHub API round-trip. Carried on every job payload
+    (not only `REVIEW`'s), matching `installation_id`/`repo_full_name`'s
+    own "shared base field, even though only some job types consume it"
+    placement — `INDEX`/`MEMORY_REACTION_POLL` jobs simply never read it.
     """
     return {
         "org_id": str(result.org_id),
         "repo_id": str(result.repo_id),
         "installation_id": event.installation_id,
         "repo_full_name": event.repo_full_name,
+        "private": event.repo_private,
     }
 
 
