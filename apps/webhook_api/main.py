@@ -62,17 +62,19 @@ run synchronously, before the webhook handler returns — not queued for the
 Worker to pick up later, unlike every other job type this entrypoint
 enqueues.
 
-``docs/plans/plan-deliver-memory.md``'s Phase 5 (Unit E) adds the Memory
-admin API (``apps/webhook_api/admin_routes.py``) — registered
-**unconditionally**, unlike the ``SETUP_MODE``-gated manifest router,
-since there's no "off by default" state for a credential-gated surface the
-way there is for the one-time App-setup flow (Assumption 7). It also adds
-this entrypoint's first ``adapter.embedding.local_onnx.LocalONNXEmbeddingClient``
-(the approve route's embedding-compute path, US-M4) — wired with the same
-fail-fast startup check ``apps/worker/main.py``'s
-``_check_embedding_model_startup`` already establishes
-(``adapter.embedding.startup_check.check_embedding_model_loaded``, reused,
-not a second copy).
+``docs/plans/plan-deliver-memory.md``'s Phase 5 (Unit E) added the Memory
+admin API (``apps/webhook_api/admin_routes.py``), registered
+unconditionally with its own static-token auth. ``docs/plans/
+plan-deliver-admin-gui.md``'s Phase 3 (Unit D, US-A7) fully retired that
+route from this entrypoint — moved wholesale to
+``apps/admin_api/memory_routes.py``, now authenticated via real per-user
+sessions instead of the shared ``admin_api_key`` static Bearer token. This
+is a one-way cutover, not a dual-auth transition (no live customer had used
+this API yet): ``admin_routes.py``, its registration below, the
+``admin_api_key`` setting, and this entrypoint's own
+``LocalONNXEmbeddingClient``/startup-check wiring (which existed solely to
+serve the approve handler that moved) are all deleted, not merely
+unregistered.
 """
 
 from __future__ import annotations
@@ -84,8 +86,6 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from fastapi import FastAPI
 
 from adapter.analyzers.gitleaks import GitleaksTextRedactor
-from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
-from adapter.embedding.startup_check import check_embedding_model_loaded
 from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.reactions import GitHubReactionFetcher
 from adapter.storage.engine import create_session_factory, create_storage_engine
@@ -98,14 +98,12 @@ from adapter.telemetry.sdk import (
     resolve_otlp_headers,
     shutdown_telemetry,
 )
-from apps.webhook_api.admin_routes import create_admin_router
 from apps.webhook_api.logging_config import configure_logging
 from apps.webhook_api.manifest_routes import create_manifest_router
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
 from apps.webhook_api.settings import WebhookAPISettings
 from apps.webhook_api.webhook_routes import create_webhook_router
 from findings.redact import NoOpTextRedactor, TextRedactor
-from indexing.embedding import EmbeddingError
 
 logger = logging.getLogger(__name__)
 
@@ -262,45 +260,6 @@ def _build_reaction_fetcher(settings: WebhookAPISettings) -> GitHubReactionFetch
     )
 
 
-def _build_embedding_client(settings: WebhookAPISettings) -> LocalONNXEmbeddingClient:
-    """Wire the admin API's own `indexing.embedding.EmbeddingClient`
-    Protocol to its local ONNX-backed implementation, per
-    `docs/plans/plan-deliver-memory.md`'s Phase 5 section (Unit E, US-M4) —
-    this entrypoint's first use of it (`apps/worker/main.py`'s
-    `_build_embedding_client` was previously the only composition root
-    building one). Same `settings.embedding_model_path` default/shape as
-    that function's own docstring.
-    """
-    return LocalONNXEmbeddingClient(model_path=settings.embedding_model_path)
-
-
-def _check_embedding_model_startup(
-    client: LocalONNXEmbeddingClient, settings: WebhookAPISettings, logger: logging.Logger
-) -> None:
-    """Run the local embedding model's startup load/inference check and
-    raise `SystemExit(1)` if it fails — the same fail-fast pattern
-    `apps/worker/main.py`'s own `_check_embedding_model_startup` already
-    establishes, reused via `adapter.embedding.startup_check
-    .check_embedding_model_loaded` rather than a second copy of this
-    check's own logic. A missing/corrupted baked model artifact fails
-    loudly here, at Webhook API boot, rather than silently on the first
-    real admin `approve` call's own `embed` stage.
-    """
-    try:
-        check_embedding_model_loaded(client)
-    except EmbeddingError as exc:
-        logger.error(
-            "local embedding model is not usable at startup; exiting",
-            extra={"embedding_model_path": settings.embedding_model_path, "error": str(exc)},
-        )
-        raise SystemExit(1) from exc
-
-    logger.info(
-        "local embedding model loaded",
-        extra={"embedding_model_path": settings.embedding_model_path},
-    )
-
-
 def _build_memory_capture_ceiling_limiter(settings: WebhookAPISettings) -> InMemoryRateLimiter:
     """Per-repo daily cap on Memory capture writes (Phase 3, Unit C) — see
     `apps/webhook_api/settings.py`'s `memory_capture_ceiling_per_repo_per_day`
@@ -401,26 +360,6 @@ def create_app(settings: WebhookAPISettings) -> FastAPI:
         logger.info("setup_mode enabled; manifest/callback routes registered")
     else:
         logger.info("setup_mode disabled; manifest/callback routes not registered")
-
-    # Memory admin API (docs/plans/plan-deliver-memory.md's Phase 5 section,
-    # Unit E) — registered unconditionally (Assumption 7), reusing the same
-    # `memory_repository` instance built above (it already implements both
-    # `MemoryAdminRepository` and the separate, single-method
-    # `PostedCommentReader`, per Assumption 8). `embedding_client`'s
-    # startup check runs synchronously, once, before `create_app` returns —
-    # the same "runs exactly once, before the dispatch loop starts" fail-
-    # fast timing `apps/worker/main.py`'s own equivalent check uses.
-    embedding_client = _build_embedding_client(settings)
-    _check_embedding_model_startup(embedding_client, settings, logger)
-    app.include_router(
-        create_admin_router(
-            admin_api_key=settings.admin_api_key,
-            repository=memory_repository,
-            posted_comment_reader=memory_repository,
-            embedding_client=embedding_client,
-        )
-    )
-    logger.info("admin API routes registered")
 
     return app
 

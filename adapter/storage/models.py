@@ -541,6 +541,18 @@ class MemoryEntryRow(Base):
     )
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Nullable FK to `admin_user.id` (docs/plans/plan-deliver-admin-gui.md's
+    # Phase 3 section, Unit D, Assumption 6) — the acting Admin's real
+    # identity at approval time, distinct from the pre-existing free-text
+    # `approved_by` column above, which no current writer populates. No
+    # `ondelete=CASCADE`, mirroring `AdminAuditLogRow.actor_user_id`'s own
+    # reasoning: `admin_user` rows are never hard-deleted (deactivation is a
+    # status flip), so this never actually cascades in practice, but a
+    # historical approval should keep resolving to its approver the same
+    # way a historical audit-log row does.
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_user.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

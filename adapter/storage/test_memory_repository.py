@@ -29,6 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.models import (
+    AdminRole,
+    AdminUserRow,
     MemoryEntryRow,
     MemoryEntryStatus,
     Org,
@@ -580,7 +582,11 @@ async def test_set_status_approves_then_rejects_then_reapproves(
     entry_id = entries[0].id
 
     approved = await repository.set_status(
-        entry_id=entry_id, status="approved", entry_type="dismissed_finding", embedding=_vector(0.5)
+        entry_id=entry_id,
+        status="approved",
+        entry_type="dismissed_finding",
+        embedding=_vector(0.5),
+        approved_by_user_id=None,
     )
     assert approved.status == "approved"
     assert approved.entry_type == "dismissed_finding"
@@ -588,14 +594,22 @@ async def test_set_status_approves_then_rejects_then_reapproves(
     assert approved.approved_at is not None
 
     rejected = await repository.set_status(
-        entry_id=entry_id, status="rejected", entry_type=None, embedding=None
+        entry_id=entry_id,
+        status="rejected",
+        entry_type=None,
+        embedding=None,
+        approved_by_user_id=None,
     )
     assert rejected.status == "rejected"
     assert rejected.entry_type is None
     assert rejected.embedding is None
 
     reapproved = await repository.set_status(
-        entry_id=entry_id, status="approved", entry_type="correction", embedding=None
+        entry_id=entry_id,
+        status="approved",
+        entry_type="correction",
+        embedding=None,
+        approved_by_user_id=None,
     )
     assert reapproved.status == "approved"
     assert reapproved.entry_type == "correction"
@@ -611,7 +625,60 @@ async def test_set_status_raises_not_found_for_an_unknown_id(
             status="approved",
             entry_type="dismissed_finding",
             embedding=None,
+            approved_by_user_id=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_set_status_records_the_approving_admin_and_leaves_it_untouched_on_reject(
+    repository: PostgresMemoryRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+) -> None:
+    """docs/plans/plan-deliver-admin-gui.md's Phase 3 section (Unit D,
+    Assumption 6): `approved_by_user_id` is set from the acting Admin's id
+    only on approve, and — mirroring `approved_at`'s own established
+    behavior — is left untouched (never cleared) on a later reject, since
+    it's only ever read while `status == "approved"`."""
+    comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9402)
+    await repository.record_signal(
+        posted_finding_comment_id=comment_id,
+        raw_signal_type="reply",
+        raw_signal_detail={"body": "not applicable"},
+        github_comment_id=778,
+    )
+    entries, _ = await repository.list_entries(
+        org_id=None, repo_id=str(repo_id), team_id=None, status=None, limit=10, offset=0
+    )
+    entry_id = entries[0].id
+
+    async with session_factory() as session, session.begin():
+        admin_user = AdminUserRow(
+            username=f"admin-{uuid.uuid4().hex}",
+            password_hash="unused-hash",
+            role=AdminRole.ADMIN,
+        )
+        session.add(admin_user)
+        await session.flush()
+        admin_user_id = str(admin_user.id)
+
+    approved = await repository.set_status(
+        entry_id=entry_id,
+        status="approved",
+        entry_type="dismissed_finding",
+        embedding=_vector(0.5),
+        approved_by_user_id=admin_user_id,
+    )
+    assert approved.approved_by_user_id == admin_user_id
+
+    rejected = await repository.set_status(
+        entry_id=entry_id,
+        status="rejected",
+        entry_type=None,
+        embedding=None,
+        approved_by_user_id=None,
+    )
+    assert rejected.approved_by_user_id == admin_user_id
 
 
 @pytest.mark.asyncio
@@ -719,7 +786,11 @@ async def test_best_effective_similarity_returns_the_correct_decayed_value(
     approved_180_days_ago = now - timedelta(days=180)
 
     await repository.set_status(
-        entry_id=entry_id, status="approved", entry_type="dismissed_finding", embedding=query_vector
+        entry_id=entry_id,
+        status="approved",
+        entry_type="dismissed_finding",
+        embedding=query_vector,
+        approved_by_user_id=None,
     )
     # `set_status` writes `approved_at = now()` server-side; hand-set it to
     # a known age directly so this test can assert an exact, hand-computed
@@ -766,7 +837,11 @@ async def _seed_approved_dismissed_finding(
         entry.id for entry in entries if entry.posted_finding_comment_id == posted_comment_id
     )
     await repository.set_status(
-        entry_id=entry_id, status="approved", entry_type="dismissed_finding", embedding=embedding
+        entry_id=entry_id,
+        status="approved",
+        entry_type="dismissed_finding",
+        embedding=embedding,
+        approved_by_user_id=None,
     )
     async with session_factory() as session, session.begin():
         row = (

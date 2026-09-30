@@ -29,6 +29,7 @@ def _entry(**overrides: object) -> MemoryEntry:
         "embedding": None,
         "approved_at": None,
         "approved_by": None,
+        "approved_by_user_id": None,
         "created_at": _NOW,
         "updated_at": _NOW,
     }

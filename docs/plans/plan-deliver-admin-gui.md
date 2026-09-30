@@ -447,6 +447,8 @@ switch needed — additive CRUD, no production hot path.
 
 ## Phase 3 — Memory admin API migration (Unit D: US-A7, US-A8–A11)
 
+**Status: Done (2026-09-30).**
+
 **Why next:** the one real cutover in this plan (per the spec's own
 Rollout & Release Safety framing) — doing it early means every later route
 module copies this same auth-swap pattern instead of inventing its own.

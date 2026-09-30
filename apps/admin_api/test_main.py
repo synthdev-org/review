@@ -1,8 +1,10 @@
 """Integration tests for apps/admin_api/main.py's create_app composition
-root — US-A3's bootstrap-admin behavior (fresh vs. already-has-admin), and
-the /healthz liveness/readiness probe, against a real Postgres/pgvector via
-testcontainers-python, per
-docs/plans/plan-deliver-admin-gui.md's Phase 1 (Unit B) Tests section.
+root — US-A3's bootstrap-admin behavior (fresh vs. already-has-admin), the
+/healthz liveness/readiness probe, and (docs/plans/plan-deliver-admin-gui.md's
+Phase 3 section, Unit D) the Memory admin API's own local embedding-model
+startup check, moved here from apps/webhook_api along with the approve
+route it serves — against a real Postgres/pgvector via
+testcontainers-python, per that same phase's Tests section.
 
 The bootstrap routine's own multi-replica concurrency guarantee (the
 advisory lock preventing duplicate admins) is covered separately, in
@@ -14,6 +16,7 @@ design and cannot exercise two overlapping bootstrap attempts on its own.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 from fastapi.testclient import TestClient
@@ -108,3 +111,64 @@ def test_bootstrap_is_a_no_op_when_an_admin_user_already_exists(
             assert rows[0].username == _BOOTSTRAP_USERNAME
 
     asyncio.run(_assert_still_one_admin())
+
+
+# --- docs/plans/plan-deliver-admin-gui.md's Phase 3 (Unit D): the Memory
+# admin API's local embedding-model startup check, moved here from
+# apps/webhook_api along with the approve route it serves --------------
+
+_UNREACHABLE_DSN = "postgresql+asyncpg://unused:unused@localhost:5432/unused"
+
+
+def _unreachable_dsn_settings(**overrides: object) -> AdminAPISettings:
+    """Settings built against a syntactically-valid but unreachable DSN —
+    safe here because `adapter.storage.engine.create_storage_engine`/
+    `create_session_factory` are non-connecting, synchronous factory calls
+    (see their own docstrings) and `_check_embedding_model_startup` runs
+    synchronously inside `create_app` itself, before any DB connection is
+    ever attempted — mirrors `apps/webhook_api/test_main.py`'s own
+    (deleted) identical pattern for this exact check."""
+    return _settings(dsn=_UNREACHABLE_DSN, **overrides)
+
+
+def test_create_app_succeeds_with_loadable_embedding_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """docs/plans/plan-deliver-admin-gui.md's Phase 3 section: this
+    entrypoint's own `LocalONNXEmbeddingClient` startup check, mirroring
+    `apps/worker/test_main.py::test_main_succeeds_with_loadable_embedding_model`
+    (and `apps/webhook_api/test_main.py`'s own, now-deleted, identical
+    test) — no mocking, the real Dockerfile-baked model, exercised for
+    real."""
+    logging.getLogger("apps.admin_api.main").disabled = False
+    settings = _unreachable_dsn_settings()  # embedding_model_path defaults to the real baked model
+
+    with caplog.at_level("INFO", logger="apps.admin_api.main"):
+        create_app(settings)  # must not raise SystemExit
+
+    assert any(
+        record.name == "apps.admin_api.main"
+        and record.getMessage() == "local embedding model loaded"
+        for record in caplog.records
+    )
+
+
+def test_create_app_exits_non_zero_with_unloadable_embedding_model(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logging.getLogger("apps.admin_api.main").disabled = False
+    settings = _unreachable_dsn_settings(embedding_model_path="/nonexistent/model/path")
+
+    with (
+        caplog.at_level("ERROR", logger="apps.admin_api.main"),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        create_app(settings)
+
+    assert excinfo.value.code == 1
+    assert any(
+        record.name == "apps.admin_api.main"
+        and record.getMessage() == "local embedding model is not usable at startup; exiting"
+        and record.levelname == "ERROR"
+        for record in caplog.records
+    )

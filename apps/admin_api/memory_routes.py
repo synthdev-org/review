@@ -1,36 +1,43 @@
-"""apps.webhook_api.admin_routes — the Memory admin API: list/approve/
-reject/delete, per ``docs/plans/plan-deliver-memory.md``'s Phase 5 section
-(Unit E, US-M4/US-M5/US-M8/US-M10).
+"""apps.admin_api.memory_routes — the Memory admin API: list/approve/
+reject/delete, migrated off the shared static token onto real per-user
+sessions, per ``docs/plans/plan-deliver-admin-gui.md``'s Phase 3 section
+(Unit D, US-A7, US-A8-A11).
 
-Follows ``apps/webhook_api/manifest_routes.py``'s exact factory-router
-shape (``create_admin_router(...) -> APIRouter``), closing over its own
+Moved wholesale from ``apps/webhook_api/admin_routes.py`` (originally
+``docs/plans/plan-deliver-memory.md``'s Phase 5, Unit E) — same route
+bodies, same ``memory.store`` Protocols, same 400/404 translation for a
+malformed/unknown ``entry_id`` — with two changes, both required by US-A7:
+
+- Auth swaps from ``_require_admin_key``'s single static
+  ``Authorization: Bearer <admin_api_key>`` check to this entrypoint's own
+  ``require_session``/``require_admin_role`` dependency chain
+  (``apps/admin_api/dependencies.py``, Phase 1). The list route depends on
+  ``require_session`` alone (Viewer parity, per US-A5's second clause —
+  reading the queue is not a mutating action); approve/reject/delete each
+  depend on ``require_admin_role``.
+- Every mutating handler (approve/reject/delete) now writes a real
+  ``admin_audit_log`` row via ``PostgresAuditLogRepository`` (Assumption 6),
+  attributed to the acting session's user id — the "someone with the
+  shared key did this" audit gap US-A7 exists to close. Approve
+  additionally attributes ``memory_entry.approved_by_user_id`` itself
+  (Assumption 6), not just the audit log.
+
+Follows ``apps/admin_api/user_routes.py``'s exact factory-router shape
+(``create_memory_router(...) -> APIRouter``), closing over its own
 dependencies rather than reading them from module-level state, per
 ``docs/rules/architecture.md``'s constructor-injection rule.
-``apps/webhook_api/main.py`` registers this router **unconditionally**
-(plan Assumption 7) — unlike ``manifest_routes.py``'s ``SETUP_MODE`` gate,
-there is no "off by default" state for the admin API: every route enforces
-its own auth per-request via ``_require_admin_key`` instead.
+``apps/admin_api/main.py`` registers this router unconditionally, the same
+as every other route module here — there is no "off by default" state for
+the admin API.
 
-Every route depends on ``_require_admin_key`` (US-M10) — a single
-``Authorization: Bearer <admin_api_key>`` check, ``hmac.compare_digest``'d
-against the configured key (never ``==``, the same constant-time-comparison
-precedent ``adapter/github/manifest.py``'s own CSRF-state check and
-``adapter/github/signature.py``'s webhook-signature check already
-establish for a security-sensitive string comparison) — registered once as
-a router-level dependency (``APIRouter(dependencies=[...])``) so every
-route below it inherits the same check rather than each repeating it.
-
-The approve route (US-M4) is the first place outside the Worker's own job
-pipeline that runs local embedding-model inference — bounded to one call
-per approve action (an authenticated, human-action-cadence operation, not
-attacker-triggerable volume), per the plan's Security review. Wrapped in
-``asyncio.to_thread`` since ``indexing.embedding.EmbeddingClient.embed`` is
-a plain, synchronous, CPU-bound call (its own docstring), never awaited
-directly from an async route handler.
-
-Every approve/reject/delete call is logged at ``info`` (entry id, action) —
-the audit trail ``spec-memory.md``'s Observability section names for a
-write-capable curation surface with no real per-user identity yet.
+The approve route (US-A9/US-M4) is the first place in ``apps/admin_api``
+that runs local embedding-model inference — bounded to one call per
+approve action (an authenticated, human-action-cadence operation, not
+attacker-triggerable volume), per the original plan's Security review.
+Wrapped in ``asyncio.to_thread`` since
+``indexing.embedding.EmbeddingClient.embed`` is a plain, synchronous,
+CPU-bound call (its own docstring), never awaited directly from an async
+route handler.
 
 Malformed input reaching ``memory.store``'s Protocol methods (a non-UUID
 ``entry_id`` in a path, or a non-UUID ``org_id``/``repo_id``/``team_id``
@@ -38,22 +45,27 @@ filter in a query string) surfaces from the concrete
 ``PostgresMemoryRepository`` as ``memory.store.MemoryStoreError`` — caught
 here and translated to a structured ``400``, never left to propagate as an
 unhandled/bare ``500``. A failed embedding computation
-(``indexing.embedding.EmbeddingError``, the approve route's own
-``embed`` call) is caught the same way and translated to a structured
-``500`` (this entrypoint's own local model-inference failure, not the
-caller's fault, so not a ``4xx``).
+(``indexing.embedding.EmbeddingError``, the approve route's own ``embed``
+call) is caught the same way and translated to a structured ``500`` (this
+entrypoint's own local model-inference failure, not the caller's fault, so
+not a ``4xx``).
 """
 
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 from typing import Annotated, Literal, NoReturn
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, SecretStr
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
+from adapter.storage.iam import PostgresAuditLogRepository
+from apps.admin_api.dependencies import (
+    AuthenticatedSession,
+    RequireAdminRoleDependency,
+    RequireSessionDependency,
+)
 from indexing.embedding import EmbeddingClient, EmbeddingError
 from memory.fingerprint import build_finding_fingerprint
 from memory.models import MemoryEntry, MemoryStatus
@@ -107,10 +119,10 @@ class _ListMemoryEntriesResponse(BaseModel):
 
 
 class _DeleteMemoryEntryResponse(BaseModel):
-    """A structured body for a successful delete, per this phase's own UX
-    section ("every response is structured JSON suitable for a future
-    Phase 5 [admin UI] screen to consume directly") — not a bare 204 with
-    no body a future screen would have nothing to read."""
+    """A structured body for a successful delete, per the original plan's
+    own UX section ("every response is structured JSON suitable for a
+    future Phase 5 [admin UI] screen to consume directly") — not a bare 204
+    with no body a future screen would have nothing to read."""
 
     deleted: bool
     entry_id: str
@@ -139,35 +151,22 @@ def _entry_id_not_found_or_invalid(entry_id: str, exc: Exception) -> NoReturn:
     raise exc
 
 
-def create_admin_router(
+def create_memory_router(
     *,
-    admin_api_key: SecretStr,
     repository: MemoryAdminRepository,
     posted_comment_reader: PostedCommentReader,
     embedding_client: EmbeddingClient,
+    audit_log_repository: PostgresAuditLogRepository,
+    require_session: RequireSessionDependency,
+    require_admin_role: RequireAdminRoleDependency,
 ) -> APIRouter:
     """Build the always-registered Memory admin router.
 
     A factory closing over its dependencies, matching
-    ``manifest_routes.py``'s ``create_manifest_router`` shape — only called
-    by ``apps/webhook_api/main.py``.
+    ``apps/admin_api/user_routes.py``'s ``create_user_router`` shape — only
+    called by ``apps/admin_api/main.py``.
     """
-
-    def _require_admin_key(request: Request) -> None:
-        """US-M10: reject any admin request without a valid
-        ``Authorization: Bearer <admin_api_key>`` header — no Memory entry
-        is read, modified, or created for a request that fails this check
-        (it runs, as a router-level dependency, before any route body
-        below executes).
-        """
-        authorization = request.headers.get("authorization")
-        if authorization is None or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="missing or invalid Authorization header")
-        provided_key = authorization.removeprefix("Bearer ")
-        if not hmac.compare_digest(provided_key, admin_api_key.get_secret_value()):
-            raise HTTPException(status_code=401, detail="invalid admin API key")
-
-    router = APIRouter(prefix="/admin/memory-entries", dependencies=[Depends(_require_admin_key)])
+    router = APIRouter(prefix="/api/v1/memory-entries")
 
     @router.get("")
     async def list_memory_entries(
@@ -177,13 +176,17 @@ def create_admin_router(
         status: MemoryStatus | None = None,
         limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = _DEFAULT_LIST_LIMIT,
         offset: Annotated[int, Query(ge=0)] = 0,
+        authenticated: AuthenticatedSession = Depends(require_session),
     ) -> _ListMemoryEntriesResponse:
         """US-M8: `org_id`/`repo_id`/`team_id`/`status` are all optional
-        filters (never an access-control boundary the key itself enforces
-        — the same single static key already reads/writes every org/repo/
-        team regardless of what's passed here, per `spec-memory.md`'s own
-        "Admin key scope" clarification), newest-first, paginated.
+        filters (never an access-control boundary — every session,
+        Admin or Viewer, reads/filters every org/repo/team, per
+        `spec-memory.md`'s own "Admin key scope" clarification, now applied
+        to `require_session` instead of the retired static key). Gated by
+        `require_session` alone (Viewer parity, US-A5's second clause) —
+        reading the queue is not a mutating action.
         """
+        _ = authenticated
         try:
             entries, total = await repository.list_entries(
                 org_id=org_id,
@@ -200,11 +203,16 @@ def create_admin_router(
         return _ListMemoryEntriesResponse(entries=entries, total=total)
 
     @router.post("/{entry_id}/approve")
-    async def approve_memory_entry(entry_id: str, payload: _ApproveRequest) -> MemoryEntry:
-        """US-M4: classify and approve `entry_id`. Only a `dismissed_finding`
+    async def approve_memory_entry(
+        entry_id: str,
+        payload: _ApproveRequest,
+        authenticated: AuthenticatedSession = Depends(require_admin_role),
+    ) -> MemoryEntry:
+        """US-A9/US-M4: classify and approve `entry_id`, attributed to the
+        acting Admin's identity (US-A7). Only a `dismissed_finding`
         approval computes and stores an embedding — `accepted_fix`/
         `correction` entries are approved with no embedding, since nothing
-        reads them yet (per the plan's own out-of-scope list)."""
+        reads them yet (per the original plan's own out-of-scope list)."""
         embedding: tuple[float, ...] | None = None
         if payload.entry_type == "dismissed_finding":
             try:
@@ -230,44 +238,76 @@ def create_admin_router(
                 status="approved",
                 entry_type=payload.entry_type,
                 embedding=embedding,
+                approved_by_user_id=authenticated.user.id,
             )
         except (MemoryEntryNotFoundError, MemoryStoreError) as exc:
             _entry_id_not_found_or_invalid(entry_id, exc)
 
+        await audit_log_repository.record(
+            actor_user_id=authenticated.user.id,
+            action="memory_entry_approved",
+            resource_type="memory_entry",
+            resource_id=entry_id,
+            metadata={"entry_type": payload.entry_type},
+        )
         logger.info(
             "memory entry approved",
-            extra={"entry_id": entry_id, "action": "approve", "entry_type": payload.entry_type},
+            extra={
+                "entry_id": entry_id,
+                "action": "approve",
+                "entry_type": payload.entry_type,
+                "actor": authenticated.user.username,
+            },
         )
         return entry
 
     @router.post("/{entry_id}/reject")
-    async def reject_memory_entry(entry_id: str) -> MemoryEntry:
-        """US-M5: reject `entry_id` — idempotent (a repeat reject of an
-        already-rejected entry is a plain 200, not an error) and reversible
-        (a later approve re-classifies exactly as a fresh entry would).
-        Clears any prior `entry_type`/`embedding`, per `memory.models
-        .MemoryEntryType`'s own "reject clears any prior classification"
-        docstring.
+    async def reject_memory_entry(
+        entry_id: str,
+        authenticated: AuthenticatedSession = Depends(require_admin_role),
+    ) -> MemoryEntry:
+        """US-A10/US-M5: reject `entry_id`, attributed to the acting Admin
+        (US-A7) — idempotent (a repeat reject of an already-rejected entry
+        is a plain 200, not an error) and reversible (a later approve
+        re-classifies exactly as a fresh entry would). Clears any prior
+        `entry_type`/`embedding`, per `memory.models.MemoryEntryType`'s own
+        "reject clears any prior classification" docstring.
         """
         try:
             entry = await repository.set_status(
-                entry_id=entry_id, status="rejected", entry_type=None, embedding=None
+                entry_id=entry_id,
+                status="rejected",
+                entry_type=None,
+                embedding=None,
+                approved_by_user_id=None,
             )
         except (MemoryEntryNotFoundError, MemoryStoreError) as exc:
             _entry_id_not_found_or_invalid(entry_id, exc)
 
-        logger.info("memory entry rejected", extra={"entry_id": entry_id, "action": "reject"})
+        await audit_log_repository.record(
+            actor_user_id=authenticated.user.id,
+            action="memory_entry_rejected",
+            resource_type="memory_entry",
+            resource_id=entry_id,
+        )
+        logger.info(
+            "memory entry rejected",
+            extra={"entry_id": entry_id, "action": "reject", "actor": authenticated.user.username},
+        )
         return entry
 
     @router.delete("/{entry_id}")
     async def delete_memory_entry(
-        entry_id: str, confirm: bool = False
+        entry_id: str,
+        confirm: bool = False,
+        authenticated: AuthenticatedSession = Depends(require_admin_role),
     ) -> _DeleteMemoryEntryResponse:
-        """US-M5: irreversibly remove `entry_id`'s row — requires an
-        explicit `confirm=true` query parameter (`400` without it, "the
-        closest a JSON API gets to a confirmation dialog's role in a UI",
-        per the plan's UX section); `404` for an already-deleted or
-        never-existing id, on either call shape.
+        """US-A11/US-M5: irreversibly remove `entry_id`'s row, attributed to
+        the acting Admin (US-A7) — requires an explicit `confirm=true` query
+        parameter (`400` without it, "the closest a JSON API gets to a
+        confirmation dialog's role in a UI", per the original plan's UX
+        section); `404` for an already-deleted or never-existing id, on
+        either call shape.
         """
         if not confirm:
             raise HTTPException(status_code=400, detail="delete requires confirm=true")
@@ -277,7 +317,16 @@ def create_admin_router(
         except (MemoryEntryNotFoundError, MemoryStoreError) as exc:
             _entry_id_not_found_or_invalid(entry_id, exc)
 
-        logger.info("memory entry deleted", extra={"entry_id": entry_id, "action": "delete"})
+        await audit_log_repository.record(
+            actor_user_id=authenticated.user.id,
+            action="memory_entry_deleted",
+            resource_type="memory_entry",
+            resource_id=entry_id,
+        )
+        logger.info(
+            "memory entry deleted",
+            extra={"entry_id": entry_id, "action": "delete", "actor": authenticated.user.username},
+        )
         return _DeleteMemoryEntryResponse(deleted=True, entry_id=entry_id)
 
     return router

@@ -148,18 +148,16 @@ llm:
       name: ""
       key: ""
 
-# Admin API auth (docs/plans/plan-deliver-memory.md's Phase 5, Unit E,
-# Assumption 7) — mirrors WebhookAPISettings' own `admin_api_key: SecretStr`
-# required-no-default field: the admin router registers unconditionally
-# and enforces this key per-request (US-M10), so an unset value leaves
-# webhook-api unable to boot, the same "no safe default" posture as
-# `github.appPrivateKey` above.
-adminApi:
-  apiKey:
-    value: ""
-    existingSecret:
-      name: ""
-      key: ""
+# `adminApi:` (docs/plans/plan-deliver-memory.md's Phase 5, Unit E,
+# Assumption 7) previously held the static `admin_api_key` credential the
+# Memory admin API's shared-token auth used. docs/plans/
+# plan-deliver-admin-gui.md's Phase 3 (Unit D, US-A7) fully retired that
+# credential — the Memory admin API now authenticates via real per-user
+# sessions instead — so this key is intentionally empty here. Phase 9 of
+# that same plan reintroduces a fresh `adminApi:` block (replicaCount/
+# image/service/resources/credentials) for the real `apps/admin_api`
+# Deployment; the two phases don't collide in shape since Phase 3 runs
+# first.
 
 database:
   # Full REVIEW_DATABASE_URL DSN (postgresql+asyncpg://user:pass@host:port/db).

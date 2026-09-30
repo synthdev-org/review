@@ -8,7 +8,7 @@
 #
 # The operator still MUST supply real values for every credential/required
 # field below (github.webhookSecret, github.appPrivateKey, llm.apiKey,
-# database.url, adminApi.apiKey, github.setupStateSecret if setupMode is
+# database.url, github.setupStateSecret if setupMode is
 # ever enabled, and BOTH webhookApi.github.appId and worker.github.appId —
 # each defaults to "" in values.yaml but is parsed as a required int with
 # no default by WebhookAPISettings/WorkerSettings respectively, so leaving

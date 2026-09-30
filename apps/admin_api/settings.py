@@ -86,3 +86,14 @@ class AdminAPISettings(OtelSettingsMixin):
     # (Assumption 7), so this is never a reuse of any session-cookie
     # material.
     admin_csrf_secret: SecretStr
+
+    # --- Memory admin API (docs/plans/plan-deliver-admin-gui.md's Phase 3
+    # section, Unit D, US-A7/US-A8-A11) ---
+    # This entrypoint's own `LocalONNXEmbeddingClient` instance — the
+    # approve route (US-A9/US-M4) moved here from `apps/webhook_api` along
+    # with the rest of `apps/webhook_api/admin_routes.py`'s handlers. Same
+    # on-disk, Dockerfile-baked model path/default `apps/webhook_api`'s own
+    # (now-deleted) field and `apps/worker/settings.py`'s
+    # `embedding_model_path` field already use — never a network location
+    # or a per-entrypoint override.
+    embedding_model_path: str = "/app/models/all-MiniLM-L6-v2"

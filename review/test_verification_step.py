@@ -51,8 +51,9 @@ from adapter.llm.litellm_client import LiteLLMClient
 from adapter.storage.engine import create_session_factory
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.models import Org, PostedFindingCommentRow, Repo
-from apps.webhook_api.main import create_app
-from apps.webhook_api.settings import WebhookAPISettings
+from apps.admin_api.dependencies import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from apps.admin_api.main import create_app as create_admin_app
+from apps.admin_api.settings import AdminAPISettings
 from findings.models import Finding
 from indexing.embedding import EmbeddingVector
 from ingestion.diff import Diff, DiffFile
@@ -951,22 +952,46 @@ async def test_us_m12_suppression_disabled_output_matches_no_suppression_configu
 
 
 # --- Unit E -> Unit F contract: real admin approve, then real suppression ---
+#
+# docs/plans/plan-deliver-admin-gui.md's Phase 3 (Unit D, US-A7) moved the
+# Memory admin API's approve route from apps/webhook_api (a static
+# admin_api_key Bearer token) to apps/admin_api (real per-user sessions) —
+# this contract test's own "approve via the real HTTP route, not a direct
+# repository call" Acceptance criterion now drives apps.admin_api.main
+# through a real login, not a static key.
 
 _REAL_MODEL_PATH = "/app/models/all-MiniLM-L6-v2"
-_CONTRACT_ADMIN_KEY = "verification-contract-test-admin-key"
+_CONTRACT_BOOTSTRAP_USERNAME = "verification-contract-test-admin"
+_CONTRACT_BOOTSTRAP_PASSWORD = "verification-contract-test-password"
 
 
 def _admin_client(*, dsn: str) -> TestClient:
-    settings = WebhookAPISettings(
+    settings = AdminAPISettings(
         environment="development",
         database_url=SecretStr(dsn),
-        github_webhook_secret=SecretStr("unused-webhook-secret"),
-        github_app_id=1,
-        github_app_private_key=SecretStr("unused-placeholder-key"),
-        admin_api_key=SecretStr(_CONTRACT_ADMIN_KEY),
+        admin_bootstrap_username=_CONTRACT_BOOTSTRAP_USERNAME,
+        admin_bootstrap_password=SecretStr(_CONTRACT_BOOTSTRAP_PASSWORD),
+        admin_csrf_secret=SecretStr("verification-contract-test-csrf-secret"),
+        session_cookie_secure=False,
         _env_file=None,
     )
-    return TestClient(create_app(settings))
+    return TestClient(create_admin_app(settings))
+
+
+def _login_as_contract_admin(client: TestClient) -> str:
+    """Logs the bootstrap admin in on ``client`` (created inside
+    ``create_admin_app``'s own ``lifespan``, per Phase 1 of
+    ``docs/plans/plan-deliver-admin-gui.md``) and returns the CSRF token
+    every subsequent mutating request below must echo back via
+    ``CSRF_HEADER_NAME`` — the same pattern
+    ``apps/admin_api/test_user_routes.py``'s own
+    ``_login_as_bootstrap_admin`` helper already establishes.
+    """
+    client.post(
+        "/api/v1/auth/login",
+        json={"username": _CONTRACT_BOOTSTRAP_USERNAME, "password": _CONTRACT_BOOTSTRAP_PASSWORD},
+    )
+    return str(client.cookies[CSRF_COOKIE_NAME])
 
 
 @pytest_asyncio.fixture
@@ -1046,10 +1071,11 @@ async def _approve_dismissed_finding_entry(
     )
 
     with _admin_client(dsn=dsn) as client:
+        csrf_token = _login_as_contract_admin(client)
         response = client.post(
-            f"/admin/memory-entries/{entry_id}/approve",
+            f"/api/v1/memory-entries/{entry_id}/approve",
             json={"entry_type": "dismissed_finding"},
-            headers={"Authorization": f"Bearer {_CONTRACT_ADMIN_KEY}"},
+            headers={CSRF_HEADER_NAME: csrf_token},
         )
     assert response.status_code == 200
     approved_body = response.json()

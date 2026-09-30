@@ -141,12 +141,6 @@ services:
         ${REVIEW_WEBHOOK_API_GITHUB_RETRY_MAX_ATTEMPTS:-3}
       REVIEW_WEBHOOK_API_MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL: >-
         ${REVIEW_WEBHOOK_API_MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL:-50}
-      # Required, no default (docs/plans/plan-deliver-memory.md's Phase 5,
-      # Unit E, Assumption 7) — the admin API registers unconditionally
-      # and enforces auth per-request via this key (US-M10); without it,
-      # webhook_api fails to boot. See .env.example.
-      REVIEW_WEBHOOK_API_ADMIN_API_KEY: >-
-        ${REVIEW_WEBHOOK_API_ADMIN_API_KEY:?set REVIEW_WEBHOOK_API_ADMIN_API_KEY in .env, see .env.example}
     # docs/plans/plan-deliver-memory.md's Phase 3/4 (Unit C/D) gave this
     # service its own outbound GitHub calls (the synchronous `pull_request
     # closed` reaction poll, Unit D's second branch) — it needs the same
@@ -211,6 +205,13 @@ services:
       # HMAC cookie; without it, admin_api fails to boot. See .env.example.
       REVIEW_ADMIN_API_ADMIN_CSRF_SECRET: >-
         ${REVIEW_ADMIN_API_ADMIN_CSRF_SECRET:?set REVIEW_ADMIN_API_ADMIN_CSRF_SECRET in .env, see .env.example}
+      # docs/plans/plan-deliver-admin-gui.md's Phase 3 (Unit D) — the
+      # Memory admin API's approve route moved here from apps/webhook_api
+      # along with its own LocalONNXEmbeddingClient wiring. Same
+      # Dockerfile-baked default every other entrypoint's own copy of this
+      # setting uses.
+      REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH: >-
+        ${REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH:-/app/models/all-MiniLM-L6-v2}
       # See webhook_api's own identical entry above for why this is a bare
       # pass-through (`KEY:`, no `:-` default) rather than
       # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}`.

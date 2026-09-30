@@ -108,6 +108,9 @@ def _to_entry(row: MemoryEntryRow) -> MemoryEntry:
         embedding=tuple(row.embedding) if row.embedding is not None else None,
         approved_at=row.approved_at,
         approved_by=row.approved_by,
+        approved_by_user_id=(
+            str(row.approved_by_user_id) if row.approved_by_user_id is not None else None
+        ),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -383,6 +386,7 @@ class PostgresMemoryRepository:
         status: Literal["approved", "rejected"],
         entry_type: MemoryEntryType,
         embedding: tuple[float, ...] | None,
+        approved_by_user_id: str | None,
     ) -> MemoryEntry:
         entry_uuid = self._parse_uuid(entry_id, operation="set_status")
 
@@ -398,6 +402,9 @@ class PostgresMemoryRepository:
             row.embedding = list(embedding) if embedding is not None else None
             if status == "approved":
                 row.approved_at = func.now()
+                row.approved_by_user_id = (
+                    uuid.UUID(approved_by_user_id) if approved_by_user_id is not None else None
+                )
             await session.flush()
             await session.refresh(row)
             return row

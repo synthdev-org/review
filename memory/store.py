@@ -198,13 +198,18 @@ class MemoryAdminRepository(Protocol):
         status: Literal["approved", "rejected"],
         entry_type: MemoryEntryType,
         embedding: tuple[float, ...] | None,
+        approved_by_user_id: str | None,
     ) -> MemoryEntry:
         """Approve or reject ``entry_id`` in one method (per US-M4/US-M5's
         "approve and reject are reversible state transitions in either
         direction" design) — sets ``status``, ``entry_type``, and
-        ``embedding`` to exactly what's given, and ``approved_at`` to the
-        current time only when ``status == "approved"`` (left untouched
-        otherwise, since it's only ever read while ``status == "approved"``).
+        ``embedding`` to exactly what's given, and ``approved_at``/
+        ``approved_by_user_id`` to the current time/given value only when
+        ``status == "approved"`` (both left untouched otherwise, since
+        they're only ever read while ``status == "approved"`` —
+        ``docs/plans/plan-deliver-admin-gui.md``'s Phase 3 section, Unit D,
+        Assumption 6). A reject call passes ``approved_by_user_id=None``
+        since it's ignored outside the ``status == "approved"`` branch.
         Raises ``MemoryEntryNotFoundError`` for an unknown ``entry_id``
         (US-M5's 404 case), or ``MemoryStoreError`` on any other
         Postgres-level failure.

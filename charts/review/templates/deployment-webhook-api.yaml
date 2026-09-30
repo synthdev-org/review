@@ -39,7 +39,5 @@ spec:
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WEBHOOK_API_SETUP_STATE_SECRET" "field" .Values.github.setupStateSecret "secretName" (include "review.secretName" .) "secretKey" "github-setup-state-secret") | nindent 12 }}
             {{- end }}
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_DATABASE_URL" "field" .Values.database.url "secretName" (include "review.secretName" .) "secretKey" "database-url") | nindent 12 }}
-            {{- /* Admin API auth (Phase 5, Unit E, Assumption 7) — registers unconditionally, so this is required for webhook-api to boot. */}}
-            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WEBHOOK_API_ADMIN_API_KEY" "field" .Values.adminApi.apiKey "secretName" (include "review.secretName" .) "secretKey" "admin-api-key") | nindent 12 }}
           resources:
             {{- toYaml .Values.webhookApi.resources | nindent 12 }}
