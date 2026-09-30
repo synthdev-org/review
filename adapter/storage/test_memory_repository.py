@@ -630,16 +630,19 @@ async def test_set_status_raises_not_found_for_an_unknown_id(
 
 
 @pytest.mark.asyncio
-async def test_set_status_records_the_approving_admin_and_leaves_it_untouched_on_reject(
+async def test_set_status_records_the_approving_admin_and_clears_it_on_reject(
     repository: PostgresMemoryRepository,
     repo_id: uuid.UUID,
     session_factory: async_sessionmaker[Any],
 ) -> None:
     """docs/plans/plan-deliver-admin-gui.md's Phase 3 section (Unit D,
     Assumption 6): `approved_by_user_id` is set from the acting Admin's id
-    only on approve, and — mirroring `approved_at`'s own established
-    behavior — is left untouched (never cleared) on a later reject, since
-    it's only ever read while `status == "approved"`."""
+    on approve, and — unlike `approved_at` — is cleared back to `None` on a
+    later reject, since the entry's full state (including this field) is
+    returned directly in list/get API responses regardless of status; a
+    stale approver id on a rejected entry would misattribute an approval
+    that's no longer in effect. A subsequent reapproval by a different
+    admin re-attributes to that admin, not the original approver."""
     comment_id = await _seed_posted_comment(session_factory, repo_id=repo_id, comment_id=9402)
     await repository.record_signal(
         posted_finding_comment_id=comment_id,
@@ -678,7 +681,26 @@ async def test_set_status_records_the_approving_admin_and_leaves_it_untouched_on
         embedding=None,
         approved_by_user_id=None,
     )
-    assert rejected.approved_by_user_id == admin_user_id
+    assert rejected.approved_by_user_id is None
+
+    async with session_factory() as session, session.begin():
+        other_admin = AdminUserRow(
+            username=f"admin-{uuid.uuid4().hex}",
+            password_hash="unused-hash",
+            role=AdminRole.ADMIN,
+        )
+        session.add(other_admin)
+        await session.flush()
+        other_admin_id = str(other_admin.id)
+
+    reapproved = await repository.set_status(
+        entry_id=entry_id,
+        status="approved",
+        entry_type="dismissed_finding",
+        embedding=_vector(0.5),
+        approved_by_user_id=other_admin_id,
+    )
+    assert reapproved.approved_by_user_id == other_admin_id
 
 
 @pytest.mark.asyncio

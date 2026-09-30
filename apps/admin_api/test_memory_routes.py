@@ -706,6 +706,38 @@ async def test_approve_attributes_the_acting_admins_session_identity(
 
 
 @pytest.mark.asyncio
+async def test_reject_clears_a_prior_approvals_attribution(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+) -> None:
+    """Assumption 6's entry-level `approved_by_user_id` field must reflect
+    the entry's current approval state, not a stale prior one: an entry
+    approved then later rejected must not still name the original
+    approver in the `GET`/list response body, since a rejected entry's
+    approval is no longer in effect."""
+    entry_id = await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8502)
+
+    with TestClient(create_app(_settings(dsn=_dsn(migrated_engine)))) as client:
+        csrf_token = _login_as_bootstrap_admin(client)
+        approve_response = client.post(
+            f"/api/v1/memory-entries/{entry_id}/approve",
+            json={"entry_type": "dismissed_finding"},
+            headers={CSRF_HEADER_NAME: csrf_token},
+        )
+        assert approve_response.status_code == 200
+        assert approve_response.json()["approved_by_user_id"] is not None
+
+        reject_response = client.post(
+            f"/api/v1/memory-entries/{entry_id}/reject",
+            headers={CSRF_HEADER_NAME: csrf_token},
+        )
+
+    assert reject_response.status_code == 200
+    assert reject_response.json()["approved_by_user_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_reject_and_delete_are_recorded_in_the_audit_log(
     migrated_engine: AsyncEngine,
     session_factory: async_sessionmaker[Any],

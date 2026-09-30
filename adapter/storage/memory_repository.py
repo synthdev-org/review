@@ -400,11 +400,11 @@ class PostgresMemoryRepository:
             row.status = MemoryEntryStatus(status)
             row.entry_type = entry_type
             row.embedding = list(embedding) if embedding is not None else None
+            row.approved_by_user_id = (
+                uuid.UUID(approved_by_user_id) if approved_by_user_id is not None else None
+            )
             if status == "approved":
                 row.approved_at = func.now()
-                row.approved_by_user_id = (
-                    uuid.UUID(approved_by_user_id) if approved_by_user_id is not None else None
-                )
             await session.flush()
             await session.refresh(row)
             return row
