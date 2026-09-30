@@ -156,3 +156,32 @@ def test_require_admin_role_allows_an_admin_session(migrated_engine: AsyncEngine
 
         assert response.status_code == 200
         assert response.json() == {"username": _BOOTSTRAP_USERNAME}
+
+
+def test_viewer_session_reads_the_session_endpoint_identically_to_an_admin_session(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US-A5's second Given/When/Then: 'Given a Viewer-role session, When it
+    calls any read endpoint this PRD adds, Then it succeeds identically to
+    an Admin-role session.' Phase 1's one read endpoint is
+    `GET /api/v1/auth/session` (require_session-gated only, no
+    require_admin_role) — exercises the real production route, not a
+    throwaway one, so a future regression that adds a role check to
+    require_session itself would fail this test.
+    """
+    dsn = str(migrated_engine.url.render_as_string(hide_password=False))
+    settings = _settings(dsn=dsn)
+    _seed_viewer(dsn)
+
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        client.post(
+            "/api/v1/auth/login",
+            json={"username": _VIEWER_USERNAME, "password": _VIEWER_PASSWORD},
+        )
+
+        response = client.get("/api/v1/auth/session")
+
+        assert response.status_code == 200
+        assert response.json() == {"username": _VIEWER_USERNAME, "role": "viewer"}

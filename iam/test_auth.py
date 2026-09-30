@@ -35,12 +35,12 @@ def _session(*, session_id: str = "session-1", last_seen_at: datetime) -> Sessio
     )
 
 
-def _user(*, user_id: str = "user-1", role: str = "admin", is_active: bool = True) -> User:
+def _user(*, user_id: str = "user-1", role: Role = "admin", is_active: bool = True) -> User:
     return User(
         id=user_id,
         username="alice",
         password_hash="irrelevant-for-these-tests",
-        role=role,  # type: ignore[arg-type]
+        role=role,
         is_active=is_active,
         created_at=_NOW,
         updated_at=_NOW,

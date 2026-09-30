@@ -22,6 +22,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
 from pydantic import SecretStr
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -54,6 +58,44 @@ def _settings(*, dsn: str, **overrides: object) -> AdminAPISettings:
 
 def _dsn(migrated_engine: AsyncEngine) -> str:
     return str(migrated_engine.url.render_as_string(hide_password=False))
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> InMemoryMetricReader:
+    """Registers a real `MeterProvider` backed by `InMemoryMetricReader` as
+    the global one, so `apps.admin_api.auth_routes`'s module-level `meter`/
+    `_login_failed_counter` (created once, at import time) pick it up via
+    OTel's proxy-instrument migration mechanism — mirrors
+    `adapter/storage/test_queue_telemetry.py`'s identical fixture.
+    """
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-admin-api-test"}),
+        metric_readers=[reader],
+    )
+    metrics.set_meter_provider(provider)
+    return reader
+
+
+def _login_failed_total(reader: InMemoryMetricReader) -> float:
+    metrics_data = reader.get_metrics_data()
+    # `None` means "nothing recorded yet by this reader" — a real, expected
+    # state before any failed login has happened, not a setup bug (see
+    # `adapter/storage/test_queue_telemetry.py`'s identical comment).
+    if metrics_data is None:
+        return 0.0
+    total = 0.0
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != "review.auth.login_failed_total":
+                    continue
+                assert isinstance(metric.data, Sum)
+                for data_point in metric.data.data_points:
+                    total += data_point.value
+    return total
 
 
 def test_login_with_correct_credentials_succeeds_and_sets_cookies(
@@ -151,6 +193,7 @@ def test_nonexistent_username_and_wrong_password_take_equivalent_time(
 
 def test_login_rate_limit_ceiling_reads_and_writes_login_attempt_not_audit_log(
     migrated_engine: AsyncEngine,
+    in_memory_metric_reader: InMemoryMetricReader,
 ) -> None:
     settings = _settings(
         dsn=_dsn(migrated_engine), login_rate_limit_attempts=2, login_rate_limit_window_minutes=15
@@ -168,6 +211,14 @@ def test_login_rate_limit_ceiling_reads_and_writes_login_attempt_not_audit_log(
             "/api/v1/auth/login", json={"username": username, "password": "irrelevant"}
         )
         assert limited_response.status_code == 429
+
+    # The aggregate, unlabeled `review.auth.login_failed_total` counter
+    # (Phase 1's Observability & rollback section) must increment on every
+    # failed login attempt, including the two that preceded the 429 — it
+    # is the low-and-slow-across-many-usernames signal the per-username
+    # `login_attempt` ceiling this test's name already covers cannot
+    # surface on its own, so both must be asserted here side by side.
+    assert _login_failed_total(in_memory_metric_reader) == 3
 
     session_factory = create_session_factory(migrated_engine)
 
