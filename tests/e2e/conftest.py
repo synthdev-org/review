@@ -139,6 +139,20 @@ def base_compose_env(**overrides: str) -> dict[str, str]:
             # GitHub App in a real deployment.
             "REVIEW_WEBHOOK_API_GITHUB_APP_ID": "123456",
             "REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY": _TEST_RSA_PRIVATE_KEY_PEM,
+            # docs/plans/plan-deliver-admin-gui.md's Phase 1 gave
+            # docker-compose.yml's `admin_api` service its own required
+            # (`:?`), no-default variables — `docker compose up` fails to
+            # even parse the file without these, for every e2e test in this
+            # package, not just ones that talk to `admin_api` directly, so
+            # they belong here rather than in a single test module's own
+            # env override. Distinct port (matching `WEBHOOK_API_PORT`
+            # above) so this never collides with a developer's own running
+            # stack's default `8001`.
+            "ADMIN_API_PORT": "18001",
+            "REVIEW_ADMIN_API_ENVIRONMENT": "development",
+            "REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME": "e2e-test-admin",
+            "REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD": "e2e-test-admin-password-0123",
+            "REVIEW_ADMIN_API_ADMIN_CSRF_SECRET": "e2e-test-admin-csrf-secret",
         }
     )
     env.update(overrides)
