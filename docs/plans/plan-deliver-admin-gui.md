@@ -421,6 +421,8 @@ as integration tests against a real Postgres.
 
 ## Phase 2 — User management (Unit C: US-A4)
 
+**Status: Done (2026-09-30).**
+
 **Why next:** ordinary CRUD once auth/roles exist; only depends on Phase
 1's `iam` package and repositories.
 

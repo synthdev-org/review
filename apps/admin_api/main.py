@@ -47,9 +47,10 @@ from adapter.telemetry.sdk import (
 )
 from apps.admin_api.auth_routes import create_auth_router
 from apps.admin_api.bootstrap import bootstrap_admin_user
-from apps.admin_api.dependencies import build_require_session
+from apps.admin_api.dependencies import build_require_admin_role, build_require_session
 from apps.admin_api.logging_config import configure_logging
 from apps.admin_api.settings import AdminAPISettings
+from apps.admin_api.user_routes import create_user_router
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,19 @@ def create_app(settings: AdminAPISettings) -> FastAPI:
         )
     )
     logger.info("auth routes registered")
+
+    require_admin_role = build_require_admin_role(require_session)
+    app.include_router(
+        create_user_router(
+            user_repository=user_repository,
+            session_store=session_store,
+            audit_log_repository=audit_log_repository,
+            password_hasher=password_hasher,
+            min_password_length=settings.min_password_length,
+            require_admin_role=require_admin_role,
+        )
+    )
+    logger.info("user routes registered")
 
     return app
 

@@ -55,6 +55,7 @@ class _FakeSessionStore(SessionStore):
         self.sessions_by_token_hash = dict(sessions or {})
         self.touched_session_ids: list[str] = []
         self.revoked_session_ids: list[str] = []
+        self.revoked_all_for_user_ids: list[str] = []
 
     async def create(self, *, user_id: str, token_hash: str, now: datetime) -> Session:
         session = Session(id=token_hash, user_id=user_id, created_at=now, last_seen_at=now)
@@ -70,6 +71,14 @@ class _FakeSessionStore(SessionStore):
     async def revoke(self, *, session_id: str) -> None:
         self.revoked_session_ids.append(session_id)
 
+    async def revoke_all_for_user(self, *, user_id: str) -> None:
+        self.revoked_all_for_user_ids.append(user_id)
+        self.sessions_by_token_hash = {
+            token_hash: session
+            for token_hash, session in self.sessions_by_token_hash.items()
+            if session.user_id != user_id
+        }
+
 
 class _FakeUserRepository(UserRepository):
     """An in-memory fake implementing iam.auth.UserRepository."""
@@ -84,6 +93,12 @@ class _FakeUserRepository(UserRepository):
         return self.users_by_id.get(user_id)
 
     async def create(self, *, username: str, password_hash: str, role: Role) -> User:
+        raise NotImplementedError("not exercised by these tests")
+
+    async def list_all(self) -> tuple[User, ...]:
+        raise NotImplementedError("not exercised by these tests")
+
+    async def deactivate(self, *, user_id: str) -> User | None:
         raise NotImplementedError("not exercised by these tests")
 
 

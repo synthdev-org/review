@@ -49,6 +49,21 @@ def is_admin(user: User) -> bool:
     return user.role == "admin"
 
 
+class UsernameAlreadyExistsError(Exception):
+    """Raised by ``UserRepository.create`` when ``username`` already exists
+    — a distinct, business-level outcome, never conflated with a generic
+    storage failure, per ``docs/rules/architecture.md``'s exception-type
+    rule (the same "specific exception types per domain concern" contract
+    ``memory.store.MemoryEntryNotFoundError`` already establishes).
+    ``apps/admin_api/user_routes.py``'s ``POST /api/v1/users`` (Phase 2,
+    Unit C) translates this into an HTTP 409.
+    """
+
+    def __init__(self, *, username: str) -> None:
+        super().__init__(f"username {username!r} already exists")
+        self.username = username
+
+
 async def authenticate_session(
     *,
     token_hash: str,
@@ -90,15 +105,19 @@ async def authenticate_session(
 
 class UserRepository(Protocol):
     """Storage boundary for ``admin_user`` rows — implemented by
-    ``adapter/storage/iam.py``'s ``PostgresUserRepository``. Kept at three
-    methods, per ``docs/rules/architecture.md``'s Protocol-size rule:
-    ``get_by_username`` (login), ``get_by_id`` (re-resolving the acting
-    user on every authenticated request, so a role/active-status change
-    is honored on the very next request rather than only at next login),
-    and ``create`` (Phase 1's own bootstrap routine goes around this
+    ``adapter/storage/iam.py``'s ``PostgresUserRepository``. Five methods —
+    two over ``docs/rules/architecture.md``'s usual 1-3 guideline, the same
+    kind of stated exception ``SessionStore`` below already takes for its
+    own four: ``get_by_username`` (login), ``get_by_id`` (re-resolving the
+    acting user on every authenticated request, so a role/active-status
+    change is honored on the very next request rather than only at next
+    login), ``create`` (Phase 1's own bootstrap routine goes around this
     Protocol entirely — see ``apps/admin_api/bootstrap.py``'s own
     docstring for why — but Phase 2's ``POST /api/v1/users`` route is this
-    method's real first caller).
+    method's real first caller), and Phase 2's own ``list_all``/
+    ``deactivate`` (Unit C, US-A4) — one repository, one real consumer
+    (``apps/admin_api/user_routes.py``), so splitting these two into a
+    second Protocol would only add ceremony for no swappability gain.
     """
 
     async def get_by_username(self, *, username: str) -> User | None:
@@ -128,6 +147,30 @@ class UserRepository(Protocol):
         ``docs/rules/architecture.md``'s "domain packages have zero infra
         imports" rule (Argon2 hashing lives in ``adapter/auth``, a
         different adapter package this one has no reason to import).
+
+        Raises ``UsernameAlreadyExistsError`` if ``username`` already
+        exists (Phase 2's ``POST /api/v1/users``, translated to an HTTP
+        409) — never a raw storage-layer constraint-violation exception.
+        """
+        ...
+
+    async def list_all(self) -> tuple[User, ...]:
+        """Every ``admin_user`` row, oldest first (Phase 2's
+        ``GET /api/v1/users``, Unit C — this Protocol's only consumer, and
+        a small, operator-managed table with no pagination need)."""
+        ...
+
+    async def deactivate(self, *, user_id: str) -> User | None:
+        """Flips ``is_active`` to ``False`` for ``user_id`` (Phase 2's
+        ``PATCH /api/v1/users/{user_id}/deactivate``, Unit C) — a status
+        flip, never a hard delete, so every ``admin_audit_log`` row already
+        attributed to this user (``actor_user_id``, no
+        ``ON DELETE CASCADE``, per Assumption 6) keeps resolving to their
+        username afterward (US-A4's second Given/When/Then). Returns the
+        updated ``User``, or ``None`` if no such user exists (translated to
+        an HTTP 404 by the route) — never raises for the not-found case,
+        the same "caller decides what missing means" contract
+        ``get_by_username`` above establishes.
         """
         ...
 
@@ -136,17 +179,20 @@ class SessionStore(Protocol):
     """Storage boundary for ``admin_session`` rows — implemented by
     ``adapter/storage/iam.py``'s ``PostgresSessionStore``.
 
-    Four methods — one over ``docs/rules/architecture.md``'s usual 1-3
+    Five methods — two over ``docs/rules/architecture.md``'s usual 1-3
     guideline — because this plan's own idle-expiry design (Assumption 7)
-    genuinely needs four distinct single-purpose operations with different
-    call sites and different error semantics: ``create`` (login),
+    genuinely needs distinct single-purpose operations with different call
+    sites and different error semantics: ``create`` (login),
     ``get_by_token_hash`` (read-only lookup, deliberately *not* combined
     with the touch below), ``touch_last_seen`` (called only after
     ``is_session_expired`` above has already judged the session still
-    valid), and ``revoke`` (logout). Combining ``get_by_token_hash`` and
-    ``touch_last_seen`` into one read-and-touch method would touch (and
-    thereby silently resurrect) a session this same call is about to
-    reject as expired — ``apps/admin_api/dependencies.py``'s
+    valid), ``revoke`` (logout, one session), and Phase 2's own
+    ``revoke_all_for_user`` (Unit C, US-A4's second Given/When/Then —
+    deactivation revokes every one of that user's sessions, not just the
+    one the deactivating admin happens to be using). Combining
+    ``get_by_token_hash`` and ``touch_last_seen`` into one read-and-touch
+    method would touch (and thereby silently resurrect) a session this same
+    call is about to reject as expired — ``apps/admin_api/dependencies.py``'s
     ``require_session`` relies on the touch happening strictly after, not
     as part of, the expiry check for exactly this reason.
     """
@@ -178,10 +224,20 @@ class SessionStore(Protocol):
         ...
 
     async def revoke(self, *, session_id: str) -> None:
-        """Permanently invalidate ``session_id`` (US-A2's explicit logout,
-        and Phase 2's deactivation-revokes-sessions flow) — a subsequent
-        ``get_by_token_hash`` for the same session's token must return
-        ``None``. A no-op (not an error) if ``session_id`` no longer
-        exists.
+        """Permanently invalidate ``session_id`` (US-A2's explicit logout)
+        — a subsequent ``get_by_token_hash`` for the same session's token
+        must return ``None``. A no-op (not an error) if ``session_id`` no
+        longer exists.
+        """
+        ...
+
+    async def revoke_all_for_user(self, *, user_id: str) -> None:
+        """Permanently invalidates every ``admin_session`` row belonging to
+        ``user_id`` (Phase 2's deactivation route, Unit C, US-A4's second
+        Given/When/Then: "that user's existing sessions are revoked and
+        they can no longer log in") — every one of that user's session
+        tokens is rejected by the very next ``require_session`` call, the
+        same way an ordinary expired/unknown session already is. A no-op
+        (not an error) if ``user_id`` currently has no sessions.
         """
         ...

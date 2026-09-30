@@ -59,6 +59,18 @@ modules can type-hint a ``require_session`` constructor parameter without
 each repeating the full ``Callable[[Request], Awaitable[AuthenticatedSession]]``
 spelling."""
 
+RequireAdminRoleDependency = Callable[..., Awaitable["AuthenticatedSession"]]
+"""Type alias for the callable ``build_require_admin_role`` returns — named
+here, matching ``RequireSessionDependency`` above, so
+``apps/admin_api/user_routes.py`` (Phase 2) and every later phase's
+mutating-route modules can type-hint a ``require_admin_role`` constructor
+parameter. ``...`` (not ``[AuthenticatedSession]``) because the real
+callable's own parameter is itself a FastAPI ``Depends(require_session)``
+sub-dependency (see ``build_require_admin_role`` below) — no caller outside
+this module ever constructs or passes that argument directly, every caller
+only ever hands the callable object itself to ``Depends(...)``.
+"""
+
 
 @dataclass(frozen=True)
 class AuthenticatedSession:

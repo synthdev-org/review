@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from adapter.storage.models import (
@@ -33,6 +34,7 @@ from adapter.storage.models import (
     LoginAttemptRow,
 )
 from adapter.storage.unit_of_work import run_in_session
+from iam.auth import UsernameAlreadyExistsError
 from iam.models import Role, Session, User
 
 # How many login_attempt windows' worth of history
@@ -96,7 +98,55 @@ class PostgresUserRepository:
         async def _write(session: AsyncSession) -> User:
             row = AdminUserRow(username=username, password_hash=password_hash, role=AdminRole(role))
             session.add(row)
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                # admin_user's own uq_admin_user_username constraint
+                # (Assumption 11) — translated to a business-level
+                # exception here rather than left as a raw
+                # sqlalchemy.exc.IntegrityError, per
+                # docs/rules/architecture.md's exception-type rule.
+                raise UsernameAlreadyExistsError(username=username) from exc
+            return _user_from_row(row)
+
+        return await run_in_session(self._session_factory, None, _write)
+
+    async def list_all(self) -> tuple[User, ...]:
+        async def _read(session: AsyncSession) -> tuple[User, ...]:
+            rows = (
+                (await session.execute(select(AdminUserRow).order_by(AdminUserRow.created_at)))
+                .scalars()
+                .all()
+            )
+            return tuple(_user_from_row(row) for row in rows)
+
+        return await run_in_session(self._session_factory, None, _read)
+
+    async def deactivate(self, *, user_id: str) -> User | None:
+        try:
+            parsed_user_id = uuid.UUID(user_id)
+        except ValueError:
+            # Malformed input, not a real id — treated as "not found",
+            # matching this Protocol's own "never raises for the
+            # not-found case" contract (get_by_username's docstring).
+            return None
+
+        async def _write(session: AsyncSession) -> User | None:
+            row = (
+                await session.execute(select(AdminUserRow).where(AdminUserRow.id == parsed_user_id))
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            row.is_active = False
             await session.flush()
+            # updated_at's onupdate=func.now() is server-computed on the
+            # UPDATE this flush just issued — refresh so _user_from_row
+            # reads the real new value rather than triggering an
+            # unexpected lazy-load later (mirrors
+            # adapter/storage/memory_repository.py's set_status, the same
+            # "mutate then refresh before returning" shape for a row with
+            # a server-side onupdate column).
+            await session.refresh(row)
             return _user_from_row(row)
 
         return await run_in_session(self._session_factory, None, _write)
@@ -153,6 +203,23 @@ class PostgresSessionStore:
         async def _write(session: AsyncSession) -> None:
             await session.execute(
                 delete(AdminSessionRow).where(AdminSessionRow.id == uuid.UUID(session_id))
+            )
+
+        await run_in_session(self._session_factory, None, _write)
+
+    async def revoke_all_for_user(self, *, user_id: str) -> None:
+        try:
+            parsed_user_id = uuid.UUID(user_id)
+        except ValueError:
+            # Malformed input, not a real id — a no-op, matching this
+            # method's own "no-op if user_id currently has no sessions"
+            # contract (there are, by construction, none for an id that
+            # isn't even a well-formed uuid).
+            return
+
+        async def _write(session: AsyncSession) -> None:
+            await session.execute(
+                delete(AdminSessionRow).where(AdminSessionRow.user_id == parsed_user_id)
             )
 
         await run_in_session(self._session_factory, None, _write)
