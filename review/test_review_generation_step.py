@@ -44,13 +44,24 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
+import opentelemetry.metrics._internal as metrics_internal
 import pytest
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.util._once import Once
 
 from adapter.llm.litellm_client import LiteLLMClient
 from findings.models import Finding
 from ingestion.diff import Diff, DiffFile
 from llmgateway.client import LLMClient
-from llmgateway.models import CompletionRequest, CompletionResponse
+from llmgateway.models import CompletionRequest, CompletionResponse, TokenUsage
+from llmgateway.routing import (
+    FallbackModelRoutingResolver,
+    ModelRoutingConfigReader,
+    ModelRoutingConfigRow,
+)
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.diff_prompt import render_diff
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
@@ -161,10 +172,17 @@ class _FakeLLMClient:
 
     response_content: str = '{"findings": []}'
     calls: list[CompletionRequest] = field(default_factory=list)
+    # US3 (docs/specs/spec-observability.md): `None` by default, matching
+    # every existing test in this file that never sets it and therefore
+    # expects byte-for-byte the same behavior as before US3 — set to a real
+    # `TokenUsage` only by this file's own US3 test section below.
+    usage: TokenUsage | None = None
 
     async def complete(self, request: CompletionRequest, *, timeout: float) -> CompletionResponse:
         self.calls.append(request)
-        return CompletionResponse(content=self.response_content, model=request.model)
+        return CompletionResponse(
+            content=self.response_content, model=request.model, usage=self.usage
+        )
 
 
 class _RecordingTextRedactor:
@@ -195,6 +213,7 @@ def _review_generation_step(
     max_diff_bytes: int = 200_000,
     timeout: float = 5.0,
     model: str = "local-model",
+    model_resolver: FallbackModelRoutingResolver | None = None,
 ) -> ReviewGenerationStep:
     return ReviewGenerationStep(
         llm_client,
@@ -202,6 +221,7 @@ def _review_generation_step(
         model=model,
         timeout=timeout,
         max_diff_bytes=max_diff_bytes,
+        model_resolver=model_resolver,
     )
 
 
@@ -887,3 +907,168 @@ async def test_redaction_ceiling_comfortably_under_no_warning(
     llm_findings = [f for f in output.findings if f.source == "llm"]
     assert len(llm_findings) == 3
     assert not [r for r in caplog.records if "ceiling" in r.message]
+
+
+# =============================================================================
+# US3 — LLM token usage (docs/specs/spec-observability.md, Unit B).
+# =============================================================================
+#
+# Uses OTel's own in-memory metric reader (no I/O, per testing.md's Unit
+# tier), registered as the *global* MeterProvider so
+# review.llm_telemetry's module-level `_llm_tokens_counter` (created once,
+# at import time, against whatever provider was global then) picks this
+# test's provider up via OTel's proxy-instrument migration mechanism — see
+# adapter/telemetry/test_heartbeat.py's own identical fixture docstring for
+# the full mechanism explanation. Defined locally in this file (not added to
+# review/conftest.py) to avoid touching shared test infra other Unit B
+# slices (review/pipeline.py, findings/merge.py, etc.) may be adding to
+# concurrently.
+
+
+@pytest.fixture
+def _reset_otel_global_meter_provider() -> Iterator[None]:
+    previous_provider = metrics_internal._METER_PROVIDER
+    previous_once = metrics_internal._METER_PROVIDER_SET_ONCE
+    metrics_internal._METER_PROVIDER = None
+    metrics_internal._METER_PROVIDER_SET_ONCE = Once()
+    try:
+        yield
+    finally:
+        metrics_internal._METER_PROVIDER = previous_provider
+        metrics_internal._METER_PROVIDER_SET_ONCE = previous_once
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    _reset_otel_global_meter_provider: None,
+) -> Iterator[InMemoryMetricReader]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-test"}), metric_readers=[reader]
+    )
+    metrics.set_meter_provider(provider)
+    yield reader
+    provider.shutdown()
+
+
+def _llm_token_data_points(reader: InMemoryMetricReader) -> list[tuple[float, dict[str, object]]]:
+    metrics_data = reader.get_metrics_data()
+    # `get_metrics_data()` returns `None` (not an empty-but-present
+    # structure) when the provider has recorded no data points at all yet —
+    # the "no usage on the response" case below hits this, not just "found
+    # the metric with zero data points".
+    if metrics_data is None:
+        return []
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != "review.llm.tokens_total":
+                    continue
+                assert isinstance(metric.data, Sum)
+                return [(dp.value, dict(dp.attributes or {})) for dp in metric.data.data_points]
+    return []
+
+
+@pytest.mark.asyncio
+async def test_us3_completion_with_usage_records_three_token_counters(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """US3: Given a completion call returns a response with `usage` set,
+    When `review_generation` runs, Then `review.llm.tokens_total` records
+    three `.add()` calls (prompt/completion/total) tagged by this step's
+    fixed stage name and the response's own model."""
+    llm_client = _FakeLLMClient(
+        response_content=_findings_response_json(0),
+        usage=TokenUsage(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+    )
+    step = _review_generation_step(
+        llm_client=llm_client, redactor=_RecordingTextRedactor(), model="local-model"
+    )
+
+    await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    data_points = {
+        attrs["token_type"]: value
+        for value, attrs in _llm_token_data_points(in_memory_metric_reader)
+    }
+    assert data_points == {"prompt": 11.0, "completion": 7.0, "total": 18.0}
+
+    for _, attributes in _llm_token_data_points(in_memory_metric_reader):
+        assert attributes["stage"] == "review-generation"
+        assert attributes["model"] == "local-model"
+        # Privacy/Compliance NFR: the attribute set is a fixed, reviewed
+        # allowlist — never a finding's/diff's free text.
+        assert set(attributes) == {"stage", "model", "token_type"}
+
+
+@pytest.mark.asyncio
+async def test_us3_completion_without_usage_records_no_token_metrics(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """When the LLM Gateway response carries no `usage` (provider didn't
+    report it), no `review.llm.tokens_total` data point is recorded at
+    all — the catalog only requires recording "a response with usage
+    set"."""
+    llm_client = _FakeLLMClient(response_content=_findings_response_json(0))
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+
+    await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    assert _llm_token_data_points(in_memory_metric_reader) == []
+
+
+# =============================================================================
+# Model routing (docs/plans/plan-deliver-admin-gui.md's Phase 5 section,
+# Unit F, Assumption 3): model_resolver injection.
+# =============================================================================
+
+
+class _StaticReader:
+    """A ``ModelRoutingConfigReader`` fake returning one fixed row for every
+    call — enough to prove the resolved model (not the constructor's own
+    ``model`` fallback) reaches the completion request."""
+
+    def __init__(self, row: ModelRoutingConfigRow) -> None:
+        self._row = row
+        self.calls: list[tuple[str | None, str]] = []
+
+    async def get(self, *, org_id: str | None, stage: str) -> ModelRoutingConfigRow | None:
+        self.calls.append((org_id, stage))
+        return self._row
+
+
+def _assert_is_reader(reader: object) -> None:
+    assert isinstance(reader, ModelRoutingConfigReader)
+
+
+@pytest.mark.asyncio
+async def test_model_resolver_when_set_resolves_model_at_dispatch_time() -> None:
+    reader = _StaticReader(
+        ModelRoutingConfigRow(org_id="org-1", stage="review_generation", model_name="routed-model")
+    )
+    _assert_is_reader(reader)
+    resolver = FallbackModelRoutingResolver(reader, static_default_model="local-model")
+    llm_client = _FakeLLMClient(response_content=_findings_response_json(0))
+    step = _review_generation_step(
+        llm_client=llm_client, redactor=_RecordingTextRedactor(), model_resolver=resolver
+    )
+
+    await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch(), org_id="org-1"), _context())
+
+    assert len(llm_client.calls) == 1
+    assert llm_client.calls[0].model == "routed-model"
+    assert reader.calls == [("org-1", "review_generation")]
+
+
+@pytest.mark.asyncio
+async def test_model_resolver_absent_uses_constructor_model_unchanged() -> None:
+    """``model_resolver=None`` (the default) restores byte-for-byte this
+    step's prior behavior — ``model`` is used directly, with zero calls to
+    any resolver."""
+    llm_client = _FakeLLMClient(response_content=_findings_response_json(0))
+    step = _review_generation_step(llm_client=llm_client, redactor=_RecordingTextRedactor())
+
+    await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    assert len(llm_client.calls) == 1
+    assert llm_client.calls[0].model == "local-model"

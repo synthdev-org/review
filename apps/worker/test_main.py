@@ -35,6 +35,7 @@ binary) tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import socket
@@ -47,7 +48,11 @@ from typing import cast
 
 import httpx
 import pytest
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.trace import TracerProvider
 
+import adapter.telemetry.heartbeat as heartbeat_module
 import apps.worker.main as worker_main
 from adapter.analyzers.gitleaks import GitleaksTextRedactor
 from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
@@ -57,6 +62,8 @@ from adapter.github.tree import GitHubTreeFetcher
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
+from adapter.storage.tenancy import PostgresUsageCounterRepository
+from adapter.telemetry.sdk import init_telemetry
 from apps.worker.main import main
 from apps.worker.settings import WorkerSettings
 from findings.redact import NoOpTextRedactor, TextRedactor
@@ -67,6 +74,7 @@ from indexing.tree import RepoTreeEntry
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
+from llmgateway.routing import FallbackModelRoutingResolver
 from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.config import StepEnablement, StepTimeouts
 from review.context_builder import CallerHit
@@ -101,13 +109,22 @@ async def _noop_dispatch_loop_forever(
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
+    usage_counter_recorder: PostgresUsageCounterRepository,
 ) -> None:
     """The fake substituted for `_run_dispatch_loop_forever` in every test
     below that reaches it — returns immediately instead of looping forever,
     so `main()` returns and the test can make its assertions. Closes
     `http_client` itself, matching the real function's own responsibility,
     so `main()` doesn't leak the real `httpx.AsyncClient` it constructs
-    across these tests."""
+    across these tests.
+
+    `usage_counter_recorder` (docs/plans/plan-deliver-admin-gui.md's Phase
+    7 section, Unit H) is accepted, unused, purely to keep this fake's
+    signature matching the real function's — these composition-root tests
+    only prove `main()` reaches this seam with the right arguments, never
+    this parameter's own behavior (that's `apps/worker/test_usage_counter.py`'s
+    job, against a real `PostgresUsageCounterRepository` and Postgres)."""
+    _ = usage_counter_recorder
     await http_client.aclose()
 
 
@@ -387,6 +404,7 @@ def _capture_redactor(
         publisher: GitHubFindingsPublisher,
         settings: WorkerSettings,
         memory_matcher: PostgresMemoryRepository,
+        model_resolver: FallbackModelRoutingResolver | None,
     ) -> StepRegistry:
         captured.append(redactor)
         return original(
@@ -402,6 +420,7 @@ def _capture_redactor(
             publisher,
             settings,
             memory_matcher,
+            model_resolver,
         )
 
     monkeypatch.setattr(worker_main, "_build_review_registry", _capturing)
@@ -661,6 +680,7 @@ async def test_all_four_context_builder_enablement_combinations_complete_success
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
         cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
     )
 
     context_builder_step = registry._by_name["context_builder"]
@@ -734,6 +754,7 @@ async def test_context_builder_enabled_but_review_generation_disabled_skips_cont
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
         cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
     )
 
     statuses = await _run_review_registry(registry)
@@ -784,6 +805,7 @@ async def test_context_builder_disabled_produces_byte_for_byte_phase_1_review_ge
         cast("GitHubFindingsPublisher", _NoOpPublisher()),
         settings,
         cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
     )
 
     intent_summary_step = registry._by_name["intent_summary"]
@@ -989,6 +1011,49 @@ def test_memory_suppression_default_enabled_logs_no_disabled_warning(
     assert not [p for p in payloads if "memory suppression is disabled" in p["message"]]
 
 
+# --- Phase 5 (admin GUI plan): model_routing_config_enabled=False -----------
+#
+# Mirrors the `memory_suppression_enabled=False` test pair immediately
+# above, exactly — per docs/plans/plan-deliver-admin-gui.md's Phase 5
+# section's own "visible, not silent" deviation-from-default requirement.
+
+
+def test_model_routing_disabled_logs_warning_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_MODEL_ROUTING_CONFIG_ENABLED", "false")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    matching = [
+        p
+        for p in payloads
+        if p["message"] == "model routing is disabled: every stage uses the static default "
+        "model, regardless of any ModelRoutingConfig row"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["level"] == "WARNING"
+
+
+def test_model_routing_default_enabled_logs_no_disabled_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    captured = capsys.readouterr()
+    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    assert not [p for p in payloads if "model routing is disabled" in p["message"]]
+
+
 # --- Phase 5 (verification pipeline plan): resolved depends_on in startup log
 
 
@@ -1012,3 +1077,162 @@ def test_step_configuration_valid_log_includes_resolved_depends_on(
         "verification": "review_generation",
         "output": "verification",
     }
+
+
+# --- docs/specs/spec-observability.md's Unit A: US10 (no-op default) and
+# US14 (heartbeat) ---------------------------------------------------------
+
+
+async def _noop_heartbeat_loop(*, interval_seconds: float = 30.0) -> None:
+    """Fast-completing fake substituted for `run_heartbeat_loop` — mirrors
+    `_noop_dispatch_loop_forever`'s own role above: `main()` gathers both
+    loops together when telemetry is enabled, and this repo's `main()` has
+    no graceful-shutdown seam of its own (a real process only stops via a
+    signal, which cancels everything `asyncio.run()` is still running) —
+    so a unit test needs both gathered coroutines to actually return for
+    `main()` to return at all.
+    """
+    return None
+
+
+def test_main_is_a_telemetry_noop_when_otlp_endpoint_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracer_provider_before = trace.get_tracer_provider()
+    meter_provider_before = metrics.get_meter_provider()
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    # US10: no SDK/exporter constructed at all — the global providers are
+    # untouched, proven by identity.
+    assert trace.get_tracer_provider() is tracer_provider_before
+    assert metrics.get_meter_provider() is meter_provider_before
+
+
+@pytest.mark.usefixtures("reset_otel_global_providers")
+def test_main_starts_heartbeat_loop_when_otlp_endpoint_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heartbeat_calls: list[float] = []
+    heartbeat_started = asyncio.Event()
+
+    async def _recording_heartbeat_loop(*, interval_seconds: float = 30.0) -> None:
+        heartbeat_calls.append(interval_seconds)
+        heartbeat_started.set()
+
+    async def _dispatch_loop_forever_after_heartbeat_starts(
+        job_queue: JobQueueRepository,
+        registry: StepRegistry,
+        indexing_deps: IndexingJobDependencies,
+        memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
+        settings: WorkerSettings,
+        worker_id: str,
+        http_client: httpx.AsyncClient,
+        usage_counter_recorder: PostgresUsageCounterRepository,
+    ) -> None:
+        # The heartbeat task (a plain `asyncio.create_task`, per
+        # `apps/worker/main.py`'s own docstring) only actually starts
+        # running once this coroutine yields control back to the event
+        # loop — in real operation, `run_dispatch_loop`'s own first
+        # `await job_queue.claim_next(...)` (real I/O) always does that
+        # well before `run_heartbeat_loop` could be starved of a turn;
+        # this fake reproduces that yield deterministically (waiting for
+        # the heartbeat fake's own signal) instead of racing the
+        # scheduler on a fake that returns with no real suspension point
+        # at all.
+        await heartbeat_started.wait()
+        await http_client.aclose()
+
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(
+        worker_main, "_run_dispatch_loop_forever", _dispatch_loop_forever_after_heartbeat_starts
+    )
+    monkeypatch.setattr(heartbeat_module, "run_heartbeat_loop", _recording_heartbeat_loop)
+
+    try:
+        main()  # must not raise SystemExit, must not hang
+    finally:
+        tracer_provider = trace.get_tracer_provider()
+        meter_provider = metrics.get_meter_provider()
+        assert isinstance(tracer_provider, TracerProvider)
+        assert isinstance(meter_provider, MeterProvider)
+        tracer_provider.shutdown()
+        meter_provider.shutdown()
+
+    assert len(heartbeat_calls) == 1
+
+
+@pytest.mark.usefixtures("reset_otel_global_providers")
+@pytest.mark.asyncio
+async def test_amain_propagates_dispatch_loop_exception_unwrapped_and_cancels_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The heartbeat task now runs as a plain `asyncio.create_task`,
+    cancelled in a `finally` block around awaiting the dispatch loop — not
+    `asyncio.TaskGroup` — specifically so a failing dispatch loop's own
+    exception propagates out of `_amain` completely unwrapped (no
+    `ExceptionGroup`/`BaseExceptionGroup`, no unwrap helper needed), and so
+    the heartbeat task is reliably cancelled rather than left running.
+    """
+    heartbeat_started = asyncio.Event()
+    heartbeat_cancelled = asyncio.Event()
+
+    async def _long_running_heartbeat_loop(*, interval_seconds: float = 30.0) -> None:
+        heartbeat_started.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            raise
+
+    async def _failing_dispatch_loop_forever(
+        job_queue: JobQueueRepository,
+        registry: StepRegistry,
+        indexing_deps: IndexingJobDependencies,
+        memory_reaction_poll_deps: MemoryReactionPollJobDependencies,
+        settings: WorkerSettings,
+        worker_id: str,
+        http_client: httpx.AsyncClient,
+        usage_counter_recorder: PostgresUsageCounterRepository,
+    ) -> None:
+        # Wait for the heartbeat task to actually start running before
+        # raising — see `test_main_starts_heartbeat_loop_when_otlp_endpoint_set`'s
+        # identical fake for why this determinism matters instead of
+        # racing the scheduler.
+        await heartbeat_started.wait()
+        await http_client.aclose()
+        raise RuntimeError("dispatch loop exploded")
+
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _failing_dispatch_loop_forever)
+    monkeypatch.setattr(heartbeat_module, "run_heartbeat_loop", _long_running_heartbeat_loop)
+
+    settings = WorkerSettings()
+    logger = logging.getLogger(__name__)
+    client = _FakeLLMClient()
+    telemetry_enabled = init_telemetry(
+        otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        service_name="review-worker-test",
+        otlp_headers=None,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="dispatch loop exploded") as excinfo:
+            await worker_main._amain(settings, logger, client, telemetry_enabled=telemetry_enabled)
+        assert not isinstance(excinfo.value, BaseExceptionGroup)
+    finally:
+        tracer_provider = trace.get_tracer_provider()
+        meter_provider = metrics.get_meter_provider()
+        assert isinstance(tracer_provider, TracerProvider)
+        assert isinstance(meter_provider, MeterProvider)
+        tracer_provider.shutdown()
+        meter_provider.shutdown()
+
+    assert heartbeat_cancelled.is_set()

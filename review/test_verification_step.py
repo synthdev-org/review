@@ -39,6 +39,10 @@ from typing import Any, Literal
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
@@ -47,13 +51,19 @@ from adapter.llm.litellm_client import LiteLLMClient
 from adapter.storage.engine import create_session_factory
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.models import Org, PostedFindingCommentRow, Repo
-from apps.webhook_api.main import create_app
-from apps.webhook_api.settings import WebhookAPISettings
+from apps.admin_api.dependencies import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from apps.admin_api.main import create_app as create_admin_app
+from apps.admin_api.settings import AdminAPISettings
 from findings.models import Finding
 from indexing.embedding import EmbeddingVector
 from ingestion.diff import Diff, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
+from llmgateway.routing import (
+    FallbackModelRoutingResolver,
+    ModelRoutingConfigReader,
+    ModelRoutingConfigRow,
+)
 from memory.fingerprint import build_finding_fingerprint
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
@@ -65,6 +75,40 @@ from review.verification import (
 )
 
 # --- Shared fixtures/helpers -------------------------------------------------
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> Iterator[InMemoryMetricReader]:
+    """Registers a real, in-memory-backed ``MeterProvider`` as the global
+    one — see ``adapter/telemetry/test_heartbeat.py``'s identical fixture
+    docstring for why this is needed for ``review.verification``'s
+    module-level counters (created once, at import time) to be observable
+    by this test's own reader via OTel's proxy-instrument migration."""
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-test"}), metric_readers=[reader]
+    )
+    metrics.set_meter_provider(provider)
+    yield reader
+    provider.shutdown()
+
+
+def _counter_value_and_attributes(
+    reader: InMemoryMetricReader, metric_name: str
+) -> tuple[float, dict[str, object]]:
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != metric_name:
+                    continue
+                assert isinstance(metric.data, Sum)
+                (data_point,) = metric.data.data_points
+                return data_point.value, dict(data_point.attributes or {})
+    raise AssertionError(f"{metric_name} was not recorded")
 
 
 @pytest.fixture(autouse=True)
@@ -180,8 +224,15 @@ def _verification_step(
     max_diff_bytes: int = 200_000,
     timeout: float = 5.0,
     model: str = "local-model",
+    model_resolver: FallbackModelRoutingResolver | None = None,
 ) -> VerificationStep:
-    return VerificationStep(llm_client, model=model, timeout=timeout, max_diff_bytes=max_diff_bytes)
+    return VerificationStep(
+        llm_client,
+        model=model,
+        timeout=timeout,
+        max_diff_bytes=max_diff_bytes,
+        model_resolver=model_resolver,
+    )
 
 
 # =============================================================================
@@ -556,6 +607,159 @@ async def test_diff_one_byte_over_ceiling_is_truncated_and_logs_warning(
     assert len(warnings) == 1
 
 
+# --- US5: verification funnel metrics (docs/specs/spec-observability.md) ----
+
+
+@pytest.mark.asyncio
+async def test_us5_verification_funnel_counters_match_the_batch_judgment_log_line(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """US5: Given the verification step judges a batch, When it completes,
+    Then ``review.verification.judged_total``/``rejected_total``/
+    ``unmatched_total`` are recorded with the same counts as the existing
+    "batch judgment completed" log line — two candidates judged, one
+    rejected for an out-of-range/unmatched verdict, none matched for that
+    one, mirroring ``test_unmatched_index_finding_is_rejected_not_silently_verified``."""
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = _verification_step(llm_client=llm_client)
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0), _llm_finding(1)]
+    )
+
+    await step.run(upstream_output, _context())
+
+    judged, _ = _counter_value_and_attributes(
+        in_memory_metric_reader, "review.verification.judged_total"
+    )
+    rejected, _ = _counter_value_and_attributes(
+        in_memory_metric_reader, "review.verification.rejected_total"
+    )
+    unmatched, _ = _counter_value_and_attributes(
+        in_memory_metric_reader, "review.verification.unmatched_total"
+    )
+    assert judged == 2
+    assert rejected == 1
+    assert unmatched == 1
+
+
+@pytest.mark.asyncio
+async def test_us5_verification_funnel_counters_carry_no_attributes(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """Privacy/Compliance + cardinality NFR: none of the three funnel
+    counters carry any attribute — in particular never a finding's own
+    ``message`` or other free text, only the bare counts."""
+    llm_client = _FakeLLMClient(
+        response_content=_verdicts_response_json(
+            [_passing_verdict(0), _failing_verdict(1, actionable=False)]
+        )
+    )
+    step = _verification_step(llm_client=llm_client)
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0), _llm_finding(1)]
+    )
+
+    await step.run(upstream_output, _context())
+
+    for metric_name in (
+        "review.verification.judged_total",
+        "review.verification.rejected_total",
+        "review.verification.unmatched_total",
+    ):
+        _, attributes = _counter_value_and_attributes(in_memory_metric_reader, metric_name)
+        assert attributes == {}
+
+
+@pytest.mark.asyncio
+async def test_us5_verification_funnel_counters_not_recorded_when_no_llm_findings(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """Given zero ``source="llm"`` findings (US-V3's second scenario), no
+    LLM Gateway call is made and no "batch judgment completed" log line is
+    emitted either — the funnel counters must not be recorded at all in
+    that path, matching "recorded at the same point as the existing log
+    line"."""
+    llm_client = _FakeLLMClient()
+    step = _verification_step(llm_client=llm_client)
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_static_finding()]
+    )
+
+    await step.run(upstream_output, _context())
+
+    metrics_data = in_memory_metric_reader.get_metrics_data()
+    recorded_names = {
+        metric.name
+        for resource_metrics in (metrics_data.resource_metrics if metrics_data else [])
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+    }
+    assert "review.verification.judged_total" not in recorded_names
+    assert "review.verification.rejected_total" not in recorded_names
+    assert "review.verification.unmatched_total" not in recorded_names
+
+
+# =============================================================================
+# Model routing (docs/plans/plan-deliver-admin-gui.md's Phase 5 section,
+# Unit F, Assumption 3): model_resolver injection.
+# =============================================================================
+
+
+class _StaticReader:
+    """A ``ModelRoutingConfigReader`` fake returning one fixed row for every
+    call — enough to prove the resolved model (not the constructor's own
+    ``model`` fallback) reaches the completion request."""
+
+    def __init__(self, row: ModelRoutingConfigRow) -> None:
+        self._row = row
+        self.calls: list[tuple[str | None, str]] = []
+
+    async def get(self, *, org_id: str | None, stage: str) -> ModelRoutingConfigRow | None:
+        self.calls.append((org_id, stage))
+        return self._row
+
+
+def _assert_is_reader(reader: object) -> None:
+    assert isinstance(reader, ModelRoutingConfigReader)
+
+
+@pytest.mark.asyncio
+async def test_model_resolver_when_set_resolves_model_at_dispatch_time() -> None:
+    reader = _StaticReader(
+        ModelRoutingConfigRow(org_id="org-1", stage="verification", model_name="routed-model")
+    )
+    _assert_is_reader(reader)
+    resolver = FallbackModelRoutingResolver(reader, static_default_model="local-model")
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = _verification_step(llm_client=llm_client, model_resolver=resolver)
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0)], org_id="org-1"
+    )
+
+    await step.run(upstream_output, _context())
+
+    assert len(llm_client.calls) == 1
+    assert llm_client.calls[0].model == "routed-model"
+    assert reader.calls == [("org-1", "verification")]
+
+
+@pytest.mark.asyncio
+async def test_model_resolver_absent_uses_constructor_model_unchanged() -> None:
+    """``model_resolver=None`` (the default) restores byte-for-byte this
+    step's prior behavior — ``model`` is used directly, with zero calls to
+    any resolver."""
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    step = _verification_step(llm_client=llm_client)
+    upstream_output = _FakeReviewGenerationOutput(
+        diff=_diff_with_patch(), findings=[_llm_finding(0)]
+    )
+
+    await step.run(upstream_output, _context())
+
+    assert len(llm_client.calls) == 1
+    assert llm_client.calls[0].model == "local-model"
+
+
 # =============================================================================
 # Memory-based similarity suppression (US-M6/US-M7/US-M9/US-M12), per
 # docs/plans/plan-deliver-memory.md's Phase 6 section (Unit F). Unit-tier
@@ -821,22 +1025,46 @@ async def test_us_m12_suppression_disabled_output_matches_no_suppression_configu
 
 
 # --- Unit E -> Unit F contract: real admin approve, then real suppression ---
+#
+# docs/plans/plan-deliver-admin-gui.md's Phase 3 (Unit D, US-A7) moved the
+# Memory admin API's approve route from apps/webhook_api (a static
+# admin_api_key Bearer token) to apps/admin_api (real per-user sessions) —
+# this contract test's own "approve via the real HTTP route, not a direct
+# repository call" Acceptance criterion now drives apps.admin_api.main
+# through a real login, not a static key.
 
 _REAL_MODEL_PATH = "/app/models/all-MiniLM-L6-v2"
-_CONTRACT_ADMIN_KEY = "verification-contract-test-admin-key"
+_CONTRACT_BOOTSTRAP_USERNAME = "verification-contract-test-admin"
+_CONTRACT_BOOTSTRAP_PASSWORD = "verification-contract-test-password"
 
 
 def _admin_client(*, dsn: str) -> TestClient:
-    settings = WebhookAPISettings(
+    settings = AdminAPISettings(
         environment="development",
         database_url=SecretStr(dsn),
-        github_webhook_secret=SecretStr("unused-webhook-secret"),
-        github_app_id=1,
-        github_app_private_key=SecretStr("unused-placeholder-key"),
-        admin_api_key=SecretStr(_CONTRACT_ADMIN_KEY),
+        admin_bootstrap_username=_CONTRACT_BOOTSTRAP_USERNAME,
+        admin_bootstrap_password=SecretStr(_CONTRACT_BOOTSTRAP_PASSWORD),
+        admin_csrf_secret=SecretStr("verification-contract-test-csrf-secret"),
+        session_cookie_secure=False,
         _env_file=None,
     )
-    return TestClient(create_app(settings))
+    return TestClient(create_admin_app(settings))
+
+
+def _login_as_contract_admin(client: TestClient) -> str:
+    """Logs the bootstrap admin in on ``client`` (created inside
+    ``create_admin_app``'s own ``lifespan``, per Phase 1 of
+    ``docs/plans/plan-deliver-admin-gui.md``) and returns the CSRF token
+    every subsequent mutating request below must echo back via
+    ``CSRF_HEADER_NAME`` — the same pattern
+    ``apps/admin_api/test_user_routes.py``'s own
+    ``_login_as_bootstrap_admin`` helper already establishes.
+    """
+    client.post(
+        "/api/v1/auth/login",
+        json={"username": _CONTRACT_BOOTSTRAP_USERNAME, "password": _CONTRACT_BOOTSTRAP_PASSWORD},
+    )
+    return str(client.cookies[CSRF_COOKIE_NAME])
 
 
 @pytest_asyncio.fixture
@@ -916,10 +1144,11 @@ async def _approve_dismissed_finding_entry(
     )
 
     with _admin_client(dsn=dsn) as client:
+        csrf_token = _login_as_contract_admin(client)
         response = client.post(
-            f"/admin/memory-entries/{entry_id}/approve",
+            f"/api/v1/memory-entries/{entry_id}/approve",
             json={"entry_type": "dismissed_finding"},
-            headers={"Authorization": f"Bearer {_CONTRACT_ADMIN_KEY}"},
+            headers={CSRF_HEADER_NAME: csrf_token},
         )
     assert response.status_code == 200
     approved_body = response.json()

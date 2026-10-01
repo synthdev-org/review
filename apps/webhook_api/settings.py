@@ -20,10 +20,12 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
+
+from adapter.telemetry.sdk import OtelSettingsMixin
 
 
-class WebhookAPISettings(BaseSettings):
+class WebhookAPISettings(OtelSettingsMixin):
     """Bootstrap settings for the Webhook API process.
 
     Required fields have no default on purpose: an entrypoint that silently
@@ -141,6 +143,11 @@ class WebhookAPISettings(BaseSettings):
     github_api_base_url: str = "https://api.github.com"
     github_api_timeout_seconds: float = 10.0
 
+    # --- Observability (docs/specs/spec-observability.md's Unit A) ---
+    # `otel_exporter_otlp_endpoint`/`otel_exporter_otlp_headers` come from
+    # `OtelSettingsMixin` above — shared with `WorkerSettings` so the two
+    # entrypoints can't silently diverge on this pair's declaration.
+
     # --- GitHub App auth / synchronous reaction fetch (Phase 4 of
     # plan-deliver-memory.md, Unit D, US-M3's second `Given/When/Then`
     # branch) ---
@@ -165,26 +172,6 @@ class WebhookAPISettings(BaseSettings):
     # — this entrypoint's own copy, since the synchronous `closed`-trigger
     # poll runs here, not in the Worker.
     memory_reaction_poll_max_comments_per_poll: int = 50
-
-    # --- Admin API (docs/plans/plan-deliver-memory.md's Phase 5 section,
-    # Unit E, US-M4/US-M5/US-M8/US-M10) ---
-    # Required, no default (Assumption 7) — mirrors `github_webhook_secret`'s
-    # own "no safe default, dangerous to silently default" pattern, not
-    # `setup_state_secret`'s conditionally-required one: the admin router
-    # registers unconditionally (see `apps/webhook_api/main.py`), enforcing
-    # auth per-request via a Bearer-token dependency, rather than being
-    # registration-gated the way `SETUP_MODE` gates the manifest flow —
-    # there is no "off by default" state for the admin API the way there is
-    # for the one-time setup flow.
-    admin_api_key: SecretStr
-
-    # This entrypoint's own `LocalONNXEmbeddingClient` instance (the admin
-    # API's approve route, US-M4, is its first consumer outside the
-    # Worker's own job pipeline) — same on-disk, Dockerfile-baked model
-    # path/default as `apps/worker/settings.py`'s `embedding_model_path`
-    # field, per that file's own docstring for why this is a filesystem
-    # path, never a network location or a per-entrypoint override.
-    embedding_model_path: str = "/app/models/all-MiniLM-L6-v2"
 
     @model_validator(mode="after")
     def _require_setup_state_secret_when_setup_mode_enabled(self) -> WebhookAPISettings:

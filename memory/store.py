@@ -198,13 +198,24 @@ class MemoryAdminRepository(Protocol):
         status: Literal["approved", "rejected"],
         entry_type: MemoryEntryType,
         embedding: tuple[float, ...] | None,
+        approved_by_user_id: str | None,
     ) -> MemoryEntry:
         """Approve or reject ``entry_id`` in one method (per US-M4/US-M5's
         "approve and reject are reversible state transitions in either
-        direction" design) — sets ``status``, ``entry_type``, and
-        ``embedding`` to exactly what's given, and ``approved_at`` to the
-        current time only when ``status == "approved"`` (left untouched
-        otherwise, since it's only ever read while ``status == "approved"``).
+        direction" design) — sets ``status``, ``entry_type``, ``embedding``,
+        and ``approved_by_user_id`` to exactly what's given on every call,
+        and ``approved_at`` to the current time only when
+        ``status == "approved"`` (left untouched otherwise, since it's
+        only ever read for approved entries — the similarity-search
+        candidate path filters to ``status == "approved"`` before reading
+        it, per ``docs/plans/plan-deliver-admin-gui.md``'s Phase 3 section,
+        Unit D, Assumption 6). ``approved_by_user_id``, unlike
+        ``approved_at``, is set unconditionally rather than left stale on
+        reject: the entry's full state (including this field) is returned
+        directly in list/get API responses regardless of status, so a
+        reject call passes ``approved_by_user_id=None`` and the repository
+        must actually clear it — leaving a prior approver's id in place
+        would misattribute a rejected entry's (no longer valid) approval.
         Raises ``MemoryEntryNotFoundError`` for an unknown ``entry_id``
         (US-M5's 404 case), or ``MemoryStoreError`` on any other
         Postgres-level failure.

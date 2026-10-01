@@ -55,6 +55,14 @@ class MemoryEntry(BaseModel):
     ``MemorySignalRecorder`` method that returns a fresh instance, never an
     in-place field update, matching every other row-shaped domain model in
     this codebase (``indexing.chunk.Chunk``, ``indexing.embedding.EmbeddingVector``).
+
+    ``approved_by_user_id`` (``docs/plans/plan-deliver-admin-gui.md``'s
+    Phase 3 section, Unit D, Assumption 6) is the acting Admin's
+    ``iam.models.User.id`` at approval time — set only when ``status ==
+    "approved"``, left untouched otherwise, the same conditional-write
+    behavior ``approved_at`` already has (it's only ever read while
+    ``status == "approved"``). Distinct from the pre-existing, free-text
+    ``approved_by`` field above, which no current writer populates.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -71,6 +79,7 @@ class MemoryEntry(BaseModel):
     embedding: tuple[float, ...] | None
     approved_at: datetime | None
     approved_by: str | None
+    approved_by_user_id: str | None
     created_at: datetime
     updated_at: datetime
 

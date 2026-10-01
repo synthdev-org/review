@@ -29,6 +29,11 @@ from findings.models import Finding
 from ingestion.diff import Diff, DiffFile
 from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
+from llmgateway.routing import (
+    FallbackModelRoutingResolver,
+    ModelRoutingConfigReader,
+    ModelRoutingConfigRow,
+)
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.intent_summary import MAX_INTENT_SUMMARY_CHARS, IntentSummaryStep
 from review.step import StepContext
@@ -342,6 +347,73 @@ def test_depends_on_is_configurable() -> None:
     )
 
     assert step.depends_on == ("prefilter",)
+
+
+# =============================================================================
+# Model routing (docs/plans/plan-deliver-admin-gui.md's Phase 5 section,
+# Unit F, Assumption 3): model_resolver injection.
+# =============================================================================
+
+
+class _StaticReader:
+    """A ``ModelRoutingConfigReader`` fake returning one fixed row for every
+    call — enough to prove the resolved model (not the constructor's own
+    ``model`` fallback) reaches the completion request."""
+
+    def __init__(self, row: ModelRoutingConfigRow) -> None:
+        self._row = row
+        self.calls: list[tuple[str | None, str]] = []
+
+    async def get(self, *, org_id: str | None, stage: str) -> ModelRoutingConfigRow | None:
+        self.calls.append((org_id, stage))
+        return self._row
+
+
+def _assert_is_reader(reader: object) -> None:
+    assert isinstance(reader, ModelRoutingConfigReader)
+
+
+@pytest.mark.asyncio
+async def test_model_resolver_when_set_resolves_model_at_dispatch_time() -> None:
+    reader = _StaticReader(
+        ModelRoutingConfigRow(org_id="org-1", stage="intent_summary", model_name="routed-model")
+    )
+    _assert_is_reader(reader)
+    resolver = FallbackModelRoutingResolver(reader, static_default_model="local-model")
+    llm_client = _FakeLLMClient()
+    step = IntentSummaryStep(
+        llm_client,
+        model="local-model",
+        timeout=5.0,
+        max_diff_bytes=200_000,
+        model_resolver=resolver,
+    )
+    upstream_output = _FakeContextBuilderOutput(diff=_diff_with_patch(), org_id="org-1")
+
+    await step.run(upstream_output, _context())
+
+    assert len(llm_client.calls) == 1
+    assert llm_client.calls[0].model == "routed-model"
+    # the resolver is called with this step's own registry name
+    # ("intent_summary") and the job's own org_id, per Assumption 3's exact
+    # `resolve(stage, org_id)` signature — the org tier already returned a
+    # row, so the platform tier is never queried.
+    assert reader.calls == [("org-1", "intent_summary")]
+
+
+@pytest.mark.asyncio
+async def test_model_resolver_absent_uses_constructor_model_unchanged() -> None:
+    """``model_resolver=None`` (the default) restores byte-for-byte this
+    step's prior behavior — ``model`` is used directly, with zero calls to
+    any resolver."""
+    llm_client = _FakeLLMClient()
+    step = IntentSummaryStep(llm_client, model="local-model", timeout=5.0, max_diff_bytes=200_000)
+    upstream_output = _FakeContextBuilderOutput(diff=_diff_with_patch())
+
+    await step.run(upstream_output, _context())
+
+    assert len(llm_client.calls) == 1
+    assert llm_client.calls[0].model == "local-model"
 
 
 # =============================================================================

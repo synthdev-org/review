@@ -45,6 +45,11 @@ and the LLM diff prompt like any other file. Bounded downstream by this
 plan's existing size/count materialization ceilings and per-step timeouts
 rather than caught here; a content-sniffing filter (magic-byte detection)
 is a reasonable Phase 8 enhancement, not built in this phase.
+
+**US7** (docs/specs/spec-observability.md): the five-count funnel below is
+also exported as five OTel counters, recorded at the same point as the
+existing ``logger.info`` call — see this module's own ``meter``/counter
+definitions.
 """
 
 from __future__ import annotations
@@ -53,12 +58,48 @@ import fnmatch
 import logging
 import posixpath
 
+from opentelemetry import metrics
 from pydantic import ConfigDict
 
 from ingestion.diff import Diff, DiffFetcher, DiffFile
+from review._telemetry import suppress_telemetry_errors
 from review.step import JobIdentity, Step, StepContext
 
 logger = logging.getLogger(__name__)
+
+# US7 (docs/specs/spec-observability.md's METRIC & SPAN CATALOG) — imports
+# only the OTel API, same `meter = metrics.get_meter(__name__)` style
+# `adapter/telemetry/heartbeat.py` uses in domain/adapter code alike;
+# `__name__` here is literally `"review.prefilter"`, the catalog's mandated
+# meter name, so no separate string literal is needed. A no-op when no
+# `MeterProvider` has been registered (`OTEL_EXPORTER_OTLP_ENDPOINT` unset),
+# per US10 — every `.add()` call below is then OTel's own no-op.
+meter = metrics.get_meter(__name__)
+
+# Catalog names, verbatim — five counters, one `.add(count)` each per job
+# run, no attributes (the funnel is a per-job scalar breakdown, not sliced
+# by any further dimension per the catalog). No source code/diff
+# content/finding text is ever recorded — only these five plain counts.
+_total_files_counter = meter.create_counter(
+    "review.prefilter.total_files_total",
+    description="Total files in the fetched diff, before any filtering.",
+)
+_passed_pattern_filter_counter = meter.create_counter(
+    "review.prefilter.passed_pattern_filter_total",
+    description="Files surviving the ignore-pattern filter.",
+)
+_dropped_by_materialization_ceiling_counter = meter.create_counter(
+    "review.prefilter.dropped_by_materialization_ceiling_total",
+    description="Files dropped by the materialization file-count ceiling.",
+)
+_dropped_by_aggregate_bytes_ceiling_counter = meter.create_counter(
+    "review.prefilter.dropped_by_aggregate_bytes_ceiling_total",
+    description="Files dropped by the aggregate materialized-bytes ceiling.",
+)
+_final_file_count_counter = meter.create_counter(
+    "review.prefilter.final_file_count_total",
+    description="Files surviving all filters, forwarded to the next step.",
+)
 
 MATERIALIZATION_FILE_CEILING = 500
 AGGREGATE_BYTES_CEILING = 200_000_000  # ~200MB
@@ -219,6 +260,19 @@ class PrefilterStep:
                 "final_file_count": len(bytes_filtered),
             },
         )
+
+        # US7 — recorded at the same point as the log line above, per the
+        # catalog: five plain counts, no attributes.
+        with suppress_telemetry_errors(
+            logger,
+            "prefilter telemetry recording failed (prefilter result unaffected)",
+            job_id=context.job_id,
+        ):
+            _total_files_counter.add(len(diff.files))
+            _passed_pattern_filter_counter.add(len(pattern_filtered))
+            _dropped_by_materialization_ceiling_counter.add(count_dropped)
+            _dropped_by_aggregate_bytes_ceiling_counter.add(bytes_dropped_count)
+            _final_file_count_counter.add(len(bytes_filtered))
 
         return PrefilterOutput(
             diff=Diff(files=tuple(bytes_filtered)),

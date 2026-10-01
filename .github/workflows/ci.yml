@@ -29,6 +29,16 @@ jobs:
       - name: mypy --strict
         run: uv run mypy --strict .
 
+      # US13 (docs/specs/spec-observability.md): fails the build if the
+      # shipped Grafana dashboard (charts/review/dashboards/review.json)
+      # references a metric name the instrumented code no longer emits, so
+      # a future metric rename can't silently break it. Runs directly
+      # (not via pytest) against this checked-out repo's own uv/Python —
+      # this job doesn't need the Docker-only local/agent execution rule,
+      # per that spec's Unit E deliverable #4.
+      - name: Dashboard/metric drift guard
+        run: uv run python scripts/check-dashboard-metrics.py
+
   test:
     name: Unit tests
     runs-on: ubuntu-latest
@@ -102,6 +112,38 @@ jobs:
 
       - name: pytest -m integration
         run: uv run pytest -m integration
+
+  frontend:
+    name: Frontend (typecheck, build, vitest)
+    # apps/admin_api's React/TypeScript/Vite frontend (Phase 8, Unit I) —
+    # its own dependency tree, separate from the Python `uv` project, so it
+    # gets its own job with Node set up rather than piggybacking on the
+    # `test` job above. Runs on every push, same as the Python unit-test
+    # job, per docs/rules/testing.md's CI-gating rule ("Unit: every push")
+    # — this is this tier's CI gate, not e2e.yml (which only builds the
+    # frontend via Docker as part of the full Compose stack and never runs
+    # `npm test`).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/admin_api/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/admin_api/frontend/package-lock.json
+
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+
+      - name: Type check + build
+        run: npm run build
+
+      - name: vitest run
+        run: npm test
 
   helm-lint:
     name: Helm chart lint & template

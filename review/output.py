@@ -62,18 +62,58 @@ ordinary, non-partial fatal failure, not this scenario.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from typing import Any, Literal, Protocol
 
+from opentelemetry import metrics
 from pydantic import BaseModel, ConfigDict, Field
 
-from findings.merge import POSTED_FINDINGS_CEILING, merge_findings
+from findings.merge import POSTED_FINDINGS_CEILING, MergeResult, merge_findings
 from findings.models import Finding
+from review._telemetry import suppress_telemetry_errors
 from review.citation import render_citation
 from review.context_bundle import ContextBundle
 from review.pipeline import StepFailureInfo
 from review.step import Step, StepContext
 
 logger = logging.getLogger(__name__)
+
+# Catalog names, verbatim (docs/specs/spec-observability.md's METRIC & SPAN
+# CATALOG, US4) — recorded here, at `merge_findings`'s one call site, rather
+# than inside `findings/merge.py` itself, which stays a pure computation per
+# that module's own docstring/architecture.md's domain-package rule (no infra
+# imports there). Meter name is the catalog's own literal
+# ("review.findings"), not `__name__` ("review.output") — this module is
+# where the metric happens to be recorded, not what it's scoped to.
+meter = metrics.get_meter("review.findings")
+
+_findings_count_total = meter.create_counter(
+    "review.findings.count_total",
+    description="Findings surviving merge, by severity and source.",
+)
+_findings_dropped_by_ceiling_total = meter.create_counter(
+    "review.findings.dropped_by_ceiling_total",
+    description="Findings dropped by the posted-findings ceiling after dedupe.",
+)
+
+
+def _record_findings_metrics(merge_result: MergeResult) -> None:
+    """Records US4's two counters from `merge_result` — one `.add()` per
+    distinct (severity, source) pair present in `merge_result.findings`
+    (never per-finding free text; only the bounded-cardinality severity/
+    source tags, per this spec's privacy/cardinality rules), plus the
+    dropped-by-ceiling count, always (even when zero, so the counter's
+    absence never has to be interpreted as "zero" versus "not yet
+    recorded")."""
+    with suppress_telemetry_errors(
+        logger, "findings metrics telemetry recording failed (merge result unaffected)"
+    ):
+        counts: Counter[tuple[str, str]] = Counter(
+            (finding.severity, finding.source) for finding in merge_result.findings
+        )
+        for (severity, source), count in counts.items():
+            _findings_count_total.add(count, {"severity": severity, "source": source})
+        _findings_dropped_by_ceiling_total.add(merge_result.dropped_by_ceiling_count)
 
 
 class FindingsPublisher(Protocol):
@@ -252,6 +292,7 @@ class FindingsOutputStep:
         self, parsed: FindingsOutputInput, context: StepContext
     ) -> FindingsOutputResult:
         merge_result = merge_findings(parsed.findings)
+        _record_findings_metrics(merge_result)
         findings = merge_result.findings
         if merge_result.dropped_by_ceiling_count:
             logger.warning(

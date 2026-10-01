@@ -79,20 +79,60 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from opentelemetry import metrics
 from pydantic import BaseModel, ConfigDict, Field
 
 from findings.models import Finding
 from indexing.embedding import EmbeddingClient
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
+from llmgateway.routing import FallbackModelRoutingResolver
 from memory.fingerprint import build_finding_fingerprint
 from memory.store import DismissedFindingMatcher
+from review._telemetry import suppress_telemetry_errors
 from review.context_bundle import ContextBundle, render_context_bundle_section
 from review.diff_prompt import render_and_truncate_diff
 from review.llm_response import build_completion_request, parse_llm_json_envelope
+from review.llm_telemetry import record_llm_token_usage
 from review.step import JobIdentity, Step, StepContext, job_identity_fields
 
 logger = logging.getLogger(__name__)
+
+# Imports only the OTel API (`opentelemetry.metrics`), the same
+# `meter = metrics.get_meter(__name__)` style established across this
+# codebase (adapter/telemetry/heartbeat.py) — no SDK/exporter construction
+# here, that stays exclusively at the composition root
+# (apps/webhook_api/main.py, apps/worker/main.py per Unit A). With no
+# MeterProvider registered (no OTLP endpoint configured, US10), every
+# `.add()` call below is OTel's own no-op.
+meter = metrics.get_meter(__name__)
+
+# Catalog names, verbatim (docs/specs/spec-observability.md's METRIC & SPAN
+# CATALOG, US5) — recorded at the same point as the existing
+# "verification: batch judgment completed" log line below. No attributes:
+# the catalog defines none for this trio, and job-level counts alone carry
+# no free text/source content (Privacy/Compliance NFR).
+_judged_counter = meter.create_counter(
+    "review.verification.judged_total",
+    description="Count of source=='llm' findings judged by the verification step.",
+)
+_rejected_counter = meter.create_counter(
+    "review.verification.rejected_total",
+    description="Count of findings rejected by the verification step's rubric or correlation.",
+)
+_unmatched_counter = meter.create_counter(
+    "review.verification.unmatched_total",
+    description="Count of findings with no verdict correlated to their index (fail-closed).",
+)
+
+# This step's own fixed pipeline-stage name, matching review_generation.py's
+# analogous constant — a closed-set label value, never free text. Passed to
+# review.llm_telemetry.record_llm_token_usage, which owns the shared
+# "review.llm" meter/counter every LLM-calling stage records against, so
+# every stage's LLM spend rolls up into one metric distinguished only by the
+# {stage} attribute.
+_PIPELINE_STAGE_NAME = "verification"
+
 
 _SYSTEM_PROMPT = (
     "You are an automated code review verification assistant — a structurally "
@@ -330,6 +370,7 @@ class VerificationStep:
         max_diff_bytes: int,
         depends_on: str = "review_generation",
         memory_suppression: MemorySuppressionConfig | None = None,
+        model_resolver: FallbackModelRoutingResolver | None = None,
     ) -> None:
         """``depends_on`` names this step's single upstream dependency —
         ``"review_generation"`` by default, its normal immediate
@@ -352,12 +393,23 @@ class VerificationStep:
         ``VerificationStep`` keeps working unchanged, matching every other
         "absent upstream data degrades gracefully" precedent this codebase
         already establishes for ``context_bundle``/``intent_summary``.
+
+        ``model_resolver`` (``docs/plans/plan-deliver-admin-gui.md``'s
+        Phase 5 section, Unit F, Assumption 3) is ``None`` by default —
+        ``model`` is then used unchanged, byte-for-byte this step's prior
+        behavior. When set, ``run()`` calls
+        ``model_resolver.resolve(self.name, parsed.org_id)`` itself, at
+        dispatch time, instead of using ``model`` — the composition root
+        never reaches into this already-built step to overwrite its own
+        ``model`` field, per ``docs/rules/architecture.md``'s "no stage
+        reaching into another stage's internals" rule.
         """
         self._llm_client = llm_client
         self._model = model
         self._timeout = timeout
         self._max_diff_bytes = max_diff_bytes
         self._memory_suppression = memory_suppression
+        self._model_resolver = model_resolver
         self.depends_on: tuple[str, ...] = (depends_on,)
 
     @staticmethod
@@ -458,12 +510,21 @@ class VerificationStep:
             step_name="verification",
         )
 
+        model = (
+            await self._model_resolver.resolve(self.name, parsed.org_id)
+            if self._model_resolver is not None
+            else self._model
+        )
         request = build_completion_request(
-            self._model,
+            model,
             system_content=_SYSTEM_PROMPT,
             user_content=_build_user_message(truncated_text, llm_findings, parsed.context_bundle),
         )
         response = await self._llm_client.complete(request, timeout=self._timeout)
+        if response.usage is not None:
+            record_llm_token_usage(
+                response.usage, model=response.model, stage=_PIPELINE_STAGE_NAME, logger=logger
+            )
         verdicts = _parse_verdicts(response.content, job_id=context.job_id)
         verdict_by_index = _correlate_verdicts(
             verdicts, candidate_count=len(llm_findings), job_id=context.job_id
@@ -497,6 +558,13 @@ class VerificationStep:
                 rejected_count += 1
                 continue
             kept_llm_findings.append(finding.model_copy(update={"verification_status": "verified"}))
+
+        with suppress_telemetry_errors(
+            logger, "verification telemetry recording failed (verification unaffected)"
+        ):
+            _judged_counter.add(len(llm_findings))
+            _rejected_counter.add(rejected_count)
+            _unmatched_counter.add(unmatched_count)
 
         log_fn = logger.warning if rejected_count > 0 else logger.info
         log_fn(

@@ -62,6 +62,22 @@ _REVIEW_PACKAGE_DIR = Path(__file__).parent
 # JSON envelope schema (`review_generation`, `verification`) — the same
 # "internal helper module, no `Step` implementation of its own" shape as
 # `diff_prompt` immediately above, excluded here for the identical reason.
+#
+# `_telemetry` holds `suppress_telemetry_errors`, shared by every step
+# module that records a US1-era metric/span ("record telemetry, never let
+# a failure to do so affect the real step outcome") — the same "internal
+# helper module, no `Step` implementation of its own" shape as
+# `diff_prompt`/`llm_response` above, excluded here for the identical
+# reason. Deliberately private/underscore-prefixed and defined inside
+# `review/` itself (never imported from `adapter/telemetry`) since domain
+# packages never import adapter code (docs/rules/architecture.md).
+#
+# `llm_telemetry` holds `record_llm_token_usage` and the shared
+# `review.llm.tokens_total` counter (US3), used by every step module that
+# makes its own LLM completion call (`review_generation`, `verification`)
+# — the same "internal helper module, no `Step` implementation of its own"
+# shape as `diff_prompt`/`llm_response`/`_telemetry` above, excluded here
+# for the identical reason.
 _FRAMEWORK_MODULES = frozenset(
     {
         "__init__",
@@ -73,6 +89,8 @@ _FRAMEWORK_MODULES = frozenset(
         "citation",
         "diff_prompt",
         "llm_response",
+        "llm_telemetry",
+        "_telemetry",
     }
 )
 

@@ -113,6 +113,20 @@ services:
         ${REVIEW_WEBHOOK_API_GITHUB_API_BASE_URL:-https://api.github.com}
       REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS: >-
         ${REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS:-10}
+      # docs/specs/spec-observability.md's Unit F: bare pass-through, not
+      # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}` — a `:-` default would inject an
+      # *empty string* into this container's env even when unset on the
+      # host/.env, which is not the same as the variable being absent
+      # (WebhookAPISettings.otel_exporter_otlp_endpoint would then be `""`,
+      # not `None`, breaking US10's no-op-by-default contract). The bare
+      # `KEY:` form below instead passes the host/.env value through
+      # verbatim when set, and leaves the variable genuinely unset in the
+      # container otherwise — verified against this exact Compose version's
+      # actual runtime behavior, not just its `config` rendering. Set
+      # `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317` in `.env`
+      # (see .env.example) only when opting into `--profile observability`.
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+      OTEL_EXPORTER_OTLP_HEADERS:
       # Required, no default (docs/plans/plan-deliver-memory.md's Phase 4,
       # Unit D, US-M3) — a `pull_request closed` event's reaction fetch
       # runs synchronously in this route, before the handler returns, so
@@ -127,12 +141,6 @@ services:
         ${REVIEW_WEBHOOK_API_GITHUB_RETRY_MAX_ATTEMPTS:-3}
       REVIEW_WEBHOOK_API_MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL: >-
         ${REVIEW_WEBHOOK_API_MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL:-50}
-      # Required, no default (docs/plans/plan-deliver-memory.md's Phase 5,
-      # Unit E, Assumption 7) — the admin API registers unconditionally
-      # and enforces auth per-request via this key (US-M10); without it,
-      # webhook_api fails to boot. See .env.example.
-      REVIEW_WEBHOOK_API_ADMIN_API_KEY: >-
-        ${REVIEW_WEBHOOK_API_ADMIN_API_KEY:?set REVIEW_WEBHOOK_API_ADMIN_API_KEY in .env, see .env.example}
     # docs/plans/plan-deliver-memory.md's Phase 3/4 (Unit C/D) gave this
     # service its own outbound GitHub calls (the synchronous `pull_request
     # closed` reaction poll, Unit D's second branch) — it needs the same
@@ -154,6 +162,85 @@ services:
           "python",
           "-c",
           "import urllib.request as u; u.urlopen('http://localhost:8000/healthz', timeout=2)",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  admin_api:
+    build:
+      context: .
+      target: runtime
+    image: review-app:compose-local
+    command: ["uvicorn", "apps.admin_api.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "${ADMIN_API_PORT:-8001}:8001"
+    environment:
+      REVIEW_ADMIN_API_ENVIRONMENT: ${REVIEW_ADMIN_API_ENVIRONMENT:-development}
+      REVIEW_ADMIN_API_LOG_LEVEL: ${REVIEW_ADMIN_API_LOG_LEVEL:-INFO}
+      # Required, no default (Phase 1) — same shared database every other
+      # entrypoint uses. Same variable name migrate's/webhook_api's/worker's
+      # blocks already inject.
+      REVIEW_DATABASE_URL: >-
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
+      REVIEW_ADMIN_API_SESSION_COOKIE_SECURE: >-
+        ${REVIEW_ADMIN_API_SESSION_COOKIE_SECURE:-false}
+      REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES: >-
+        ${REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES:-30}
+      # Required, no default (Assumption 11) — the bootstrap routine
+      # (apps/admin_api/bootstrap.py) cannot create the first admin user
+      # without them; every environment, including post-bootstrap restarts,
+      # keeps these set (the routine is a no-op past the first run).
+      REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME: >-
+        ${REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME:?set REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME in .env, see .env.example}
+      REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD: >-
+        ${REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD:?set REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD in .env, see .env.example}
+      REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_ATTEMPTS: >-
+        ${REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_ATTEMPTS:-5}
+      REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_WINDOW_MINUTES: >-
+        ${REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_WINDOW_MINUTES:-15}
+      REVIEW_ADMIN_API_MIN_PASSWORD_LENGTH: ${REVIEW_ADMIN_API_MIN_PASSWORD_LENGTH:-12}
+      # Required, no default (Assumption 13) — signs the session-bound CSRF
+      # HMAC cookie; without it, admin_api fails to boot. See .env.example.
+      REVIEW_ADMIN_API_ADMIN_CSRF_SECRET: >-
+        ${REVIEW_ADMIN_API_ADMIN_CSRF_SECRET:?set REVIEW_ADMIN_API_ADMIN_CSRF_SECRET in .env, see .env.example}
+      # docs/plans/plan-deliver-admin-gui.md's Phase 3 (Unit D) — the
+      # Memory admin API's approve route moved here from apps/webhook_api
+      # along with its own LocalONNXEmbeddingClient wiring. Same
+      # Dockerfile-baked default every other entrypoint's own copy of this
+      # setting uses.
+      REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH: >-
+        ${REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH:-/app/models/all-MiniLM-L6-v2}
+      # docs/plans/plan-deliver-admin-gui.md's Phase 5 (Unit F) — model
+      # routing's static-default tier. Same literal default as
+      # REVIEW_WORKER_LLM_MODEL below; keep both in sync.
+      REVIEW_ADMIN_API_LLM_MODEL: ${REVIEW_ADMIN_API_LLM_MODEL:-local-model}
+      # docs/plans/plan-deliver-admin-gui.md's Phase 6 (Unit G) — the
+      # admin-stats dashboard's Prometheus-reading adapter. Defaults to the
+      # `prometheus` service below, which only actually starts under the
+      # `observability` profile (see that block's own header comment); the
+      # dashboard endpoint degrades to a clean 5xx (never a hang) if it's
+      # not running, per that phase's own Observability & rollback section.
+      REVIEW_ADMIN_API_PROMETHEUS_BASE_URL: >-
+        ${REVIEW_ADMIN_API_PROMETHEUS_BASE_URL:-http://prometheus:9090}
+      # See webhook_api's own identical entry above for why this is a bare
+      # pass-through (`KEY:`, no `:-` default) rather than
+      # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}`.
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+      OTEL_EXPORTER_OTLP_HEADERS:
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Same no-curl-in-the-runtime-image reasoning as webhook_api's own
+      # healthcheck above.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; u.urlopen('http://localhost:8001/healthz', timeout=2)",
         ]
       interval: 3s
       timeout: 3s
@@ -197,6 +284,11 @@ services:
       REVIEW_WORKER_GITHUB_API_BASE_URL: ${REVIEW_WORKER_GITHUB_API_BASE_URL:-https://api.github.com}
       REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: ${REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS:-10}
       REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: ${REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS:-3}
+      # See webhook_api's own identical entry above for why this is a bare
+      # pass-through (`KEY:`, no `:-` default) rather than
+      # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}`.
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+      OTEL_EXPORTER_OTLP_HEADERS:
     # `host.docker.internal` is provided for free on Docker Desktop, but
     # plain Docker Engine on Linux needs this mapping to resolve it — this
     # is what actually makes the C4 doc's "worker calls LM Studio on the
@@ -239,3 +331,62 @@ services:
     # `running` (not `exited`) and never restarts during its observation
     # window, not the old "exits 0 once" claim.
     restart: unless-stopped
+
+  # --- `observability` profile (docs/specs/spec-observability.md's Unit F)
+  # ---
+  # Additive-only: every service below carries `profiles: ["observability"]`,
+  # so a plain `docker compose up` (no `--profile` flag) never starts any of
+  # them — Compose only starts a profiled service when its profile is
+  # explicitly requested (`--profile observability`) or listed in
+  # `COMPOSE_PROFILES`. The default stack (postgres/migrate/webhook_api/
+  # worker) is unchanged; only `docker compose --profile observability up`
+  # additionally brings up an OTel Collector, Prometheus, and Grafana
+  # (pre-loaded with Unit E's shipped dashboard), per US12's "optional local
+  # demo path" scope. See .env.example for the one manual step this still
+  # needs (pointing `OTEL_EXPORTER_OTLP_ENDPOINT` at the bundled collector —
+  # Compose profiles gate *services*, not env var values, so that one step
+  # can't be made profile-conditional inside this same file).
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    profiles: ["observability"]
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      # OTLP gRPC receiver — what webhook_api/worker's
+      # OTEL_EXPORTER_OTLP_ENDPOINT points at.
+      - "${OTEL_COLLECTOR_OTLP_GRPC_PORT:-4317}:4317"
+      # Prometheus-scrapeable metrics endpoint (also exposed on the host for
+      # manual inspection; `prometheus` below scrapes it over the Compose
+      # network, not this published port).
+      - "${OTEL_COLLECTOR_PROMETHEUS_PORT:-8889}:8889"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    profiles: ["observability"]
+    environment:
+      # Local demo only (see this block's own header comment) — never the
+      # posture for a customer's own, separately-run Grafana, which has its
+      # own access control entirely outside this platform's boundary (per
+      # ADR-0008's own framing).
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Unit E's one committed dashboard JSON, mounted read-only — not
+      # copied, per this block's own header comment.
+      - ./charts/review/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus

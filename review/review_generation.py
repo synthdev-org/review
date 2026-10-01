@@ -82,12 +82,23 @@ from findings.models import SEVERITY_RANK, Finding, Severity
 from findings.redact import TextRedactor, apply_redaction_ceiling, redact_findings
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
+from llmgateway.routing import FallbackModelRoutingResolver
 from review.context_bundle import ContextBundle, render_context_bundle_section
 from review.diff_prompt import INERT_REFERENCE_DATA_FRAMING, render_and_truncate_diff
 from review.llm_response import build_completion_request, parse_llm_json_envelope
+from review.llm_telemetry import record_llm_token_usage
 from review.step import JobIdentity, Step, StepContext, job_identity_fields
 
 logger = logging.getLogger(__name__)
+
+# This step's own fixed pipeline-stage name, per docs/specs/spec-observability.md's
+# METRIC & SPAN CATALOG US3 entry ({stage: "review-generation", ...}) — a
+# closed-set label value, never free text, matching the Scale NFR's
+# cardinality bound. Passed to review.llm_telemetry.record_llm_token_usage,
+# which owns the shared "review.llm" meter/counter every LLM-calling stage
+# records against.
+_PIPELINE_STAGE_NAME = "review-generation"
+
 
 # Combined across every `source: "llm"` finding a single completion returns —
 # a real code review has no legitimate reason to produce hundreds of
@@ -376,6 +387,7 @@ class ReviewGenerationStep:
         timeout: float,
         max_diff_bytes: int,
         depends_on: str = "static_analysis",
+        model_resolver: FallbackModelRoutingResolver | None = None,
     ) -> None:
         """``depends_on`` names this step's single upstream dependency —
         ``"static_analysis"`` by default (the ordinary, both-steps-enabled
@@ -391,12 +403,23 @@ class ReviewGenerationStep:
         field ``_ReviewGenerationInput`` needs except ``findings``/
         ``context_bundle``/``intent_summary`` (all of which default safely),
         so falling back to it is always safe.
+
+        ``model_resolver`` (``docs/plans/plan-deliver-admin-gui.md``'s
+        Phase 5 section, Unit F, Assumption 3) is ``None`` by default —
+        ``model`` is then used unchanged, byte-for-byte this step's prior
+        behavior. When set, ``run()`` calls
+        ``model_resolver.resolve(self.name, parsed.org_id)`` itself, at
+        dispatch time, instead of using ``model`` — the composition root
+        never reaches into this already-built step to overwrite its own
+        ``model`` field, per ``docs/rules/architecture.md``'s "no stage
+        reaching into another stage's internals" rule.
         """
         self._llm_client = llm_client
         self._redactor = redactor
         self._model = model
         self._timeout = timeout
         self._max_diff_bytes = max_diff_bytes
+        self._model_resolver = model_resolver
         self.depends_on: tuple[str, ...] = (depends_on,)
 
     async def run(self, input: Any, context: StepContext) -> ReviewGenerationOutput:
@@ -416,8 +439,13 @@ class ReviewGenerationStep:
             step_name="review-generation",
         )
 
+        model = (
+            await self._model_resolver.resolve(self.name, parsed.org_id)
+            if self._model_resolver is not None
+            else self._model
+        )
         request = build_completion_request(
-            self._model,
+            model,
             system_content=_build_system_prompt(parsed.intent_summary),
             user_content=_build_user_message(
                 truncated_text,
@@ -427,6 +455,10 @@ class ReviewGenerationStep:
             ),
         )
         response = await self._llm_client.complete(request, timeout=self._timeout)
+        if response.usage is not None:
+            record_llm_token_usage(
+                response.usage, model=response.model, stage=_PIPELINE_STAGE_NAME, logger=logger
+            )
         llm_findings = _parse_llm_findings(response.content, job_id=context.job_id)
 
         # Sorted by severity (stable, so same-severity findings keep the

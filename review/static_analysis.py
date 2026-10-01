@@ -201,6 +201,12 @@ class StaticAnalysisStep:
             enabled=self._enabled,
             timeouts=self._timeouts,
             on_failure=FailurePolicy.ISOLATE,
+            # Distinct from the outer per-job root span's default
+            # "review.job.run" name — this inner registry's seed_input is
+            # a static-analysis-specific input, not a job identity, so its
+            # span must not collide with (and be mistaken for) the real
+            # one-per-job root span the catalog expects.
+            root_span_name="review.step.static_analysis.run",
         )
 
     async def run(self, input: Any, context: StepContext) -> StaticAnalysisOutput:

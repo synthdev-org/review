@@ -6,7 +6,9 @@ webhooks directly over HTTP rather than through a real GitHub App
 delivery).
 
 Follows ``tests/e2e/test_review_pipeline.py``'s established shape exactly:
-one module-scoped Docker Compose stack (Webhook API + Worker + Postgres),
+one module-scoped Docker Compose stack (Webhook API + Admin API + Worker +
+Postgres — Admin API since docs/plans/plan-deliver-admin-gui.md's Phase 3,
+Unit D, US-A7 moved the Memory admin routes Unit E below drives onto it),
 a self-contained stub GitHub server and a self-contained stub LLM Gateway
 server (self-contained per that file's own docstring reasoning — this
 file's scenario/call-log needs differ enough from ``tests/e2e/conftest.py``'s
@@ -42,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.cookiejar
 import json
 import re
 import threading
@@ -71,7 +74,15 @@ _OWNER_REPO = "acme/widgets"
 _INSTALLATION_ID = 123456
 _WEBHOOK_URL_PATH = "/webhooks/github"
 _WEBHOOK_SECRET = "e2e-test-webhook-secret"
-_ADMIN_API_KEY = "e2e-test-admin-key"
+# docs/plans/plan-deliver-admin-gui.md's Phase 3 (Unit D, US-A7) retired the
+# static `admin_api_key` Bearer token this file used to send in favor of a
+# real per-user session cookie plus a CSRF token every mutating request must
+# echo back — these two constants are this black-box HTTP test's own copy
+# of apps/admin_api/dependencies.py's `CSRF_COOKIE_NAME`/`CSRF_HEADER_NAME`
+# wire contract (not an in-process import of that module, to keep this file
+# genuinely HTTP-only, per its own module docstring).
+_CSRF_COOKIE_NAME = "review_admin_csrf"
+_CSRF_HEADER_NAME = "X-CSRF-Token"
 _WAIT_TIMEOUT_SECONDS = 60.0
 
 _FILE_PATH = "README.md"
@@ -370,10 +381,6 @@ def _e2e_env() -> dict[str, str]:
         REVIEW_WORKER_GITHUB_API_BASE_URL=f"http://host.docker.internal:{STUB_GITHUB_PORT}",
         REVIEW_WEBHOOK_API_GITHUB_API_BASE_URL=f"http://host.docker.internal:{STUB_GITHUB_PORT}",
         REVIEW_WORKER_POLL_INTERVAL_SECONDS="0.2",
-        # Required, no default (docs/plans/plan-deliver-memory.md's Phase 5,
-        # Unit E, Assumption 7) — the admin API (US-M4/US-M5/US-M8/US-M10)
-        # this test drives directly needs a real key.
-        REVIEW_WEBHOOK_API_ADMIN_API_KEY=_ADMIN_API_KEY,
     )
 
 
@@ -390,6 +397,13 @@ def running_stack(
     )
     try:
         wait_for_healthy("webhook_api", env)
+        # Unit E now drives apps/admin_api (Phase 3, Unit D, US-A7) instead
+        # of webhook_api's retired static-token route — its own healthcheck
+        # (docker-compose.yml) only reports healthy once the local ONNX
+        # embedding model has finished loading, so waiting here (rather
+        # than discovering readiness via the first failed login later in
+        # the test) keeps that startup cost off the test's own assertions.
+        wait_for_healthy("admin_api", env)
         wait_for_log_line("worker", env, "worker started")
         yield env
     finally:
@@ -399,7 +413,7 @@ def running_stack(
 
 
 # ---------------------------------------------------------------------------
-# Webhook signing / posting / admin-API helpers
+# Webhook signing / posting / admin-API session helpers
 # ---------------------------------------------------------------------------
 
 
@@ -441,24 +455,74 @@ def _pull_request_payload(
     return payload
 
 
-def _admin_request(
-    env: dict[str, str], *, method: str, path: str, body: dict[str, object] | None = None
-) -> tuple[int, dict[str, object]]:
-    port = env["WEBHOOK_API_PORT"]
-    data = json.dumps(body).encode() if body is not None else None
-    headers = {"Authorization": f"Bearer {_ADMIN_API_KEY}"}
-    if data is not None:
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(
-        f"http://localhost:{port}{path}", data=data, method=method, headers=headers
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            raw = response.read()
-            return int(response.status), (json.loads(raw) if raw else {})
-    except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        return int(exc.code), (json.loads(raw) if raw else {})
+class _AdminSession:
+    """A real, logged-in ``apps.admin_api`` HTTP session.
+
+    ``docs/plans/plan-deliver-admin-gui.md``'s Phase 3 (Unit D, US-A7)
+    moved the Memory admin API from ``apps/webhook_api`` (a static
+    ``admin_api_key`` Bearer token) to ``apps/admin_api`` (real per-user
+    sessions, ``require_session``/``require_admin_role``) — this is that
+    migration's E2E-tier, real-HTTP equivalent of
+    ``review/test_verification_step.py``'s own ``_admin_client``/
+    ``_login_as_contract_admin`` helpers, which drive the same app
+    in-process via ``TestClient`` instead of over the wire against the
+    Compose stack's own ``admin_api`` container.
+
+    Logs in once (the bootstrap admin ``conftest.base_compose_env`` already
+    provisions via ``REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME``/
+    ``PASSWORD``), keeps the session cookie in a cookie jar, and echoes the
+    CSRF cookie's value back on every subsequent request via
+    ``_CSRF_HEADER_NAME`` — cheap to do unconditionally even for the one
+    GET the test below makes, since ``apps/admin_api/dependencies.py``'s
+    own CSRF check only actually enforces it on mutating methods.
+    """
+
+    def __init__(self, env: dict[str, str]) -> None:
+        self._port = env["ADMIN_API_PORT"]
+        self._jar = http.cookiejar.CookieJar()
+        self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._jar))
+        self._csrf_token = self._login(
+            username=env["REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME"],
+            password=env["REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD"],
+        )
+
+    def _login(self, *, username: str, password: str) -> str:
+        status, _ = self._raw_request(
+            method="POST",
+            path="/api/v1/auth/login",
+            body={"username": username, "password": password},
+        )
+        assert status == 200, f"admin bootstrap login failed with status {status}"
+        for cookie in self._jar:
+            if cookie.name == _CSRF_COOKIE_NAME:
+                assert cookie.value is not None
+                return cookie.value
+        raise AssertionError("admin login response did not set the CSRF cookie")
+
+    def _raw_request(
+        self, *, method: str, path: str, body: dict[str, object] | None, csrf_token: str = ""
+    ) -> tuple[int, dict[str, object]]:
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if csrf_token:
+            headers[_CSRF_HEADER_NAME] = csrf_token
+        request = urllib.request.Request(
+            f"http://localhost:{self._port}{path}", data=data, method=method, headers=headers
+        )
+        try:
+            with self._opener.open(request, timeout=15) as response:
+                raw = response.read()
+                return int(response.status), (json.loads(raw) if raw else {})
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            return int(exc.code), (json.loads(raw) if raw else {})
+
+    def request(
+        self, *, method: str, path: str, body: dict[str, object] | None = None
+    ) -> tuple[int, dict[str, object]]:
+        return self._raw_request(method=method, path=path, body=body, csrf_token=self._csrf_token)
 
 
 def _wait_until_check_run_count(
@@ -561,12 +625,15 @@ def test_memory_pipeline_happy_path_end_to_end(
 
     # --- Unit E (US-M4/US-M8): the admin API lists what Units B-D just ----
     # --- captured, and approving one computes a real local-ONNX embedding -
+    # Real login against apps/admin_api, per Phase 3's (Unit D, US-A7)
+    # retirement of the old static admin_api_key route on webhook_api.
+    admin_session = _AdminSession(running_stack)
     entry_id: str | None = None
     deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
     pending_entries: list[dict[str, object]] = []
     while time.monotonic() < deadline:
-        list_status, list_body = _admin_request(
-            running_stack, method="GET", path="/admin/memory-entries?status=pending&limit=50"
+        list_status, list_body = admin_session.request(
+            method="GET", path="/api/v1/memory-entries?status=pending&limit=50"
         )
         assert list_status == 200
         raw_entries = list_body.get("entries", [])
@@ -590,10 +657,9 @@ def test_memory_pipeline_happy_path_end_to_end(
     }
     assert raw_signal_types == {"reply", "thread_resolution", "reaction"}
 
-    approve_status, approved_entry = _admin_request(
-        running_stack,
+    approve_status, approved_entry = admin_session.request(
         method="POST",
-        path=f"/admin/memory-entries/{entry_id}/approve",
+        path=f"/api/v1/memory-entries/{entry_id}/approve",
         body={"entry_type": "dismissed_finding"},
     )
     assert approve_status == 200

@@ -1,0 +1,49 @@
+# OTel Collector config for the `observability` Compose profile (Unit F,
+# docs/specs/spec-observability.md's US11/US12). Not used in production —
+# a customer's own collector config is entirely their own, per ADR-0001's
+# "customer forwards metrics if they want them" framing; this file exists
+# only to make the local demo profile self-contained.
+#
+# Receives OTLP (gRPC + HTTP) from webhook_api/worker (once an operator
+# points OTEL_EXPORTER_OTLP_ENDPOINT at this collector — see
+# docker-compose.yml's `otel-collector` service and .env.example), and
+# re-exposes metrics on a plain Prometheus-scrapeable `/metrics` endpoint
+# via the `prometheus` exporter (pull-based — matches Prometheus's own
+# scrape model, as opposed to `prometheusremotewrite`, which would need a
+# push-receiving Prometheus config this demo doesn't set up). Traces are
+# accepted (so a real OTLP trace export never errors/retries against this
+# collector) and sent to the `debug` exporter only — no trace backend
+# (Jaeger/Tempo) is bundled, since the dashboard (US11) only renders
+# metrics; bundling a trace UI is out of this PRD's scope.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # `service.name` -> the Prometheus `job` label (and `service.instance.id`
+    # -> `instance`) is the exporter's own default OTel-to-Prometheus
+    # translation, not something this config opts into — matches the
+    # dashboard JSON's own comment/queries (`job="review-webhook-api"` /
+    # `job="review-worker"`) with no extra config needed here.
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

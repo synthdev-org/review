@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -541,6 +542,18 @@ class MemoryEntryRow(Base):
     )
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Nullable FK to `admin_user.id` (docs/plans/plan-deliver-admin-gui.md's
+    # Phase 3 section, Unit D, Assumption 6) — the acting Admin's real
+    # identity at approval time, distinct from the pre-existing free-text
+    # `approved_by` column above, which no current writer populates. No
+    # `ondelete=CASCADE`, mirroring `AdminAuditLogRow.actor_user_id`'s own
+    # reasoning: `admin_user` rows are never hard-deleted (deactivation is a
+    # status flip), so this never actually cascades in practice, but a
+    # historical approval should keep resolving to its approver the same
+    # way a historical audit-log row does.
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_user.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -613,3 +626,195 @@ class IndexGraphEdgeRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class AdminRole(enum.StrEnum):
+    """Storage-layer mirror of ``iam.models.Role`` (a domain ``Literal``) —
+    the same domain-``Literal``-vs-storage-``enum.StrEnum`` split
+    ``MemoryStatus``/``MemoryEntryStatus`` already establish, per
+    ``docs/plans/plan-deliver-admin-gui.md``'s Phase 1 section (Unit B)."""
+
+    ADMIN = "admin"
+    VIEWER = "viewer"
+
+
+class AdminUserRow(Base):
+    """One human operator who can sign in to the Admin UI, per the plan's
+    Phase 1 section (Unit B, Assumption 11). ``username`` carries its own
+    ``UniqueConstraint`` regardless of the bootstrap routine's own
+    advisory-lock-based race closure (``apps/admin_api/bootstrap.py``) —
+    ordinary integrity protection for Phase 2's ``POST /api/v1/users``,
+    per Assumption 11's own reasoning. ``is_active`` exists here, in Phase
+    1's own migration, even though nothing in this phase ever sets it to
+    ``False`` — Phase 2's deactivation route needs it to already exist
+    (that phase's own plan section adds no migration of its own), and
+    every Phase 1 row is created with the default ``True``.
+    """
+
+    __tablename__ = "admin_user"
+    __table_args__ = (UniqueConstraint("username", name="uq_admin_user_username"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Always an already-computed Argon2id hash
+    # (adapter/auth/argon2_hasher.py) — this table never stores a plaintext
+    # password. Argon2id's own encoded-hash format
+    # ($argon2id$v=...$m=...,t=...,p=...$salt$hash) comfortably fits within
+    # 255 characters for the OWASP-baseline cost parameters this codebase
+    # uses (Assumption 14).
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[AdminRole] = mapped_column(
+        Enum(AdminRole, name="admin_role", native_enum=False, validate_strings=True),
+        nullable=False,
+    )
+    is_active: Mapped[bool] = mapped_column(nullable=False, default=True, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class AdminSessionRow(Base):
+    """One ``admin_user``'s signed-in session, per the plan's Phase 1
+    section (Unit B, Assumption 7). ``token_hash`` — never the raw session
+    token itself — is the SHA-256 hex digest of the opaque token delivered
+    via the ``HttpOnly`` session cookie; carries its own
+    ``UniqueConstraint`` so ``PostgresSessionStore.get_by_token_hash``'s
+    lookup is a real unique-index hit, not a table scan.
+
+    ``ondelete="CASCADE"`` on ``user_id`` is defense-in-depth for a case
+    this plan never actually exercises (``admin_user`` rows are
+    deactivated, never hard-deleted) — kept for the same "narrow the
+    scope"-style integrity-protection reasoning
+    ``adapter/storage/models.py``'s other FK columns already use.
+    """
+
+    __tablename__ = "admin_session"
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_admin_session_token_hash"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("admin_user.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # US-A2's sliding-window idle expiry (iam.auth.is_session_expired) is
+    # computed against this column — updated on every authenticated request
+    # (PostgresSessionStore.touch_last_seen), never only at creation.
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class AdminAuditLogRow(Base):
+    """One entry of the single, generic admin-action audit log, per the
+    plan's Phase 1 section (Assumption 6) — every mutating admin action
+    across every phase of this plan (approve/reject/delete, config write,
+    routing write, user management, bulk actions, login failures/successes)
+    is recorded here, rather than bespoke attribution columns bolted onto
+    every affected table.
+
+    ``actor_user_id`` is nullable — a failed login attempt against a
+    nonexistent username (or before any session exists at all) has no
+    resolved actor to attribute; a successful login's row does carry the
+    real ``id``. No ``ON DELETE CASCADE`` from ``admin_user`` is declared
+    (``ondelete`` left unset, i.e. Postgres's own default ``NO ACTION``) —
+    ``admin_user`` rows are deactivated, never hard-deleted, in this plan's
+    scope, so a historical audit row always keeps resolving to the acting
+    user's id even after that user is later deactivated (Assumption 6's
+    own "historical audit rows keep resolving to the deactivated user"
+    requirement, carried by the FK staying valid rather than by any
+    cascade behavior).
+
+    ``metadata`` is the column name (matches the plan's own field list
+    verbatim); the Python attribute is named ``extra`` instead, since
+    ``metadata`` collides with SQLAlchemy's own reserved
+    ``DeclarativeBase.metadata`` class attribute.
+    """
+
+    __tablename__ = "admin_audit_log"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_user.id"), nullable=True
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    extra: Mapped[dict[str, object]] = mapped_column(
+        "metadata", JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class LoginAttemptRow(Base):
+    """A Postgres-backed windowed counter of failed login attempts per
+    username, per the plan's Phase 1 section (Assumption 5) — **not** the
+    existing in-process ``InMemoryRateLimiter`` (undercounts across
+    ``apps/admin_api``'s multiple stateless replicas) and **not** the
+    general ``admin_audit_log`` table above (unbounded, no index/retention
+    policy suited to this hot-path access pattern).
+
+    ``(username, window_start)`` is this table's own uniqueness key — one
+    row per username per fixed window, atomically incremented via
+    ``INSERT ... ON CONFLICT DO UPDATE attempt_count = attempt_count + 1``
+    (``adapter/storage/iam.py``'s ``PostgresLoginAttemptRepository``),
+    mirroring Phase 7's own ``PrivateRepoReviewCount`` atomic-upsert
+    pattern for the same structural problem (bounded-window occurrence
+    counting). ``PostgresLoginAttemptRepository`` also purges rows older
+    than a few windows on every write, bounding this table's growth against
+    a flood of attempts against nonexistent usernames (the Security review
+    section's own residual-risk note).
+    """
+
+    __tablename__ = "login_attempt"
+    __table_args__ = (
+        UniqueConstraint("username", "window_start", name="uq_login_attempt_username_window"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(nullable=False, default=1, server_default="1")
+
+
+class PrivateRepoReviewCount(Base):
+    """The free-tier usage counter (plan's Phase 7 section, Unit H,
+    US-A19, Assumption 2) — one row per ``(installation_id, day)``,
+    atomically incremented via ``INSERT ... ON CONFLICT DO UPDATE count =
+    count + 1`` (``adapter/storage/tenancy.py``'s
+    ``PostgresUsageCounterRepository``), the same atomic-upsert pattern
+    ``LoginAttemptRow`` above already uses for the identical structural
+    problem (bounded-window occurrence counting).
+
+    ``day`` is already the 04:00-anchored calendar day (``date_for``/
+    ``day_for``'s output, per ADR-0008's "reset 04:00, not midnight"
+    Decision) by the time it reaches this table — never a raw
+    ``datetime.now()`` — so this column is a plain ``Date``, not a
+    ``DateTime``. Unlike ``OrgRepoTeamSetting``'s/``ModelRoutingConfig``'s
+    scope columns, neither ``installation_id`` nor ``day`` is nullable
+    here, so a native Postgres ``ON CONFLICT (installation_id, day)``
+    target works correctly with no ``isnot_distinct_from`` NULL-handling
+    needed (unlike those two tables' own ``upsert`` methods).
+    """
+
+    __tablename__ = "private_repo_review_count"
+    __table_args__ = (
+        UniqueConstraint(
+            "installation_id", "day", name="uq_private_repo_review_count_installation_day"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    installation_id: Mapped[int] = mapped_column(BigInteger(), nullable=False)
+    day: Mapped[date] = mapped_column(Date(), nullable=False)
+    count: Mapped[int] = mapped_column(nullable=False, default=1, server_default="1")

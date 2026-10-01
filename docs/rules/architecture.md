@@ -15,11 +15,15 @@ requires a new ADR, not a one-off exception.
   `litellm`, `subprocess` — those live only in adapters). Adapters
   (`adapter/github`, `adapter/analyzers`, `adapter/storage`, `adapter/llm`)
   depend inward on domain-defined `typing.Protocol` interfaces only.
-  Entrypoints (`apps/webhook_api`, `apps/worker`) depend on the domain and
-  wire adapters in; the domain never imports entrypoint or adapter code.
-- Two deployable entrypoints share every package below `apps/`: the Webhook
-  API and the Worker (which itself dispatches both indexing and review jobs)
-  are thin composition roots, not separate codebases with duplicated logic.
+  Entrypoints (`apps/webhook_api`, `apps/worker`, `apps/admin_api`) depend
+  on the domain and wire adapters in; the domain never imports entrypoint
+  or adapter code.
+- Three deployable entrypoints share every package below `apps/`: the
+  Webhook API, the Worker (which itself dispatches both indexing and
+  review jobs), and the Admin API (`apps/admin_api`, per
+  [ADR-0001](../adr/0001-self-hosted-kubernetes-deployment.md)'s
+  2026-09-20 amendment and `docs/specs/spec-admin-gui.md`) are thin
+  composition roots, not separate codebases with duplicated logic.
 
 ## Decoupling
 
@@ -67,9 +71,13 @@ requires a new ADR, not a one-off exception.
 
 - No interface, abstraction, or generic without a second real implementation
   already in view — YAGNI over speculative flexibility.
-- No separate message broker, no separate admin-UI service, no third
-  deployable component until a real requirement forces one — see the C4
-  doc's "two deployable components, not five" note.
+- No separate message broker, no fourth deployable component beyond the
+  three named above until a real requirement forces one — see the C4
+  doc's "three deployable components, not five" note. The Admin UI
+  (`apps/admin_api`) is the one exception already forced: an enterprise
+  standalone-deployment requirement, per
+  [ADR-0001](../adr/0001-self-hosted-kubernetes-deployment.md)'s
+  2026-09-20 amendment.
 - Explicit over clever.
 
 ---

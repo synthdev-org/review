@@ -1,9 +1,11 @@
-# Non-secret bootstrap values for both entrypoints, per the plan's Phase 6
-# section ("ConfigMap ... for non-secret bootstrap values"). Keys mirror
-# apps/webhook_api/settings.py's WebhookAPISettings and
-# apps/worker/settings.py's WorkerSettings fields one-for-one — each
-# entrypoint's own env_prefix (REVIEW_WEBHOOK_API_ / REVIEW_WORKER_) keeps
-# the two sets of keys from colliding in one shared ConfigMap.
+# Non-secret bootstrap values for all three entrypoints, per the plan's
+# Phase 6 section ("ConfigMap ... for non-secret bootstrap values"). Keys
+# mirror apps/webhook_api/settings.py's WebhookAPISettings,
+# apps/worker/settings.py's WorkerSettings, and (Phase 9)
+# apps/admin_api/settings.py's AdminAPISettings fields one-for-one — each
+# entrypoint's own env_prefix (REVIEW_WEBHOOK_API_ / REVIEW_WORKER_ /
+# REVIEW_ADMIN_API_) keeps the three sets of keys from colliding in one
+# shared ConfigMap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -44,3 +46,21 @@ data:
   REVIEW_WORKER_GITHUB_API_BASE_URL: {{ .Values.worker.github.apiBaseUrl | quote }}
   REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: {{ .Values.worker.github.apiTimeoutSeconds | quote }}
   REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: {{ .Values.worker.github.retryMaxAttempts | quote }}
+
+  # --- Admin API (apps/admin_api/settings.py) — Phase 9 ---
+  REVIEW_ADMIN_API_ENVIRONMENT: {{ .Values.adminApi.environment | quote }}
+  REVIEW_ADMIN_API_LOG_LEVEL: {{ .Values.adminApi.logLevel | quote }}
+  REVIEW_ADMIN_API_SESSION_COOKIE_SECURE: {{ .Values.adminApi.sessionCookieSecure | quote }}
+  REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES: >-
+    {{ .Values.adminApi.sessionIdleTimeoutMinutes | quote }}
+  REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_ATTEMPTS: {{ .Values.adminApi.loginRateLimit.attempts | quote }}
+  REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_WINDOW_MINUTES: >-
+    {{ .Values.adminApi.loginRateLimit.windowMinutes | quote }}
+  REVIEW_ADMIN_API_MIN_PASSWORD_LENGTH: {{ .Values.adminApi.minPasswordLength | quote }}
+  REVIEW_ADMIN_API_LLM_MODEL: {{ .Values.adminApi.llmModel | quote }}
+  REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH: {{ .Values.adminApi.embeddingModelPath | quote }}
+  REVIEW_ADMIN_API_PROMETHEUS_BASE_URL: {{ .Values.adminApi.prometheus.baseUrl | quote }}
+  REVIEW_ADMIN_API_PROMETHEUS_TIMEOUT_SECONDS: >-
+    {{ .Values.adminApi.prometheus.timeoutSeconds | quote }}
+  REVIEW_ADMIN_API_PROMETHEUS_RETRY_MAX_ATTEMPTS: >-
+    {{ .Values.adminApi.prometheus.retryMaxAttempts | quote }}

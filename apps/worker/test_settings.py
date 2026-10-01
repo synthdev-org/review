@@ -185,6 +185,29 @@ def test_memory_suppression_fields_are_overridable_from_env(
     assert settings.memory_decay_half_life_days == 90.0
 
 
+def test_model_routing_config_enabled_defaults_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """docs/plans/plan-deliver-admin-gui.md's Phase 5 section (Unit F) —
+    mirrors `memory_suppression_enabled`'s own default-true shape exactly."""
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.model_routing_config_enabled is True
+
+
+def test_model_routing_config_enabled_is_overridable_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_MODEL_ROUTING_CONFIG_ENABLED", "false")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.model_routing_config_enabled is False
+
+
 # --- US-F7: an all-disabled step configuration is caught at startup --------
 #
 # Per the plan's Phase 2 section, this predicate operates at the
@@ -320,6 +343,37 @@ def test_github_fields_default_per_the_plan(monkeypatch: pytest.MonkeyPatch) -> 
     assert settings.github_api_base_url == "https://api.github.com"
     assert settings.github_api_timeout_seconds == 10.0
     assert settings.github_retry_max_attempts == 3
+
+
+def test_empty_otel_endpoint_env_value_is_treated_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """See WebhookAPISettings' identical test (same reasoning): the
+    `observability` Compose profile's bare `OTEL_EXPORTER_OTLP_ENDPOINT:`
+    pass-through still forwards a present-but-empty `.env` value (exactly
+    what `.env.example` ships) as `""`, not absent — without the field
+    validator this proves, that would silently break US10's
+    no-op-by-default contract.
+    """
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.otel_exporter_otlp_endpoint is None
+    assert settings.otel_exporter_otlp_headers is None
+
+
+def test_non_empty_otel_endpoint_env_value_still_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.otel_exporter_otlp_endpoint == "http://otel-collector:4317"
 
 
 def test_github_app_private_key_never_appears_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:

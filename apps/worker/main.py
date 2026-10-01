@@ -99,6 +99,25 @@ role — Assumption 8), threaded into `apps/worker/dispatch.py`'s
 Settings are parsed and logging configured inside `main()`, not at module
 import time, so importing this module (mypy, pytest collection) never
 requires environment variables or performs process-level side effects.
+
+docs/specs/spec-observability.md's Unit A adds this entrypoint's OTel
+wiring: `adapter.telemetry.sdk.init_telemetry` is called in `main()`,
+alongside `configure_logging` (both are process-wide observability
+bootstrapping, not a fail-fast check with a real external dependency to
+verify) — and, once `_amain` has built the dispatch loop's own
+dependencies, US14's heartbeat loop runs concurrently with
+`run_dispatch_loop` (both run forever), with the heartbeat task started
+only when `settings.otel_exporter_otlp_endpoint` is set (US10's no-op
+default). Run as a plain `asyncio.create_task`, cancelled in a `finally`
+block around awaiting the dispatch loop — not `asyncio.TaskGroup` — so the
+dispatch loop's own exception propagates out of `_amain` completely
+unwrapped, exactly as it did before the heartbeat task existed, with no
+`ExceptionGroup`/`BaseExceptionGroup` unwrapping step needed. This is safe
+specifically because `run_heartbeat_loop` never lets anything but
+`CancelledError` escape (see its own docstring) — the heartbeat task can
+never itself be the one that fails, only be cancelled once the dispatch
+loop already has, so there is no second failure mode a `TaskGroup` would
+need to help aggregate.
 """
 
 from __future__ import annotations
@@ -127,8 +146,16 @@ from adapter.llm.litellm_client import LiteLLMClient
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.indexing_repository import IndexingRepository
+from adapter.storage.llm_routing import PostgresModelRoutingRepository
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
+from adapter.storage.tenancy import PostgresUsageCounterRepository
+from adapter.telemetry.heartbeat import heartbeat_task_scope
+from adapter.telemetry.sdk import (
+    init_telemetry,
+    resolve_otlp_headers,
+    shutdown_telemetry,
+)
 from apps.worker.dispatch import run_dispatch_loop
 from apps.worker.logging_config import configure_logging
 from apps.worker.settings import WorkerSettings
@@ -137,6 +164,7 @@ from indexing.embedding import EmbeddingError
 from indexing.pipeline import IndexingJobDependencies
 from llmgateway.client import LLMClient
 from llmgateway.exceptions import LLMError
+from llmgateway.routing import FallbackModelRoutingResolver
 from llmgateway.startup_check import check_llm_reachable
 from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review.config import (
@@ -489,6 +517,26 @@ def _log_memory_suppression_disabled_warning(
         )
 
 
+def _log_model_routing_disabled_warning(settings: WorkerSettings, logger: logging.Logger) -> None:
+    """A one-time `warning`-level startup log when `model_routing_config_enabled`
+    is `False` (docs/plans/plan-deliver-admin-gui.md's Phase 5 section, Unit
+    F) — mirrors `_log_memory_suppression_disabled_warning`'s own shape
+    exactly: the deployment can still boot and run correctly (disabling
+    model routing restores exactly this phase's own prior LLM-calling step
+    construction — every step uses `settings.llm_model` directly, zero
+    `ModelRoutingConfig` reads), but the deviation from the shipped default
+    — every org/stage gets the one static default model, regardless of any
+    `ModelRoutingConfig` row an Admin may have written — must be visible,
+    not silent.
+    """
+    if not settings.model_routing_config_enabled:
+        logger.warning(
+            "model routing is disabled: every stage uses the static default model, "
+            "regardless of any ModelRoutingConfig row",
+            extra={"model_routing_config_enabled": False},
+        )
+
+
 _DEPRECATED_SETTINGS_ENV_VARS: tuple[tuple[str, str], ...] = (
     ("REVIEW_WORKER_LLM_REVIEW_ENABLED", "REVIEW_WORKER_REVIEW_GENERATION_ENABLED"),
     (
@@ -667,6 +715,7 @@ def _build_review_registry(
     publisher: GitHubFindingsPublisher,
     settings: WorkerSettings,
     memory_matcher: PostgresMemoryRepository,
+    model_resolver: FallbackModelRoutingResolver | None,
 ) -> StepRegistry:
     """Construct the macro-step registry `REVIEW` jobs dispatch to.
 
@@ -735,6 +784,20 @@ def _build_review_registry(
     above, this isn't gated through `enabled_mapping`/`resolved` — it's an
     internal behavior toggle inside the already-registered `verification`
     step, not a separate pipeline stage of its own.
+
+    `docs/plans/plan-deliver-admin-gui.md`'s Phase 5 section (Unit F,
+    Assumption 3) adds `model_resolver` — passed as a new
+    `model_resolver=` keyword argument to all three LLM-calling steps
+    (`IntentSummaryStep`/`ReviewGenerationStep`/`VerificationStep`),
+    alongside their existing `llm_step_kwargs` (which still includes
+    `model`, now each step's own fallback/default when `model_resolver` is
+    `None`). `None` when `model_routing_config_enabled` is `False`,
+    restoring byte-for-byte each step's pre-Phase-5 construction (every
+    call uses `settings.llm_model` directly). When set, each step resolves
+    its own model at dispatch time inside its own `run()` — this function
+    never overwrites an already-built step's `model` field from the
+    outside, per architecture.md's "no stage reaching into another stage's
+    internals" rule.
     """
     enabled_mapping = enablement.as_mapping()
     timeouts_mapping = timeouts.as_mapping()
@@ -814,17 +877,20 @@ def _build_review_registry(
             IntentSummaryStep(
                 llm_client,
                 **llm_step_kwargs,
+                model_resolver=model_resolver,
                 depends_on=resolved["intent_summary"],
             ),
             ReviewGenerationStep(
                 llm_client,
                 redactor=redactor,
                 **llm_step_kwargs,
+                model_resolver=model_resolver,
                 depends_on=resolved["review_generation"],
             ),
             VerificationStep(
                 llm_client,
                 **llm_step_kwargs,
+                model_resolver=model_resolver,
                 depends_on=resolved["verification"],
                 memory_suppression=memory_suppression,
             ),
@@ -857,6 +923,7 @@ async def _run_dispatch_loop_forever(
     settings: WorkerSettings,
     worker_id: str,
     http_client: httpx.AsyncClient,
+    usage_counter_recorder: PostgresUsageCounterRepository,
 ) -> None:
     """The one seam `main()` exposes for the dispatch loop itself — real in
     production, substituted with a no-op fake in
@@ -871,6 +938,14 @@ async def _run_dispatch_loop_forever(
     coroutine/event-loop it's used from for the loop's entire lifetime,
     regardless of whether the loop returns normally or the process is
     interrupted.
+
+    `usage_counter_recorder` (docs/plans/plan-deliver-admin-gui.md's Phase
+    7 section, Unit H, US-A19) — always a real
+    `PostgresUsageCounterRepository` in production; no kill switch, per
+    that phase's own Observability & rollback section ("this side effect
+    fails soft... a metering bug can never turn into a review-pipeline
+    outage" on its own, so no separate off switch is needed the way
+    `model_routing_config_enabled` needs one).
     """
     try:
         await run_dispatch_loop(
@@ -882,26 +957,50 @@ async def _run_dispatch_loop_forever(
             poll_interval_seconds=settings.poll_interval_seconds,
             stuck_job_warning_threshold_seconds=settings.stuck_job_warning_threshold_seconds,
             dry_run=settings.dry_run,
+            usage_counter_recorder=usage_counter_recorder,
         )
     finally:
         await http_client.aclose()
 
 
-async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMClient) -> None:
+async def _amain(
+    settings: WorkerSettings, logger: logging.Logger, client: LLMClient, *, telemetry_enabled: bool
+) -> None:
     """The async body of `main()` below, run inside a single `asyncio.run()`
     call for the whole process lifetime.
 
-    Everything here — the LLM startup check and the dispatch loop alike —
-    must share one event loop: `client` (and, once built, `github_http_client`)
-    carry async resources (e.g. LiteLLM's own cached async HTTP client/
-    connection pool, keyed by call params rather than by event loop) that
-    are bound to whichever loop first uses them. Splitting the startup check
-    and the dispatch loop across two separate `asyncio.run()` calls, as an
-    earlier version of this function did, closes the first loop out from
-    under those resources before the dispatch loop (running in a second,
-    new loop) ever gets to reuse them — surfacing as a
-    "bound to a different event loop" error on the first real job, not at
-    startup.
+    A thin try/finally around `_run` below: flushes/shuts down the OTel
+    providers before the process exits — see `shutdown_telemetry`'s own
+    docstring for why this is needed on top of `init_telemetry`'s default
+    batching/export intervals — the same "wrap the real body in a thin
+    finally, don't re-indent it" shape `apps/webhook_api/main.py`'s
+    `_build_lifespan` uses for the equivalent shutdown hook. Wraps the
+    startup checks too (not just the dispatch loop/heartbeat task) so a
+    fail-fast `SystemExit` from any of them (e.g. a misconfigured GitHub
+    App key) still flushes whatever telemetry was already buffered, instead
+    of dropping it silently.
+    """
+    try:
+        await _run(settings, logger, client, telemetry_enabled=telemetry_enabled)
+    finally:
+        if telemetry_enabled:
+            await shutdown_telemetry()
+
+
+async def _run(
+    settings: WorkerSettings, logger: logging.Logger, client: LLMClient, *, telemetry_enabled: bool
+) -> None:
+    """`_amain`'s real body: startup checks, adapter/registry construction,
+    then the dispatch loop — everything here must share one event loop.
+    `client` (and, once built, `github_http_client`) carry async resources
+    (e.g. LiteLLM's own cached async HTTP client/connection pool, keyed by
+    call params rather than by event loop) that are bound to whichever loop
+    first uses them. Splitting the startup check and the dispatch loop
+    across two separate `asyncio.run()` calls, as an earlier version of
+    this function did, closes the first loop out from under those resources
+    before the dispatch loop (running in a second, new loop) ever gets to
+    reuse them — surfacing as a "bound to a different event loop" error on
+    the first real job, not at startup. `_amain` is the only caller.
     """
     await _check_llm_startup(client, settings, logger)
 
@@ -928,6 +1027,25 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
     redactor = _build_text_redactor(settings, logger)
     _log_verification_disabled_warning(settings, logger)
     _log_memory_suppression_disabled_warning(settings, logger)
+    _log_model_routing_disabled_warning(settings, logger)
+    # docs/plans/plan-deliver-admin-gui.md's Phase 5 section (Unit F,
+    # Assumption 3) — `None` when `model_routing_config_enabled` is
+    # `False`, restoring exactly the pre-Phase-5 construction (every
+    # LLM-calling step uses `settings.llm_model` directly, zero
+    # `ModelRoutingConfig` reads). The same `FallbackModelRoutingResolver`
+    # *class* `apps/admin_api/main.py`'s own composition root also wires
+    # (a separate instance here, sharing the class, never a second
+    # independently-derived fallback chain) — see that module's own
+    # docstring for why this one implementation is shared by name across
+    # both entrypoints.
+    model_routing_repository = PostgresModelRoutingRepository(session_factory)
+    model_routing_resolver = (
+        FallbackModelRoutingResolver(
+            model_routing_repository, static_default_model=settings.llm_model
+        )
+        if settings.model_routing_config_enabled
+        else None
+    )
     # The same database session factory IndexRepository already uses (see
     # `_build_indexing_deps` below) — no second connection pool. Built here,
     # ahead of `publisher`, so `_build_findings_publisher` (Phase 2, US-M11)
@@ -951,6 +1069,7 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
         publisher,
         settings,
         memory_repository,
+        model_routing_resolver,
     )
     index_repository = IndexingRepository(session_factory)
     indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)
@@ -962,9 +1081,14 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
         settings, reaction_fetcher, memory_repository
     )
     worker_id = _build_worker_id()
+    # docs/plans/plan-deliver-admin-gui.md's Phase 7 section (Unit H,
+    # US-A19) — the same `session_factory` every other storage adapter
+    # here already shares, no second connection pool. Always wired in, no
+    # kill switch (see `_run_dispatch_loop_forever`'s own docstring).
+    usage_counter_recorder = PostgresUsageCounterRepository(session_factory)
 
     logger.info("worker started", extra={"worker_id": worker_id})
-    await _run_dispatch_loop_forever(
+    dispatch_loop_forever = _run_dispatch_loop_forever(
         job_queue,
         registry,
         indexing_deps,
@@ -972,7 +1096,13 @@ async def _amain(settings: WorkerSettings, logger: logging.Logger, client: LLMCl
         settings,
         worker_id,
         github_http_client,
+        usage_counter_recorder,
     )
+    # The heartbeat task is started only when telemetry is configured,
+    # per US10 — see `heartbeat_task_scope`'s own docstring for the
+    # create/cancel sequencing shared with `apps/webhook_api/main.py`.
+    async with heartbeat_task_scope(telemetry_enabled):
+        await dispatch_loop_forever
 
 
 def main() -> None:
@@ -987,6 +1117,14 @@ def main() -> None:
     """
     settings = WorkerSettings()
     configure_logging(settings.log_level)
+    # docs/specs/spec-observability.md's Unit A: process-wide observability
+    # bootstrapping, alongside `configure_logging` above — a true no-op
+    # (US10) when `settings.otel_exporter_otlp_endpoint` is unset.
+    telemetry_enabled = init_telemetry(
+        otlp_endpoint=settings.otel_exporter_otlp_endpoint,
+        service_name="review-worker",
+        otlp_headers=resolve_otlp_headers(settings.otel_exporter_otlp_headers),
+    )
 
     logger = logging.getLogger(__name__)
     _check_deprecated_settings_env_vars(logger)
@@ -994,7 +1132,7 @@ def main() -> None:
     logger.info("worker starting", extra={"environment": settings.environment})
 
     client = _build_llm_client(settings)
-    asyncio.run(_amain(settings, logger, client))
+    asyncio.run(_amain(settings, logger, client, telemetry_enabled=telemetry_enabled))
 
 
 if __name__ == "__main__":

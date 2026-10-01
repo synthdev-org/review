@@ -58,6 +58,16 @@ class WebhookEvent(BaseModel):
     genuine, benign production case (Phase 5 skips the pre-change fetch
     entirely when it's ``None``), not only a deploy-migration-window
     concern.
+
+    ``repo_private`` (docs/plans/plan-deliver-admin-gui.md's Phase 7
+    section, Unit H, US-A19) is whether GitHub reports this repo as
+    private — sourced from ``adapter/github/schemas.py``'s
+    ``Repository.private`` (see that field's own docstring for why it
+    defaults to ``False`` rather than being required), threaded through by
+    ``apps/webhook_api/webhook_routes.py``'s ``_build_webhook_event`` into
+    the ``REVIEW`` job payload's own ``"private"`` field so
+    ``apps/worker/dispatch.py`` can decide whether a completed job counts
+    toward the free-tier usage counter.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -69,6 +79,7 @@ class WebhookEvent(BaseModel):
     pr_number: int | None
     head_sha: str | None
     base_sha: str | None = None
+    repo_private: bool = False
 
 
 class OrgRepoIds(BaseModel):

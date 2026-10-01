@@ -64,15 +64,19 @@ files they don't need.
    AWS/Azure/GCP Secrets Manager, External Secrets Operator, Sealed Secrets,
    or similar) — the Helm chart's job is to consume a `Secret` object, not to
    pick which tool populates it. See "Configuration & Secrets" below.
-8. **Optional augmentation, never a dependency.** Review owns its full code
-   indexing pipeline outright — chunking, embeddings, and the call/import
-   graph never depend on any other system, and the platform is fully
-   functional with none configured. A separate, independently-deployed
-   product — knowhow, a general-purpose multi-source RAG knowledge base
-   (Confluence, Slack, tickets, and more) — can optionally be connected over
-   its MCP API to add non-code product knowledge to review context. Its
-   absence is a normal, fully supported deployment state, not a degraded
-   one. (See [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).)
+8. **Optional augmentation, never a dependency, and never locked to one
+   vendor.** Review owns its full code indexing pipeline outright —
+   chunking, embeddings, and the call/import graph never depend on any
+   other system, and the platform is fully functional with none configured.
+   Any external product-knowledge provider — a general-purpose multi-source
+   RAG knowledge base (Confluence, Slack, tickets, and more) — can
+   optionally be connected over MCP, provided it implements review's own
+   vendor-neutral product-knowledge contract, to add non-code product
+   knowledge to review context. knowhow is that contract's reference and
+   first implementation, not a special-cased dependency. Absence of any
+   configured provider is a normal, fully supported deployment state, not a
+   degraded one. (See
+   [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).)
 9. **Continual learning must be human-validated and reversible, not silent.**
    The platform is meant to get better at reviewing a given codebase over
    successive PRs — the pattern every mature vendor converges on independently
@@ -133,11 +137,15 @@ development, Kubernetes/Helm for production. There is no vendor-hosted
 counterpart.
 
 A third, *optional* external system is deliberately omitted from the diagram
-above because nothing in the platform depends on it: **knowhow**, a separate
-self-hosted product a customer may also run. When configured, the Worker's
-Context Builder calls knowhow's MCP API to pull in non-code product knowledge
-(Confluence, Slack, tickets) alongside review's own code-derived context — see
-Level 2 and [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).
+above because nothing in the platform depends on it: **an external
+product-knowledge provider** — any MCP server implementing review's own
+product-knowledge contract, with **knowhow** (a separate self-hosted product
+a customer may also run) as that contract's reference implementation. When
+configured, the Worker's Context Builder calls the configured provider's MCP
+endpoint to pull in non-code product knowledge (Confluence, Slack, tickets,
+or whatever the provider connects) alongside review's own code-derived
+context — see Level 2 and
+[ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).
 
 ---
 
@@ -151,8 +159,7 @@ Level 2 and [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).
 │  │ Webhook API              │  FastAPI service. Verifies GitHub webhook        │
 │  │ (stateless, scales        │  signature, resolves the installation/org/repo,  │
 │  │  horizontally)             │  enqueues a review or reindex job. Also serves   │
-│  │                             │  the GitHub App callback + minimal admin/config │
-│  │                             │  endpoints.                                      │
+│  │                             │  the GitHub App callback.                       │
 │  └───────────┬─────────────────┘                                                │
 │              │ enqueues                                                         │
 │              ▼                                                                  │
@@ -182,6 +189,18 @@ Level 2 and [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).
 │  └────────────────────────────────────────────────────────────────┘               │
 │              │ reads/writes                                                     │
 │              ▼                                                                  │
+│  ┌───────────────────────┐                                                     │
+│  │ Admin API                 │  FastAPI service, standalone from Webhook API   │
+│  │ (stateless, scales         │  and Worker — own image/Deployment, per        │
+│  │  horizontally, reads/       │  ADR-0001's 2026-09-20 amendment. Local       │
+│  │  writes Postgres directly,  │  login, org/repo/team config, Memory          │
+│  │  no job queue involved)     │  approve/reject/delete (moved here from       │
+│  │                              │  Webhook API), model routing, admin-stats    │
+│  │                              │  dashboard, free-tier usage disclosure       │
+│  │                              │  (design goal 9).                            │
+│  └───────────┬──────────────────┘                                              │
+│              │ reads/writes                                                     │
+│              ▼                                                                  │
 │  ┌───────────────────────────────────────────────────────────────┐            │
 │  │ Postgres + pgvector                    (the one stateful dependency)          │
 │  │  — repo index (AST chunks, embeddings, call/import graph)                     │
@@ -201,11 +220,15 @@ Level 2 and [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).
 
 **Reading this diagram:**
 
-- **Two deployable components, not five.** Webhook API and Worker are the only
-  two container images to build, scan, and patch — indexing and review are
-  both job types the same Worker pool handles, dispatched by job type, rather
-  than separate services. Fewer images is fewer things for an enterprise
-  security team to have to approve and for us to operate.
+- **Three deployable components, not five.** Webhook API, Worker, and the
+  Admin API (`apps/admin_api`, added by
+  [ADR-0001](../adr/0001-self-hosted-kubernetes-deployment.md)'s
+  2026-09-20 amendment and `docs/specs/spec-admin-gui.md`, standalone from
+  the Webhook API per an enterprise deployment requirement) are the only
+  three container images to build, scan, and patch — indexing and review
+  are both job types the same Worker pool handles, dispatched by job type,
+  rather than separate services. Fewer images is fewer things for an
+  enterprise security team to have to approve and for us to operate.
 - **No broker beyond Postgres.** The job queue lives in the same Postgres
   instance as everything else (`SKIP LOCKED`-style claiming), rather than
   requiring the customer to also stand up Redis or Kafka. This can move behind
@@ -255,16 +278,22 @@ Level 2 and [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).
   keeps indexing free of inference spend the customer never asked for. Richer
   enrichment techniques are deferred as an optional, explicitly opt-in
   capability — see [ADR-0007](../adr/0007-llm-free-indexing-deferred-rag-enrichment.md).
-- **Context Builder can optionally call out to knowhow.** After querying
-  review's own index, the Context Builder makes an additional MCP client call
-  to knowhow (`knowhow_search`/`knowhow_fetch`/`knowhow_related`) when a
-  knowhow endpoint is configured for the org/repo, pulling in non-code
-  product knowledge (Confluence, Slack, tickets). Review's own code-derived
-  context and knowhow's product-knowledge results are kept as distinct,
-  labeled sources in the bundle handed to the LLM Gateway, never silently
+- **Context Builder can optionally call out to an external product-knowledge
+  provider.** After querying review's own index, the Context Builder makes
+  an additional MCP client call against review's own product-knowledge
+  contract (`product_knowledge_search`/`product_knowledge_fetch`/
+  `product_knowledge_related`) when a provider endpoint is configured for
+  the org/repo, pulling in non-code product knowledge (Confluence, Slack,
+  tickets, or whatever the configured provider connects). Review's own
+  code-derived context and the provider's product-knowledge results are kept
+  as distinct, labeled sources — labeled with the provider's configured
+  display name — in the bundle handed to the LLM Gateway, never silently
   merged — the two carry different trust/freshness characteristics. This
   call is skipped entirely, with no error and no degraded behavior, when no
-  knowhow endpoint is configured. See
+  provider endpoint is configured. knowhow is the contract's reference
+  implementation and the only one that exists today, but review's Context
+  Builder code has no knowledge of, or dependency on, which product sits
+  behind the endpoint. See
   [ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md).
 - **Config is customer-owned platform state, not repo files.** Helm values set
   it up at install time; day-two changes go through the platform's own
@@ -292,10 +321,10 @@ Two different kinds of configuration exist, deliberately handled differently:
   rule — never read ad hoc from domain or adapter code.
 - **Day-two platform config** — org/repo/team settings, per-stage model
   routing, rules, Memory, and — when the optional augmentation is enabled — a
-  per-org/repo knowhow endpoint and credential
-  ([ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md)). This
-  already lives in Postgres, managed through the platform's own admin API
-  (see Level 2 above) — not a file, not an env var.
+  per-org/repo product-knowledge provider endpoint, credential, and display
+  label ([ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md)).
+  This already lives in Postgres, managed through the platform's own admin
+  API (see Level 2 above) — not a file, not an env var.
 
 Bootstrap config is rendered by the Helm chart as a `ConfigMap` (non-secret
 values) and a `Secret` (credentials), sourced from `values.yaml` for a quick
@@ -380,7 +409,12 @@ entirely outside the product's supported configuration contract.)
   committed to the MVP release, not a fast-follow (the Memory
   approve/reject/delete surface scoped by design goal 9 is its first
   concrete screen) — but whether SSO/OIDC ships in that same MVP or follows
-  shortly after is still open.
+  shortly after is still open. Whether this product joins the cross-product
+  identity broker is separately resolved (yes, in principle — see
+  `platform/docs/adr/0005-cross-product-identity-broker.md`'s 2026-09-10
+  amendment): this product has no local login/user-identity model at all
+  yet (no `user` table, no login code), which is the real prerequisite this
+  bullet is blocked on, not just SSO timing.
 - Exact schema for per-team rules/config and for Memory entries specifically
   — column-level design for status/provenance/approver/timestamps (design
   goal 9), and how a dismissal turns into the similarity-check signal design
@@ -393,11 +427,11 @@ entirely outside the product's supported configuration contract.)
 - GitLab/Bitbucket adapters are explicitly deferred, not designed away — the
   git-host boundary in the domain layer must not leak GitHub-specific shapes
   (webhook payload fields, check-run semantics) into pipeline logic.
-- Exact context-fusion/citation UX for the optional knowhow augmentation —
-  how dual-sourced (code vs. product-knowledge) context is presented to the
-  review-generation LLM call, and how citations back to knowhow-sourced
-  content should render in a posted PR comment
+- Exact context-fusion/citation UX for the optional product-knowledge
+  augmentation — how dual-sourced (code vs. product-knowledge) context is
+  presented to the review-generation LLM call, and how citations back to
+  provider-sourced content should render in a posted PR comment
   ([ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md)).
-- Knowhow's MCP contract versioning/deprecation policy — needs confirming
-  before the augmentation ships as a supported feature, not just a
-  prototype.
+- Review's own product-knowledge MCP contract versioning/deprecation policy
+  — needs confirming before the augmentation ships as a supported feature,
+  not just a prototype.

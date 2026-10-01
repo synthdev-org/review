@@ -9,17 +9,43 @@ internal-only change), US-F2 (independent steps run concurrently), US-F3
 disabled step is never invoked), and US-F6 (a raising *or* timed-out macro
 step is fatal and short-circuits every downstream step) — matching
 docs/specs/pipeline-step-framework.md's own Testing table.
+
+Also covers US2 (docs/specs/spec-observability.md, Unit B): the
+``review.job.run`` root span / ``review.step.{name}`` child span / the
+``review.pipeline.step.duration_ms`` histogram ``StepRegistry.run()``/
+``_run_one`` record around every step outcome (success, failed, timeout,
+disabled) — proven here, against the same fakes the rest of this file
+already uses, rather than in ``review/test_review_job.py``'s own single
+"a review job" acceptance case (which proves the shape end to end, not
+every outcome). Uses OTel's own in-memory SDK test components
+(``InMemorySpanExporter``/``InMemoryMetricReader``), genuinely no I/O, per
+``testing.md``'s Unit tier — and asserts the exact, fixed attribute
+allowlist on every emitted span/metric per the Privacy/Compliance NFR
+(never a step's own exception text).
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from opentelemetry import metrics as otel_metrics
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import Histogram, InMemoryMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from adapter.telemetry.conftest import (
+    reset_otel_global_providers as _reset_otel_global_providers,  # noqa: F401
+)
+from review import pipeline as pipeline_module
 from review.pipeline import FailurePolicy, PipelineFailedError, StepFailureInfo, StepRegistry
 from review.step import StepContext
 
@@ -533,3 +559,299 @@ def test_circular_dependency_rejected_at_construction() -> None:
             timeouts=_uniform_timeouts(5, "a", "b"),
             on_failure=FailurePolicy.FATAL,
         )
+
+
+# --- US2: review.job.run root span / review.step.{name} child span / ------
+# --- review.pipeline.step.duration_ms histogram -----------------------------
+
+
+@pytest.fixture
+def in_memory_span_exporter(
+    reset_otel_global_providers: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[InMemorySpanExporter]:
+    """Registers a real ``TracerProvider`` backed by ``InMemorySpanExporter``
+    as the *global* one — required for ``review.pipeline``'s module-level
+    ``tracer`` (created once, at import time) to pick this test's provider
+    up.
+
+    Unlike ``MeterProvider``'s own proxy-instrument migration (see
+    ``adapter/telemetry/test_heartbeat.py``'s identical fixture docstring),
+    the installed ``opentelemetry-api``'s own ``ProxyTracer`` caches its
+    resolved real ``Tracer`` permanently on first use
+    (``opentelemetry.trace.ProxyTracer._tracer``'s own ``if
+    self._real_tracer: return self._real_tracer`` — no per-set-provider
+    re-migration callback the way ``ProxyMeter`` has) — verified against
+    the installed ``opentelemetry-api`` source. Left alone, only the first
+    test in the whole process to use this fixture would ever see
+    ``review.pipeline.tracer`` pick up its own provider; every later test
+    would keep exporting to the first test's already-``shutdown()``
+    exporter. This fixture resets that cache directly (the same "reach
+    into OTel's own private state between tests" approach
+    ``adapter/telemetry/conftest.py``'s own fixture already takes for the
+    module-level globals) so every test using this fixture gets a fresh
+    migration."""
+    monkeypatch.setattr(pipeline_module.tracer, "_real_tracer", None, raising=False)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(resource=Resource.create({"service.name": "review-test"}))
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    otel_trace.set_tracer_provider(provider)
+    yield exporter
+    provider.shutdown()
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> Iterator[InMemoryMetricReader]:
+    """Registers a real ``MeterProvider`` backed by ``InMemoryMetricReader``
+    as the *global* one — same reasoning as ``in_memory_span_exporter``
+    above, for ``review.pipeline``'s module-level ``_step_duration_histogram``."""
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-test"}), metric_readers=[reader]
+    )
+    otel_metrics.set_meter_provider(provider)
+    yield reader
+    provider.shutdown()
+
+
+def _histogram_data_points(
+    reader: InMemoryMetricReader, metric_name: str
+) -> list[tuple[float, int, dict[str, object]]]:
+    """Returns ``(sum, count, attributes)`` per data point recorded against
+    ``metric_name``."""
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+    points: list[tuple[float, int, dict[str, object]]] = []
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != metric_name:
+                    continue
+                assert isinstance(metric.data, Histogram)
+                for data_point in metric.data.data_points:
+                    points.append(
+                        (data_point.sum, data_point.count, dict(data_point.attributes or {}))
+                    )
+    return points
+
+
+@dataclass
+class _SeedWithIdentity:
+    """A minimal stand-in for a ``review.step.JobIdentity``-derived
+    ``seed_input`` — only the two string attributes ``run()``'s own
+    best-effort org/repo span attributes look for, per this module's own
+    "set org/repo attributes too if/when available in that scope" note."""
+
+    org_id: str
+    repo_id: str
+
+
+@pytest.mark.asyncio
+async def test_run_produces_root_span_tagged_with_job_id_only_when_seed_has_no_identity(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    registry = StepRegistry(
+        [_FakeStep(name="a")],
+        enabled=_all_enabled("a"),
+        timeouts=_uniform_timeouts(5, "a"),
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    await registry.run(seed_input="diff", context=_context(job_id="job-1"))
+
+    spans = in_memory_span_exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "review.job.run")
+    # Privacy/Compliance NFR: the root span's attribute set is a fixed
+    # allowlist — a plain-string seed_input has no org_id/repo_id, so only
+    # the job ID is present, never anything derived from the seed itself.
+    assert dict(root.attributes or {}) == {"review.job.id": "job-1"}
+
+
+@pytest.mark.asyncio
+async def test_run_root_span_includes_org_and_repo_id_when_present_on_seed_input(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    registry = StepRegistry(
+        [_FakeStep(name="a")],
+        enabled=_all_enabled("a"),
+        timeouts=_uniform_timeouts(5, "a"),
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    await registry.run(
+        seed_input=_SeedWithIdentity(org_id="org-1", repo_id="repo-2"),
+        context=_context(job_id="job-2"),
+    )
+
+    spans = in_memory_span_exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "review.job.run")
+    assert dict(root.attributes or {}) == {
+        "review.job.id": "job-2",
+        "review.job.org_id": "org-1",
+        "review.job.repo_id": "repo-2",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_root_span_ignores_non_string_org_and_repo_id(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    """A ``seed_input`` whose ``org_id``/``repo_id`` aren't strings (any
+    other shape than a real ``JobIdentity``-derived model) never blocks or
+    fails the trace — per ``run()``'s own docstring, this is best-effort."""
+
+    @dataclass
+    class _WronglyTypedSeed:
+        org_id: int
+        repo_id: int
+
+    registry = StepRegistry(
+        [_FakeStep(name="a")],
+        enabled=_all_enabled("a"),
+        timeouts=_uniform_timeouts(5, "a"),
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    await registry.run(seed_input=_WronglyTypedSeed(org_id=1, repo_id=2), context=_context())
+
+    spans = in_memory_span_exporter.get_finished_spans()
+    root = next(span for span in spans if span.name == "review.job.run")
+    assert dict(root.attributes or {}) == {"review.job.id": "job-1"}
+
+
+@pytest.mark.asyncio
+async def test_run_produces_a_child_span_per_step_nested_under_the_root(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    step_a = _FakeStep(name="a")
+    step_b = _FakeStep(name="b")
+    registry = StepRegistry(
+        [step_a, step_b],
+        enabled=_all_enabled("a", "b"),
+        timeouts=_uniform_timeouts(5, "a", "b"),
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    await registry.run(seed_input="diff", context=_context())
+
+    spans = in_memory_span_exporter.get_finished_spans()
+    by_name = {span.name: span for span in spans}
+    assert set(by_name) == {"review.job.run", "review.step.a", "review.step.b"}
+    root = by_name["review.job.run"]
+
+    for step_name in ("a", "b"):
+        child = by_name[f"review.step.{step_name}"]
+        assert child.parent is not None
+        assert child.parent.span_id == root.context.span_id
+        # Privacy/Compliance NFR: exactly this fixed allowlist.
+        attrs = dict(child.attributes or {})
+        assert set(attrs) == {
+            "review.step.name",
+            "review.step.status",
+            "review.step.duration_ms",
+        }
+        assert attrs["review.step.name"] == step_name
+        assert attrs["review.step.status"] == "success"
+        assert isinstance(attrs["review.step.duration_ms"], int)
+        assert attrs["review.step.duration_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_run_child_span_records_failed_status_without_leaking_exception_text(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    failing = _FakeStep(name="a", error=RuntimeError("do-not-leak-this-secret"))
+    registry = StepRegistry(
+        [failing],
+        enabled=_all_enabled("a"),
+        timeouts=_uniform_timeouts(5, "a"),
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    with pytest.raises(PipelineFailedError):
+        await registry.run(seed_input="diff", context=_context())
+
+    spans = in_memory_span_exporter.get_finished_spans()
+    child = next(span for span in spans if span.name == "review.step.a")
+    attrs = dict(child.attributes or {})
+    # Privacy/Compliance NFR: exactly this fixed allowlist — no "error"
+    # key, and the exception's own text never appears in any value.
+    assert set(attrs) == {"review.step.name", "review.step.status", "review.step.duration_ms"}
+    assert attrs["review.step.status"] == "failed"
+    assert "do-not-leak-this-secret" not in " ".join(str(v) for v in attrs.values())
+    assert child.status.status_code != otel_trace.StatusCode.ERROR
+
+
+@pytest.mark.asyncio
+async def test_run_child_span_records_timeout_status(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    slow = _FakeStep(name="a", delay_seconds=0.3)
+    registry = StepRegistry(
+        [slow],
+        enabled=_all_enabled("a"),
+        timeouts={"a": 0.05},
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    with pytest.raises(PipelineFailedError):
+        await registry.run(seed_input="diff", context=_context())
+
+    spans = in_memory_span_exporter.get_finished_spans()
+    child = next(span for span in spans if span.name == "review.step.a")
+    assert dict(child.attributes or {})["review.step.status"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_run_disabled_step_never_gets_a_child_span(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    enabled_step = _FakeStep(name="a")
+    disabled_step = _FakeStep(name="b")
+    registry = StepRegistry(
+        [enabled_step, disabled_step],
+        enabled={"a": True, "b": False},
+        timeouts=_uniform_timeouts(5, "a", "b"),
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    await registry.run(seed_input="diff", context=_context())
+
+    span_names = {span.name for span in in_memory_span_exporter.get_finished_spans()}
+    assert "review.step.a" in span_names
+    assert "review.step.b" not in span_names
+
+
+@pytest.mark.asyncio
+async def test_step_duration_histogram_records_bounded_attributes_matching_span(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    succeeding = _FakeStep(name="a")
+    failing = _FakeStep(name="b", error=RuntimeError("do-not-leak-this-either"))
+    registry = StepRegistry(
+        [succeeding, failing],
+        enabled=_all_enabled("a", "b"),
+        timeouts=_uniform_timeouts(5, "a", "b"),
+        on_failure=FailurePolicy.ISOLATE,
+    )
+
+    await registry.run(seed_input="diff", context=_context())
+
+    points = _histogram_data_points(in_memory_metric_reader, "review.pipeline.step.duration_ms")
+    by_attrs = {tuple(sorted(attrs.items())): (total, count) for total, count, attrs in points}
+
+    success_key = (("status", "success"), ("step_name", "a"))
+    failed_key = (("status", "failed"), ("step_name", "b"))
+    assert success_key in by_attrs
+    assert failed_key in by_attrs
+    for total, count in by_attrs.values():
+        assert count == 1
+        assert total >= 0
+
+    # Privacy/Compliance NFR: every recorded attribute set is exactly
+    # {"step_name", "status"} — never the failing step's own exception text.
+    for _, _, attrs in points:
+        assert set(attrs) == {"step_name", "status"}
+        assert "do-not-leak-this-either" not in " ".join(str(v) for v in attrs.values())

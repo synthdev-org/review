@@ -110,7 +110,8 @@ document; this is walking-skeleton infrastructure, not a metered feature.
 - Admin UI, DB-backed day-two step/org/repo/team configuration — Phase 5
   (also out of scope per `pipeline-step-framework.md`).
 - Multi-org RBAC beyond simple auto-provisioned Org/Repo rows — Phase 6.
-- Knowhow augmentation — Phase 7.
+- External product-knowledge augmentation (knowhow as reference
+  implementation) — Phase 7.
 - **Comment-triggered re-review** (e.g. a `/review` slash-command like
   PR-Agent's) — not part of the roadmap's Phase 1 scope; only the PR
   lifecycle events listed above trigger a review.

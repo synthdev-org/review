@@ -49,6 +49,13 @@ mutants/
 .idea/
 .DS_Store
 
+# Frontend build artifacts (apps/admin_api/frontend, Phase 8) — node_modules
+# is regenerable from package-lock.json; dist/ (already covered by the
+# generic `dist/` pattern above) is built fresh by the Docker image's own
+# frontend-build stage, never committed.
+apps/admin_api/frontend/node_modules/
+apps/admin_api/frontend/dist/
+
 # Helm build artifacts (charts/review, Phase 6) — `helm dependency update`
 # packages the local charts/postgresql/ subchart source into a .tgz plus a
 # Chart.lock; both are regenerable from source and neither should be
