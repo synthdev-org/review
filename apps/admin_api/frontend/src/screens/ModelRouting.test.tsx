@@ -4,6 +4,7 @@
 // docs/plans/plan-deliver-admin-gui.md's Phase 8 section.
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { axe } from "vitest-axe";
 
 import type { ModelRoutingView } from "../api/types";
 import { ModelRoutingScreen } from "./ModelRouting";
@@ -97,5 +98,12 @@ describe("ModelRoutingScreen", () => {
     render(<ModelRoutingScreen />);
     await screen.findByText("review_generation");
     expect(screen.queryByRole("button", { name: /save routing/i })).not.toBeInTheDocument();
+  });
+
+  it("has no detectable accessibility violations", async () => {
+    getModelRouting.mockResolvedValue(view);
+    const { container } = render(<ModelRoutingScreen />);
+    await screen.findByText("review_generation");
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

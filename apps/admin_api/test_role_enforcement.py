@@ -22,6 +22,10 @@ from pathlib import Path
 import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -119,8 +123,46 @@ def _mount_admin_only_dummy_route(app: FastAPI, *, settings: AdminAPISettings, d
         return {"username": authenticated.user.username}
 
 
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> InMemoryMetricReader:
+    """Registers a real `MeterProvider` backed by `InMemoryMetricReader` as
+    the global one, so `apps.admin_api.dependencies`'s module-level
+    `_session_rejected_counter` (created once, at import time) picks it up
+    via OTel's proxy-instrument migration mechanism — mirrors
+    `apps/admin_api/test_auth_routes.py`'s identical fixture."""
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-admin-api-test"}),
+        metric_readers=[reader],
+    )
+    metrics.set_meter_provider(provider)
+    return reader
+
+
+def _session_rejected_points(
+    reader: InMemoryMetricReader,
+) -> list[tuple[float, dict[str, object]]]:
+    metrics_data = reader.get_metrics_data()
+    if metrics_data is None:
+        return []
+    points: list[tuple[float, dict[str, object]]] = []
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != "review.admin.session_rejected_total":
+                    continue
+                assert isinstance(metric.data, Sum)
+                for data_point in metric.data.data_points:
+                    points.append((data_point.value, dict(data_point.attributes or {})))
+    return points
+
+
 def test_require_admin_role_rejects_a_viewer_session_with_403(
-    migrated_engine: AsyncEngine, tmp_path: Path
+    migrated_engine: AsyncEngine,
+    tmp_path: Path,
+    in_memory_metric_reader: InMemoryMetricReader,
 ) -> None:
     dsn = str(migrated_engine.url.render_as_string(hide_password=False))
     settings = _settings(dsn=dsn)
@@ -144,6 +186,13 @@ def test_require_admin_role_rejects_a_viewer_session_with_403(
         response = client.get("/__test-only/admin-only")
 
         assert response.status_code == 403
+
+    # `apps/admin_api/dependencies.py`'s `review.admin.session_rejected_total`
+    # counter — the `role_forbidden` reason, the one of its four closed-set
+    # values the other module (`test_auth_routes.py`) can't exercise since it
+    # has no admin-role-gated route to set up a Viewer-vs-Admin mismatch
+    # against.
+    assert (1.0, {"reason": "role_forbidden"}) in _session_rejected_points(in_memory_metric_reader)
 
 
 def test_require_admin_role_allows_an_admin_session(

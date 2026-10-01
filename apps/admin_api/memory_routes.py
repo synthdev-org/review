@@ -69,6 +69,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Literal, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from opentelemetry import metrics
 from pydantic import BaseModel, Field
 
 from adapter.storage.iam import PostgresAuditLogRepository
@@ -96,6 +97,30 @@ from memory.store import (
 _ApproveEntryType = Literal["dismissed_finding", "accepted_fix", "correction"]
 
 logger = logging.getLogger(__name__)
+
+meter = metrics.get_meter("review.memory")
+
+# `{operation}` -> `"approve"`/`"reject"` (2 values). Phase 10's own
+# `_run_bulk_operation` folds a per-item failure into that item's
+# `_BulkItemResult.success=False` in the HTTP response body alone — no log
+# line, no metric — so an operator bulk-acting on the Memory queue has
+# today's only signal in a browser network tab, not a dashboard/alert.
+_bulk_operation_item_failed_counter = meter.create_counter(
+    "review.memory.bulk_operation_item_failed_total",
+    description="Count of individual entry failures inside a bulk-approve/bulk-reject call, "
+    "labeled by operation — these are swallowed into the per-item response body and would "
+    "otherwise have no server-side signal at all.",
+)
+
+# Unlabeled: this is the admin API's one call site of local embedding-model
+# inference (approve's `dismissed_finding` path) — a degraded embedding
+# runtime (OOM, model load failure, contention with a concurrently-running
+# indexing job) would otherwise only be visible as a structured 500 an
+# operator has to notice and report, never as a trend.
+_embedding_failed_counter = meter.create_counter(
+    "review.memory.embedding_failed_total",
+    description="Count of embedding computation failures during a dismissed_finding approval.",
+)
 
 # US-M8: "default limit=50, capped at 200" — enforced as a hard `Query`
 # upper bound (a request for more than this many rows is rejected with a
@@ -200,7 +225,10 @@ def _entry_id_not_found_or_invalid(entry_id: str, exc: Exception) -> NoReturn:
 
 
 async def _run_bulk_operation(
-    entry_ids: Sequence[str], operation: Callable[[str], Awaitable[object]]
+    entry_ids: Sequence[str],
+    operation: Callable[[str], Awaitable[object]],
+    *,
+    operation_name: Literal["approve", "reject"],
 ) -> _BulkOperationResponse:
     """Phase 10 (US-A23): run ``operation`` once per id in ``entry_ids``,
     collecting each id's own success/failure into the response rather than
@@ -222,6 +250,7 @@ async def _run_bulk_operation(
         try:
             await operation(entry_id)
         except HTTPException as exc:
+            _bulk_operation_item_failed_counter.add(1, {"operation": operation_name})
             results.append(_BulkItemResult(entry_id=entry_id, success=False, error=str(exc.detail)))
         else:
             results.append(_BulkItemResult(entry_id=entry_id, success=True, error=None))
@@ -304,6 +333,7 @@ def create_memory_router(
             try:
                 vectors = await asyncio.to_thread(embedding_client.embed, (fingerprint_text,))
             except EmbeddingError as exc:
+                _embedding_failed_counter.add(1)
                 raise HTTPException(
                     status_code=500, detail=f"embedding computation failed: {exc}"
                 ) from exc
@@ -425,6 +455,7 @@ def create_memory_router(
             lambda entry_id: approve_memory_entry(
                 entry_id, _ApproveRequest(entry_type=payload.entry_type), authenticated
             ),
+            operation_name="approve",
         )
 
     @router.post("/bulk-reject")
@@ -440,6 +471,7 @@ def create_memory_router(
         return await _run_bulk_operation(
             payload.entry_ids,
             lambda entry_id: reject_memory_entry(entry_id, authenticated),
+            operation_name="reject",
         )
 
     return router

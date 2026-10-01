@@ -19,7 +19,11 @@ repeat call; list filters/paginates correctly; every route rejects an
 unauthenticated request or one carrying the old, now fully retired static
 token; every mutating route rejects a Viewer session; approve/reject
 attribute the acting Admin's session identity (audit log +
-``approved_by_user_id``).
+``approved_by_user_id``). Also covers two counters added alongside the
+bulk routes: ``review.memory.bulk_operation_item_failed_total`` (a
+per-item bulk-approve/bulk-reject failure) and
+``review.memory.embedding_failed_total`` (a failed embedding computation
+during a ``dismissed_finding`` approval).
 """
 
 from __future__ import annotations
@@ -31,11 +35,16 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from adapter.auth.argon2_hasher import Argon2PasswordHasher
+from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
 from adapter.storage.engine import create_session_factory
 from adapter.storage.models import (
     AdminAuditLogRow,
@@ -51,6 +60,7 @@ from adapter.storage.models import (
 from apps.admin_api.dependencies import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
 from apps.admin_api.main import create_app
 from apps.admin_api.settings import AdminAPISettings
+from indexing.embedding import EmbeddingError
 
 pytestmark = pytest.mark.integration
 
@@ -167,6 +177,43 @@ async def _seed_viewer(session_factory: async_sessionmaker[Any]) -> None:
                 role=AdminRole.VIEWER,
             )
         )
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> InMemoryMetricReader:
+    """Registers a real `MeterProvider` backed by `InMemoryMetricReader` as
+    the global one, so `apps.admin_api.memory_routes`'s module-level
+    `_bulk_operation_item_failed_counter`/`_embedding_failed_counter`
+    (created once, at import time) pick it up via OTel's proxy-instrument
+    migration mechanism — mirrors `apps/admin_api/test_auth_routes.py`'s
+    identical fixture."""
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-admin-api-test"}),
+        metric_readers=[reader],
+    )
+    metrics.set_meter_provider(provider)
+    return reader
+
+
+def _sum_points(
+    reader: InMemoryMetricReader, metric_name: str
+) -> list[tuple[float, dict[str, object]]]:
+    metrics_data = reader.get_metrics_data()
+    if metrics_data is None:
+        return []
+    points: list[tuple[float, dict[str, object]]] = []
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != metric_name:
+                    continue
+                assert isinstance(metric.data, Sum)
+                for data_point in metric.data.data_points:
+                    points.append((data_point.value, dict(data_point.attributes or {})))
+    return points
 
 
 def test_list_without_a_session_returns_401(migrated_engine: AsyncEngine) -> None:
@@ -403,6 +450,46 @@ async def test_approve_dismissed_finding_computes_and_stores_a_real_embedding(
     assert body["approved_at"] is not None
     assert body["embedding"] is not None
     assert len(body["embedding"]) == _EMBEDDING_DIMENSION
+
+
+@pytest.mark.asyncio
+async def test_approve_dismissed_finding_embedding_failure_returns_500_and_increments_counter(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+    in_memory_metric_reader: InMemoryMetricReader,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``review.memory.embedding_failed_total`` — the admin API's one call
+    site of local embedding-model inference. A degraded embedding runtime
+    (OOM, model load failure, contention with a concurrently-running
+    indexing job) must be visible as a trend, not just a 500 an operator
+    happens to notice and report."""
+
+    def _raise(self: LocalONNXEmbeddingClient, texts: Any) -> Any:
+        raise EmbeddingError(detail="simulated embedding runtime failure")
+
+    entry_id = await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8210)
+    # Build the app first (its own startup check runs a real probe
+    # inference call through the real, unpatched client) and only then
+    # patch `embed` to fail — patching before `create_app` would fail the
+    # startup check itself rather than the approve route under test.
+    app = create_app(_settings(dsn=_dsn(migrated_engine)))
+    monkeypatch.setattr(LocalONNXEmbeddingClient, "embed", _raise)
+
+    with TestClient(app) as client:
+        csrf_token = _login_as_bootstrap_admin(client)
+        response = client.post(
+            f"/api/v1/memory-entries/{entry_id}/approve",
+            json={"entry_type": "dismissed_finding"},
+            headers={CSRF_HEADER_NAME: csrf_token},
+        )
+
+    assert response.status_code == 500
+
+    assert _sum_points(in_memory_metric_reader, "review.memory.embedding_failed_total") == [
+        (1.0, {})
+    ]
 
 
 @pytest.mark.asyncio
@@ -845,6 +932,7 @@ async def test_bulk_approve_partial_failure(
     migrated_engine: AsyncEngine,
     session_factory: async_sessionmaker[Any],
     repo_id: uuid.UUID,
+    in_memory_metric_reader: InMemoryMetricReader,
 ) -> None:
     """US-A23's first Given/When/Then, including its own "any single
     entry's failure ... doesn't roll back or block the others" clause: of N
@@ -883,12 +971,20 @@ async def test_bulk_approve_partial_failure(
         e["status"] == "approved" and e["entry_type"] == "accepted_fix" for e in listed["entries"]
     )
 
+    # `review.memory.bulk_operation_item_failed_total{operation="approve"}`
+    # — the one id's 404 is the only server-side signal of a partial bulk
+    # failure; today it's otherwise swallowed into the response body alone.
+    assert (1.0, {"operation": "approve"}) in _sum_points(
+        in_memory_metric_reader, "review.memory.bulk_operation_item_failed_total"
+    )
+
 
 @pytest.mark.asyncio
 async def test_bulk_reject_partial_failure(
     migrated_engine: AsyncEngine,
     session_factory: async_sessionmaker[Any],
     repo_id: uuid.UUID,
+    in_memory_metric_reader: InMemoryMetricReader,
 ) -> None:
     """US-A23's second Given/When/Then: same partial-failure handling as
     bulk-approve, exercised for reject instead."""
@@ -920,6 +1016,10 @@ async def test_bulk_reject_partial_failure(
 
     assert listed["total"] == 3
     assert all(e["status"] == "rejected" for e in listed["entries"])
+
+    assert (1.0, {"operation": "reject"}) in _sum_points(
+        in_memory_metric_reader, "review.memory.bulk_operation_item_failed_total"
+    )
 
 
 @pytest.mark.asyncio

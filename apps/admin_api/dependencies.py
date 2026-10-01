@@ -21,12 +21,28 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fastapi import Depends, HTTPException, Request
+from opentelemetry import metrics
 
 from apps.admin_api.csrf import verify_csrf_token
 from iam.auth import SessionStore, UserRepository, authenticate_session, is_admin
 from iam.models import User
 
 logger = logging.getLogger(__name__)
+
+meter = metrics.get_meter("review.admin")
+# `{reason}` -> one of four closed-set values (`missing_cookie`,
+# `invalid_or_expired_session`, `csrf_token_missing_or_invalid`,
+# `role_forbidden`) — mirrors `apps/admin_api/auth_routes.py`'s own
+# `review.auth.login_failed_total` counter, extended to every authenticated
+# admin request rather than just login: a stolen/replayed session cookie, a
+# CSRF-stripping proxy misconfiguration, or a regression in
+# `session_idle_timeout_minutes` would otherwise only be visible by grepping
+# `WARNING` "session rejected"/"admin action rejected" log lines.
+_session_rejected_counter = meter.create_counter(
+    "review.admin.session_rejected_total",
+    description="Every rejected require_session/require_admin_role check, labeled by reason — "
+    "the post-login counterpart to review.auth.login_failed_total's low-and-slow signal.",
+)
 
 SESSION_COOKIE_NAME = "review_admin_session"
 CSRF_COOKIE_NAME = "review_admin_csrf"
@@ -105,6 +121,7 @@ def build_require_session(
         raw_token = request.cookies.get(SESSION_COOKIE_NAME)
         if raw_token is None:
             logger.warning("session rejected", extra={"reason": "missing_cookie"})
+            _session_rejected_counter.add(1, {"reason": "missing_cookie"})
             raise HTTPException(status_code=401, detail="not authenticated")
 
         token_hash = hash_session_token(raw_token)
@@ -122,6 +139,7 @@ def build_require_session(
             # "reveals nothing" posture; which specific check failed is not
             # information this HTTP boundary exposes.
             logger.warning("session rejected", extra={"reason": "invalid_or_expired_session"})
+            _session_rejected_counter.add(1, {"reason": "invalid_or_expired_session"})
             raise HTTPException(status_code=401, detail="not authenticated")
 
         if request.method not in _SAFE_METHODS:
@@ -136,6 +154,7 @@ def build_require_session(
                         "username": identity.user.username,
                     },
                 )
+                _session_rejected_counter.add(1, {"reason": "csrf_token_missing_or_invalid"})
                 raise HTTPException(status_code=403, detail="missing or invalid CSRF token")
 
         return AuthenticatedSession(session_id=identity.session.id, user=identity.user)
@@ -161,6 +180,7 @@ def build_require_admin_role(
                 "admin action rejected",
                 extra={"reason": "role_forbidden", "username": authenticated.user.username},
             )
+            _session_rejected_counter.add(1, {"reason": "role_forbidden"})
             raise HTTPException(status_code=403, detail="admin role required")
         return authenticated
 

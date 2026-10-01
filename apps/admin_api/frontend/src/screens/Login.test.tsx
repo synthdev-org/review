@@ -4,6 +4,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { axe } from "vitest-axe";
 
 import { ApiError } from "../api/client";
 import { LoginScreen } from "./Login";
@@ -86,5 +87,11 @@ describe("LoginScreen", () => {
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: /sign in/i })).not.toBeInTheDocument();
     });
+  });
+
+  it("has no detectable accessibility violations", async () => {
+    mockUseAuth.mockReturnValue({ status: "unauthenticated", login: vi.fn() });
+    const { container } = renderLogin();
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

@@ -702,7 +702,8 @@ appears alongside).
   `UsageCounterReader` Protocols.
 - `adapter/storage/models.py`: new `PrivateRepoReviewCount` row
   (`installation_id`, `day` (04:00-anchored date), `count`), unique per
-  `(installation_id, day)`; migration `0009_usage_counter.py`.
+  `(installation_id, day)`; migration `0010_usage_counter.py` (0009 was
+  already consumed by Phase 3's `0009_memory_entry_approved_by_user_id.py`).
 - `adapter/storage/tenancy.py`: `PostgresUsageCounterRepository` — atomic
   `INSERT ... ON CONFLICT DO UPDATE count = count + 1`; a pure `day_for(now)`
   helper computing the 04:00-anchored calendar day, unit-tested against
@@ -850,7 +851,13 @@ config` validates the new service.
 
 ## Phase 10 — Bulk approve/reject (Unit K, Could: US-A23)
 
-**Status: Done (2026-09-30).**
+**Status: Done (2026-09-30); frontend UI + E2E closed 2026-10-01.** The
+2026-09-30 commit shipped the backend API and its Integration coverage
+only — the queue-screen bulk-select UI this section always described (see
+"Observability & rollback" below, written against the UI from the start)
+hadn't actually been built yet, leaving US-A23 unreachable from the
+product despite a passing API-level test. Closed out the next day: see the
+UI bullet and E2E test entry below.
 
 **Why last:** the plan's only optional unit (no roadmap/ADR commitment
 forces it); depends on Phase 3's migrated Memory routes; nothing later in
@@ -862,10 +869,26 @@ this plan depends on it, so it is safe to cut if time runs out.
   individually (not a new bulk-specific domain method), collecting
   per-item success/failure into the response rather than rolling back the
   batch on one failure.
+- `apps/admin_api/frontend/src/screens/MemoryQueue.tsx` gains a per-row
+  select checkbox (pending entries only, matching the existing single-row
+  Approve/Reject scope) plus a select-all-pending header checkbox, and a
+  bulk-action bar (entry count, one classification select, Approve
+  selected/Reject selected/Clear selection) wired to two new
+  `apps/admin_api/frontend/src/api/endpoints.ts` functions
+  (`bulkApproveMemoryEntries`/`bulkRejectMemoryEntries`). A partial
+  failure is surfaced in the same `Notice` component every other mutating
+  action here uses (e.g. "2 approved, 1 failed"), never swallowed.
 
 **Tests:** `apps/admin_api/test_memory_routes.py` — bulk-approve of N
 entries with one pre-deleted id: N-1 succeed, one reports its own failure,
-response shape distinguishes them.
+response shape distinguishes them. `apps/admin_api/frontend/src/screens/MemoryQueue.test.tsx`
+covers multi-select + bulk-approve, partial-failure surfacing on
+bulk-reject, and the bulk bar's own visibility (hidden with no selection,
+absent entirely for a Viewer). `tests/e2e/test_admin_ui.py`'s
+`test_bulk_approve_and_reject_round_trip_over_the_real_api` proves the
+same Given/When/Then against the real built stack (real Postgres, real
+`admin_api` process), closing the gap an Integration-only test left: that
+the HTTP contract worked but nothing in the product actually exposed it.
 
 **Observability & rollback:** no kill switch needed — additive UI-level
 convenience over already-shipped, already-tested single-entry behavior;
@@ -873,7 +896,8 @@ disabling it is simply not rendering the bulk-select UI, zero backend
 risk.
 
 **Acceptance:** US-A23's Given/When/Then passes, including the
-partial-failure case.
+partial-failure case — now provably reachable from the queue screen, not
+just the HTTP API.
 
 ## Security review
 
@@ -1038,3 +1062,4 @@ table, mapped to this plan's phase numbers.
 | 9 | US-A21 | `charts/review/test-render.sh` | Integration (Helm template rendering) |
 | 9 | US-A22 | `charts/review/test-render.sh` | Integration (Helm template rendering) |
 | 10 | US-A23 | `apps/admin_api/test_memory_routes.py` | Integration |
+| 10 | US-A23 | `tests/e2e/test_admin_ui.py` | E2E |

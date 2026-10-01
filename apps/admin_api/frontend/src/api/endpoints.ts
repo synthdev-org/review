@@ -8,6 +8,7 @@ import { apiRequest } from "./client";
 import type {
   AdminStatsView,
   AdminUser,
+  BulkOperationResponse,
   ConfigTree,
   DeleteMemoryEntryResponse,
   ListMemoryEntriesResponse,
@@ -97,6 +98,26 @@ export function deleteMemoryEntry(entryId: string): Promise<DeleteMemoryEntryRes
     `/memory-entries/${encodeURIComponent(entryId)}?confirm=true`,
     { method: "DELETE" }
   );
+}
+
+// US-A23: bulk-approve/bulk-reject — one explicit `entry_type` applied to
+// every selected id for approve, none needed for reject (matches
+// `_BulkApproveRequest`/`_BulkRejectRequest` on the backend).
+export function bulkApproveMemoryEntries(
+  entryIds: string[],
+  entryType: "dismissed_finding" | "accepted_fix" | "correction"
+): Promise<BulkOperationResponse> {
+  return apiRequest<BulkOperationResponse>("/memory-entries/bulk-approve", {
+    method: "POST",
+    body: { entry_ids: entryIds, entry_type: entryType },
+  });
+}
+
+export function bulkRejectMemoryEntries(entryIds: string[]): Promise<BulkOperationResponse> {
+  return apiRequest<BulkOperationResponse>("/memory-entries/bulk-reject", {
+    method: "POST",
+    body: { entry_ids: entryIds },
+  });
 }
 
 // --- Org/repo/team configuration (Unit E) ---

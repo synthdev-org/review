@@ -9,7 +9,11 @@ including a timing-equivalence assertion), US-A2 (idle expiry, explicit
 logout revocation + replay rejection), US-A6 (session info), the
 login-rate-limit ceiling (asserting it reads/writes login_attempt, not
 admin_audit_log), and a mutating request with a missing/mismatched CSRF
-header being rejected.
+header being rejected. Also covers `apps/admin_api/dependencies.py`'s
+`review.admin.session_rejected_total` counter (missing_cookie/
+invalid_or_expired_session/csrf_token_missing_or_invalid reasons) — the
+role_forbidden reason is covered by `test_role_enforcement.py` instead,
+where a Viewer-vs-Admin session is already set up.
 """
 
 from __future__ import annotations
@@ -96,6 +100,28 @@ def _login_failed_total(reader: InMemoryMetricReader) -> float:
                 for data_point in metric.data.data_points:
                     total += data_point.value
     return total
+
+
+def _sum_points(
+    reader: InMemoryMetricReader, metric_name: str
+) -> list[tuple[float, dict[str, object]]]:
+    """Returns `(value, attributes)` per recorded data point of a `Sum`
+    (counter) metric — mirrors `apps/worker/test_dispatch.py`'s identical
+    helper, needed here (unlike `_login_failed_total` above) because
+    `review.admin.session_rejected_total` is labeled by `reason`."""
+    metrics_data = reader.get_metrics_data()
+    if metrics_data is None:
+        return []
+    points: list[tuple[float, dict[str, object]]] = []
+    for resource_metrics in metrics_data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != metric_name:
+                    continue
+                assert isinstance(metric.data, Sum)
+                for data_point in metric.data.data_points:
+                    points.append((data_point.value, dict(data_point.attributes or {})))
+    return points
 
 
 def test_login_with_correct_credentials_succeeds_and_sets_cookies(
@@ -238,6 +264,7 @@ def test_login_rate_limit_ceiling_reads_and_writes_login_attempt_not_audit_log(
 
 def test_logout_revokes_session_and_a_replayed_cookie_is_rejected(
     migrated_engine: AsyncEngine,
+    in_memory_metric_reader: InMemoryMetricReader,
 ) -> None:
     settings = _settings(dsn=_dsn(migrated_engine))
     with TestClient(create_app(settings)) as client:
@@ -260,13 +287,28 @@ def test_logout_revokes_session_and_a_replayed_cookie_is_rejected(
         )
         assert replay_response.status_code == 401
 
+    # `apps/admin_api/dependencies.py`'s `review.admin.session_rejected_total`
+    # counter — the post-login counterpart to `review.auth.login_failed_total`
+    # above, covering every subsequent authenticated request rather than just
+    # login. A revoked/replayed session is `invalid_or_expired_session`.
+    assert (1.0, {"reason": "invalid_or_expired_session"}) in _sum_points(
+        in_memory_metric_reader, "review.admin.session_rejected_total"
+    )
 
-def test_get_session_without_a_cookie_returns_401(migrated_engine: AsyncEngine) -> None:
+
+def test_get_session_without_a_cookie_returns_401(
+    migrated_engine: AsyncEngine,
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
     settings = _settings(dsn=_dsn(migrated_engine))
     with TestClient(create_app(settings)) as client:
         response = client.get("/api/v1/auth/session")
 
         assert response.status_code == 401
+
+    assert (1.0, {"reason": "missing_cookie"}) in _sum_points(
+        in_memory_metric_reader, "review.admin.session_rejected_total"
+    )
 
 
 def test_get_session_with_a_valid_cookie_returns_username_and_role(
@@ -314,7 +356,10 @@ def test_idle_expired_session_is_rejected_on_the_next_request(
         assert response.status_code == 401
 
 
-def test_logout_without_a_csrf_header_is_rejected(migrated_engine: AsyncEngine) -> None:
+def test_logout_without_a_csrf_header_is_rejected(
+    migrated_engine: AsyncEngine,
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
     settings = _settings(dsn=_dsn(migrated_engine))
     with TestClient(create_app(settings)) as client:
         client.post(
@@ -325,6 +370,10 @@ def test_logout_without_a_csrf_header_is_rejected(migrated_engine: AsyncEngine) 
         response = client.post("/api/v1/auth/logout")
 
         assert response.status_code == 403
+
+    assert (1.0, {"reason": "csrf_token_missing_or_invalid"}) in _sum_points(
+        in_memory_metric_reader, "review.admin.session_rejected_total"
+    )
 
 
 def test_logout_with_a_mismatched_csrf_header_is_rejected(migrated_engine: AsyncEngine) -> None:

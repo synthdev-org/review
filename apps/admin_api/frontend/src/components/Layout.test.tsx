@@ -5,6 +5,7 @@
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
+import { axe } from "vitest-axe";
 
 import { Layout } from "./Layout";
 
@@ -48,5 +49,22 @@ describe("Layout", () => {
     expect(screen.queryByRole("link", { name: /users/i })).not.toBeInTheDocument();
     // Read-only screens remain reachable.
     expect(screen.getByRole("link", { name: /dashboard/i })).toBeInTheDocument();
+  });
+
+  it("has no detectable accessibility violations", async () => {
+    mockUseAuth.mockReturnValue({
+      username: "root-admin",
+      role: "admin",
+      isAdmin: true,
+      logout: vi.fn(),
+    });
+    const { container } = render(
+      <MemoryRouter>
+        <Layout>
+          <div />
+        </Layout>
+      </MemoryRouter>
+    );
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

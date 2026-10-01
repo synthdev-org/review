@@ -3,6 +3,7 @@
 // docs/plans/plan-deliver-admin-gui.md's Phase 8 section.
 import { render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { axe } from "vitest-axe";
 
 import type { AdminStatsView, UsageView } from "../api/types";
 import { DashboardScreen } from "./Dashboard";
@@ -92,5 +93,13 @@ describe("DashboardScreen", () => {
     expect(screen.getByText("gpt-x")).toBeInTheDocument();
     expect(screen.getByText("Acme")).toBeInTheDocument();
     expect(screen.getByText(/over guideline/i)).toBeInTheDocument();
+  });
+
+  it("has no detectable accessibility violations", async () => {
+    getStats.mockResolvedValue(emptyStats);
+    getUsage.mockResolvedValue(emptyUsage);
+    const { container } = render(<DashboardScreen />);
+    await screen.findByText(/no reviews counted yet today/i);
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

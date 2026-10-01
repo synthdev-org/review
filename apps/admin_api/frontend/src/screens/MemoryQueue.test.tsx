@@ -3,6 +3,7 @@
 // docs/plans/plan-deliver-admin-gui.md's Phase 8 section.
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { axe } from "vitest-axe";
 
 import type { MemoryEntry } from "../api/types";
 import { MemoryQueueScreen } from "./MemoryQueue";
@@ -11,12 +12,16 @@ const listMemoryEntries = vi.fn();
 const approveMemoryEntry = vi.fn();
 const rejectMemoryEntry = vi.fn();
 const deleteMemoryEntry = vi.fn();
+const bulkApproveMemoryEntries = vi.fn();
+const bulkRejectMemoryEntries = vi.fn();
 
 vi.mock("../api/endpoints", () => ({
   listMemoryEntries: (...args: unknown[]) => listMemoryEntries(...args),
   approveMemoryEntry: (...args: unknown[]) => approveMemoryEntry(...args),
   rejectMemoryEntry: (...args: unknown[]) => rejectMemoryEntry(...args),
   deleteMemoryEntry: (...args: unknown[]) => deleteMemoryEntry(...args),
+  bulkApproveMemoryEntries: (...args: unknown[]) => bulkApproveMemoryEntries(...args),
+  bulkRejectMemoryEntries: (...args: unknown[]) => bulkRejectMemoryEntries(...args),
 }));
 
 let mockIsAdmin = true;
@@ -43,12 +48,20 @@ const pendingEntry: MemoryEntry = {
   updated_at: "2026-09-30T00:00:00Z",
 };
 
+const secondPendingEntry: MemoryEntry = {
+  ...pendingEntry,
+  id: "entry-2",
+  repo_id: "repo-2",
+};
+
 describe("MemoryQueueScreen", () => {
   beforeEach(() => {
     listMemoryEntries.mockReset();
     approveMemoryEntry.mockReset();
     rejectMemoryEntry.mockReset();
     deleteMemoryEntry.mockReset();
+    bulkApproveMemoryEntries.mockReset();
+    bulkRejectMemoryEntries.mockReset();
     handleSessionExpired.mockReset();
     mockIsAdmin = true;
   });
@@ -121,5 +134,78 @@ describe("MemoryQueueScreen", () => {
     expect(screen.queryByRole("button", { name: /reject/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /delete/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: /actions/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+  });
+
+  it("Admin: selecting multiple pending entries and bulk-approving sends every selected id with the chosen classification", async () => {
+    listMemoryEntries.mockResolvedValue({
+      entries: [pendingEntry, secondPendingEntry],
+      total: 2,
+    });
+    bulkApproveMemoryEntries.mockResolvedValue({
+      results: [
+        { entry_id: "entry-1", success: true, error: null },
+        { entry_id: "entry-2", success: true, error: null },
+      ],
+    });
+    render(<MemoryQueueScreen />);
+
+    await screen.findByText("repo-1");
+    fireEvent.click(screen.getByRole("checkbox", { name: /select entry entry-1/i }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /select entry entry-2/i }));
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /approve selected/i }));
+
+    await waitFor(() =>
+      expect(bulkApproveMemoryEntries).toHaveBeenCalledWith(
+        ["entry-1", "entry-2"],
+        "dismissed_finding"
+      )
+    );
+    expect(await screen.findByTestId("notice")).toHaveTextContent(/2 approved/i);
+    // Selection clears after a completed bulk action.
+    expect(screen.queryByText(/selected$/)).not.toBeInTheDocument();
+  });
+
+  it("Admin: a bulk action's partial failure is surfaced, not swallowed", async () => {
+    listMemoryEntries.mockResolvedValue({
+      entries: [pendingEntry, secondPendingEntry],
+      total: 2,
+    });
+    bulkRejectMemoryEntries.mockResolvedValue({
+      results: [
+        { entry_id: "entry-1", success: true, error: null },
+        { entry_id: "entry-2", success: false, error: "memory entry 'entry-2' not found" },
+      ],
+    });
+    render(<MemoryQueueScreen />);
+
+    await screen.findByText("repo-1");
+    fireEvent.click(screen.getByRole("checkbox", { name: /select all pending/i }));
+    fireEvent.click(screen.getByRole("button", { name: /reject selected/i }));
+
+    await waitFor(() =>
+      expect(bulkRejectMemoryEntries).toHaveBeenCalledWith(["entry-1", "entry-2"])
+    );
+    expect(await screen.findByTestId("notice")).toHaveTextContent(/1 rejected, 1 failed/i);
+  });
+
+  it("Admin: the bulk action bar only appears once an entry is selected", async () => {
+    listMemoryEntries.mockResolvedValue({ entries: [pendingEntry], total: 1 });
+    render(<MemoryQueueScreen />);
+
+    await screen.findByText("repo-1");
+    expect(screen.queryByRole("button", { name: /approve selected/i })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /select entry entry-1/i }));
+    expect(screen.getByRole("button", { name: /approve selected/i })).toBeInTheDocument();
+  });
+
+  it("has no detectable accessibility violations", async () => {
+    listMemoryEntries.mockResolvedValue({ entries: [pendingEntry], total: 1 });
+    const { container } = render(<MemoryQueueScreen />);
+    await screen.findByText("repo-1");
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

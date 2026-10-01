@@ -4,6 +4,7 @@
 // docs/plans/plan-deliver-admin-gui.md's Phase 8 section.
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { axe } from "vitest-axe";
 
 import type { ConfigTree } from "../api/types";
 import { ConfigScreen } from "./Config";
@@ -95,5 +96,12 @@ describe("ConfigScreen", () => {
     await screen.findByText("Platform-wide");
     expect(screen.queryByRole("button", { name: /save setting/i })).not.toBeInTheDocument();
     expect(screen.getByText(/viewers can see configuration but not change it/i)).toBeInTheDocument();
+  });
+
+  it("has no detectable accessibility violations", async () => {
+    getConfig.mockResolvedValue(emptyTree);
+    const { container } = render(<ConfigScreen />);
+    await screen.findByText("Platform-wide");
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

@@ -668,9 +668,11 @@ No further governance work blocks Unit B.
 - **Unit K — Bulk approve/reject (US-A23, Could).** Depends on: Unit D.
   Risk: low — no new domain behavior, just applying Unit D's existing
   approve/reject calls to a selected set with per-item, not all-or-nothing,
-  failure handling. **Acceptance:** US-A23's `Given/When/Then` passes as an
-  integration test, including the partial-failure case (one selected entry
-  already deleted, the rest still succeed).
+  failure handling. **Acceptance:** US-A23's `Given/When/Then` passes at
+  Integration tier (`apps/admin_api/test_memory_routes.py`) and E2E tier
+  (`tests/e2e/test_admin_ui.py`, against the real queue-screen bulk-select
+  UI and the real built stack), including the partial-failure case (one
+  selected entry already deleted, the rest still succeed).
 
 ## Testing / Key Scenarios
 
@@ -687,6 +689,7 @@ Per `testing.md`'s pyramid.
 | US-A7 | Old static Bearer token rejected on migrated Memory routes; new session accepted; action attributed to acting user | `apps/admin_api/test_memory_routes.py` (migrated from `apps/webhook_api/test_admin_routes.py`) | Integration |
 | US-A8–A11 | List/approve/reject/delete behave identically to `docs/specs/spec-memory.md`'s US-M4/US-M5/US-M8, now under real session auth | `apps/admin_api/test_memory_routes.py` | Integration |
 | US-A23 | Bulk-approve/reject applies the existing per-entry behavior to each selected entry; one entry's failure doesn't block the rest | `apps/admin_api/test_memory_routes.py` | Integration |
+| US-A23 | Same scenario, against the real queue-screen bulk-select UI and the real built stack | `tests/e2e/test_admin_ui.py` | E2E |
 | US-A12 | Config screen shows org → repo → team hierarchy with current `OrgRepoTeamSetting` values, empty scopes shown as "using defaults" | `apps/admin_api/test_config_routes.py` (new) | Integration |
 | US-A13 | Setting a value at a scope writes/updates `OrgRepoTeamSetting`; invalid value rejected (422); narrower scope overrides broader at read time | `apps/admin_api/test_config_routes.py` | Integration |
 | US-A14 | Model routing screen shows effective model per stage with its source (org/platform/static default) | `apps/admin_api/test_model_routing_routes.py` (new) | Integration |

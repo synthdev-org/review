@@ -60,6 +60,18 @@ export interface DeleteMemoryEntryResponse {
   entry_id: string;
 }
 
+// US-A23: one selected id's own outcome inside a bulk-approve/bulk-reject
+// call — mirrors `apps/admin_api/memory_routes.py`'s `_BulkItemResult`.
+export interface BulkItemResult {
+  entry_id: string;
+  success: boolean;
+  error: string | null;
+}
+
+export interface BulkOperationResponse {
+  results: BulkItemResult[];
+}
+
 // --- Org/repo/team configuration (Unit E) ---
 
 export interface ScopeSettings {

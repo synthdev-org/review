@@ -23,19 +23,37 @@ frontend router entirely in that case, per
 crash" behavior), and a client-side route neither `apps/admin_api` nor any
 static file literally defines (``/dashboard``) still resolves to that same
 HTML — proving the SPA catch-all, not a directory listing or a 404.
+
+Phase 10 (Unit K, US-A23) adds a second scenario to this same light
+admin_api + postgres stack: bulk-approve/bulk-reject. Its own precondition
+(existing ``pending`` ``memory_entry`` rows) is seeded with a direct SQL
+insert over a raw ``asyncpg`` connection to the real, Compose-exposed
+Postgres port — not an import of ``adapter.storage``'s ORM models, which
+would conflict with this file's "never by importing application code
+directly" rule above. That rule is about never substituting the
+``admin_api`` HTTP entrypoint under test with an in-process shortcut; a raw
+SQL precondition against the real database the real process itself reads
+from is a different thing, and the same trade this file already makes by
+staying scoped to admin_api + postgres rather than dragging in the full
+webhook/worker pipeline just to produce a row whose provenance this
+story's own Given/When/Then never mentions.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
+import uuid
 from collections.abc import Iterator
 
+import asyncpg
 import httpx
 import pytest
 
 from tests.e2e.conftest import base_compose_env, compose, compose_down, wait_for_healthy
 
 _ASSET_SCRIPT_RE = re.compile(r'src="\./assets/index-[\w-]+\.js"')
+_NONEXISTENT_ENTRY_ID = "00000000-0000-0000-0000-000000000000"
 
 
 @pytest.fixture
@@ -164,3 +182,155 @@ def test_login_and_model_routing_round_trip_over_the_real_api(
         # real session store, not just a client-side cookie clear.
         session_after_logout = client.get("/api/v1/auth/session")
         assert session_after_logout.status_code == 401
+
+
+async def _seed_pending_memory_entries_async(env: dict[str, str], count: int) -> list[str]:
+    """Inserts one ``org``/``repo`` row plus ``count`` ``pending``
+    ``memory_entry`` rows (each with its own ``posted_finding_comment``
+    parent, per that FK) directly against the real Postgres container this
+    module's own ``admin_ui_stack`` fixture brings up — see this module's
+    docstring for why a direct SQL seed, rather than driving the full
+    webhook/worker pipeline, is the right scope for this story."""
+    conn = await asyncpg.connect(
+        host="localhost",
+        port=int(env["POSTGRES_PORT"]),
+        user=env["POSTGRES_USER"],
+        password=env["POSTGRES_PASSWORD"],
+        database=env["POSTGRES_DB"],
+    )
+    try:
+        org_id = uuid.uuid4()
+        repo_id = uuid.uuid4()
+        await conn.execute(
+            "INSERT INTO org (id, name, slug) VALUES ($1, $2, $3)",
+            org_id,
+            "e2e-bulk-org",
+            f"e2e-bulk-org-{org_id}",
+        )
+        await conn.execute(
+            "INSERT INTO repo (id, org_id, name, full_name) VALUES ($1, $2, $3, $4)",
+            repo_id,
+            org_id,
+            "widgets",
+            "acme/widgets",
+        )
+        entry_ids: list[str] = []
+        for i in range(count):
+            comment_id = 9_000_000 + i
+            await conn.execute(
+                """
+                INSERT INTO posted_finding_comment
+                    (id, repo_id, pr_number, commit_sha, finding_file, finding_message)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                comment_id,
+                repo_id,
+                1,
+                "f" * 40,
+                "README.md",
+                f"e2e bulk finding {i}",
+            )
+            entry_id = uuid.uuid4()
+            await conn.execute(
+                """
+                INSERT INTO memory_entry
+                    (id, repo_id, status, raw_signal_type, raw_signal_detail,
+                     posted_finding_comment_id)
+                VALUES ($1, $2, 'PENDING', 'reaction', '{}'::jsonb, $3)
+                """,
+                entry_id,
+                repo_id,
+                comment_id,
+            )
+            entry_ids.append(str(entry_id))
+        return entry_ids
+    finally:
+        await conn.close()
+
+
+def _seed_pending_memory_entries(env: dict[str, str], count: int) -> list[str]:
+    return asyncio.run(_seed_pending_memory_entries_async(env, count))
+
+
+def test_bulk_approve_and_reject_round_trip_over_the_real_api(
+    admin_ui_stack: dict[str, str],
+) -> None:
+    """US-A23's own Given/When/Then (``docs/specs/spec-admin-gui.md``),
+    proven against the real built stack (real Postgres, real ``admin_api``
+    process) — the integration-tier `apps/admin_api/test_memory_routes.py`
+    already proves the same contract against an in-process `TestClient`;
+    this is the "the whole real system, not just the route handler" proof
+    the traceability table's E2E row for this story now points at.
+
+    Three pending entries are seeded (see `_seed_pending_memory_entries`);
+    the first two are bulk-approved alongside one nonexistent id, the third
+    is bulk-rejected alongside the same nonexistent id — the nonexistent
+    id's own failure must never block or roll back its batch-mates, in
+    either direction, exactly like the integration test's own scenario.
+    """
+    env = admin_ui_stack
+    entry_ids = _seed_pending_memory_entries(env, count=3)
+
+    with httpx.Client(base_url=_base_url(env)) as client:
+        login_response = client.post(
+            "/api/v1/auth/login",
+            json={
+                "username": env["REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME"],
+                "password": env["REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD"],
+            },
+        )
+        assert login_response.status_code == 200
+        csrf_token = client.cookies["review_admin_csrf"]
+
+        # US-A23's first Given/When/Then: one explicit `entry_type` applied
+        # to two real pending ids plus one nonexistent id in the same call.
+        # `accepted_fix` (not `dismissed_finding`) deliberately skips the
+        # embedding-computation branch — that path has its own dedicated
+        # coverage (`apps/admin_api/test_memory_routes.py`'s
+        # `test_approve_dismissed_finding_computes_and_stores_a_real_embedding`);
+        # re-proving it here would just be slow duplication, not additional
+        # proof of this story's own "a batch's one bad id doesn't block the
+        # rest" behavior.
+        bulk_approve_response = client.post(
+            "/api/v1/memory-entries/bulk-approve",
+            json={
+                "entry_ids": [entry_ids[0], entry_ids[1], _NONEXISTENT_ENTRY_ID],
+                "entry_type": "accepted_fix",
+            },
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        assert bulk_approve_response.status_code == 200
+        approve_results = {r["entry_id"]: r for r in bulk_approve_response.json()["results"]}
+        assert approve_results[entry_ids[0]]["success"] is True
+        assert approve_results[entry_ids[1]]["success"] is True
+        assert approve_results[_NONEXISTENT_ENTRY_ID]["success"] is False
+
+        # The very next read reflects both real writes — not just the
+        # response body's own claim, the same "no restart involved" proof
+        # the model-routing scenario above already makes for its own story.
+        approved_listed = client.get("/api/v1/memory-entries?status=approved").json()
+        approved_ids = {e["id"] for e in approved_listed["entries"]}
+        assert {entry_ids[0], entry_ids[1]} <= approved_ids
+
+        # US-A23's second Given/When/Then: bulk-reject the third pending id
+        # plus the same nonexistent id — same partial-failure handling.
+        bulk_reject_response = client.post(
+            "/api/v1/memory-entries/bulk-reject",
+            json={"entry_ids": [entry_ids[2], _NONEXISTENT_ENTRY_ID]},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        assert bulk_reject_response.status_code == 200
+        reject_results = {r["entry_id"]: r for r in bulk_reject_response.json()["results"]}
+        assert reject_results[entry_ids[2]]["success"] is True
+        assert reject_results[_NONEXISTENT_ENTRY_ID]["success"] is False
+
+        rejected_listed = client.get("/api/v1/memory-entries?status=rejected").json()
+        assert entry_ids[2] in {e["id"] for e in rejected_listed["entries"]}
+
+        # A mutating bulk call with no CSRF header is rejected (Assumption
+        # 13) — proven here against the real dependency chain, same
+        # posture as the model-routing scenario's own equivalent assertion.
+        unauthenticated_bulk = client.post(
+            "/api/v1/memory-entries/bulk-reject", json={"entry_ids": [entry_ids[0]]}
+        )
+        assert unauthenticated_bulk.status_code == 403

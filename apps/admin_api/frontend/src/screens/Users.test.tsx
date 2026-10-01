@@ -5,6 +5,7 @@
 // docs/plans/plan-deliver-admin-gui.md's Phase 8 section.
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { axe } from "vitest-axe";
 
 import type { AdminUser } from "../api/types";
 import { UsersScreen } from "./Users";
@@ -149,5 +150,12 @@ describe("UsersScreen", () => {
 
     await waitFor(() => expect(handleSessionExpired).toHaveBeenCalledTimes(1));
     expect(screen.queryByTestId("notice")).not.toBeInTheDocument();
+  });
+
+  it("has no detectable accessibility violations", async () => {
+    listUsers.mockResolvedValue([activeUser]);
+    const { container } = render(<UsersScreen />);
+    await screen.findByText("alice");
+    expect(await axe(container)).toHaveNoViolations();
   });
 });
