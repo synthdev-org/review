@@ -676,14 +676,14 @@ class ContextBuilderStep:
                 outcome = "degraded_empty"
         return _CodeRun(bundle, stats, outcome, error_extra)
 
-    async def run(self, input: Any, context: StepContext) -> ContextBuilderOutput:
+    async def run(self, step_input: Any, context: StepContext) -> ContextBuilderOutput:
         # Any (not _ContextBuilderInput) because the registry passes the
         # raw upstream step output here for validation — it may be
         # StaticAnalysisOutput or, when static analysis can't produce
         # findings, PrefilterOutput (see depends_on fallback above).
         # `model_validate(..., from_attributes=True)` below enforces the
         # actual shape at runtime.
-        parsed = _ContextBuilderInput.model_validate(input, from_attributes=True)
+        parsed = _ContextBuilderInput.model_validate(step_input, from_attributes=True)
         job_id = context.job_id
         start = time.monotonic()
 
@@ -993,6 +993,33 @@ class ContextBuilderStep:
             if section is not None
             else 0
         )
+        self._record_job_telemetry(job_id, trace_, item_count, total_bytes)
+
+        log_extra: dict[str, Any] = {
+            "job_id": job_id,
+            "org_id": parsed.org_id,
+            "repo_id": parsed.repo_id,
+            "provider_ref": trace_.credential_ref,
+            "endpoint_host": trace_.endpoint_host,
+            "operation": "job",
+            "outcome": outcome.value,
+            "status_code": trace_.status_code,
+            "duration_ms": trace_.duration_ms,
+            "item_count": item_count,
+            "bytes": total_bytes,
+        }
+        if outcome in _PK_CONFIG_CLASS:
+            logger.warning("product_knowledge degraded", extra=log_extra)
+        elif outcome is ProviderOutcome.NOT_CONFIGURED:
+            logger.debug("product_knowledge not configured", extra=log_extra)
+        else:
+            logger.info("product_knowledge completed", extra=log_extra)
+
+    def _record_job_telemetry(
+        self, job_id: str, trace_: _ProviderTrace, item_count: int, total_bytes: int
+    ) -> None:
+        """The job-level metrics and span (errors suppressed: review unaffected)."""
+        outcome = trace_.outcome
         attributes = {
             "operation": "job",
             "outcome": outcome.value,
@@ -1020,26 +1047,6 @@ class ContextBuilderStep:
             if trace_.searched:
                 _pk_item_count_histogram.record(item_count, {"outcome": outcome.value})
                 _pk_bytes_histogram.record(total_bytes, {"outcome": outcome.value})
-
-        log_extra: dict[str, Any] = {
-            "job_id": job_id,
-            "org_id": parsed.org_id,
-            "repo_id": parsed.repo_id,
-            "provider_ref": trace_.credential_ref,
-            "endpoint_host": trace_.endpoint_host,
-            "operation": "job",
-            "outcome": outcome.value,
-            "status_code": trace_.status_code,
-            "duration_ms": trace_.duration_ms,
-            "item_count": item_count,
-            "bytes": total_bytes,
-        }
-        if outcome in _PK_CONFIG_CLASS:
-            logger.warning("product_knowledge degraded", extra=log_extra)
-        elif outcome is ProviderOutcome.NOT_CONFIGURED:
-            logger.debug("product_knowledge not configured", extra=log_extra)
-        else:
-            logger.info("product_knowledge completed", extra=log_extra)
 
 
 # Runtime confirmation (not just a docstring claim) that this class actually

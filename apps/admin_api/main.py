@@ -79,6 +79,7 @@ from apps.admin_api.memory_routes import create_memory_router
 from apps.admin_api.model_routing_routes import create_model_routing_router
 from apps.admin_api.product_knowledge_routes import (
     ProbeFactory,
+    ProductKnowledgeRouterConfig,
     create_product_knowledge_router,
     create_provider_write_validator,
 )
@@ -334,21 +335,23 @@ def create_app(
     # same adapter path as the Worker (cache bypassed), never a second probe.
     app.include_router(
         create_product_knowledge_router(
-            credentials=credential_map,
-            enabled=settings.product_knowledge_enabled and endpoint_allowlist is not None,
-            endpoint_allowlist=endpoint_allowlist or (),
-            probe_factory=probe_factory
-            or ProviderClientFactory(
-                credentials=credential_map or CredentialMap.empty(),
-                policy=EgressPolicy(
-                    allow_private_networks=settings.product_knowledge_allow_private_networks,
-                    endpoint_allowlist=endpoint_allowlist or (),
+            config=ProductKnowledgeRouterConfig(
+                credentials=credential_map,
+                enabled=settings.product_knowledge_enabled and endpoint_allowlist is not None,
+                endpoint_allowlist=endpoint_allowlist or (),
+                probe_factory=probe_factory
+                or ProviderClientFactory(
+                    credentials=credential_map or CredentialMap.empty(),
+                    policy=EgressPolicy(
+                        allow_private_networks=settings.product_knowledge_allow_private_networks,
+                        endpoint_allowlist=endpoint_allowlist or (),
+                    ),
+                    timeouts=ClientTimeouts(
+                        call_seconds=float(settings.product_knowledge_call_timeout_seconds)
+                    ),
+                    bypass_cache=True,
+                    top_k=1,
                 ),
-                timeouts=ClientTimeouts(
-                    call_seconds=float(settings.product_knowledge_call_timeout_seconds)
-                ),
-                bypass_cache=True,
-                top_k=1,
             ),
             audit_log_repository=audit_log_repository,
             require_session=require_session,

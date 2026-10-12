@@ -28,6 +28,10 @@ from review.product_knowledge import (
     ProductKnowledgeProvider,
     ProviderItem,
     ProviderOutcome,
+    _ascii_host,
+    _parse_http_url,
+    _parse_updated_at,
+    _rebuild_url,
     assemble_product_knowledge,
     formulate_query,
     normalize_fetch,
@@ -244,6 +248,73 @@ def test_sanitize_url_is_idempotent() -> None:
     once = sanitize_url("https://wiki.example.com/a b/(x)?q=%41&z=1 2")
     assert once is not None
     assert sanitize_url(once) == once
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://Wiki.example.com:8443/x", ("wiki.example.com", 8443)),
+        ("http://wiki.example.com/x", ("wiki.example.com", None)),
+        ("HTTP://[::1]/x", ("::1", None)),
+        ("ftp://wiki.example.com/x", None),
+        ("//wiki.example.com/x", None),
+        ("https:///x", None),
+        ("https://u@wiki.example.com/x", None),
+        ("https://wiki.example.com:99999/x", None),
+    ],
+)
+def test_parse_http_url_accepts_only_hosted_http_without_userinfo(
+    url: str, expected: tuple[str, int | None] | None
+) -> None:
+    parsed = _parse_http_url(url)
+    assert (parsed if parsed is None else (parsed[1], parsed[2])) == expected
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("Wiki.Example.com", "wiki.example.com"),
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("::1", "::1"),
+        ("10.0.0.1", "10.0.0.1"),
+        ("a b.example", None),
+        ("a_b!.example", None),
+        ("x" * 70 + ".example", None),
+    ],
+)
+def test_ascii_host_normalizes_or_rejects(host: str, expected: str | None) -> None:
+    assert _ascii_host(host) == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "host", "port", "expected"),
+    [
+        ("HTTPS://x/a b?q=[1]#f(1)", "x", None, "https://x/a%20b?q=%5B1%5D#f%281%29"),
+        ("http://x:80/", "x", 80, "http://x:80/"),
+        ("http://[::1]:9/p", "::1", 9, "http://[::1]:9/p"),
+        ("http://x", "x", None, "http://x"),
+    ],
+)
+def test_rebuild_url_is_canonical(url: str, host: str, port: int | None, expected: str) -> None:
+    parts = _parse_http_url(url)
+    assert parts is not None
+    assert _rebuild_url(parts[0], host, port) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_iso"),
+    [
+        ("2026-01-02T03:04:05+00:00", "2026-01-02T03:04:05+00:00"),
+        ("2026-01-02", "2026-01-02T00:00:00"),
+        ("not-a-date", None),
+        ("", None),
+        (None, None),
+        (20260102, None),
+    ],
+)
+def test_parse_updated_at_is_tolerant(raw: object, expected_iso: str | None) -> None:
+    parsed = _parse_updated_at(raw)
+    assert (parsed.isoformat() if parsed is not None else None) == expected_iso
 
 
 def test_url_display_flags_cleartext_and_ip_literals() -> None:

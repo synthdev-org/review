@@ -192,8 +192,9 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
             self.outcome = outcome
         return EgressBlocked(message)
 
-    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
-        url = request.url
+    def _check_target(self, url: httpx2.URL) -> tuple[str, str, int]:
+        """``(scheme, canonical host, port)`` of the request, refusing anything
+        that is not the one bound endpoint origin."""
         scheme = url.scheme.lower()
         if scheme not in ("http", "https") or not self._usable:
             raise self._refuse(ProviderOutcome.BLOCKED_EGRESS, "scheme or endpoint not permitted")
@@ -201,6 +202,9 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
         port = _effective_port(scheme, url.port)
         if host is None or host != self._host or port != self._port or scheme != self._scheme:
             raise self._refuse(ProviderOutcome.BLOCKED_EGRESS, "request target is not the endpoint")
+        return scheme, host, port
+
+    def _check_allowlist(self, host: str, port: int) -> None:
         policy = self._policy
         listed = host_matches_allowlist(host, policy.endpoint_allowlist, port)
         if self._credential is None and not listed:
@@ -211,12 +215,22 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
         elif policy.endpoint_allowlist and not listed:
             raise self._refuse(ProviderOutcome.BLOCKED_EGRESS, "host not in the allow-list")
 
-        pinned, classes = await self._resolve(host, port)
+    def _check_classes(self, classes: list[AddressClass]) -> None:
         if AddressClass.DENIED in classes:
             raise self._refuse(ProviderOutcome.BLOCKED_EGRESS, "address class is always denied")
-        if AddressClass.PRIVATE in classes and not policy.allow_private_networks:
+        if AddressClass.PRIVATE in classes and not self._policy.allow_private_networks:
             raise self._refuse(ProviderOutcome.BLOCKED_EGRESS, "private networks are disabled")
 
+    def _outbound_headers(
+        self,
+        request: httpx2.Request,
+        scheme: str,
+        host: str,
+        port: int,
+        classes: list[AddressClass],
+    ) -> httpx2.Headers:
+        """Request headers with any caller-supplied ``Authorization`` dropped
+        and the bearer token attached only after the binding checks."""
         headers = httpx2.Headers(request.headers)
         headers.pop("authorization", None)
         headers["accept-encoding"] = "identity"
@@ -231,13 +245,20 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
                     ProviderOutcome.BLOCKED_EGRESS, "credential refused over cleartext http"
                 )
             headers["authorization"] = f"Bearer {credential.token.get_secret_value()}"
+        return headers
 
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        scheme, host, port = self._check_target(request.url)
+        self._check_allowlist(host, port)
+        pinned, classes = await self._resolve(host, port)
+        self._check_classes(classes)
+        headers = self._outbound_headers(request, scheme, host, port, classes)
         extensions = dict(request.extensions)
         if scheme == "https":
             extensions["sni_hostname"] = host
         forwarded = httpx2.Request(
             request.method,
-            url.copy_with(host=pinned),
+            request.url.copy_with(host=pinned),
             headers=headers,
             stream=request.stream,
             extensions=extensions,
@@ -258,30 +279,41 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
             raise httpx2.ConnectError("name resolution returned no address")
         return addresses[0], [classify_address(a) for a in addresses]
 
-    async def _check_response(self, response: httpx2.Response) -> httpx2.Response:
-        status = response.status_code
-        if 300 <= status < 400:
+    async def _reject_redirect(self, response: httpx2.Response) -> None:
+        if 300 <= response.status_code < 400:
             await response.aclose()
             raise self._refuse(ProviderOutcome.BLOCKED_EGRESS, "redirects are never followed")
-        if status >= 400:
+
+    def _record_error_status(self, response: httpx2.Response) -> None:
+        if response.status_code >= 400:
             # The *last* error status: a legacy provider legitimately answers
             # the modern probe with 400 before the real failure.
-            self.status = status
+            self.status = response.status_code
             raw = response.headers.get("retry-after", "")
             if _is_small_int(raw):
                 self.retry_after_seconds = int(raw)
+
+    async def _reject_encoded(self, response: httpx2.Response) -> None:
         encoding = response.headers.get("content-encoding", "identity").strip().lower()
         if encoding not in ("", "identity"):
             await response.aclose()
             if self.outcome is None:
                 self.outcome = ProviderOutcome.MALFORMED
             raise ResponseTooLarge("encoded response bodies are refused")
+
+    async def _reject_oversized_length(self, response: httpx2.Response) -> None:
         length = response.headers.get("content-length", "")
         if _is_digits(length) and (len(length) >= _MAX_DIGITS or int(length) > self._cap):
             await response.aclose()
             if self.outcome is None:
                 self.outcome = ProviderOutcome.OVERSIZED
             raise ResponseTooLarge("response exceeded the size cap")
+
+    async def _check_response(self, response: httpx2.Response) -> httpx2.Response:
+        await self._reject_redirect(response)
+        self._record_error_status(response)
+        await self._reject_encoded(response)
+        await self._reject_oversized_length(response)
         stream = response.stream
         if not isinstance(stream, httpx2.AsyncByteStream):
             await response.aclose()
@@ -292,7 +324,7 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
                 self.outcome = ProviderOutcome.OVERSIZED
 
         return httpx2.Response(
-            status,
+            response.status_code,
             headers=response.headers,
             stream=_CappedStream(stream, self._cap, _exceeded),
             extensions=response.extensions,

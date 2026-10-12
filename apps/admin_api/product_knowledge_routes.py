@@ -36,6 +36,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Annotated, Final, Literal, Protocol
 from urllib.parse import urlsplit
 
@@ -71,6 +72,7 @@ from tenancy.settings import (
 __all__ = [
     "ProbeFactory",
     "ProbeStatus",
+    "ProductKnowledgeRouterConfig",
     "create_product_knowledge_router",
     "create_provider_write_validator",
 ]
@@ -254,12 +256,20 @@ def create_provider_write_validator(
     return validate
 
 
+@dataclass(frozen=True, slots=True)
+class ProductKnowledgeRouterConfig:
+    """What the test-connection probe runs against. ``credentials=None`` means
+    the map was malformed at startup."""
+
+    credentials: CredentialMap | None
+    enabled: bool
+    endpoint_allowlist: tuple[str, ...]
+    probe_factory: ProbeFactory
+
+
 def create_product_knowledge_router(
     *,
-    credentials: CredentialMap | None,
-    enabled: bool,
-    endpoint_allowlist: tuple[str, ...],
-    probe_factory: ProbeFactory,
+    config: ProductKnowledgeRouterConfig,
     audit_log_repository: PostgresAuditLogRepository,
     require_session: RequireSessionDependency,
     require_admin_role: RequireAdminRoleDependency,
@@ -267,6 +277,7 @@ def create_product_knowledge_router(
 ) -> APIRouter:
     """``credentials=None`` means the map was malformed at startup: the
     routes stay mounted (the UI needs a clear answer) but report disabled."""
+    credentials = config.credentials
     router = APIRouter(prefix="/api/v1/product-knowledge")
     session_limiter = _SlidingWindow(limit=SESSION_LIMIT_PER_MINUTE, clock=clock)
     # Per *user* too: a fresh login (new session id) must not reset the quota.
@@ -313,6 +324,18 @@ def create_product_knowledge_router(
             {"status": status, "message": _MESSAGES[status], **fields}
         )
 
+    def charge_limiters(authenticated: AuthenticatedSession, response: Response) -> None:
+        windows = (
+            (session_limiter, str(authenticated.session_id)),
+            (user_limiter, str(authenticated.user.id)),
+            (global_limiter, "global"),
+        )
+        if not all(window.has_room(key) for window, key in windows):
+            response.headers["Retry-After"] = "60"
+            raise HTTPException(status_code=429, detail="rate_limited")
+        for window, key in windows:
+            window.record(key)
+
     @router.post("/test-connection")
     async def test_connection(
         payload: ProbeRequest,
@@ -323,24 +346,13 @@ def create_product_knowledge_router(
         # Both limiters are checked before either is charged, so a global
         # rejection never burns a session slot. The global window is per
         # Admin API pod (in-memory), not cluster-wide.
-        session_key = str(authenticated.session_id)
-        user_key = str(authenticated.user.id)
-        if not (
-            session_limiter.has_room(session_key)
-            and user_limiter.has_room(user_key)
-            and global_limiter.has_room("global")
-        ):
-            response.headers["Retry-After"] = "60"
-            raise HTTPException(status_code=429, detail="rate_limited")
-        session_limiter.record(session_key)
-        user_limiter.record(user_key)
-        global_limiter.record("global")
+        charge_limiters(authenticated, response)
 
         host = _host_of(payload.endpoint_url)
         ref = payload.credential_ref
 
         # 2. Kill switch / unavailable map.
-        if not enabled or credentials is None:
+        if not config.enabled or credentials is None:
             await audit(authenticated, host=host, ref=ref, status="disabled")
             return result("disabled")
 
@@ -356,20 +368,26 @@ def create_product_knowledge_router(
 
         # 4. The target must be one the operator provisioned (host, and port
         # when the entry carries one).
-        origin = endpoint_origin(payload.endpoint_url)
-        if origin is None or not (
-            credentials.any_binds(*origin)
-            or host_matches_allowlist(origin[0], endpoint_allowlist, origin[1])
-        ):
+        if not _target_is_provisioned(credentials, payload.endpoint_url, config.endpoint_allowlist):
             await audit(authenticated, host=host, ref=ref, status="blocked_by_policy")
             return result("blocked_by_policy")
 
         # 5. Same adapter path as the Worker.
-        status, fields = await _probe(probe_factory, payload, clock)
+        status, fields = await _probe(config.probe_factory, payload, clock)
         await audit(authenticated, host=host, ref=ref, status=status)
         return result(status, **fields)
 
     return router
+
+
+def _target_is_provisioned(
+    credentials: CredentialMap, endpoint_url: str, endpoint_allowlist: tuple[str, ...]
+) -> bool:
+    origin = endpoint_origin(endpoint_url)
+    return origin is not None and (
+        credentials.any_binds(*origin)
+        or host_matches_allowlist(origin[0], endpoint_allowlist, origin[1])
+    )
 
 
 async def _probe(

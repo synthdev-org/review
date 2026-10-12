@@ -75,24 +75,40 @@ _ROOT_READ_RE = re.compile(r'(?:_ROOT|ROOT|REPO_ROOT|parents\[\d\])((?:\s*/\s*"[
 _SELF = Path(__file__).resolve()
 
 
+def _repo_root_reads(test_file: Path) -> list[str]:
+    """Repo-root relative paths a test module builds from ``_ROOT / "a" / "b"``."""
+    return [
+        "/".join(re.findall(r'"([^"]+)"', match.group(1)))
+        for match in _ROOT_READ_RE.finditer(test_file.read_text())
+    ]
+
+
+def _is_copied(path: str, config: dict[str, list[str]]) -> bool:
+    also_copy = [entry.rstrip("/") for entry in config["also_copy"]]
+    return (
+        path == "pyproject.toml"
+        or any(path == e or path.startswith(f"{e}/") for e in also_copy)
+        or path.startswith(tuple(config["source_paths"]))
+        or not (_ROOT / path).exists()
+    )
+
+
 def test_every_repo_root_file_read_by_a_unit_test_is_in_mutmut_also_copy() -> None:
     # mutmut only copies source_paths + tests + also_copy into its sandbox; a
     # unit test reading any other repo-root file fails against every mutant.
     config = tomllib.loads((_ROOT / "pyproject.toml").read_text())["tool"]["mutmut"]
-    also_copy = [entry.rstrip("/") for entry in config["also_copy"]]
-    uncovered: set[str] = set()
-    for package in config["source_paths"]:
-        for test_file in (_ROOT / package).rglob("test_*.py"):
-            if test_file.resolve() == _SELF or "node_modules" in test_file.parts:
-                continue
-            for match in _ROOT_READ_RE.finditer(test_file.read_text()):
-                path = "/".join(re.findall(r'"([^"]+)"', match.group(1)))
-                if path == "pyproject.toml" or any(
-                    path == e or path.startswith(f"{e}/") for e in also_copy
-                ):
-                    continue
-                if (_ROOT / path).exists() and not path.startswith(tuple(config["source_paths"])):
-                    uncovered.add(f"{test_file.relative_to(_ROOT)}: {path}")
+    test_files = [
+        f
+        for package in config["source_paths"]
+        for f in (_ROOT / package).rglob("test_*.py")
+        if f.resolve() != _SELF and "node_modules" not in f.parts
+    ]
+    uncovered = {
+        f"{test_file.relative_to(_ROOT)}: {path}"
+        for test_file in test_files
+        for path in _repo_root_reads(test_file)
+        if not _is_copied(path, config)
+    }
     assert not uncovered, f"add to [tool.mutmut].also_copy: {sorted(uncovered)}"
 
 

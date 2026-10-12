@@ -34,7 +34,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Protocol
-from urllib.parse import quote, urlsplit
+from urllib.parse import SplitResult, quote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
@@ -431,6 +431,42 @@ def _clean_line(text: str, limit: int) -> str:
     return " ".join(_clean_text(text).split())[:limit]
 
 
+def _parse_http_url(url: str) -> tuple[SplitResult, str, int | None] | None:
+    """``(parts, hostname, port)`` for an ``http``/``https`` URL with a host
+    and no userinfo; ``None`` otherwise (incl. a malformed port)."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+        host = parts.hostname
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not host or "@" in parts.netloc:
+        return None
+    return parts, host, port
+
+
+def _ascii_host(host: str) -> str | None:
+    """The lower-cased IDNA/ASCII form of ``host``, ``None`` if unusable."""
+    try:
+        host = host.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    return host if _HOST_RE.fullmatch(host) else None
+
+
+def _rebuild_url(parts: SplitResult, host: str, port: int | None) -> str:
+    """Canonical, percent-encoded URL from already-validated components."""
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    result = f"{parts.scheme.lower()}://{netloc}{quote(parts.path, safe=_URL_SAFE)}"
+    if parts.query:
+        result += "?" + quote(parts.query, safe=_URL_SAFE + "?")
+    if parts.fragment:
+        result += "#" + quote(parts.fragment, safe=_URL_SAFE + "?")
+    return result
+
+
 def sanitize_url(url: object) -> str | None:
     """The single URL sanitizer (normalization and citation both use it).
 
@@ -442,28 +478,14 @@ def sanitize_url(url: object) -> str | None:
         return None
     if any(unicodedata.category(ch) in _STRIP_CATEGORIES for ch in url):
         return None
-    try:
-        parts = urlsplit(url)
-        port = parts.port
-        host = parts.hostname
-    except ValueError:
+    parsed = _parse_http_url(url)
+    if parsed is None:
         return None
-    if parts.scheme.lower() not in ("http", "https") or not host or "@" in parts.netloc:
+    parts, raw_host, port = parsed
+    host = _ascii_host(raw_host)
+    if host is None:
         return None
-    try:
-        host = host.encode("idna").decode("ascii").lower()
-    except UnicodeError:
-        return None
-    if not _HOST_RE.fullmatch(host):
-        return None
-    netloc = f"[{host}]" if ":" in host else host
-    if port is not None:
-        netloc = f"{netloc}:{port}"
-    result = f"{parts.scheme.lower()}://{netloc}{quote(parts.path, safe=_URL_SAFE)}"
-    if parts.query:
-        result += "?" + quote(parts.query, safe=_URL_SAFE + "?")
-    if parts.fragment:
-        result += "#" + quote(parts.fragment, safe=_URL_SAFE + "?")
+    result = _rebuild_url(parts, host, port)
     return result if len(result) <= URL_MAX_CHARS else None
 
 
@@ -512,6 +534,16 @@ class NormalizedResults(BaseModel):
     outcome: ProviderOutcome
 
 
+def _parse_updated_at(raw_updated: object) -> datetime | None:
+    """ISO-8601 string to ``datetime``; anything else (or malformed) ``None``."""
+    if not isinstance(raw_updated, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw_updated)
+    except ValueError:
+        return None
+
+
 def _normalize_item(raw: object) -> ProviderItem | None:
     if not isinstance(raw, Mapping):
         return None
@@ -535,19 +567,12 @@ def _normalize_item(raw: object) -> ProviderItem | None:
         return None
     if not re.fullmatch(_SOURCE_TYPE_PATTERN, source_type):
         source_type = "other"
-    updated_at: datetime | None = None
-    raw_updated = raw.get("updated_at")
-    if isinstance(raw_updated, str):
-        try:
-            updated_at = datetime.fromisoformat(raw_updated)
-        except ValueError:
-            updated_at = None
     return ProviderItem(
         provider_item_id=item_id,
         title=clean_title,
         source_type=source_type,
         url=sanitize_url(raw.get("url")),
-        updated_at=updated_at,
+        updated_at=_parse_updated_at(raw.get("updated_at")),
         content=_clean_text(snippet, keep_newlines=True)[:SNIPPET_MAX_CHARS],
     )
 

@@ -1109,7 +1109,8 @@ def test_product_knowledge_default_wires_a_factory_without_warning_or_token_in_l
     wired = [p for p in payloads if p["message"] == "product knowledge wired"]
     assert len(wired) == 1
     assert wired[0]["credential_count"] == 1
-    assert not [p for p in payloads if p["message"] == _PK_DISABLED_MESSAGE]
+    if [p for p in payloads if p["message"] == _PK_DISABLED_MESSAGE]:
+        pytest.fail("no disabled-provider message expected")
     assert "tok-1" not in out
 
 

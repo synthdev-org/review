@@ -81,24 +81,23 @@ _ROUTABLE_V6_NETWORKS: Final = tuple(ipaddress.ip_network(n) for n in ("2000::/3
 _NUMERIC_V4_RE: Final = re.compile(r"^(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+)){0,3}$", re.I)
 
 
-def split_host_port(value: str) -> tuple[str, str | None] | None:
-    """Splits ``host``, ``host:port``, ``[v6]`` or ``[v6]:port``.
+_HOST_FORBIDDEN_CHARS: Final = "@/\\?# \t\r\n%"
 
-    Returns ``None`` for anything that is not one of those (userinfo, a
-    scheme, a path, whitespace, an IPv6 zone id, a non-numeric port).
-    A bare IPv6 literal (two or more colons, no brackets) has no port.
-    """
-    if not value or any(c in value for c in "@/\\?# \t\r\n%"):
+
+def _split_bracketed(value: str) -> tuple[str, str | None] | None:
+    """``[v6]`` / ``[v6]:port``; ``value`` starts with ``[``."""
+    host, sep, rest = value[1:].partition("]")
+    if not sep or not host:
         return None
-    if value.startswith("["):
-        host, sep, rest = value[1:].partition("]")
-        if not sep or not host:
-            return None
-        if not rest:
-            return host, None
-        if rest.startswith(":") and rest[1:].isdigit():
-            return host, rest[1:]
-        return None
+    if not rest:
+        return host, None
+    if rest.startswith(":") and rest[1:].isdigit():
+        return host, rest[1:]
+    return None
+
+
+def _split_unbracketed(value: str) -> tuple[str, str | None] | None:
+    """``host`` / ``host:port`` / a bare IPv6 literal (never has a port)."""
     if value.count(":") >= 2:
         return value, None
     host, sep, port = value.partition(":")
@@ -107,6 +106,44 @@ def split_host_port(value: str) -> tuple[str, str | None] | None:
     if sep and not port.isdigit():
         return None
     return host, (port if sep else None)
+
+
+def split_host_port(value: str) -> tuple[str, str | None] | None:
+    """Splits ``host``, ``host:port``, ``[v6]`` or ``[v6]:port``.
+
+    Returns ``None`` for anything that is not one of those (userinfo, a
+    scheme, a path, whitespace, an IPv6 zone id, a non-numeric port).
+    A bare IPv6 literal (two or more colons, no brackets) has no port.
+    """
+    if not value or any(c in value for c in _HOST_FORBIDDEN_CHARS):
+        return None
+    if value.startswith("["):
+        return _split_bracketed(value)
+    return _split_unbracketed(value)
+
+
+def _canonical_ipv6(host: str) -> str | None:
+    try:
+        return str(ipaddress.IPv6Address(host))
+    except ValueError:
+        return None
+
+
+def _canonical_numeric_ipv4(host: str) -> str | None:
+    try:
+        return socket.inet_ntoa(socket.inet_aton(host))
+    except OSError:
+        return None
+
+
+def _canonical_dns_name(host: str) -> str | None:
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    if len(host) > 253 or any(not (0 < len(label) <= 63) for label in host.split(".")):
+        return None
+    return host
 
 
 def canonicalize_host(value: str) -> str | None:
@@ -121,49 +158,65 @@ def canonicalize_host(value: str) -> str | None:
     if not host:
         return None
     if ":" in host:
-        try:
-            return str(ipaddress.IPv6Address(host))
-        except ValueError:
-            return None
+        return _canonical_ipv6(host)
     if _NUMERIC_V4_RE.match(host):
-        try:
-            return socket.inet_ntoa(socket.inet_aton(host))
-        except OSError:
-            return None
+        return _canonical_numeric_ipv4(host)
+    return _canonical_dns_name(host)
+
+
+_IP = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def _in_any(ip: _IP, networks: Iterable[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> bool:
+    return any(ip in net for net in networks)
+
+
+def _parse_address(address: str | _IP) -> _IP | None:
+    if not isinstance(address, str):
+        return address
     try:
-        host = host.encode("idna").decode("ascii")
-    except UnicodeError:
+        return ipaddress.ip_address(address)
+    except ValueError:
         return None
-    if len(host) > 253 or any(not (0 < len(label) <= 63) for label in host.split(".")):
-        return None
-    return host
 
 
-def classify_address(address: str | ipaddress.IPv4Address | ipaddress.IPv6Address) -> AddressClass:
-    """Classifies one *resolved* address. Unparseable input is ``DENIED``."""
-    if isinstance(address, str):
-        try:
-            ip: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(address)
-        except ValueError:
-            return AddressClass.DENIED
-    else:
-        ip = address
-    if isinstance(ip, ipaddress.IPv6Address):
-        if ip.ipv4_mapped is not None:
-            ip = ip.ipv4_mapped
-        elif not any(ip in net for net in _ROUTABLE_V6_NETWORKS) or any(
-            ip in net for net in _DENIED_V6_NETWORKS
-        ):
-            return AddressClass.DENIED
-    if isinstance(ip, ipaddress.IPv4Address) and any(ip in net for net in _DENIED_V4_NETWORKS):
-        return AddressClass.DENIED
-    if (
+def _is_denied_v6(ip: ipaddress.IPv6Address) -> bool:
+    """Outside the allow-listed global/ULA blocks, or an explicit transition deny."""
+    return not _in_any(ip, _ROUTABLE_V6_NETWORKS) or _in_any(ip, _DENIED_V6_NETWORKS)
+
+
+def _unmap_v6(ip: ipaddress.IPv6Address) -> _IP | None:
+    """The address to keep classifying: the embedded IPv4 of a mapped
+    address, ``ip`` itself, or ``None`` when ``ip`` is denied outright."""
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return None if _is_denied_v6(ip) else ip
+
+
+def _is_denied_special(ip: _IP) -> bool:
+    """Loopback, link-local, unspecified, multicast and cloud-metadata addresses."""
+    return (
         ip.is_loopback
         or ip.is_link_local
         or ip.is_unspecified
         or ip.is_multicast
         or ip in _METADATA_ADDRESSES
-    ):
+    )
+
+
+def classify_address(address: str | _IP) -> AddressClass:
+    """Classifies one *resolved* address. Unparseable input is ``DENIED``."""
+    ip = _parse_address(address)
+    if ip is None:
+        return AddressClass.DENIED
+    if isinstance(ip, ipaddress.IPv6Address):
+        unmapped = _unmap_v6(ip)
+        if unmapped is None:
+            return AddressClass.DENIED
+        ip = unmapped
+    if isinstance(ip, ipaddress.IPv4Address) and _in_any(ip, _DENIED_V4_NETWORKS):
+        return AddressClass.DENIED
+    if _is_denied_special(ip):
         return AddressClass.DENIED
     return AddressClass.PUBLIC if ip.is_global else AddressClass.PRIVATE
 

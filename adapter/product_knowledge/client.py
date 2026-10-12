@@ -41,10 +41,10 @@ import json
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Final, TypeVar
+from typing import Any, Final, TypedDict, TypeVar, Unpack
 from urllib.parse import urlsplit
 
 import httpx2
@@ -80,7 +80,9 @@ from review.product_knowledge import (
 
 __all__ = [
     "ClientTimeouts",
+    "ClientTuning",
     "EndpointGate",
+    "FactoryTuning",
     "McpProductKnowledgeClient",
     "NegotiationCache",
 ]
@@ -279,12 +281,82 @@ def _leaves(exc: BaseException) -> Iterator[BaseException]:
             yield from _leaves(exc.__cause__)
 
 
+def _typed_leaf_outcome(leaves: list[BaseException]) -> ProviderOutcome | None:
+    """Our own typed errors raised inside the SDK's task group arrive wrapped
+    in an ExceptionGroup; keep their specific outcome."""
+    for leaf in leaves:
+        if isinstance(leaf, ProductKnowledgeError):
+            return leaf.outcome
+    return None
+
+
+def _network_outcome(leaves: list[BaseException]) -> ProviderOutcome | None:
+    if any(isinstance(e, TimeoutError | httpx2.TimeoutException) for e in leaves):
+        return ProviderOutcome.TIMEOUT
+    if any(isinstance(e, httpx2.TransportError) for e in leaves):
+        return ProviderOutcome.UNREACHABLE
+    return None
+
+
+def _is_malformed(leaves: list[BaseException]) -> bool:
+    return any(
+        isinstance(e, RecursionError | json.JSONDecodeError | ValidationError)
+        or (isinstance(e, MCPError) and e.code == types.PARSE_ERROR)
+        for e in leaves
+    )
+
+
+class FactoryTuning(TypedDict, total=False):
+    """Keyword options shared by the client and its factory. Grouped as an
+    ``Unpack`` TypedDict (not a config object) so every call site keeps its
+    keyword spelling while ``__init__`` stays under the parameter limit."""
+
+    cache: NegotiationCache | None
+    gate: EndpointGate | None
+    bypass_cache: bool
+    top_k: int
+
+
+class ClientTuning(FactoryTuning, total=False):
+    supported_majors: frozenset[str]
+    deprecated_majors: frozenset[str]
+    rate_limit_cooldown_seconds: float
+
+
+def _reject_unknown_tuning(tuning: Mapping[str, object]) -> None:
+    """``**tuning`` is not checked by the interpreter the way named keyword
+    parameters are: an unknown option must still be a ``TypeError``."""
+    unknown = sorted(set(tuning) - ClientTuning.__optional_keys__)
+    if unknown:
+        raise TypeError(f"unexpected keyword argument {unknown[0]!r}")
+
+
+def _endpoint_identity(
+    endpoint_url: str, credential_ref: str | None
+) -> tuple[bool, str, str, CacheKey]:
+    """``(usable, host, origin, cache_key)``. Total: a malformed URL
+    ('host:abc', port > 65535, an unbalanced IPv6 bracket) is unusable and
+    every call then fails closed with ``blocked_egress`` instead of raising."""
+    try:
+        parts = urlsplit(endpoint_url)
+        port = parts.port
+        host = canonicalize_host(parts.hostname or "") or "invalid"
+        scheme = parts.scheme.lower()
+        origin = f"{scheme}://{host}:{port or (443 if scheme == 'https' else 80)}"
+        return True, host, origin, (f"{scheme}://{host}:{port or ''}{parts.path}", credential_ref)
+    except ValueError:
+        return False, "invalid", "invalid://invalid", ("invalid://invalid", credential_ref)
+
+
 class McpProductKnowledgeClient:
     """Implements ``ProductKnowledgeProvider`` for one endpoint (+credential).
 
     Constructed from already-parsed config only — no env or file reads.
     ``resolver`` and ``inner_transport`` are test seams (a fake resolver and a
     transport that connects to a loopback fake); production passes neither.
+    The remaining options are ``ClientTuning`` keywords (``cache``, ``gate``,
+    ``supported_majors``, ``deprecated_majors``,
+    ``rate_limit_cooldown_seconds``, ``bypass_cache``, ``top_k``).
     """
 
     def __init__(
@@ -294,52 +366,31 @@ class McpProductKnowledgeClient:
         credential: ProviderCredential | None = None,
         policy: EgressPolicy | None = None,
         timeouts: ClientTimeouts | None = None,
-        cache: NegotiationCache | None = None,
-        gate: EndpointGate | None = None,
-        supported_majors: frozenset[str] = SUPPORTED_MAJORS,
-        deprecated_majors: frozenset[str] = frozenset(),
-        rate_limit_cooldown_seconds: float = 30.0,
-        bypass_cache: bool = False,
-        top_k: int = TOP_K,
         resolver: Resolver = system_resolver,
         inner_transport: httpx2.AsyncBaseTransport | None = None,
+        **tuning: Unpack[ClientTuning],
     ) -> None:
+        _reject_unknown_tuning(tuning)
         _silence_sdk_logging()
         self._url = endpoint_url
         self._credential = credential
         self._policy = policy or EgressPolicy()
         self._timeouts = timeouts or ClientTimeouts()
-        self._cache = cache or NegotiationCache()
-        self._gate = gate or EndpointGate()
-        self._supported = supported_majors
-        self._deprecated = deprecated_majors
-        self._cooldown = rate_limit_cooldown_seconds
-        self._bypass_cache = bypass_cache
+        self._cache = tuning.get("cache") or NegotiationCache()
+        self._gate = tuning.get("gate") or EndpointGate()
+        self._supported = tuning.get("supported_majors", SUPPORTED_MAJORS)
+        self._deprecated = tuning.get("deprecated_majors", frozenset())
+        self._cooldown = tuning.get("rate_limit_cooldown_seconds", 30.0)
+        self._bypass_cache = tuning.get("bypass_cache", False)
         # Latest negotiation of a bypass_cache client (test-connection): the
         # route negotiates once, search()/fetch() reuse that result.
         self._probe_negotiation: NegotiationResult | None = None
-        self._top_k = top_k
+        self._top_k = tuning.get("top_k", TOP_K)
         self._resolver = resolver
         self._inner = inner_transport
-        # Total construction: a malformed URL ('host:abc', port > 65535, an
-        # unbalanced IPv6 bracket) marks the client unusable; every call then
-        # fails closed with ``blocked_egress`` instead of raising here.
-        self._usable = True
-        try:
-            parts = urlsplit(endpoint_url)
-            port = parts.port
-            self._host = canonicalize_host(parts.hostname or "") or "invalid"
-            scheme = parts.scheme.lower()
-            self._origin = f"{scheme}://{self._host}:{port or (443 if scheme == 'https' else 80)}"
-            self._cache_key: CacheKey = (
-                f"{scheme}://{self._host}:{port or ''}{parts.path}",
-                credential.ref if credential else None,
-            )
-        except ValueError:
-            self._usable = False
-            self._host = "invalid"
-            self._origin = "invalid://invalid"
-            self._cache_key = ("invalid://invalid", credential.ref if credential else None)
+        self._usable, self._host, self._origin, self._cache_key = _endpoint_identity(
+            endpoint_url, credential.ref if credential else None
+        )
 
     # --- ProductKnowledgeProvider ------------------------------------------
 
@@ -529,21 +580,9 @@ class McpProductKnowledgeClient:
             async with asyncio.timeout(self._timeouts.call_seconds):
                 return await body(sdk)
 
-    def _classify(
-        self, exc: BaseException, transport: GuardedTransport, endpoint: str
-    ) -> ProviderOutcome:
-        if transport.outcome is not None:
-            return transport.outcome
-        leaves = list(_leaves(exc))
-        # Our own typed errors raised inside the SDK's task group arrive
-        # wrapped in an ExceptionGroup; keep their specific outcome.
-        for leaf in leaves:
-            if isinstance(leaf, ProductKnowledgeError):
-                return leaf.outcome
-        if any(isinstance(e, TimeoutError | httpx2.TimeoutException) for e in leaves):
-            return ProviderOutcome.TIMEOUT
-        if any(isinstance(e, httpx2.TransportError) for e in leaves):
-            return ProviderOutcome.UNREACHABLE
+    def _status_outcome(self, transport: GuardedTransport, endpoint: str) -> ProviderOutcome | None:
+        """Outcome implied by the last HTTP error status, if any (a 429 also
+        starts the endpoint cool-down)."""
         status = transport.status
         if status in (401, 403):
             return ProviderOutcome.AUTH_FAILED
@@ -555,10 +594,23 @@ class McpProductKnowledgeClient:
                 self._cache_key[1],
             )
             return ProviderOutcome.PROVIDER_ERROR
-        if any(
-            isinstance(e, RecursionError | json.JSONDecodeError | ValidationError)
-            or (isinstance(e, MCPError) and e.code == types.PARSE_ERROR)
-            for e in leaves
-        ):
-            return ProviderOutcome.MALFORMED
-        return ProviderOutcome.PROVIDER_ERROR
+        return None
+
+    def _classify(
+        self, exc: BaseException, transport: GuardedTransport, endpoint: str
+    ) -> ProviderOutcome:
+        if transport.outcome is not None:
+            return transport.outcome
+        leaves = list(_leaves(exc))
+        # Order is the precedence: typed errors, then timeout, then transport
+        # failure, then the HTTP status, then malformed bodies.
+        found = _typed_leaf_outcome(leaves)
+        if found is None:
+            found = _network_outcome(leaves)
+        if found is None:
+            found = self._status_outcome(transport, endpoint)
+        if found is not None:
+            return found
+        return (
+            ProviderOutcome.MALFORMED if _is_malformed(leaves) else ProviderOutcome.PROVIDER_ERROR
+        )

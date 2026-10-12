@@ -262,3 +262,59 @@ def test_invalid_credential_error_has_no_exception_context_and_no_token_named_ke
         assert CANARY not in str(err)
         err = err.__cause__ or err.__context__
     assert excinfo.value.__context__ is None and excinfo.value.__cause__ is None
+
+
+# --- extracted helpers ------------------------------------------------------
+
+
+def test_load_entry_error_has_no_exception_context_and_never_echoes_key_names() -> None:
+    from adapter.product_knowledge.credentials import _load_entry
+
+    with pytest.raises(CredentialMapError) as excinfo:
+        _load_entry("ref", {"token": "x", "allowed_hosts": ["h"], CANARY: 1})
+
+    assert excinfo.value.__context__ is None
+    assert excinfo.value.__cause__ is None
+    assert CANARY not in str(excinfo.value)
+    assert "unexpected field" in str(excinfo.value)
+
+
+def test_load_entry_names_only_known_fields_sorted() -> None:
+    from adapter.product_knowledge.credentials import _load_entry
+
+    with pytest.raises(CredentialMapError) as excinfo:
+        _load_entry("ref", {"token": 1, "allowed_hosts": "h"})
+
+    assert "check allowed_hosts, token " in str(excinfo.value)
+
+
+def test_bound_hosts_checks_token_then_hosts_and_dedupes() -> None:
+    from adapter.product_knowledge.credentials import _bound_hosts, _Entry
+
+    ok = _Entry(token=SecretStr("t"), allowed_hosts=["A.internal", "a.internal.", "b:8443"])
+    assert _bound_hosts("r", ok) == ("a.internal", "b:8443")
+    with pytest.raises(CredentialMapError, match="empty token"):
+        _bound_hosts("r", _Entry(token=SecretStr(" "), allowed_hosts=[]))
+    with pytest.raises(CredentialMapError, match="no allowed_hosts"):
+        _bound_hosts("r", _Entry(token=SecretStr("t"), allowed_hosts=[]))
+    for bad in ("*.example.com", "https://h", "h/p"):
+        with pytest.raises(CredentialMapError, match="invalid allowed_hosts entry"):
+            _bound_hosts("r", _Entry(token=SecretStr("t"), allowed_hosts=[bad]))
+
+
+def test_duplicate_ref_is_rejected_by_the_decoder() -> None:
+    from adapter.product_knowledge.credentials import _decode_map
+
+    with pytest.raises(CredentialMapError, match="duplicate"):
+        _decode_map('{"a": {}, "a": {}}')
+
+
+def test_parse_credential_numbers_the_invalid_ref_by_position() -> None:
+    raw = _raw(
+        **{
+            "ok": {"token": "t", "allowed_hosts": ["h"]},
+            "BAD REF": {"token": "t", "allowed_hosts": ["h"]},
+        }
+    )
+    with pytest.raises(CredentialMapError, match=r"credential #2 has an invalid ref"):
+        parse_credential_map(raw)

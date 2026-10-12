@@ -258,7 +258,8 @@ def test_admin_empty_or_whitespace_credentials_are_the_same_as_unset(blank: str)
     settings = _unreachable_dsn_settings(product_knowledge_credentials=SecretStr(blank))
 
     assert settings.product_knowledge_credentials is None
-    assert not settings.credential_map()
+    if settings.credential_map():
+        pytest.fail("expected: not settings.credential_map()")
 
 
 def test_admin_defaults_have_no_map_and_the_kill_switch_on() -> None:
@@ -266,7 +267,8 @@ def test_admin_defaults_have_no_map_and_the_kill_switch_on() -> None:
 
     assert settings.product_knowledge_enabled is True
     assert settings.product_knowledge_call_timeout_seconds == 5
-    assert settings.product_knowledge_allow_private_networks is True
+    if settings.product_knowledge_allow_private_networks is not True:
+        pytest.fail("expected: settings.product_knowledge_allow_private_networks is True")
     assert settings.endpoint_allowlist() == ()
     assert not settings.credential_map()
 
@@ -300,8 +302,10 @@ def test_admin_load_credential_map_fails_open_with_a_value_free_log(
     with caplog.at_level(logging.ERROR):
         loaded = _load_credential_map(settings)
 
-    assert loaded is None
-    assert "credential map is invalid" in caplog.text
+    if loaded is not None:
+        pytest.fail("expected: loaded is None")
+    if "credential map is invalid" not in caplog.text:
+        pytest.fail('expected: "credential map is invalid" in caplog.text')
     assert _PK_CANARY not in caplog.text
 
 

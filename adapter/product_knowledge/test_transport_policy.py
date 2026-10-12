@@ -207,3 +207,112 @@ async def test_declared_content_length_over_the_cap_is_refused_before_any_body_r
     assert transport.outcome is ProviderOutcome.OVERSIZED
     assert inner.body.closed
     assert not inner.body.iterated
+
+
+# --- extracted guard steps (each refusal pinned individually) ---------------
+
+
+def _guard(
+    policy: EgressPolicy | None = None, credential: ProviderCredential | None = None
+) -> GuardedTransport:
+    return _transport(URL, _Inner(), policy=policy, credential=credential)
+
+
+def test_check_target_accepts_only_the_bound_origin() -> None:
+    guard = _guard()
+
+    assert guard._check_target(httpx2.URL("https://WIKI.internal.:8443/x")) == (
+        "https",
+        "wiki.internal",
+        8443,
+    )
+    for other in (
+        "http://wiki.internal:8443/mcp",  # scheme differs
+        "https://other.internal:8443/mcp",  # host differs
+        "https://wiki.internal/mcp",  # port differs
+        "ftp://wiki.internal:8443/mcp",  # scheme not http(s)
+    ):
+        with pytest.raises(EgressBlocked):
+            guard._check_target(httpx2.URL(other))
+        assert guard.outcome is ProviderOutcome.BLOCKED_EGRESS
+
+
+def test_check_target_refuses_everything_on_an_unusable_endpoint() -> None:
+    guard = _transport("https://u:p@wiki.internal:8443/mcp", _Inner())
+
+    with pytest.raises(EgressBlocked):
+        guard._check_target(httpx2.URL(URL))
+
+
+def test_check_allowlist_unauthenticated_needs_allowlist_or_credential_host() -> None:
+    _guard(EgressPolicy(endpoint_allowlist=("wiki.internal:8443",)))._check_allowlist(
+        "wiki.internal", 8443
+    )
+    _guard(EgressPolicy(credential_hosts=("wiki.internal:8443",)))._check_allowlist(
+        "wiki.internal", 8443
+    )
+    for policy in (EgressPolicy(), EgressPolicy(endpoint_allowlist=("wiki.internal:1",))):
+        with pytest.raises(EgressBlocked):
+            _guard(policy)._check_allowlist("wiki.internal", 8443)
+
+
+def test_check_allowlist_authenticated_is_open_without_allowlist_but_enforced_with_one() -> None:
+    cred = _cred("wiki.internal:8443")
+    _guard(EgressPolicy(), cred)._check_allowlist("wiki.internal", 8443)
+    with pytest.raises(EgressBlocked):
+        _guard(EgressPolicy(endpoint_allowlist=("other.internal",)), cred)._check_allowlist(
+            "wiki.internal", 8443
+        )
+
+
+def test_check_classes_denied_beats_everything() -> None:
+    from adapter.product_knowledge.egress import AddressClass
+
+    guard = _guard(EgressPolicy(allow_private_networks=True))
+    with pytest.raises(EgressBlocked, match="always denied"):
+        guard._check_classes([AddressClass.PUBLIC, AddressClass.DENIED])
+
+
+def test_check_classes_private_only_when_switched_off() -> None:
+    from adapter.product_knowledge.egress import AddressClass
+
+    _guard(EgressPolicy(allow_private_networks=True))._check_classes([AddressClass.PRIVATE])
+    _guard(EgressPolicy(allow_private_networks=False))._check_classes([AddressClass.PUBLIC])
+    with pytest.raises(EgressBlocked, match="private networks are disabled"):
+        _guard(EgressPolicy(allow_private_networks=False))._check_classes([AddressClass.PRIVATE])
+
+
+def test_outbound_headers_strip_caller_authorization_and_force_identity() -> None:
+    from adapter.product_knowledge.egress import AddressClass
+
+    request = httpx2.Request(
+        "POST", URL, headers={"authorization": "Bearer attacker", "accept-encoding": "gzip"}
+    )
+    headers = _guard()._outbound_headers(
+        request, "https", "wiki.internal", 8443, [AddressClass.PRIVATE]
+    )
+
+    assert "authorization" not in headers
+    assert headers["accept-encoding"] == "identity"
+
+
+def test_outbound_headers_attach_token_only_when_bound_and_not_cleartext_public() -> None:
+    from adapter.product_knowledge.egress import AddressClass
+
+    request = httpx2.Request("POST", URL)
+    bound = _guard(credential=_cred("wiki.internal:8443"))
+    headers = bound._outbound_headers(
+        request, "https", "wiki.internal", 8443, [AddressClass.PUBLIC]
+    )
+    assert headers["authorization"] == "Bearer tok-SECRET"
+
+    # cleartext http is fine to a private address, refused to a public one
+    bound._outbound_headers(request, "http", "wiki.internal", 8443, [AddressClass.PRIVATE])
+    with pytest.raises(EgressBlocked, match="cleartext"):
+        bound._outbound_headers(request, "http", "wiki.internal", 8443, [AddressClass.PUBLIC])
+    assert bound.outcome is ProviderOutcome.BLOCKED_EGRESS
+
+    unbound = _guard(credential=_cred("other.internal"))
+    with pytest.raises(EgressBlocked, match="not bound"):
+        unbound._outbound_headers(request, "https", "wiki.internal", 8443, [AddressClass.PRIVATE])
+    assert unbound.outcome is ProviderOutcome.CREDENTIAL_UNAVAILABLE

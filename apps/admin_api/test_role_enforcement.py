@@ -302,7 +302,8 @@ def test_viewer_is_403_on_provider_config_put_and_test_connection_but_can_read(
         config = client.get("/api/v1/config")
         credentials = client.get("/api/v1/product-knowledge/credentials")
 
-    assert put.status_code == 403
+    if put.status_code != 403:
+        pytest.fail("expected: put.status_code == 403")
     assert probe.status_code == 403
     assert config.status_code == 200
     assert config.json()["platform_settings"] == {}  # the 403 stored nothing

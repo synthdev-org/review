@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Annotated, Literal, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -152,23 +152,42 @@ class ProductKnowledgeProviderSetting(BaseModel):
         return validate_endpoint_url(value)
 
 
+def _is_printable_ascii_url(value: str) -> bool:
+    """At most 512 chars, ASCII, no whitespace or control characters."""
+    return (
+        len(value) <= 512 and value.isascii() and not any(c.isspace() or ord(c) < 32 for c in value)
+    )
+
+
+def _has_http_scheme_and_host(parts: SplitResult) -> bool:
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
+def _has_userinfo(parts: SplitResult) -> bool:
+    return parts.username is not None or parts.password is not None
+
+
+def _has_query_or_fragment(parts: SplitResult, value: str) -> bool:
+    return bool(parts.query or parts.fragment or "?" in value or "#" in value)
+
+
 def validate_endpoint_url(value: str) -> str:
     """Absolute ``http(s)`` URL, <= 512 chars, with a host and no userinfo,
     fragment or query (a credential or secret must never ride the URL).
     Returned unchanged; raises ``ValueError`` (with a fixed message, never the
     value) otherwise."""
-    if len(value) > 512 or not value.isascii() or any(c.isspace() or ord(c) < 32 for c in value):
+    if not _is_printable_ascii_url(value):
         raise ValueError("endpoint_url must be a printable ASCII URL of at most 512 characters")
     try:
         parts = urlsplit(value)
         parts.port  # noqa: B018 - raises ValueError on a malformed port
     except ValueError as exc:
         raise ValueError("endpoint_url is not a valid URL") from exc
-    if parts.scheme not in ("http", "https") or not parts.hostname:
+    if not _has_http_scheme_and_host(parts):
         raise ValueError("endpoint_url must be an absolute http(s) URL with a host")
-    if parts.username is not None or parts.password is not None:
+    if _has_userinfo(parts):
         raise ValueError("endpoint_url must not contain userinfo")
-    if parts.query or parts.fragment or "?" in value or "#" in value:
+    if _has_query_or_fragment(parts, value):
         raise ValueError("endpoint_url must not contain a query or fragment")
     return value
 

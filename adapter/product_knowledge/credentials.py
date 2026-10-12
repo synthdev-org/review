@@ -155,6 +155,76 @@ class CredentialMap:
         return None
 
 
+def _decode_map(text: str) -> dict[str, object]:
+    try:
+        decoded = json.loads(text, object_pairs_hook=_reject_duplicates)
+    except CredentialMapError:
+        raise
+    except (ValueError, RecursionError):
+        # Not ``from`` the decode error: its text can echo input fragments.
+        raise CredentialMapError("credential map is not valid JSON") from None
+    if not isinstance(decoded, dict) or not decoded:
+        raise CredentialMapError("credential map must be a non-empty JSON object")
+    return decoded
+
+
+def _bad_field_names(exc: ValidationError) -> list[str]:
+    # Only the two known field names are ever echoed: an unexpected key's
+    # *name* could itself be a pasted token.
+    return sorted(
+        {
+            str(e["loc"][0]) if e["loc"] and e["loc"][0] in _FIELDS else "unexpected field"
+            for e in exc.errors()
+        }
+    )
+
+
+def _load_entry(ref: str, body: object) -> _Entry:
+    entry: _Entry | None = None
+    bad_fields: list[str] = []
+    try:
+        entry = _Entry.model_validate(body)
+    except ValidationError as exc:
+        bad_fields = _bad_field_names(exc)
+    if entry is None:
+        # Raised outside the ``except`` block: no ``__context__`` chain, so
+        # the pydantic error (whose loc may be a token-named key) can never
+        # ride a traceback.
+        raise CredentialMapError(
+            f"credential {ref!r} is invalid: check {', '.join(bad_fields)} "
+            "(expected {token, allowed_hosts})"
+        )
+    return entry
+
+
+def _bound_hosts(ref: str, entry: _Entry) -> tuple[str, ...]:
+    if not entry.token.get_secret_value().strip():
+        raise CredentialMapError(f"credential {ref!r} has an empty token")
+    if not entry.allowed_hosts:
+        raise CredentialMapError(
+            f"credential {ref!r} has no allowed_hosts (a token must be bound to hosts)"
+        )
+    hosts: list[str] = []
+    for host_entry in entry.allowed_hosts:
+        bound = _bound_host(host_entry)
+        if bound is None:
+            raise CredentialMapError(
+                f"credential {ref!r} has an invalid allowed_hosts entry "
+                "(an exact host or host:port, without scheme, path or wildcard)"
+            )
+        hosts.append(bound)
+    return tuple(dict.fromkeys(hosts))
+
+
+def _parse_credential(index: int, ref: str, body: object) -> ProviderCredential:
+    if not validate_credential_ref(ref):
+        raise CredentialMapError(
+            f"credential #{index} has an invalid ref (expected [a-z0-9_-]{{1,64}})"
+        )
+    entry = _load_entry(ref, body)
+    return ProviderCredential(ref=ref, token=entry.token, allowed_hosts=_bound_hosts(ref, entry))
+
+
 def parse_credential_map(raw: SecretStr | str | None) -> CredentialMap:
     """Parse and validate the bootstrap credential map.
 
@@ -165,61 +235,10 @@ def parse_credential_map(raw: SecretStr | str | None) -> CredentialMap:
     text = raw.get_secret_value() if isinstance(raw, SecretStr) else raw
     if text is None or not text.strip():
         return CredentialMap.empty()
-    try:
-        decoded = json.loads(text, object_pairs_hook=_reject_duplicates)
-    except CredentialMapError:
-        raise
-    except (ValueError, RecursionError):
-        # Not ``from`` the decode error: its text can echo input fragments.
-        raise CredentialMapError("credential map is not valid JSON") from None
-    if not isinstance(decoded, dict) or not decoded:
-        raise CredentialMapError("credential map must be a non-empty JSON object")
-
+    decoded = _decode_map(text)
     parsed: dict[str, ProviderCredential] = {}
     for index, (ref, body) in enumerate(decoded.items(), start=1):
-        if not validate_credential_ref(ref):
-            raise CredentialMapError(
-                f"credential #{index} has an invalid ref (expected [a-z0-9_-]{{1,64}})"
-            )
-        entry: _Entry | None = None
-        bad_fields: list[str] = []
-        try:
-            entry = _Entry.model_validate(body)
-        except ValidationError as exc:
-            # Only the two known field names are ever echoed: an unexpected
-            # key's *name* could itself be a pasted token.
-            bad_fields = sorted(
-                {
-                    str(e["loc"][0]) if e["loc"] and e["loc"][0] in _FIELDS else "unexpected field"
-                    for e in exc.errors()
-                }
-            )
-        if entry is None:
-            # Raised outside the ``except`` block: no ``__context__`` chain,
-            # so the pydantic error (whose loc may be a token-named key)
-            # can never ride a traceback.
-            raise CredentialMapError(
-                f"credential {ref!r} is invalid: check {', '.join(bad_fields)} "
-                "(expected {token, allowed_hosts})"
-            )
-        if not entry.token.get_secret_value().strip():
-            raise CredentialMapError(f"credential {ref!r} has an empty token")
-        if not entry.allowed_hosts:
-            raise CredentialMapError(
-                f"credential {ref!r} has no allowed_hosts (a token must be bound to hosts)"
-            )
-        hosts: list[str] = []
-        for host_entry in entry.allowed_hosts:
-            bound = _bound_host(host_entry)
-            if bound is None:
-                raise CredentialMapError(
-                    f"credential {ref!r} has an invalid allowed_hosts entry "
-                    "(an exact host or host:port, without scheme, path or wildcard)"
-                )
-            hosts.append(bound)
-        parsed[ref] = ProviderCredential(
-            ref=ref, token=entry.token, allowed_hosts=tuple(dict.fromkeys(hosts))
-        )
+        parsed[ref] = _parse_credential(index, ref, body)
     return CredentialMap(parsed)
 
 

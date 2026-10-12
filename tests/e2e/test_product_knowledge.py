@@ -417,34 +417,7 @@ def _repo_scope(client: httpx.Client) -> str:
     raise AssertionError(f"repo {_OWNER_REPO} not in config tree: {tree}")
 
 
-# ---------------------------------------------------------------------------
-# The scenario.
-# ---------------------------------------------------------------------------
-
-
-def test_product_knowledge_is_cited_when_configured_and_review_survives_provider_down(
-    running_stack: dict[str, str],
-    provider_process: _ProviderProcess,
-    stub_github_server: HTTPServer,
-    stub_llm_server_pk: HTTPServer,
-) -> None:
-    env = running_stack
-    provider = provider_process.provider
-
-    # 1. No provider configured: review posted, no block, provider untouched.
-    baseline = _review_and_wait(
-        env,
-        stub_github_server,
-        stub_llm_server_pk,
-        number=1,
-        title="Tidy helper",
-        head_ref="chore/tidy",
-    )
-    assert "Changing this return value" in baseline
-    assert "Product knowledge" not in baseline
-    assert provider.requests == []
-
-    # 2. Configure the provider at repo scope through the real Admin API.
+def _configure_repo_provider(env: dict[str, str]) -> None:
     with httpx.Client(base_url=f"http://localhost:{env['ADMIN_API_PORT']}") as client:
         login = client.post(
             "/api/v1/auth/login",
@@ -473,6 +446,53 @@ def test_product_knowledge_is_cited_when_configured_and_review_survives_provider
         # The token never appears in any config response.
         assert _PROVIDER_TOKEN not in client.get("/api/v1/config").text
 
+
+def _assert_provider_saw_scoped_authenticated_search(
+    provider: FakeProvider, llm: HTTPServer, cited: str
+) -> None:
+    searches = [r for r in provider.requests if r.tool == "product_knowledge_search"]
+    assert searches, "the provider never received a search"
+    for request in provider.requests:
+        assert request.authorization == f"Bearer {_PROVIDER_TOKEN}"
+    query = str(searches[0].arguments["query"] if searches[0].arguments else "")
+    assert _ISSUE_KEY in query
+    assert _DIFF_CANARY not in query
+
+    # The provider token never reaches the LLM prompt or the posted comment.
+    assert _PROVIDER_TOKEN not in cited
+    assert all(_PROVIDER_TOKEN not in prompt for prompt in llm.prompts)  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# The scenario.
+# ---------------------------------------------------------------------------
+
+
+def test_product_knowledge_is_cited_when_configured_and_review_survives_provider_down(
+    running_stack: dict[str, str],
+    provider_process: _ProviderProcess,
+    stub_github_server: HTTPServer,
+    stub_llm_server_pk: HTTPServer,
+) -> None:
+    env = running_stack
+    provider = provider_process.provider
+
+    # 1. No provider configured: review posted, no block, provider untouched.
+    baseline = _review_and_wait(
+        env,
+        stub_github_server,
+        stub_llm_server_pk,
+        number=1,
+        title="Tidy helper",
+        head_ref="chore/tidy",
+    )
+    assert "Changing this return value" in baseline
+    assert "Product knowledge" not in baseline
+    assert provider.requests == []
+
+    # 2. Configure the provider at repo scope through the real Admin API.
+    _configure_repo_provider(env)
+
     cited = _review_and_wait(
         env,
         stub_github_server,
@@ -485,20 +505,7 @@ def test_product_knowledge_is_cited_when_configured_and_review_survives_provider
     assert "Product doc 1" in cited
     assert "https://wiki.example.com/docs/1" in cited
 
-    searches = [r for r in provider.requests if r.tool == "product_knowledge_search"]
-    assert searches, "the provider never received a search"
-    for request in provider.requests:
-        assert request.authorization == f"Bearer {_PROVIDER_TOKEN}"
-    query = str(searches[0].arguments["query"] if searches[0].arguments else "")
-    assert _ISSUE_KEY in query
-    assert _DIFF_CANARY not in query
-
-    # The provider token never reaches the LLM prompt or the posted comment.
-    assert _PROVIDER_TOKEN not in cited
-    assert all(
-        _PROVIDER_TOKEN not in prompt
-        for prompt in stub_llm_server_pk.prompts  # type: ignore[attr-defined]
-    )
+    _assert_provider_saw_scoped_authenticated_search(provider, stub_llm_server_pk, cited)
 
     # 3. Provider down: the review is still posted; only the block is absent.
     provider_process.stop()

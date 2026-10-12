@@ -302,10 +302,7 @@ class FakeProvider(AbstractAsyncContextManager["FakeProvider"]):
         if mode == "error_result":
             return _error("internal", f"{ERROR_BODY_CANARY} provider exploded")
         if tool == TOOL_CONTRACT:
-            versions = ["99"] if mode == "badversion" else self.supported_versions
-            if mode == "bad_structure":
-                return _ok({"supported_versions": "1"})
-            return _ok({"supported_versions": versions})
+            return self._contract(mode)
         if (
             mode != "accept_any_version"
             and args.get("contract_version") not in self.supported_versions
@@ -316,10 +313,19 @@ class FakeProvider(AbstractAsyncContextManager["FakeProvider"]):
         if tool == TOOL_FETCH:
             return self._fetch(args, mode)
         if tool == TOOL_RELATED and self.with_related:
-            if mode == "bad_structure":
-                return _ok({"results": "not-a-list"})
-            return _ok({"results": self.items[:1]})
+            return self._related(mode)
         return _error("invalid_argument", "unknown tool")
+
+    def _contract(self, mode: str | None) -> types.CallToolResult:
+        if mode == "bad_structure":
+            return _ok({"supported_versions": "1"})
+        versions = ["99"] if mode == "badversion" else self.supported_versions
+        return _ok({"supported_versions": versions})
+
+    def _related(self, mode: str | None) -> types.CallToolResult:
+        if mode == "bad_structure":
+            return _ok({"results": "not-a-list"})
+        return _ok({"results": self.items[:1]})
 
     def _search(self, args: dict[str, Any], mode: str | None) -> types.CallToolResult:
         top_k = int(args.get("top_k", 5))
@@ -377,6 +383,168 @@ class _InProcessServer(uvicorn.Server):
         yield
 
 
+async def _read_body(receive: Receive) -> bytes | None:
+    """The full request body, or None if the client disconnected first."""
+    body = b""
+    while True:
+        message = await receive()
+        if message["type"] != "http.request":
+            return None
+        body += message.get("body", b"")
+        if not message.get("more_body", False):
+            return bytes(body)
+
+
+def _parse_rpc(body: bytes) -> tuple[dict[str, Any] | None, Any, Any]:
+    """(json-rpc envelope | None, params.name, params.arguments)."""
+    try:
+        parsed = json.loads(body) if body else None
+    except ValueError:
+        parsed = None
+    rpc = parsed if isinstance(parsed, dict) else None
+    params = rpc.get("params") if rpc else None
+    if not isinstance(params, dict):
+        return rpc, None, None
+    return rpc, params.get("name"), params.get("arguments")
+
+
+def _record(
+    scope: Scope,
+    headers: dict[str, str],
+    rpc: dict[str, Any] | None,
+    tool: Any,
+    arguments: Any,
+) -> RecordedRequest:
+    return RecordedRequest(
+        http_method=scope["method"],
+        path=scope["path"],
+        host_header=headers.get("host", ""),
+        authorization=headers.get("authorization"),
+        protocol_version=headers.get("mcp-protocol-version"),
+        session_id=headers.get("mcp-session-id"),
+        rpc_method=rpc.get("method") if rpc else None,
+        tool=tool if isinstance(tool, str) else None,
+        arguments=arguments if isinstance(arguments, dict) else None,
+        accept_encoding=headers.get("accept-encoding"),
+    )
+
+
+_Fault = Callable[[str, dict[str, str], Send], Awaitable[None]]
+_CONNECT_METHODS = ("server/discover", "initialize")
+
+
+async def _fault_hang(mode: str, headers: dict[str, str], send: Send) -> None:
+    await asyncio.sleep(3600)
+
+
+async def _fault_status(mode: str, headers: dict[str, str], send: Send) -> None:
+    status = int(mode.removeprefix("status"))
+    extra = [(b"retry-after", b"7")] if status == 429 else []
+    await _respond(send, status, b'{"error":"fault"}', extra)
+
+
+async def _fault_error_body_with_token(mode: str, headers: dict[str, str], send: Send) -> None:
+    leaked = headers.get("authorization", "")
+    await _respond(send, 500, f"upstream failure for {leaked}".encode())
+
+
+async def _fault_redirect(mode: str, headers: dict[str, str], send: Send) -> None:
+    await _respond(send, 307, b"", [(b"location", b"http://192.0.2.1:9/mcp")])
+
+
+async def _fault_malformed(mode: str, headers: dict[str, str], send: Send) -> None:
+    await _respond(send, 200, b"{this is not json", content_type=b"application/json")
+
+
+async def _fault_deep_json(mode: str, headers: dict[str, str], send: Send) -> None:
+    depth = 100_000
+    await _respond(send, 200, b"[" * depth + b"]" * depth, content_type=b"application/json")
+
+
+async def _fault_gzip_bomb(mode: str, headers: dict[str, str], send: Send) -> None:
+    await _respond(
+        send,
+        200,
+        gzip.compress(b"0" * 5_000_000),
+        [(b"content-encoding", b"gzip")],
+        content_type=b"application/json",
+    )
+
+
+async def _drip(send: Send, response_headers: list[tuple[bytes, bytes]]) -> None:
+    """Valid headers, then one byte every 0.2 s: defeats per-read timeouts."""
+    await send({"type": "http.response.start", "status": 200, "headers": response_headers})
+    for _ in range(300):
+        await send({"type": "http.response.body", "body": b" ", "more_body": True})
+        await asyncio.sleep(0.2)
+
+
+async def _fault_slow_drip(mode: str, headers: dict[str, str], send: Send) -> None:
+    # Only a wall-clock deadline ends this.
+    await _drip(send, [(b"content-type", b"application/json")])
+
+
+async def _fault_chunked_no_length(mode: str, headers: dict[str, str], send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    chunk = b" " * 16384
+    for _ in range(64):  # 1 MiB, no Content-Length
+        await send({"type": "http.response.body", "body": chunk, "more_body": True})
+    await send({"type": "http.response.body", "body": b"{}", "more_body": False})
+
+
+_HTTP_FAULTS: dict[str, _Fault] = {
+    "hang": _fault_hang,
+    "status401": _fault_status,
+    "status403": _fault_status,
+    "status429": _fault_status,
+    "status500": _fault_status,
+    "error_body_with_token": _fault_error_body_with_token,
+    "redirect": _fault_redirect,
+    "malformed": _fault_malformed,
+    "deep_json": _fault_deep_json,
+    "gzip_bomb": _fault_gzip_bomb,
+    "slow_drip": _fault_slow_drip,
+    "chunked_no_length": _fault_chunked_no_length,
+}
+
+
+def _is_tool_call(rpc: dict[str, Any] | None, tool: Any) -> bool:
+    return bool(rpc and rpc.get("method") == "tools/call" and isinstance(tool, str))
+
+
+async def _connect_fault(mode: str, rpc: dict[str, Any] | None, send: Send) -> bool:
+    rpc_method = rpc.get("method") if rpc is not None else None
+    if mode == "hang_connect" and rpc_method in _CONNECT_METHODS:
+        await asyncio.sleep(3600)
+        return True
+    oversized = {
+        "huge_connect": _CONNECT_METHODS,
+        "huge_tools_list": ("tools/list",),
+    }.get(mode)
+    if oversized and rpc is not None and rpc_method in oversized:
+        # Valid JSON-RPC envelope, well over MAX_RESPONSE_BYTES.
+        envelope = {"jsonrpc": "2.0", "id": rpc.get("id"), "result": {"p": "x" * (512 * 1024)}}
+        await _respond(send, 200, json.dumps(envelope).encode())
+        return True
+    return False
+
+
+async def _delete_fault(mode: str, send: Send) -> bool:
+    if mode == "hang_delete":
+        await asyncio.sleep(3600)
+        return True
+    if mode == "drip_delete":
+        await _drip(send, [])
+        return True
+    return False
+
+
 class _Gate:
     """ASGI wrapper: era pinning, auth, request recording, HTTP-level faults."""
 
@@ -388,181 +556,87 @@ class _Gate:
         if scope["type"] != "http":
             await self._app(scope, receive, send)
             return
-        body = b""
-        while True:
-            message = await receive()
-            if message["type"] != "http.request":
-                return  # disconnect before the body arrived
-            body += message.get("body", b"")
-            if not message.get("more_body", False):
-                break
+        body = await _read_body(receive)
+        if body is None:
+            return  # disconnect before the body arrived
         headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
-        rpc: dict[str, Any] | None = None
-        try:
-            parsed = json.loads(body) if body else None
-            rpc = parsed if isinstance(parsed, dict) else None
-        except ValueError:
-            rpc = None
-        params = rpc.get("params") if rpc else None
-        tool = params.get("name") if isinstance(params, dict) else None
-        arguments = params.get("arguments") if isinstance(params, dict) else None
-        self._p.requests.append(
-            RecordedRequest(
-                http_method=scope["method"],
-                path=scope["path"],
-                host_header=headers.get("host", ""),
-                authorization=headers.get("authorization"),
-                protocol_version=headers.get("mcp-protocol-version"),
-                session_id=headers.get("mcp-session-id"),
-                rpc_method=rpc.get("method") if rpc else None,
-                tool=tool if isinstance(tool, str) else None,
-                arguments=arguments if isinstance(arguments, dict) else None,
-                accept_encoding=headers.get("accept-encoding"),
-            )
-        )
+        rpc, tool, arguments = _parse_rpc(body)
+        self._p.requests.append(_record(scope, headers, rpc, tool, arguments))
 
-        if self._p.token is not None and headers.get("authorization") != f"Bearer {self._p.token}":
-            await _respond(send, 401, b'{"error":"unauthorized"}')
+        if await self._reject(headers, rpc, send):
+            return
+        if await self._stall_fault(scope["method"], rpc, send):
             return
 
+        if not _is_tool_call(rpc, tool):
+            await self._app(scope, _replay(body, receive), send)
+            return
+        self._p.in_flight += 1
+        self._p.peak_in_flight = max(self._p.peak_in_flight, self._p.in_flight)
+        try:
+            if await self._call_fault(tool, arguments, headers, send):
+                return
+            await self._app(scope, _replay(body, receive), send)
+        finally:
+            self._p.in_flight -= 1
+
+    async def _reject(
+        self, headers: dict[str, str], rpc: dict[str, Any] | None, send: Send
+    ) -> bool:
+        """Auth and era pinning; True when a response was sent."""
+        p = self._p
+        if p.token is not None and headers.get("authorization") != f"Bearer {p.token}":
+            await _respond(send, 401, b'{"error":"unauthorized"}')
+            return True
         modern_marker = (
             "mcp-method" in headers or headers.get("mcp-protocol-version") == _MODERN_VERSION
         )
-        if self._p.era is Era.LEGACY and modern_marker:
+        if p.era is Era.LEGACY and modern_marker:
             await _respond(send, 400, _rpc_error(-32600, "Bad Request: unsupported protocol"))
-            return
-        if self._p.era is Era.MODERN and rpc and rpc.get("method") == "initialize":
+            return True
+        if p.era is Era.MODERN and rpc and rpc.get("method") == "initialize":
             await _respond(send, 400, _rpc_error(-32601, "Method not found"))
-            return
+            return True
+        return False
 
-        if (
-            self._p.fault is not None
-            and self._p.fault.mode == "hang_connect"
-            and rpc is not None
-            and rpc.get("method") in ("server/discover", "initialize")
-        ):
-            await asyncio.sleep(3600)
-            return
+    async def _stall_fault(self, http_method: str, rpc: dict[str, Any] | None, send: Send) -> bool:
+        """Connect-time and DELETE faults; True when the request was consumed."""
+        mode = self._p.fault.mode if self._p.fault is not None else ""
+        if http_method == "DELETE":
+            return await _delete_fault(mode, send)
+        return await _connect_fault(mode, rpc, send)
 
-        oversized = {
-            "huge_connect": ("server/discover", "initialize"),
-            "huge_tools_list": ("tools/list",),
-        }.get(self._p.fault.mode if self._p.fault is not None else "")
-        if oversized and rpc is not None and rpc.get("method") in oversized:
-            # Valid JSON-RPC envelope, well over MAX_RESPONSE_BYTES.
-            padding = "x" * (512 * 1024)
-            await _respond(
-                send,
-                200,
-                json.dumps(
-                    {"jsonrpc": "2.0", "id": rpc.get("id"), "result": {"p": padding}}
-                ).encode(),
-            )
-            return
-
-        if (
-            scope["method"] == "DELETE"
-            and self._p.fault is not None
-            and self._p.fault.mode in ("hang_delete", "drip_delete")
-        ):
-            if self._p.fault.mode == "hang_delete":
-                await asyncio.sleep(3600)
-                return
-            # One byte per 0.2 s after valid headers: evades per-read timeouts.
-            await send({"type": "http.response.start", "status": 200, "headers": []})
-            for _ in range(300):
-                await send({"type": "http.response.body", "body": b" ", "more_body": True})
-                await asyncio.sleep(0.2)
-            return
-
-        is_call = bool(rpc and rpc.get("method") == "tools/call" and isinstance(tool, str))
-        if is_call:
-            self._p.in_flight += 1
-            self._p.peak_in_flight = max(self._p.peak_in_flight, self._p.in_flight)
-        try:
-            if is_call and isinstance(tool, str):
-                args = arguments if isinstance(arguments, dict) else None
-                mode = self._p._active_fault(tool, args)
-                if mode is not None and await self._http_fault(mode, headers, send):
-                    return
-
-            sent = False
-
-            async def replay() -> Message:
-                nonlocal sent
-                if not sent:
-                    sent = True
-                    return {"type": "http.request", "body": body, "more_body": False}
-                return await receive()
-
-            await self._app(scope, replay, send)
-        finally:
-            if is_call:
-                self._p.in_flight -= 1
+    async def _call_fault(
+        self, tool: Any, arguments: Any, headers: dict[str, str], send: Send
+    ) -> bool:
+        args = arguments if isinstance(arguments, dict) else None
+        mode = self._p._active_fault(tool, args)
+        return mode is not None and await self._http_fault(mode, headers, send)
 
     async def _http_fault(self, mode: str, headers: dict[str, str], send: Send) -> bool:
+        """Run an HTTP-level fault; True when it consumed the request."""
         if mode == "slow":
             await asyncio.sleep(self._p.slow_seconds)
             return False
-        if mode == "hang":
-            await asyncio.sleep(3600)
-            return True
-        if mode in ("status401", "status403", "status429", "status500"):
-            status = int(mode.removeprefix("status"))
-            extra = [(b"retry-after", b"7")] if status == 429 else []
-            await _respond(send, status, b'{"error":"fault"}', extra)
-            return True
-        if mode == "error_body_with_token":
-            leaked = headers.get("authorization", "")
-            await _respond(send, 500, f"upstream failure for {leaked}".encode())
-            return True
-        if mode == "redirect":
-            await _respond(send, 307, b"", [(b"location", b"http://192.0.2.1:9/mcp")])
-            return True
-        if mode == "malformed":
-            await _respond(send, 200, b"{this is not json", content_type=b"application/json")
-            return True
-        if mode == "deep_json":
-            depth = 100_000
-            await _respond(send, 200, b"[" * depth + b"]" * depth, content_type=b"application/json")
-            return True
-        if mode == "gzip_bomb":
-            await _respond(
-                send,
-                200,
-                gzip.compress(b"0" * 5_000_000),
-                [(b"content-encoding", b"gzip")],
-                content_type=b"application/json",
-            )
-            return True
-        if mode == "slow_drip":
-            # Valid headers, then one byte every 0.2 s: defeats per-read
-            # timeouts, so only a wall-clock deadline ends it.
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-type", b"application/json")],
-                }
-            )
-            for _ in range(300):
-                await send({"type": "http.response.body", "body": b" ", "more_body": True})
-                await asyncio.sleep(0.2)
-            return True
-        if mode == "chunked_no_length":
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 200,
-                    "headers": [(b"content-type", b"application/json")],
-                }
-            )
-            chunk = b" " * 16384
-            for _ in range(64):  # 1 MiB, no Content-Length
-                await send({"type": "http.response.body", "body": chunk, "more_body": True})
-            await send({"type": "http.response.body", "body": b"{}", "more_body": False})
-            return True
-        return False
+        handler = _HTTP_FAULTS.get(mode)
+        if handler is None:
+            return False
+        await handler(mode, headers, send)
+        return True
+
+
+def _replay(body: bytes, receive: Receive) -> Receive:
+    """A receive() that re-serves the already-consumed body once."""
+    sent = False
+
+    async def replay() -> Message:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return replay
 
 
 def _rpc_error(code: int, message: str) -> bytes:

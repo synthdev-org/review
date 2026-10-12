@@ -14,6 +14,7 @@ from apps.admin_api.dependencies import AuthenticatedSession
 from apps.admin_api.product_knowledge_routes import (
     GLOBAL_LIMIT_PER_MINUTE,
     SESSION_LIMIT_PER_MINUTE,
+    ProductKnowledgeRouterConfig,
     create_product_knowledge_router,
 )
 from iam.models import User
@@ -47,10 +48,12 @@ def test_a_global_rejection_does_not_consume_the_sessions_own_slots() -> None:
     app = FastAPI()
     app.include_router(
         create_product_knowledge_router(
-            credentials=None,  # answers `disabled` once past the limiters
-            enabled=True,
-            endpoint_allowlist=(),
-            probe_factory=lambda url, ref: (_ for _ in ()).throw(AssertionError("no probe")),
+            config=ProductKnowledgeRouterConfig(
+                credentials=None,  # answers `disabled` once past the limiters
+                enabled=True,
+                endpoint_allowlist=(),
+                probe_factory=lambda url, ref: (_ for _ in ()).throw(AssertionError("no probe")),
+            ),
             audit_log_repository=_Audit(),  # type: ignore[arg-type]
             require_session=require_session,  # type: ignore[arg-type]
             require_admin_role=require_session,
@@ -85,10 +88,12 @@ def test_session_limiter_trips_independently_of_the_user_limiter() -> None:
     app = FastAPI()
     app.include_router(
         create_product_knowledge_router(
-            credentials=None,
-            enabled=True,
-            endpoint_allowlist=(),
-            probe_factory=lambda url, ref: (_ for _ in ()).throw(AssertionError("no probe")),
+            config=ProductKnowledgeRouterConfig(
+                credentials=None,
+                enabled=True,
+                endpoint_allowlist=(),
+                probe_factory=lambda url, ref: (_ for _ in ()).throw(AssertionError("no probe")),
+            ),
             audit_log_repository=_Audit(),  # type: ignore[arg-type]
             require_session=require_session,  # type: ignore[arg-type]
             require_admin_role=require_session,

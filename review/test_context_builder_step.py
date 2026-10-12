@@ -20,7 +20,7 @@ import logging
 import time
 import uuid
 from collections.abc import Iterator, Sequence
-from typing import Any
+from typing import Any, NamedTuple, TypedDict, Unpack
 
 import pytest
 import pytest_asyncio
@@ -1219,35 +1219,47 @@ def _pk_opener(provider: FakeProvider, timeouts: ClientTimeouts = _PK_FAST) -> P
     )
 
 
+class _PkStepOptions(TypedDict, total=False):
+    """Keyword overrides ``_pk_step`` accepts (all optional)."""
+
+    redactor: TextRedactor | None
+    opener: ProviderOpener | str | None
+    resolver: Any
+    graph_query: GraphQuery | None
+    similarity_query: SimilarityQuery | None
+    deadline: float
+    internal_timeout_seconds: float
+    timeouts: ClientTimeouts
+
+
 def _pk_step(
     session_factory: async_sessionmaker[Any],
     provider: FakeProvider,
-    *,
-    redactor: TextRedactor | None = None,
-    opener: ProviderOpener | str | None = "default",
-    resolver: Any = "default",
-    graph_query: GraphQuery | None = None,
-    similarity_query: SimilarityQuery | None = None,
-    deadline: float = 5.0,
-    internal_timeout_seconds: float = 25.0,
-    timeouts: ClientTimeouts = _PK_FAST,
+    **options: Unpack[_PkStepOptions],
 ) -> ContextBuilderStep:
+    opener: Any = options.get("opener", "default")
+    resolver: Any = options.get("resolver", "default")
+    redactor = options.get("redactor")
     return ContextBuilderStep(
         _FakeDiffFetcher({_APP_PATH: _APP_POST_MODIFIED}),
         _FakeTreeFetcher({_APP_PATH: _APP_PRE}),
-        graph_query or _EmptyGraphQuery(),
-        similarity_query or _DistinctPerFileSimilarityQuery(),
+        options.get("graph_query") or _EmptyGraphQuery(),
+        options.get("similarity_query") or _DistinctPerFileSimilarityQuery(),
         _ZeroVectorEmbeddingClient(),
-        internal_timeout_seconds=internal_timeout_seconds,
+        internal_timeout_seconds=options.get("internal_timeout_seconds", 25.0),
         max_total_bytes=200_000,
         provider_resolver=(
             FailOpenProviderResolver(PostgresSettingRepository(session_factory))
             if resolver == "default"
             else resolver
         ),
-        provider_opener=_pk_opener(provider, timeouts) if opener == "default" else opener,  # type: ignore[arg-type]
+        provider_opener=(
+            _pk_opener(provider, options.get("timeouts", _PK_FAST))
+            if opener == "default"
+            else opener
+        ),
         provider_redactor=redactor if redactor is not None else _MaskingRedactor(),
-        provider_deadline_seconds=deadline,
+        provider_deadline_seconds=options.get("deadline", 5.0),
     )
 
 
@@ -1343,29 +1355,34 @@ async def test_provider_section_joins_the_bundle_with_ids_after_code_ids(
     assert code_count == len(bundle.items)  # provider items never counted as code items
 
 
+class _GateCase(NamedTuple):
+    private: bool
+    is_fork: bool | None
+    allow_public: bool
+    expected: str
+    queried: bool
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("private", "is_fork", "allow_public", "expected", "queried"),
+    "case",
     [
-        (True, False, False, "ok", True),
-        (False, False, False, "skipped_public_repo", False),
-        (True, True, False, "skipped_fork", False),
-        (True, None, False, "skipped_fork", False),  # old payload: fail closed
-        (False, True, True, "ok", True),  # explicit per-scope opt-in
+        _GateCase(True, False, False, "ok", True),
+        _GateCase(False, False, False, "skipped_public_repo", False),
+        _GateCase(True, True, False, "skipped_fork", False),
+        _GateCase(True, None, False, "skipped_fork", False),  # old payload: fail closed
+        _GateCase(False, True, True, "ok", True),  # explicit per-scope opt-in
     ],
 )
 async def test_exposure_gate_matrix_sends_zero_requests_on_skip(
-    private: bool,
-    is_fork: bool | None,
-    allow_public: bool,
-    expected: str,
-    queried: bool,
+    case: _GateCase,
     upstream_output: Any,
     session_factory: async_sessionmaker[Any],
     pk_scope: dict[str, str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """US-PK20 (A1)."""
+    private, is_fork, allow_public, expected, queried = case
     caplog.set_level(logging.INFO, logger="review.context_builder")
     async with FakeProvider(token=_PK_TOKEN) as provider:
         await _write_setting(
@@ -1612,31 +1629,36 @@ async def test_unbound_credential_fails_closed_before_any_request(
     assert warned[0].endpoint_host == _PK_HOST  # type: ignore[attr-defined]
 
 
+class _FlowCase(NamedTuple):
+    private: bool
+    credential_ref: str
+    redactor: TextRedactor | None
+    opener: Any
+    expected: str
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("private", "credential_ref", "redactor", "opener", "expected"),
+    "case",
     [
         # A1 gate precedes the credential lookup.
-        (False, "gone", None, "default", "skipped_public_repo"),
+        _FlowCase(False, "gone", None, "default", "skipped_public_repo"),
         # credential lookup precedes the A5 redaction precondition.
-        (True, "gone", NoOpTextRedactor(), "default", "credential_unavailable"),
+        _FlowCase(True, "gone", NoOpTextRedactor(), "default", "credential_unavailable"),
         # kill switch (no opener) precedes the A1 gate.
-        (False, "wiki", None, None, "disabled"),
+        _FlowCase(False, "wiki", None, None, "disabled"),
     ],
     ids=["a1_before_credential", "credential_before_a5", "disabled_before_a1"],
 )
 async def test_provider_flow_order_with_overlapping_skip_conditions(
-    private: bool,
-    credential_ref: str,
-    redactor: TextRedactor | None,
-    opener: Any,
-    expected: str,
+    case: _FlowCase,
     upstream_output: Any,
     session_factory: async_sessionmaker[Any],
     pk_scope: dict[str, str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Plan Phase 7 branch flow: disabled -> A1 -> credential -> A5."""
+    private, credential_ref, redactor, opener, expected = case
     caplog.set_level(logging.INFO, logger="review.context_builder")
     async with FakeProvider(token=_PK_TOKEN) as provider:
         await _write_setting(
@@ -1925,6 +1947,31 @@ _PK_ALLOWED_ATTRIBUTES = {
 }
 
 
+def _pk_metric_attributes(reader: InMemoryMetricReader) -> dict[str, list[dict[str, Any]]]:
+    """Every ``review.product_knowledge.*`` data point's attributes, by metric."""
+    data = reader.get_metrics_data()
+    assert data is not None
+    seen: dict[str, list[dict[str, Any]]] = {}
+    for rm in data.resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if not metric.name.startswith("review.product_knowledge."):
+                    continue
+                assert isinstance(metric.data, Sum | Histogram)
+                seen.setdefault(metric.name, []).extend(
+                    dict(p.attributes or {}) for p in metric.data.data_points
+                )
+    return seen
+
+
+def _assert_closed_attribute_sets(seen: dict[str, list[dict[str, Any]]]) -> None:
+    for name, attribute_sets in seen.items():
+        if name not in _PK_ALLOWED_ATTRIBUTES:
+            continue  # config_resolution_total has its own closed {source} set
+        for attributes in attribute_sets:
+            assert set(attributes) <= _PK_ALLOWED_ATTRIBUTES[name], (name, attributes)
+
+
 @pytest.mark.asyncio
 async def test_telemetry_uses_only_closed_label_sets_and_no_sensitive_text(
     upstream_output: Any,
@@ -1940,24 +1987,9 @@ async def test_telemetry_uses_only_closed_label_sets_and_no_sensitive_text(
             _pk_upstream(upstream_output, pk_scope), _context()
         )
 
-    data = in_memory_metric_reader.get_metrics_data()
-    assert data is not None
-    seen: dict[str, list[dict[str, Any]]] = {}
-    for rm in data.resource_metrics:
-        for sm in rm.scope_metrics:
-            for metric in sm.metrics:
-                if not metric.name.startswith("review.product_knowledge."):
-                    continue
-                assert isinstance(metric.data, Sum | Histogram)
-                seen.setdefault(metric.name, []).extend(
-                    dict(p.attributes or {}) for p in metric.data.data_points
-                )
+    seen = _pk_metric_attributes(in_memory_metric_reader)
     assert set(_PK_ALLOWED_ATTRIBUTES) <= set(seen)
-    for name, attribute_sets in seen.items():
-        if name not in _PK_ALLOWED_ATTRIBUTES:
-            continue  # config_resolution_total has its own closed {source} set
-        for attributes in attribute_sets:
-            assert set(attributes) <= _PK_ALLOWED_ATTRIBUTES[name], (name, attributes)
+    _assert_closed_attribute_sets(seen)
     calls = seen["review.product_knowledge.call_total"]
     assert {a["operation"] for a in calls} == {"contract", "search", "fetch", "job"}
     assert {a["origin"] for a in calls} == {"worker"}

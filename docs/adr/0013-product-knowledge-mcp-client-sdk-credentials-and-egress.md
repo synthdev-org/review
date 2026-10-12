@@ -225,37 +225,37 @@ not available.
 
 **Easier / positive:**
 
-* Both MCP eras work with no per-era code of ours; a customer's existing
+- Both MCP eras work with no per-era code of ours; a customer's existing
   legacy-era MCP server and a new modern-era one are configured identically.
-* Credential handling is identical to every other credential the platform
+- Credential handling is identical to every other credential the platform
   holds: `existingSecret`, any secret backend, no new at-rest key, nothing
   secret in the database dump or the Admin API.
-* An Admin session cannot turn the integration into a token-exfiltration or
+- An Admin session cannot turn the integration into a token-exfiltration or
   cloud-metadata SSRF primitive, and in-cluster providers still work with zero
   extra config.
-* Third-party provider implementers get a small, stable, explicitly
+- Third-party provider implementers get a small, stable, explicitly
   versioned target and a runnable conformance suite.
 
 **Harder / trade-offs:**
 
-* A new third-party runtime dependency (`mcp` and its transitive set, which
+- A new third-party runtime dependency (`mcp` and its transitive set, which
   includes Starlette-family packages already present via FastAPI). Mitigated
   by confinement to one adapter and the Protocol boundary; the SDK's v2 line
   is two months old at the time of writing, so version pinning
   (`>=2.3,<3`) and the two-era integration tests are load-bearing.
-* Adding a *new credential* (a new token or a new provider host) requires an
+- Adding a *new credential* (a new token or a new provider host) requires an
   operator action (update the Secret, restart/roll Worker and Admin API) —
   an Admin cannot self-serve a new secret. Switching an existing credential's
   endpoint within its bound hosts, enabling/disabling, and relabeling stay
   fully self-service.
-* The Admin API and the Worker both need the credential map (the Admin API
+- The Admin API and the Worker both need the credential map (the Admin API
   runs the test-connection probe), so the same `Secret` key is mounted in
   both Deployments.
-* OAuth 2.1 interactive flows (the MCP authorization spec's default) are not
+- OAuth 2.1 interactive flows (the MCP authorization spec's default) are not
   supported: review is a headless client acting on its own behalf and accepts
   a pre-provisioned bearer token only. A client-credentials flow is deferred
   until a provider requires it.
-* Integer-major versioning plus an always-additive rule means a provider can
+- Integer-major versioning plus an always-additive rule means a provider can
   never rely on a *new* field being sent to it by an old review; contract
   authors carry that discipline.
 
@@ -312,18 +312,18 @@ open question — see the spec's Out of scope.)
 
 ## Related
 
-* [`docs/specs/spec-product-knowledge.md`](../specs/spec-product-knowledge.md)
+- [`docs/specs/spec-product-knowledge.md`](../specs/spec-product-knowledge.md)
   — the PRD this ADR supports; carries the wire contract and policy detail.
-* [ADR-0003](0003-knowhow-product-knowledge-augmentation.md) — the governing
+- [ADR-0003](0003-knowhow-product-knowledge-augmentation.md) — the governing
   decision; this ADR closes its versioning and credential-placement
   questions.
-* [ADR-0004](0004-multi-org-tenancy.md) — org is a scoping key, not a
+- [ADR-0004](0004-multi-org-tenancy.md) — org is a scoping key, not a
   security boundary, which is why per-org encryption was not introduced.
-* [ADR-0011](0011-otel-api-imported-directly-in-domain-packages.md) and
+- [ADR-0011](0011-otel-api-imported-directly-in-domain-packages.md) and
   [ADR-0012](0012-telemetry-recording-failures-log-and-continue.md) — how
   provider-call telemetry is recorded.
-* [`docs/rules/architecture.md`](../rules/architecture.md) — Protocol at
+- [`docs/rules/architecture.md`](../rules/architecture.md) — Protocol at
   consumer, adapters import infra, composition-root wiring.
-* MCP specification `2026-07-28` (versioning, discovery, Streamable HTTP,
+- MCP specification `2026-07-28` (versioning, discovery, Streamable HTTP,
   authorization) and its feature-lifecycle policy; official Python SDK v2 —
   URLs in the spec's "Research basis".

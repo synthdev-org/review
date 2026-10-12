@@ -172,7 +172,8 @@ async def test_keyed_read_returns_only_platform_org_and_repo_rows_of_that_key(
     )
 
     assert {r.value["display_name"] for r in rows} == {"Platform", "Acme", "W"}
-    assert all(r.team_id is None and r.key == _KEY for r in rows)
+    if not all(r.team_id is None and r.key == _KEY for r in rows):
+        pytest.fail("every row must be org-scoped with the provider key")
 
 
 @pytest.mark.integration
@@ -232,7 +233,8 @@ async def test_platform_scope_enabled_false_disables_the_provider_for_every_org_
     await _insert_raw(session_factory, org_id=None, value=_value(enabled=False))
     resolver = FailOpenProviderResolver(PostgresSettingRepository(session_factory))
 
-    assert await resolver.resolve(str(hierarchy["acme"]), str(hierarchy["widgets"])) is None
+    if await resolver.resolve(str(hierarchy["acme"]), str(hierarchy["widgets"])) is not None:
+        pytest.fail("acme/widgets must resolve to None")
     assert await resolver.resolve(str(hierarchy["globex"]), str(hierarchy["gadgets"])) is None
 
 
@@ -261,7 +263,8 @@ async def test_resolver_fails_open_with_counter_and_warning_when_postgres_is_unr
     finally:
         await dead.dispose()
 
-    assert provider is None
+    if provider is not None:
+        pytest.fail("expected: provider is None")
     assert sources == ["fallback_on_error"]
     assert "lookup failed" in caplog.text
 
@@ -326,7 +329,8 @@ async def test_config_tree_tolerates_an_orphaned_key_and_reports_effective_value
     assert repos[str(widgets)].effective[_KEY].source == f"repo:{acme}:{widgets}"
     team_node = acme_node.teams[0]
     assert team_node.effective[_KEY].value["display_name"] == "Acme"
-    assert "retired_key" not in acme_node.effective
+    if "retired_key" in acme_node.effective:
+        pytest.fail("retired_key must not be effective")
     # The invalid stored row is unusable: it must not be presented as the
     # effective value (nor fall through to a parent) - it is unconfigured.
     globex_node = next(o for o in tree.orgs if o.id == str(hierarchy["globex"]))

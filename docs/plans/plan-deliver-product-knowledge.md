@@ -84,7 +84,7 @@ Admin API pod environments (Admin API now holds provider tokens).
 | F7 | **Privacy claim reversed**: "No new data leaves the deployment on the retrieval side" (`spec-context-builder.md`) is no longer true with a provider configured. | Phase 8 (UI), Phase 7 (minimum runbook), Phase 9 |
 | F8 | **Mechanical doc edits outstanding**: `operations.md`, `spec-observability.md` catalog, ADR-0005/0011 scope lists, `.env.example`/Helm values, `platform/docs/vision.md` line 57. | Phases 1, 6, 7, 9 |
 | F9 | **Two-way failure isolation is not free**: `_orchestrate` runs under one `asyncio.wait_for` and `run()` replaces the whole bundle on any typed failure. | Phase 7 |
-| F10 | **`ContextBundle.item()` is positional** (`id` == index) and returns `ContextBundleItem | None`. Provider ids continue after code ids. | Phase 3 |
+| F10 | **`ContextBundle.item()` is positional** (`id` == index) and returns `ContextBundleItem \| None`. Provider ids continue after code ids. | Phase 3 |
 | F11 | **Config-tree rollback**: `get_config_tree` returns raw rows without registry validation, so after a code revert orphaned `product_knowledge_provider` rows remain un-editable/un-deletable via the API (only writes validate). | Phase 6 test; Phase 9 runbook SQL cleanup |
 | F12 | **Helm optional-env trap**: `review.credentialEnvVar` always emits a `secretKeyRef` with no `optional`, so a new always-rendered credential breaks every existing install on upgrade. | Phase 6 |
 
@@ -622,8 +622,8 @@ refs) asserting the message names the problem and not the token (caplog +
 exception text); **"internal_timeout=8, no map, starts clean"**; empty-string
 ≡ unset on both Worker and Admin API. Integration
 (`adapter/storage/test_tenancy.py`, extended, real Postgres — keyed
-effective read; narrowest wins; repo opt-out; DB error ⇒ fail-open + counter
-+ warning; a **hung repository** ⇒ review completes, code context
+effective read; narrowest wins; repo opt-out; DB error ⇒ fail-open + counter +
+warning; a **hung repository** ⇒ review completes, code context
 unaffected; `get_config_tree` tolerates an orphan `product_knowledge_provider`
 row — F11). Integration (`apps/admin_api/test_config_routes.py`, extended —
 US-PK8 422s; token never in a response/audit row; A4 audit metadata).
@@ -801,8 +801,8 @@ block Phases 7 or 9 (API-only configuration is valid).
   missing from the fetched list renders as a disabled option "Unknown
   credential `x` (removed by operator)". Viewers get credential names only
   (Phase 6), so their dropdown shows no bound hosts.
-- **Accessibility:** 422 `detail` codes map to field ids via `aria-invalid`
-  + `aria-describedby`, focus moves to the first invalid field on submit;
+- **Accessibility:** 422 `detail` codes map to field ids via `aria-invalid` +
+  `aria-describedby`, focus moves to the first invalid field on submit;
   test result is a `role="status"` polite region mounted *before* the result
   arrives, failures `role="alert"`; the disclosure is a `<p>` tied to the
   endpoint field via `aria-describedby`, not a tooltip; status shown with an
@@ -1014,13 +1014,13 @@ source; restated as a checkable artifact, **corrected** from the first draft).
 | US-PK3 | 3 | `review/test_citation.py`; `review/test_findings_output_step.py` | Unit (rendering) + Integration (recorded GitHub cassette) |
 | US-PK6 | 3, 4 | `review/test_review_generation_step.py`; `review/test_verification_step.py`; `review/test_findings_output_step.py`; `adapter/product_knowledge/test_client.py` (hostile metadata/error bodies) | Integration |
 | US-PK7 | 3, 7 | `review/test_context_bundle.py`; `review/test_context_builder_step.py` | Unit (pure) + Integration |
-| US-PK5 (transport classes) | 4 | `adapter/product_knowledge/test_client.py` | Integration (fake provider, fault injection) |
+| US-PK5 (transport classes) | 4 | `adapter/product_knowledge/test_client_faults.py` | Integration (fake provider, fault injection) |
 | US-PK12 | 4 | `adapter/product_knowledge/test_egress_pure.py`; `test_egress.py` | Unit (pure classifier) + Integration (real sockets) |
 | US-PK18 | 4 | `adapter/product_knowledge/test_client.py` | Integration |
 | US-PK19 | 4 | `adapter/product_knowledge/test_client.py` | Integration (two-era fake processes) |
 | US-PK17 | 5 | `adapter/product_knowledge/test_conformance.py` | Integration (fake provider; live-mode opt-in) |
 | US-PK8 | 6 | `apps/admin_api/test_config_routes.py`; `adapter/storage/test_tenancy.py` | Integration (real Postgres) |
-| US-PK9 | 6 | `apps/admin_api/test_product_knowledge_routes.py`; `apps/admin_api/test_config_routes.py`; `adapter/product_knowledge/test_client.py` | Integration (real Postgres; log-capture) |
+| US-PK9 | 6 | `apps/admin_api/test_product_knowledge_routes.py`; `apps/admin_api/test_product_knowledge_routes_ordering.py`; `apps/admin_api/test_product_knowledge_routes_limits.py`; `apps/admin_api/test_config_routes.py`; `adapter/product_knowledge/test_client.py` | Integration (real Postgres; log-capture) |
 | US-PK10 (6b) | 6 | `apps/admin_api/test_product_knowledge_routes.py` | Integration (fake provider process) |
 | US-PK11 | 6 | `apps/admin_api/test_role_enforcement.py` | Integration |
 | US-PK13 | 6, 7 | `apps/worker/test_settings.py` (incl. conditional timeout validator), `apps/admin_api/test_main.py` (pure validators, unit); `apps/test_product_knowledge_env_sync.py` (`.env.example` assertion, Assumption 8); `apps/worker/test_main.py` (composition root) | Unit + Integration |

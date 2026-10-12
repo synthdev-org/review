@@ -297,11 +297,13 @@ def test_analyzer_env_drops_only_the_credential_map() -> None:
         }
     )
 
-    assert env == {
+    expected = {
         "PATH": "/usr/bin",
         "HOME": "/root",
         "REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST": "wiki",
     }
+    if env != expected:
+        pytest.fail(f"env {env!r} != {expected!r}")
 
 
 @pytest.mark.asyncio

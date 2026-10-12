@@ -230,3 +230,186 @@ def test_explicit_v6_denies_hold_without_the_routable_allow_list(
     monkeypatch.setattr(egress, "_ROUTABLE_V6_NETWORKS", (ipaddress.ip_network("::/0"),))
 
     assert classify_address(address) is AddressClass.DENIED
+
+
+# --- extracted predicates (each deny network pinned individually) -------------
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["127.0.0.1", "127.255.255.254", "::1"],
+)
+def test_is_denied_special_loopback(address: str) -> None:
+    from adapter.product_knowledge.egress import _is_denied_special
+
+    assert _is_denied_special(ipaddress.ip_address(address))
+
+
+@pytest.mark.parametrize("address", ["169.254.169.254", "169.254.0.1", "fe80::1"])
+def test_is_denied_special_link_local(address: str) -> None:
+    from adapter.product_knowledge.egress import _is_denied_special
+
+    assert _is_denied_special(ipaddress.ip_address(address))
+
+
+@pytest.mark.parametrize("address", ["0.0.0.0", "::"])
+def test_is_denied_special_unspecified(address: str) -> None:
+    from adapter.product_knowledge.egress import _is_denied_special
+
+    assert _is_denied_special(ipaddress.ip_address(address))
+
+
+@pytest.mark.parametrize("address", ["224.0.0.1", "239.255.255.255", "ff02::1", "ff0e::1"])
+def test_is_denied_special_multicast(address: str) -> None:
+    from adapter.product_knowledge.egress import _is_denied_special
+
+    assert _is_denied_special(ipaddress.ip_address(address))
+
+
+@pytest.mark.parametrize(
+    "address", ["fd00:ec2::254", "100.100.100.200", "168.63.129.16", "192.0.0.192"]
+)
+def test_is_denied_special_cloud_metadata(address: str) -> None:
+    from adapter.product_knowledge.egress import _is_denied_special
+
+    assert _is_denied_special(ipaddress.ip_address(address))
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["8.8.8.8", "10.0.0.1", "100.100.100.201", "168.63.129.17", "192.0.0.193", "2606:4700::1111"],
+)
+def test_is_denied_special_is_false_for_ordinary_addresses(address: str) -> None:
+    from adapter.product_knowledge.egress import _is_denied_special
+
+    assert not _is_denied_special(ipaddress.ip_address(address))
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "64:ff9b::808:808",  # NAT64
+        "64:ff9b:1::1",  # NAT64 local-use
+        "2002:808:808::1",  # 6to4
+        "2001:0:4136::1",  # Teredo
+        "::1.2.3.4",  # IPv4-compatible
+        "::1",
+        "::",
+        "100::1",  # outside 2000::/3 and fc00::/7
+        "fe80::1",
+        "fec0::1",
+        "ff02::1",
+    ],
+)
+def test_is_denied_v6_denies(address: str) -> None:
+    from adapter.product_knowledge.egress import _is_denied_v6
+
+    assert _is_denied_v6(ipaddress.IPv6Address(address))
+
+
+@pytest.mark.parametrize(
+    "address", ["2606:4700:4700::1111", "2000::1", "3fff::1", "fc00::1", "fd00::1", "fdff::1"]
+)
+def test_is_denied_v6_allows_global_unicast_and_ula(address: str) -> None:
+    from adapter.product_knowledge.egress import _is_denied_v6
+
+    assert not _is_denied_v6(ipaddress.IPv6Address(address))
+
+
+def test_unmap_v6() -> None:
+    from adapter.product_knowledge.egress import _unmap_v6
+
+    assert _unmap_v6(ipaddress.IPv6Address("::ffff:10.0.0.1")) == ipaddress.IPv4Address("10.0.0.1")
+    assert _unmap_v6(ipaddress.IPv6Address("::1")) is None
+    global_v6 = ipaddress.IPv6Address("2606:4700:4700::1111")
+    assert _unmap_v6(global_v6) == global_v6
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["0.0.0.0", "0.0.0.1", "0.255.255.255", "240.0.0.0", "247.1.2.3", "255.255.255.255"],
+)
+def test_denied_v4_networks_each_deny(address: str) -> None:
+    assert classify_address(ipaddress.IPv4Address(address)) is AddressClass.DENIED
+
+
+@pytest.mark.parametrize("address", ["1.0.0.0", "223.255.255.255"])
+def test_denied_v4_networks_do_not_overreach(address: str) -> None:
+    assert classify_address(ipaddress.IPv4Address(address)) is AddressClass.PUBLIC
+
+
+def test_classify_address_accepts_address_objects() -> None:
+    assert classify_address(ipaddress.IPv6Address("::1")) is AddressClass.DENIED
+    assert classify_address(ipaddress.IPv4Address("8.8.8.8")) is AddressClass.PUBLIC
+
+
+def test_parse_address() -> None:
+    from adapter.product_knowledge.egress import _parse_address
+
+    assert _parse_address("8.8.8.8") == ipaddress.IPv4Address("8.8.8.8")
+    assert _parse_address("nope") is None
+    obj = ipaddress.IPv6Address("::1")
+    assert _parse_address(obj) is obj
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("[::1]", ("::1", None)),
+        ("[::1]:80", ("::1", "80")),
+        ("[::1]:", None),
+        ("[::1]:x", None),
+        ("[::1]x", None),
+        ("[]", None),
+        ("[::1", None),
+    ],
+)
+def test_split_bracketed(value: str, expected: tuple[str, str | None] | None) -> None:
+    from adapter.product_knowledge.egress import _split_bracketed
+
+    assert _split_bracketed(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("h", ("h", None)),
+        ("h:80", ("h", "80")),
+        ("h:", None),
+        ("h:x", None),
+        (":80", None),
+        ("::1", ("::1", None)),
+        ("a:b:c", ("a:b:c", None)),
+    ],
+)
+def test_split_unbracketed(value: str, expected: tuple[str, str | None] | None) -> None:
+    from adapter.product_knowledge.egress import _split_unbracketed
+
+    assert _split_unbracketed(value) == expected
+
+
+@pytest.mark.parametrize("char", list("@/\\?# \t\r\n%"))
+def test_split_host_port_rejects_each_forbidden_char(char: str) -> None:
+    assert split_host_port(f"ho{char}st") is None
+
+
+def test_split_host_port_rejects_empty() -> None:
+    assert split_host_port("") is None
+
+
+def test_canonical_helpers() -> None:
+    from adapter.product_knowledge.egress import (
+        _canonical_dns_name,
+        _canonical_ipv6,
+        _canonical_numeric_ipv4,
+    )
+
+    assert _canonical_ipv6("0:0:0:0:0:0:0:1") == "::1"
+    assert _canonical_ipv6("zz::1") is None
+    assert _canonical_numeric_ipv4("0x7f.1") == "127.0.0.1"
+    assert _canonical_numeric_ipv4("1.2.3.4.5") is None
+    assert _canonical_dns_name("bücher.example") == "xn--bcher-kva.example"
+    assert _canonical_dns_name("a..b") is None
+    assert _canonical_dns_name("a" * 64) is None
+    assert _canonical_dns_name("a" * 63) == "a" * 63
+    assert _canonical_dns_name(".".join(["a" * 63] * 4)) is None  # > 253 chars

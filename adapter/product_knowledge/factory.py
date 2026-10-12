@@ -12,12 +12,14 @@ per request after DNS - defense in depth, same canonicaliser.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Unpack
 
 import httpx2
 
 from adapter.product_knowledge.client import (
     ClientTimeouts,
     EndpointGate,
+    FactoryTuning,
     McpProductKnowledgeClient,
     NegotiationCache,
 )
@@ -37,22 +39,22 @@ class ProviderClientFactory:
         credentials: CredentialMap,
         policy: EgressPolicy,
         timeouts: ClientTimeouts | None = None,
-        cache: NegotiationCache | None = None,
-        gate: EndpointGate | None = None,
-        bypass_cache: bool = False,
-        top_k: int = TOP_K,
         resolver: Resolver = system_resolver,
         inner_transport: httpx2.AsyncBaseTransport | None = None,
+        **tuning: Unpack[FactoryTuning],
     ) -> None:
+        unknown = sorted(set(tuning) - FactoryTuning.__optional_keys__)
+        if unknown:
+            raise TypeError(f"unexpected keyword argument {unknown[0]!r}")
         self._credentials = credentials
         self._policy = policy
         self._timeouts = timeouts or ClientTimeouts()
         # Shared across every client this factory builds: one negotiation per
         # endpoint per TTL and one concurrency bound per endpoint.
-        self._cache = cache or NegotiationCache()
-        self._gate = gate or EndpointGate()
-        self._bypass_cache = bypass_cache
-        self._top_k = top_k
+        self._cache = tuning.get("cache") or NegotiationCache()
+        self._gate = tuning.get("gate") or EndpointGate()
+        self._bypass_cache = tuning.get("bypass_cache", False)
+        self._top_k = tuning.get("top_k", TOP_K)
         self._resolver = resolver
         self._inner = inner_transport
 

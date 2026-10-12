@@ -1,5 +1,7 @@
-"""review.step — the ``Step`` Protocol and the shared ``StepContext`` every
-step receives, per the plan's Phase 2 section
+"""
+The ``Step`` Protocol and the shared ``StepContext`` every step receives.
+
+Per the plan's Phase 2 section
 (docs/plans/plan-phase-1-walking-skeleton.md) and
 docs/specs/pipeline-step-framework.md's Scope section.
 
@@ -37,10 +39,12 @@ OutputT = TypeVar("OutputT", covariant=True)
 
 
 class JobIdentity(BaseModel):
-    """The job-identifying fields (which org/repo/installation/PR a job
-    is for) that every macro step's own Input and Output model carries
-    forward, per ``review.pipeline.StepRegistry``'s single-dependency-input
-    design: each step's ``Output`` becomes the next step's ``Input``, so
+    """
+    The job-identifying fields every macro step's Input and Output carry.
+
+    These say which org/repo/installation/PR a job is for. Per
+    ``review.pipeline.StepRegistry``'s single-dependency-input design: each
+    step's ``Output`` becomes the next step's ``Input``, so
     the identity has to ride along on every one of them, unchanged, all
     the way to the final findings-output step — see
     ``review/prefilter.py``'s ``PrefilterOutput``,
@@ -95,8 +99,10 @@ class JobIdentity(BaseModel):
 
 
 def job_identity_fields(source: JobIdentity) -> dict[str, Any]:
-    """``source``'s own ``JobIdentity`` fields, as a dict keyed by
-    field name — for a step's own Output construction that forwards every
+    """
+    Return ``source``'s own ``JobIdentity`` fields as a dict by field name.
+
+    For a step's own Output construction that forwards every
     ``JobIdentity`` field unchanged from its parsed input, without
     hand-listing each keyword argument. Previously duplicated
     byte-for-byte across ``review/review_generation.py``,
@@ -110,8 +116,8 @@ def job_identity_fields(source: JobIdentity) -> dict[str, Any]:
 
 
 class StepContext(BaseModel):
-    """Shared, step-agnostic context passed identically to every step's
-    ``run()`` call.
+    """
+    Shared, step-agnostic context passed identically to every step.
 
     Deliberately minimal — per pipeline-step-framework.md's Scope section,
     ``context`` exists so cross-cutting concerns are available to *any*
@@ -125,8 +131,10 @@ class StepContext(BaseModel):
 
 
 class Step(Protocol[InputT, OutputT]):
-    """A single pipeline stage — macro or sub-step alike; the registry
-    (``review/pipeline.py``) treats both uniformly.
+    """
+    A single pipeline stage, macro or sub-step alike.
+
+    The registry (``review/pipeline.py``) treats both uniformly.
 
     ``name`` must be unique within whichever registry a step is registered
     in — the registry's own construction fails fast on a duplicate.

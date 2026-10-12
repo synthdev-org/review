@@ -89,18 +89,40 @@ function mapFieldErrors(detail: string): Partial<Record<FieldName, string>> {
     errors.endpoint_url = UNAUTHENTICATED_HOST_COPY;
     return errors;
   }
-  if (detail === "unknown_credential_ref" || detail === "credential_host_not_bound" || detail === "credential_map_unavailable") {
+  if (CREDENTIAL_CODES.has(detail)) {
     errors.credential_ref = detail;
     return errors;
   }
   for (const part of detail.split("; ")) {
-    const match = /^(\w+)(?:\.\d+)?: (.*)$/.exec(part);
-    const field = match?.[1] as FieldName | undefined;
-    if (match && field && FIELD_ORDER.includes(field)) {
-      errors[field] = errors[field] ?? match[2];
-    }
+    const parsed = parseFieldMessage(part);
+    if (parsed) errors[parsed.field] = errors[parsed.field] ?? parsed.message;
   }
   return errors;
+}
+
+const CREDENTIAL_CODES = new Set([
+  "unknown_credential_ref",
+  "credential_host_not_bound",
+  "credential_map_unavailable",
+]);
+
+// One "<field>[.<n>]: <message>" segment of the registry's 422 detail.
+function parseFieldMessage(part: string): { field: FieldName; message: string } | null {
+  const match = /^(\w+)(?:\.\d+)?: (.*)$/.exec(part);
+  if (!match || !FIELD_ORDER.includes(match[1] as FieldName)) return null;
+  return { field: match[1] as FieldName, message: match[2] };
+}
+
+// Failure of the test request itself, mapped to what the panel should do.
+type TestFailure =
+  | { kind: "rate_limited" }
+  | { kind: "invalid" }
+  | { kind: "error"; message: string };
+
+function classifyTestFailure(error: unknown): TestFailure {
+  if (error instanceof ApiError && error.status === 429) return { kind: "rate_limited" };
+  if (error instanceof ApiError && error.status === 422) return { kind: "invalid" };
+  return { kind: "error", message: error instanceof ApiError ? error.detail : "test failed" };
 }
 
 type TestState =
@@ -184,6 +206,13 @@ export function ProductKnowledgePanel({
     return null;
   }
 
+  function showFieldErrors(mapped: Partial<Record<FieldName, string>> | null): void {
+    if (!mapped) return;
+    setFieldErrors(mapped);
+    const first = FIELD_ORDER.find((f) => mapped[f] !== undefined);
+    if (first) setFocusRequest({ field: first });
+  }
+
   async function handleSave(): Promise<void> {
     setSaving(true);
     setGeneralError(null);
@@ -196,12 +225,7 @@ export function ProductKnowledgePanel({
         handleSessionExpired();
         return;
       }
-      const mapped = applyApiError(error, "save failed");
-      if (mapped) {
-        setFieldErrors(mapped);
-        const first = FIELD_ORDER.find((f) => mapped[f] !== undefined);
-        if (first) setFocusRequest({ field: first });
-      }
+      showFieldErrors(applyApiError(error, "save failed"));
     } finally {
       setSaving(false);
     }
@@ -232,21 +256,12 @@ export function ProductKnowledgePanel({
         handleSessionExpired();
         return;
       }
-      if (error instanceof ApiError && error.status === 429) {
-        setTestState({ kind: "rate_limited" });
-      } else if (error instanceof ApiError && error.status === 422) {
+      const failure = classifyTestFailure(error);
+      if (failure.kind === "invalid") {
         setTestState({ kind: "idle" });
-        const mapped = applyApiError(error, "test failed");
-        if (mapped) {
-          setFieldErrors(mapped);
-          const first = FIELD_ORDER.find((f) => mapped[f] !== undefined);
-          if (first) setFocusRequest({ field: first });
-        }
+        showFieldErrors(applyApiError(error, "test failed"));
       } else {
-        setTestState({
-          kind: "error",
-          message: error instanceof ApiError ? error.detail : "test failed",
-        });
+        setTestState(failure);
       }
     }
   }

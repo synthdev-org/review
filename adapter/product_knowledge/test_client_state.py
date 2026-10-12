@@ -187,3 +187,130 @@ def test_unrelated_exception_is_a_provider_error_not_malformed() -> None:
     transport = GuardedTransport(URL, policy=EgressPolicy())
     assert client._classify(ValueError("x"), transport, URL) is ProviderOutcome.PROVIDER_ERROR
     assert client._classify(httpx2.ConnectError("x"), transport, URL) is ProviderOutcome.UNREACHABLE
+
+
+# --- extracted classification / construction helpers ------------------------
+
+
+def _bare_transport(status: int | None = None, retry: int | None = None) -> GuardedTransport:
+    transport = GuardedTransport(URL, policy=EgressPolicy())
+    transport.status = status
+    transport.retry_after_seconds = retry
+    return transport
+
+
+def test_classify_precedence_typed_then_timeout_then_transport_then_status() -> None:
+    client = _client("t")
+    typed = ProductKnowledgeError(ProviderOutcome.UNSUPPORTED_VERSION)
+    group: Any = BaseExceptionGroup("tg", [httpx2.ReadTimeout("x"), typed])
+    assert client._classify(group, _bare_transport(401), URL) is ProviderOutcome.UNSUPPORTED_VERSION
+
+    timeout_and_transport: Any = BaseExceptionGroup(
+        "tg", [httpx2.ConnectError("x"), httpx2.ReadTimeout("x")]
+    )
+    assert (
+        client._classify(timeout_and_transport, _bare_transport(401), URL)
+        is ProviderOutcome.TIMEOUT
+    )
+    assert client._classify(TimeoutError(), _bare_transport(), URL) is ProviderOutcome.TIMEOUT
+    assert (
+        client._classify(httpx2.ConnectError("x"), _bare_transport(401), URL)
+        is ProviderOutcome.UNREACHABLE
+    )
+    assert client._classify(ValueError(), _bare_transport(401), URL) is ProviderOutcome.AUTH_FAILED
+    assert client._classify(ValueError(), _bare_transport(403), URL) is ProviderOutcome.AUTH_FAILED
+    # a status wins over a malformed body
+    assert (
+        client._classify(RecursionError(), _bare_transport(401), URL) is ProviderOutcome.AUTH_FAILED
+    )
+
+
+def test_classify_transport_outcome_wins_over_everything() -> None:
+    client = _client("t")
+    transport = _bare_transport(401)
+    transport.outcome = ProviderOutcome.OVERSIZED
+
+    typed = ProductKnowledgeError(ProviderOutcome.UNSUPPORTED_VERSION)
+    assert client._classify(typed, transport, URL) is ProviderOutcome.OVERSIZED
+
+
+def test_status_outcome_429_starts_a_capped_cooldown() -> None:
+    gate = EndpointGate()
+    credential = ProviderCredential(ref="w", token=SecretStr("t"), allowed_hosts=("h",))
+    client = McpProductKnowledgeClient(URL, credential=credential, gate=gate)
+
+    assert client._status_outcome(_bare_transport(500), "ep") is None
+    assert not gate.cooling("ep", "w")
+    assert (
+        client._status_outcome(_bare_transport(429, 99999), "ep") is ProviderOutcome.PROVIDER_ERROR
+    )
+    assert gate.cooling("ep", "w")
+    assert gate._cooldowns[("ep", "w")] - gate._clock() <= 300.0 + 1
+
+
+def test_unknown_tuning_keyword_is_a_type_error_like_a_named_parameter() -> None:
+    with pytest.raises(TypeError, match="bypas_cache"):
+        McpProductKnowledgeClient(URL, bypas_cache=True)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="supported_majors"):
+        from adapter.product_knowledge.credentials import CredentialMap
+        from adapter.product_knowledge.factory import ProviderClientFactory
+
+        ProviderClientFactory(
+            credentials=CredentialMap.empty(),
+            policy=EgressPolicy(),
+            supported_majors=frozenset(),  # type: ignore[call-arg]
+        )
+
+
+def test_tuning_options_are_applied() -> None:
+    cache, gate = NegotiationCache(), EndpointGate()
+    client = McpProductKnowledgeClient(
+        URL,
+        cache=cache,
+        gate=gate,
+        supported_majors=frozenset({"7"}),
+        deprecated_majors=frozenset({"6"}),
+        rate_limit_cooldown_seconds=1.5,
+        bypass_cache=True,
+        top_k=2,
+    )
+
+    assert client._cache is cache
+    assert client._gate is gate
+    assert client._supported == frozenset({"7"})
+    assert client._deprecated == frozenset({"6"})
+    assert client._cooldown == 1.5
+    assert client._bypass_cache is True
+    assert client._top_k == 2
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://Wiki.example.com:8443/mcp",
+            (True, "wiki.example.com", "https://wiki.example.com:8443", "wiki.example.com:8443"),
+        ),
+        ("http://h.internal/x", (True, "h.internal", "http://h.internal:80", "h.internal:")),
+        ("https://h.internal/", (True, "h.internal", "https://h.internal:443", "h.internal:")),
+    ],
+)
+def test_endpoint_identity(url: str, expected: tuple[bool, str, str, str]) -> None:
+    from adapter.product_knowledge.client import _endpoint_identity
+
+    usable, host, origin, key = _endpoint_identity(url, "ref")
+    assert (usable, host, origin) == expected[:3]
+    assert key[1] == "ref"
+    assert expected[3] in key[0]
+
+
+@pytest.mark.parametrize("url", ["http://h:abc/", "http://h:99999/", "http://[::1/"])
+def test_endpoint_identity_malformed_url_is_unusable(url: str) -> None:
+    from adapter.product_knowledge.client import _endpoint_identity
+
+    assert _endpoint_identity(url, "r") == (
+        False,
+        "invalid",
+        "invalid://invalid",
+        ("invalid://invalid", "r"),
+    )

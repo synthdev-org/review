@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 WORKFLOWS_DIR = Path(__file__).resolve().parents[1] / ".github" / "workflows"
@@ -112,9 +113,13 @@ def test_live_product_knowledge_conformance_step_is_nightly_only_and_non_gating(
     condition = step.get("if", "")
     # e2e.yml also triggers on push to main: the event guard keeps the live
     # run off merges, PK_LIVE_URL opts a repo in, and a red run never gates.
-    assert "github.event_name == 'schedule'" in condition
-    assert "github.event_name == 'workflow_dispatch'" in condition
+    if "github.event_name == 'schedule'" not in condition:
+        pytest.fail("live step must run on schedule")
+    if "github.event_name == 'workflow_dispatch'" not in condition:
+        pytest.fail("live step must run on workflow_dispatch")
     assert "PK_LIVE_URL" in condition
-    assert step.get("continue-on-error") is True
+    if step.get("continue-on-error") is not True:
+        pytest.fail("live step must be non-gating (continue-on-error)")
     assert "PK_LIVE_URL" not in (WORKFLOWS_DIR / "ci.yml").read_text()
-    assert "adapter.product_knowledge.conformance" not in (WORKFLOWS_DIR / "ci.yml").read_text()
+    if "adapter.product_knowledge.conformance" in (WORKFLOWS_DIR / "ci.yml").read_text():
+        pytest.fail("ci.yml must not run the live conformance suite")

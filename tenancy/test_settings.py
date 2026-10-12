@@ -18,6 +18,7 @@ from tenancy.settings import (
     format_scope_descriptor,
     parse_scope_descriptor,
     resolve_setting,
+    validate_endpoint_url,
     validate_setting_value,
 )
 
@@ -336,3 +337,41 @@ class TestEffectiveSettings:
         ]
 
         assert effective_settings(rows, org_id=None, repo_id=None, team_id=None) == {}
+
+
+class TestValidateEndpointUrl:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://wiki.internal/mcp",
+            "http://kb:8080",
+            "https://[::1]:8443/mcp",
+            "https://wiki.internal/" + "a" * 480,
+        ],
+    )
+    def test_accepts_and_returns_unchanged(self, value: str) -> None:
+        assert validate_endpoint_url(value) == value
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            ("https://wiki.internal/" + "a" * 600, "printable ASCII"),
+            ("https://wiki.internal/\u00e9", "printable ASCII"),
+            ("https://wiki.internal/a b", "printable ASCII"),
+            ("https://wiki.internal/\x00", "printable ASCII"),
+            ("https://wiki.internal:99999/x", "not a valid URL"),
+            ("ftp://wiki.internal/x", "absolute http.s. URL with a host"),
+            ("/relative/path", "absolute http.s. URL with a host"),
+            ("https:///x", "absolute http.s. URL with a host"),
+            ("https://user:pw@wiki.internal/x", "userinfo"),
+            ("https://user@wiki.internal/x", "userinfo"),
+            ("https://wiki.internal/x?t=1", "query or fragment"),
+            ("https://wiki.internal/x#f", "query or fragment"),
+            ("https://wiki.internal/x?", "query or fragment"),
+            ("https://wiki.internal/x#", "query or fragment"),
+        ],
+    )
+    def test_rejects_with_fixed_message(self, value: str, message: str) -> None:
+        with pytest.raises(ValueError, match=message) as info:
+            validate_endpoint_url(value)
+        assert value not in str(info.value)

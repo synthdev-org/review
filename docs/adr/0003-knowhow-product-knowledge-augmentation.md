@@ -22,17 +22,17 @@ and [ADR-0013](0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md),
 again in place (nothing has shipped against this contract). Three substantive
 changes to the text above, none altering the decision's direction:
 
-* **The contract gains fields it was missing for deterministic citations:**
+- **The contract gains fields it was missing for deterministic citations:**
   every result item carries a required `title`, and search/related items carry
   an optional `updated_at`; `url` and `score` are optional-nullable. A fourth
   tool, `product_knowledge_contract`, is how a provider declares the contract
   version(s) it implements (the "negotiated at connection time" mechanism).
   `product_knowledge_related` is optional for providers.
-* **The credential is held by reference.** The per-org/repo day-two config
+- **The credential is held by reference.** The per-org/repo day-two config
   stores the endpoint, display name, and a credential *reference*; the token
   itself is bootstrap config (a Kubernetes `Secret`, `existingSecret`-
   compatible) bound to specific hosts, consistent with design goal 7.
-* **The "works out of the box" claim for knowhow is not yet true:** knowhow
+- **The "works out of the box" claim for knowhow is not yet true:** knowhow
   currently exposes `knowhow_search`/`knowhow_fetch`/`knowhow_related` with
   different arguments and encoding. It becomes true when knowhow registers the
   contract tools; the conformance suite is the acceptance check.
@@ -146,7 +146,7 @@ provider's roadmap, knowhow's included.
 | **External provider as full indexing base** | Weak — capped by that provider's general-purpose chunking/graph choices, outside review's control | Mismatched — general knowledge sync cadence, not per-push SLA | N/A (rejected on quality grounds regardless of vendor) | Hard — review non-functional without it |
 | **Fully self-contained** (no external augmentation) | Strong — review controls its entire quality bar | Strong — review's own index is inherently fresh | None | None — but duplicates Confluence/Slack/ticket connectors from scratch |
 | **Split responsibility, knowhow-specific contract** (original 2026 decision) | Strong for code; appropriate for non-code | Code stays per-push fresh; non-code inherits provider cadence | High — config schema, job payloads, and citation text all name knowhow specifically; a different provider has no supported path in | Soft — review functions without it, richer with it |
-| **Split responsibility, review-owned vendor-neutral contract** (this decision) | Strong for code; appropriate for non-code | Same as above | None — any MCP server implementing review's contract plugs in; knowhow is the reference implementation, not a special case | Soft — review functions without it, richer with it | **Accept** |
+| **Split responsibility, review-owned vendor-neutral contract** (this decision) | Strong for code; appropriate for non-code | Same as above | None — any MCP server implementing review's contract plugs in; knowhow is the reference implementation, not a special case | Soft — review functions without it, richer with it — **Accept** |
 
 ## Decision
 
@@ -203,53 +203,55 @@ provider's roadmap, knowhow's included.
 ## Consequences
 
 **Easier / positive:**
-* Code-review quality stays fully in review's control — own chunker, own
+
+- Code-review quality stays fully in review's control — own chunker, own
   graph, own freshness SLA — with no dependency on any external provider's
   roadmap for review's core capability.
-* Review has no hard runtime dependency on any product-knowledge provider.
+- Review has no hard runtime dependency on any product-knowledge provider.
   It ships and functions standalone; the "optional module" framing describes
   the augmentation feature itself, not review's basic operation.
-* Still captures a real, appropriately-scoped reuse win: no need to build
+- Still captures a real, appropriately-scoped reuse win: no need to build
   Confluence/Slack/ticket connectors or cross-source retrieval — for
   whichever provider a customer already runs.
-* No vendor lock-in on the one optional-augmentation feature: a customer
+- No vendor lock-in on the one optional-augmentation feature: a customer
   running a different internal RAG system, or a future competing product,
   has a real, supported path to the same capability by implementing one
   small MCP contract — not a reason to fork review or wait on a
   knowhow-specific integration.
-* Licensing/upsell story is still literal and arguably stronger: knowhow
+- Licensing/upsell story is still literal and arguably stronger: knowhow
   connectivity remains a config toggle that unlocks a genuinely additive
   capability ("buy knowhow too and reviews get better"), but the pitch no
   longer depends on review having hardcoded a competitor out.
-* The self-hosted trust/simplicity story (one product, one Postgres, two
+- The self-hosted trust/simplicity story (one product, one Postgres, two
   container images) is preserved for customers who only run review; it only
   extends to a second product's footprint for customers who opt into the
   augmentation, regardless of which product that is.
 
 **Harder / trade-offs:**
-* Review keeps the full engineering cost of its own indexing pipeline
+
+- Review keeps the full engineering cost of its own indexing pipeline
   (chunker, embedder, graph, incremental reindex) — no reuse savings apply
   to the code-indexing slice, only to the non-code augmentation. (Unchanged.)
-* Two heterogeneous retrieval results (review's own ranked candidates, the
+- Two heterogeneous retrieval results (review's own ranked candidates, the
   provider's MCP search results) need a real fusion/presentation design in
   the Context Builder, and must stay distinguishable per the Decision above
   rather than being silently blended. (Unchanged.)
-* Review now owns defining and versioning its own contract — previously an
+- Review now owns defining and versioning its own contract — previously an
   open question was "confirm knowhow's MCP contract versioning/deprecation
   policy"; now review must set and maintain that policy itself, for a
   contract other parties (starting with knowhow, potentially others later)
   depend on. This is more upfront design work than adopting an existing
   API, in exchange for not being coupled to it.
-* A third-party MCP server claiming to implement the contract might do so
+- A third-party MCP server claiming to implement the contract might do so
   incorrectly or incompletely (e.g. `product_knowledge_related` returning
   unrelated results, or `source_type`/`url` fields populated inconsistently)
   with no way for review to verify conformance beyond runtime behavior —
   see "Open questions."
-* Provider-sourced content carries its own freshness cadence and its own
+- Provider-sourced content carries its own freshness cadence and its own
   indexing-time enrichment that review doesn't control or independently
   verify — the citation-labeling requirement is a mitigation, not a full
   fix. (Unchanged from the original decision, now stated generically.)
-* Tenancy mapping between review's org/repo/team model and a given
+- Tenancy mapping between review's org/repo/team model and a given
   provider's own tenant model is a real integration detail per provider,
   not solved once for knowhow specifically.
 
@@ -257,40 +259,40 @@ provider's roadmap, knowhow's included.
 
 All four original open questions are resolved (2026-10-11):
 
-* **Context-fusion/citation UX** — resolved in
+- **Context-fusion/citation UX** — resolved in
   [`spec-product-knowledge.md`](../specs/spec-product-knowledge.md): a
   separate labeled prompt section and a separate bundle budget; citations
   rendered by the platform as `[title](url) — source_type · host` under a
   label naming the provider's display name.
-* **Feeding Memory back to a provider** — decided **out of scope**: the
+- **Feeding Memory back to a provider** — decided **out of scope**: the
   contract is read-only and Memory stays review-owned and human-approved
   (design goal 9). Revisit only as a new optional tool under its own ADR.
-* **Contract versioning/deprecation policy** — decided in
+- **Contract versioning/deprecation policy** — decided in
   [ADR-0013](0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md)
   decision 4: integer majors, additive-only within a major, current and
   previous major supported, 12-month minimum deprecation window.
-* **Conformance harness** — decided **yes**, shipped with Phase 7 as a
+- **Conformance harness** — decided **yes**, shipped with Phase 7 as a
   pytest-runnable suite plus an in-repo fake provider.
 
 ## Related
 
-* [`docs/reference/c4-architecture.md`](../reference/c4-architecture.md) —
+- [`docs/reference/c4-architecture.md`](../reference/c4-architecture.md) —
   review's indexing pipeline as designed, reaffirmed here unchanged; needs
   the optional augmentation call in the Context Builder step documented in
   provider-agnostic terms.
-* [`docs/roadmap.md`](../roadmap.md) — Phase 7, which delivers this
+- [`docs/roadmap.md`](../roadmap.md) — Phase 7, which delivers this
   contract and its reference (knowhow) configuration.
-* [`docs/specs/spec-product-knowledge.md`](../specs/spec-product-knowledge.md)
+- [`docs/specs/spec-product-knowledge.md`](../specs/spec-product-knowledge.md)
   and [ADR-0013](0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md)
   — the wire contract, configuration, security model, and client
   implementation decisions for Phase 7.
-* [`docs/adr/0001-self-hosted-kubernetes-deployment.md`](0001-self-hosted-kubernetes-deployment.md)
+- [`docs/adr/0001-self-hosted-kubernetes-deployment.md`](0001-self-hosted-kubernetes-deployment.md)
   — the self-hosted trust/simplicity story this decision preserves for
   review-only deployments.
-* [`docs/adr/0002-implement-in-python.md`](0002-implement-in-python.md) —
+- [`docs/adr/0002-implement-in-python.md`](0002-implement-in-python.md) —
   the language boundary that rules out in-process reuse of any TypeScript
   provider's code, knowhow included.
-* [`docs/research/research-current-art.md`](../research/research-current-art.md)
+- [`docs/research/research-current-art.md`](../research/research-current-art.md)
   §2.1 — the AST-chunking and call-graph "blast radius" findings that
   motivated keeping code indexing under review's own control regardless of
   which external provider, if any, is configured.

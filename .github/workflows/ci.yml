@@ -63,7 +63,7 @@ jobs:
           mkdir -p "$HOME/.local/semgrep-bin"
           ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
           echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
-          semgrep --version
+          "$HOME/.local/semgrep-bin/semgrep" --version
 
       # No `-m integration` here on purpose: integration tests (Phase 2
       # onward, tagged @pytest.mark.integration) run on every PR, not every
@@ -105,7 +105,7 @@ jobs:
           mkdir -p "$HOME/.local/semgrep-bin"
           ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
           echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
-          semgrep --version
+          "$HOME/.local/semgrep-bin/semgrep" --version
 
       # Gitleaks is not (a Go binary
       # with no first-party Python packaging, per the plan's Assumptions
