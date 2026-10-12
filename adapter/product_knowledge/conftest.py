@@ -1,4 +1,5 @@
-"""pytest options for ``test_conformance.py`` (plan Phase 5, US-PK17).
+"""
+pytest options for ``test_conformance.py`` (plan Phase 5, US-PK17).
 
 ``--pk-url`` (or ``PK_URL``) opts the live-endpoint test in; the bearer token
 is read from ``PK_TOKEN`` only, never from argv, so it cannot land in a

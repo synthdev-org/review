@@ -1,5 +1,8 @@
-"""adapter.product_knowledge.provider_resolver — the runtime reader of the
-``product_knowledge_provider`` setting (plan Phase 6, Assumption 6; F6).
+"""
+adapter.product_knowledge.provider_resolver: the runtime reader of the provider setting.
+
+It reads the ``product_knowledge_provider`` setting (plan Phase 6,
+Assumption 6; F6).
 
 Mirrors ``llmgateway/routing.py``'s ``FallbackModelRoutingResolver``: bounded
 by ``asyncio.wait_for``, broad-except fail-open, and a closed-set
@@ -47,7 +50,8 @@ ResolutionSource = Literal[
 class SettingRowReader(Protocol):
     async def list_rows_for_key(
         self, *, key: str, org_id: str | None, repo_id: str | None
-    ) -> tuple[SettingRow, ...]: ...
+    ) -> tuple[SettingRow, ...]:
+        """Return the setting rows for ``key`` visible at the given scope."""
 
 
 def _scope_of(row: SettingRow) -> ResolutionSource:
@@ -65,6 +69,7 @@ class FailOpenProviderResolver:
         *,
         timeout_seconds: float = DEFAULT_RESOLUTION_TIMEOUT_SECONDS,
     ) -> None:
+        """Bind the setting-row reader and the per-resolution timeout."""
         self._reader = reader
         self._timeout = timeout_seconds
 

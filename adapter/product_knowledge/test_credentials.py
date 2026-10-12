@@ -1,6 +1,9 @@
-"""Unit tests for the credential map, binding check, allow-list parsing and
-the per-endpoint client factory's job-time re-check (plan Phase 6; US-PK9,
-US-PK13). Pure: no network, no database."""
+"""
+Unit tests for the credential map, binding check, allow-list parsing and client factory.
+
+Also covers the per-endpoint client factory's job-time re-check (plan
+Phase 6; US-PK9, US-PK13). Pure: no network, no database.
+"""
 
 from __future__ import annotations
 

@@ -1,6 +1,8 @@
-"""docs/plans/plan-deliver-product-knowledge.md's Phase 9 (Unit I) E2E scenario
-- US-PK1-7 happy path plus the provider-down failure mode that matters, over
-the real Docker Compose stack (Webhook API + Worker + Admin API + Postgres).
+"""
+E2E scenario for docs/plans/plan-deliver-product-knowledge.md Phase 9 (Unit I).
+
+US-PK1-7 happy path plus the provider-down failure mode that matters, over the real Docker Compose
+stack (Webhook API + Worker + Admin API + Postgres).
 
 **Fixture order (plan Phase 9, Assumption 9).** The fake product-knowledge
 provider is a *host process* (the ``stub_llm_server`` precedent in
@@ -138,7 +140,7 @@ class _CallLog:
 
 
 class _StubGitHubHandler(BaseHTTPRequestHandler):
-    def log_message(self, format: str, *args: object) -> None:
+    def log_message(self, *_args: object) -> None:
         pass
 
     def _calls(self) -> _CallLog:
@@ -189,8 +191,11 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
 
 
 class _StubLLMHandler(BaseHTTPRequestHandler):
-    """Routes by call position within a job: 1 = intent_summary, 2 =
-    review_generation (one finding citing context id 0), 3 = verification."""
+    """
+    Routes by call position within a job.
+
+    1 = intent_summary, 2 = review_generation (one finding citing context id 0), 3 = verification.
+    """
 
     _CONTENT = (
         "This PR changes a function's return value.",
@@ -222,7 +227,7 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
         ),
     )
 
-    def log_message(self, format: str, *args: object) -> None:
+    def log_message(self, *_args: object) -> None:
         pass
 
     def do_POST(self) -> None:

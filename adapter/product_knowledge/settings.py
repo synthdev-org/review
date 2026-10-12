@@ -1,7 +1,8 @@
-"""adapter.product_knowledge.settings — the product-knowledge bootstrap
-settings, declared once and mixed into both ``WorkerSettings`` and
-``AdminAPISettings`` (plan Phase 6, Assumption 14; same shape as
-``adapter.telemetry.sdk.OtelSettingsMixin``).
+"""
+adapter.product_knowledge.settings: the product-knowledge bootstrap settings.
+
+Declared once and mixed into both ``WorkerSettings`` and ``AdminAPISettings`` (plan Phase 6,
+Assumption 14; same shape as ``adapter.telemetry.sdk.OtelSettingsMixin``).
 
 Each entrypoint still parses its own settings instance at its own
 composition root and passes values down; nothing here reads the
@@ -68,8 +69,9 @@ class ProductKnowledgeSettingsMixin(BaseSettings):
         return value
 
     def credential_map(self) -> CredentialMap:
-        """Parsed credentials; raises ``CredentialMapError`` (value-free) when
-        malformed."""
+        """
+        Parsed credentials; raises ``CredentialMapError`` (value-free) when malformed.
+        """
         return parse_credential_map(self.product_knowledge_credentials)
 
     def endpoint_allowlist(self) -> tuple[str, ...]:

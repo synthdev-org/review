@@ -1,4 +1,5 @@
-"""Integration tests for ``product_knowledge_routes.py``: status classes (US-PK10).
+"""
+Integration tests for ``product_knowledge_routes.py``: status classes (US-PK10).
 
 See ``pk_routes_harness`` for the shared app/provider harness (plan
 ``plan-deliver-product-knowledge.md`` Phase 6 / 6b; A2).

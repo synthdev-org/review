@@ -1,5 +1,9 @@
-"""Unit tests for ``ProductKnowledgeSettingsMixin`` — the shared bootstrap
-settings both entrypoints mix in (plan Phase 6, Assumption 14)."""
+"""
+Unit tests for ``ProductKnowledgeSettingsMixin``.
+
+The mixin is the shared bootstrap settings both entrypoints mix in (plan
+Phase 6, Assumption 14).
+"""
 
 from __future__ import annotations
 

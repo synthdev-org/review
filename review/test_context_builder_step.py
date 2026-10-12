@@ -1110,8 +1110,11 @@ async def test_base_sha_none_with_nonzero_similarity_hits_is_ok_and_base_sha_mis
 async def test_product_knowledge_capture_fields_are_forwarded_to_output(
     upstream_output: Any,
 ) -> None:
-    """Phase 2 of docs/plans/plan-deliver-product-knowledge.md: the optional
-    ``JobIdentity`` fields must be explicitly forwarded by this step."""
+    """
+    Phase 2 of docs/plans/plan-deliver-product-knowledge.md: forward optional identity fields.
+
+    The optional ``JobIdentity`` fields must be explicitly forwarded by this step.
+    """
     diff = _diff(DiffFile(path=_APP_PATH, status="modified", patch=_APP_PATCH))
     step = _step(
         diff_fetcher=_FakeDiffFetcher({_APP_PATH: _APP_POST_MODIFIED}),
@@ -1400,8 +1403,11 @@ async def test_exposure_gate_matrix_sends_zero_requests_on_skip(
 
 
 class _ChainDiffFetcher:
-    """Serves both the prefilter's ``fetch`` and the later steps'
-    ``fetch_content`` for the chain-level ``private`` test."""
+    """
+    Serve both the prefilter's ``fetch`` and the later steps' ``fetch_content``.
+
+    Used by the chain-level ``private`` test.
+    """
 
     async def fetch(self, **_: Any) -> Diff:
         return _PK_DIFF
@@ -1424,10 +1430,12 @@ async def test_private_flag_survives_prefilter_static_analysis_to_the_exposure_g
     pk_scope: dict[str, str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A1: the raw job payload's ``private`` key must reach the gate through
-    the real prefilter -> static_analysis -> context_builder hand-offs; a
-    dropped forward would silently turn every private repo into
-    ``skipped_public_repo``."""
+    """
+    A1: the raw job payload's ``private`` key reaches the gate through every hand-off.
+
+    It must travel through the real prefilter -> static_analysis -> context_builder hand-offs;
+    a dropped forward would silently turn every private repo into ``skipped_public_repo``.
+    """
     from review.prefilter import PrefilterStep
     from review.static_analysis import StaticAnalysisStep
 
@@ -1680,8 +1688,11 @@ async def test_code_duration_metric_and_log_exclude_provider_wait(
     caplog: pytest.LogCaptureFixture,
     in_memory_metric_reader: InMemoryMetricReader,
 ) -> None:
-    """The existing duration histogram/log stay code-branch-only: a provider
-    that hangs until its 1.5 s deadline must not show up in them."""
+    """
+    The existing duration histogram/log stay code-branch-only.
+
+    A provider that hangs until its 1.5 s deadline must not show up in them.
+    """
     caplog.set_level(logging.INFO, logger="review.context_builder")
     async with FakeProvider(
         token=_PK_TOKEN, fault=Fault("hang", "product_knowledge_search")
@@ -1843,8 +1854,11 @@ async def test_hanging_provider_cannot_exceed_the_internal_window_or_hurt_code_c
     pk_scope: dict[str, str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Two-way isolation, direction 2, with a provider deadline *larger* than
-    the internal window: the branch is capped to the window."""
+    """
+    Two-way isolation, direction 2, with a provider deadline larger than the window.
+
+    The deadline is *larger* than the internal window: the branch is capped to the window.
+    """
     caplog.set_level(logging.INFO, logger="review.context_builder")
     async with FakeProvider(
         token=_PK_TOKEN, fault=Fault("hang", "product_knowledge_search")
@@ -1979,8 +1993,11 @@ async def test_telemetry_uses_only_closed_label_sets_and_no_sensitive_text(
     pk_scope: dict[str, str],
     in_memory_metric_reader: InMemoryMetricReader,
 ) -> None:
-    """US-PK14: metric attributes are the closed allow-list; the pasted
-    secret, query, titles, URLs and token appear nowhere in them."""
+    """
+    US-PK14: metric attributes are the closed allow-list.
+
+    The pasted secret, query, titles, URLs and token appear nowhere in them.
+    """
     async with FakeProvider(token=_PK_TOKEN) as provider:
         await _write_setting(session_factory, pk_scope, provider.port)
         await _pk_step(session_factory, provider).run(
@@ -2027,8 +2044,11 @@ async def test_only_the_code_branch_timing_out_keeps_the_provider_section(
     pk_scope: dict[str, str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Two-way isolation, direction 1 via the code branch's own ``wait_for``
-    (TimeoutError from a hung graph query), not a typed query error."""
+    """
+    Two-way isolation, direction 1, via the code branch's own ``wait_for``.
+
+    The failure is a TimeoutError from a hung graph query, not a typed query error.
+    """
     caplog.set_level(logging.INFO, logger="review.context_builder")
     async with FakeProvider(token=_PK_TOKEN) as provider:
         await _write_setting(session_factory, pk_scope, provider.port)

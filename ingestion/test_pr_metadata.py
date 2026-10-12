@@ -1,5 +1,8 @@
-"""Unit tests for ``ingestion.pr_metadata`` (product-knowledge Phase 2,
-US-PK2 capture / US-PK20 fork + prefix gates). Pure, no I/O."""
+"""
+Unit tests for ``ingestion.pr_metadata`` (product-knowledge Phase 2).
+
+Covers US-PK2 capture and US-PK20 fork + prefix gates. Pure, no I/O.
+"""
 
 from __future__ import annotations
 

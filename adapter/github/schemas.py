@@ -52,9 +52,13 @@ class Repository(BaseModel):
 
 
 class PullRequestHeadRepo(BaseModel):
-    """The ``pull_request.head.repo`` object — only what the product-knowledge
-    exposure gate's fork check (docs/plans/plan-deliver-product-knowledge.md
-    Phase 2, A1) needs. GitHub sends ``null`` here for a deleted fork."""
+    """
+    The ``pull_request.head.repo`` object, reduced to what the fork check needs.
+
+    Only what the product-knowledge exposure gate's fork check
+    (docs/plans/plan-deliver-product-knowledge.md Phase 2, A1) needs. GitHub
+    sends ``null`` here for a deleted fork.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -63,8 +67,12 @@ class PullRequestHeadRepo(BaseModel):
 
 
 class PullRequestHead(BaseModel):
-    """The ``pull_request.head`` object — ``sha`` plus the optional
-    ``ref``/``repo`` the product-knowledge capture (Phase 2) reads."""
+    """
+    The ``pull_request.head`` object.
+
+    ``sha`` plus the optional ``ref``/``repo`` the product-knowledge capture
+    (Phase 2) reads.
+    """
 
     model_config = ConfigDict(extra="ignore")
 

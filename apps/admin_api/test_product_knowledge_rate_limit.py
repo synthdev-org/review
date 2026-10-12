@@ -1,6 +1,9 @@
-"""Unit test: the test-connection limiters are checked together before either
-is charged, so a global rejection never burns a session slot (plan M8). Driven
-through the real router with a fake clock and stub dependencies (no I/O)."""
+"""
+Unit test: the test-connection limiters are checked together before either is charged.
+
+So a global rejection never burns a session slot (plan M8). Driven through
+the real router with a fake clock and stub dependencies (no I/O).
+"""
 
 from __future__ import annotations
 
@@ -79,8 +82,12 @@ def test_a_global_rejection_does_not_consume_the_sessions_own_slots() -> None:
 
 
 def test_session_limiter_trips_independently_of_the_user_limiter() -> None:
-    """Two users share one session id: neither user is near the per-user limit
-    (3 each), yet the session's own window rejects the 7th request."""
+    """
+    Two users sharing one session id are limited by the session's own window.
+
+    Neither user is near the per-user limit (3 each), yet the session's own
+    window rejects the 7th request.
+    """
 
     async def require_session(x_sid: str = Header(), x_uid: str = Header()) -> AuthenticatedSession:
         return _session(x_sid, x_uid)

@@ -1,5 +1,7 @@
-"""TLS and environment-isolation tests for the egress transport (plan Phase 4,
-US-PK12; audit B2 and cross-cutting M1).
+"""
+TLS and environment-isolation tests for the egress transport (plan Phase 4).
+
+Covers US-PK12; audit B2 and cross-cutting M1.
 
 The https path rewrites the request URL to the pinned *private IP* and carries
 the hostname in ``sni_hostname``; certificate verification must therefore still

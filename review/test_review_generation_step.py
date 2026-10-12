@@ -1201,9 +1201,13 @@ async def test_us_pk4_no_provider_request_body_is_byte_identical_to_phase_2(
 async def test_us_pk4_context_builder_output_with_and_without_provider_section_differs_only_by_it(
     stub_llm_server: Callable[..., str],
 ) -> None:
-    """Driven with real ``ContextBuilderOutput`` objects (the step's actual
+    """
+    A provider section adds only itself to the wire request.
+
+    Driven with real ``ContextBuilderOutput`` objects (the step's actual
     upstream type): the wire request with a provider section is the request
-    without one plus the provider section, and nothing else."""
+    without one plus the provider section, and nothing else.
+    """
     from review.context_builder import ContextBuilderOutput
 
     def _output(bundle: ContextBundle) -> ContextBuilderOutput:
@@ -1256,9 +1260,13 @@ async def test_empty_provider_section_leaves_prompt_unchanged() -> None:
 
 @pytest.mark.asyncio
 async def test_pr_metadata_is_forwarded_to_the_real_output() -> None:
-    """Product-knowledge capture fields (Phase 1/2) are optional
-    ``JobIdentity`` fields and not auto-carried; they must reach
-    ``ReviewGenerationOutput`` for the A1 gate downstream."""
+    """
+    Product-knowledge capture fields reach ``ReviewGenerationOutput``.
+
+    The Phase 1/2 capture fields are optional ``JobIdentity`` fields and not
+    auto-carried; they must reach ``ReviewGenerationOutput`` for the A1 gate
+    downstream.
+    """
 
     @dataclass
     class _WithPr(_FakeStaticAnalysisOutput):

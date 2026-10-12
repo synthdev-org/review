@@ -339,8 +339,11 @@ async def test_no_funnel_counter_carries_any_attribute(
 
 @pytest.mark.asyncio
 async def test_product_knowledge_capture_fields_are_forwarded_to_output() -> None:
-    """Phase 2 of docs/plans/plan-deliver-product-knowledge.md: the optional
-    ``JobIdentity`` fields must be explicitly forwarded by this step."""
+    """
+    Phase 2 of docs/plans/plan-deliver-product-knowledge.md: forward optional identity fields.
+
+    The optional ``JobIdentity`` fields must be explicitly forwarded by this step.
+    """
     step = PrefilterStep(_FakeDiffFetcher(Diff(files=(_file("app.py"),))))
     job_input = {
         **_INPUT,

@@ -1,5 +1,7 @@
-"""Unit tests for the Phase 3 pure domain logic in review.product_knowledge
-(US-PK1-3, PK6, PK7, PK20), per ADR-0005's pure-no-I/O exemption. The
+"""
+Unit tests for the Phase 3 pure domain logic in review.product_knowledge.
+
+Covers US-PK1-3, PK6, PK7, PK20, per ADR-0005's pure-no-I/O exemption. The
 Protocols are exercised through fakes only; nothing here touches a network.
 """
 
@@ -410,9 +412,13 @@ def test_normalize_strips_control_characters() -> None:
 
 
 def test_snippet_and_fetched_content_keep_newlines_but_title_id_url_never_do() -> None:
-    """Deliberate asymmetry: multi-line bodies stay readable (and are safe,
-    because the prompt/comment serialise them as JSON), while single-line
-    identity fields can never carry a newline."""
+    """
+    Deliberate asymmetry between multi-line bodies and single-line identity fields.
+
+    Multi-line bodies stay readable (and are safe, because the prompt/comment
+    serialise them as JSON), while single-line identity fields can never carry a
+    newline.
+    """
     raw = {
         "results": [
             _raw_item(0, title="T\nTwo", snippet="line1\nline2", url="https://w.example.com/a\nb"),

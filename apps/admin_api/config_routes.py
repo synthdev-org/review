@@ -69,10 +69,13 @@ ProviderWriteValidator = Callable[[str, dict[str, object]], Awaitable[None]]
 
 
 def _provider_audit_view(value: dict[str, object] | None) -> dict[str, object] | None:
-    """Reconstructable-but-secret-free summary of a provider setting for the
-    audit trail (Amendment A4): endpoint *host*, credential *reference*,
-    enabled and allow_public_repos. Never a token (none is stored here) and
-    never the full URL path."""
+    """
+    Return a reconstructable-but-secret-free summary of a provider setting.
+
+    For the audit trail (Amendment A4): endpoint *host*, credential
+    *reference*, enabled and allow_public_repos. Never a token (none is stored here) and
+    never the full URL path.
+    """
     if value is None:
         return None
     endpoint = value.get("endpoint_url")

@@ -1,6 +1,7 @@
-"""Explicit assertion that every product-knowledge bootstrap variable is
-documented in ``.env.example`` for both entrypoints (plan Phase 6,
-Assumption 8; US-PK13).
+"""
+Every product-knowledge bootstrap variable is documented in ``.env.example``.
+
+Explicit assertion for both entrypoints (plan Phase 6, Assumption 8; US-PK13).
 
 ``apps/test_env_example_sync.py`` already covers the Worker generically but
 deliberately excludes ``AdminAPISettings``; this test pins the new

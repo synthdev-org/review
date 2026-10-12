@@ -274,8 +274,11 @@ def test_admin_defaults_have_no_map_and_the_kill_switch_on() -> None:
 
 
 def test_admin_settings_construct_with_a_malformed_map_and_never_echo_the_token() -> None:
-    """Fail open: settings construction does not validate the map (the Worker
-    does); parsing is on demand and its error names no value."""
+    """
+    Fail open: settings construction does not validate the map.
+
+    The Worker validates it; parsing is on demand and its error names no value.
+    """
     from adapter.product_knowledge.credentials import CredentialMapError
 
     settings = _unreachable_dsn_settings(

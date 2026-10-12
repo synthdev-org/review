@@ -13,9 +13,6 @@ from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-from adapter.telemetry.conftest import (
-    reset_otel_global_providers as _reset_otel_global_providers,  # noqa: F401
-)
 from review.citation import render_citation
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.product_knowledge import (
@@ -192,7 +189,7 @@ def test_mixed_valid_and_unknown_ids_renders_only_the_valid_one(
 
 
 def _pk_item(
-    id: int,
+    item_id: int,
     *,
     title: str = "Refund policy",
     url: str | None = "https://wiki.example.com/refunds",
@@ -200,8 +197,8 @@ def _pk_item(
     content: str = "SECRET-SNIPPET-TEXT",
 ) -> ProductKnowledgeItem:
     return ProductKnowledgeItem(
-        id=id,
-        provider_item_id=f"doc-{id}",
+        id=item_id,
+        provider_item_id=f"doc-{item_id}",
         title=title,
         source_type=source_type,
         url=url,

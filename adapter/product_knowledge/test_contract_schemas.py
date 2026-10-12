@@ -1,6 +1,9 @@
-"""US-PK16 — the committed product-knowledge contract schemas equal the ones
-generated from ``review.product_knowledge``'s wire models, and every committed
-example validates (or fails) as its name says.
+"""
+US-PK16: the committed product-knowledge contract schemas match the models.
+
+The committed schemas equal the ones generated from
+``review.product_knowledge``'s wire models, and every committed example
+validates (or fails) as its name says.
 
 Pure static check, no I/O beyond reading committed files (ADR-0005's
 pure-logic exemption). The integration evidence for US-PK16 is Phase 4/5's

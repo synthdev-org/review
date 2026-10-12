@@ -163,9 +163,13 @@ class ContextBundleItem(BaseModel):
 
 
 def _next_item_id(existing: Sequence[object]) -> int:
-    """The single id-allocation rule shared by code-item assembly (below) and
-    provider assembly (``ContextBundle.next_item_id``): ids are dense and
-    continue after the last already-assigned id."""
+    """
+    Allocate ids by the single rule shared by code-item and provider assembly.
+
+    Shared by code-item assembly (below) and provider assembly
+    (``ContextBundle.next_item_id``): ids are dense and continue after the last
+    already-assigned id.
+    """
     return len(existing)
 
 
@@ -304,12 +308,15 @@ def render_context_bundle_section(context_bundle: ContextBundle | None) -> str:
 
 
 def render_product_knowledge_section(context_bundle: ContextBundle | None) -> str:
-    """The provider's prompt section, headed with its display name and framed
-    as inert reference data. ``""`` when absent or empty, so a no-provider
-    prompt is byte-for-byte what it was before this feature.
+    """
+    Render the provider's prompt section, or ``""`` when absent or empty.
+
+    The section is headed with its display name and framed as inert reference data. With no
+    provider the prompt is byte-for-byte what it was before this feature.
 
     The "do not quote verbatim" instruction is best effort, not a control —
-    the exposure gate (A1) is what bounds disclosure."""
+    the exposure gate (A1) is what bounds disclosure.
+    """
     section = context_bundle.product_knowledge if context_bundle is not None else None
     if section is None or not section.items:
         return ""

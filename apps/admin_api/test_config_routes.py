@@ -42,9 +42,6 @@ from adapter.storage.models import (
     Repo,
     Team,
 )
-from adapter.telemetry.conftest import (
-    reset_otel_global_providers as _reset_otel_global_providers,  # noqa: F401
-)
 from apps.admin_api.dependencies import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
 from apps.admin_api.main import create_app
 from apps.admin_api.settings import AdminAPISettings
@@ -543,8 +540,11 @@ def test_provider_setting_is_stored_with_defaults_and_the_token_is_never_exposed
 def test_provider_setting_audit_metadata_carries_old_and_new_host_ref_and_enabled(
     migrated_engine: AsyncEngine, session_factory: async_sessionmaker[Any]
 ) -> None:
-    """Amendment A4: a redirect of a credential or a provider swap must be
-    reconstructable from the audit trail, without a token or a URL path."""
+    """
+    Amendment A4: a credential redirect or provider swap is reconstructable from the audit trail.
+
+    It must be reconstructable without a token or a URL path.
+    """
     with TestClient(create_app(_pk_settings(_dsn(migrated_engine)))) as client:
         csrf = _login_and_csrf(client)
         first = _put_pk(client, csrf, endpoint_url="https://wiki.example.com/secret/path/mcp")
@@ -664,8 +664,11 @@ def test_team_scope_is_rejected_for_the_provider_key(
 def test_non_ascii_endpoint_host_lookalike_is_rejected_outright(
     migrated_engine: AsyncEngine,
 ) -> None:
-    """A Cyrillic lookalike never reaches the binding check: endpoint URLs
-    are printable ASCII (IDN hosts are supplied as punycode)."""
+    """
+    A Cyrillic lookalike never reaches the binding check.
+
+    Endpoint URLs are printable ASCII (IDN hosts are supplied as punycode).
+    """
     with TestClient(create_app(_pk_settings(_dsn(migrated_engine)))) as client:
         csrf = _login_and_csrf(client)
 
@@ -755,8 +758,11 @@ def test_credential_allowed_hosts_port_is_enforced_at_write_time(
 def test_provider_setting_is_still_stored_when_the_kill_switch_is_off(
     migrated_engine: AsyncEngine,
 ) -> None:
-    """The kill switch gates test-connection and runtime use, never config
-    writes: an operator can stage the setting while the feature is off."""
+    """
+    The kill switch gates test-connection and runtime use, never config writes.
+
+    An operator can stage the setting while the feature is off.
+    """
     settings = _settings(
         dsn=_dsn(migrated_engine),
         product_knowledge_credentials=SecretStr(_PK_MAP),

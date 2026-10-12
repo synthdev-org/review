@@ -185,9 +185,12 @@ def record_product_knowledge_call(
     *,
     origin: str,
 ) -> None:
-    """Record one provider call on the shared instruments. ``origin`` is the
-    closed set {"worker", "test_connection"}; the Admin API's test-connection
-    path uses this too so both appear on one dashboard row."""
+    """
+    Record one provider call on the shared instruments.
+
+    ``origin`` is the closed set {"worker", "test_connection"}; the Admin API's test-connection
+    path uses this too so both appear on one dashboard row.
+    """
     attributes = {
         "operation": operation,
         "outcome": outcome.value,
@@ -393,9 +396,12 @@ def _diff_byte_size(diff: Diff) -> int:
 
 @dataclass
 class _ProviderTrace:
-    """Mutable record the provider branch fills in as it goes, so the
-    wrapper can report accurately even when the deadline cancels the flow
-    mid-way. Holds only closed-set values and counts — never provider text."""
+    """
+    Mutable record the provider branch fills in as it goes.
+
+    It lets the wrapper report accurately even when the deadline cancels the flow mid-way.
+    Holds only closed-set values and counts — never provider text.
+    """
 
     outcome: ProviderOutcome = ProviderOutcome.PROVIDER_ERROR
     contract_version: str = "none"
@@ -642,10 +648,13 @@ class ContextBuilderStep:
         return bundle, stats
 
     async def _run_code_branch(self, parsed: _ContextBuilderInput, job_id: str) -> _CodeRun:
-        """The code-retrieval branch (Units A-D) with its own single
-        ``wait_for`` and its own typed-failure degradation (US7). The
-        outcome/degraded labels and every pre-existing metric/log value are
-        computed from this branch only."""
+        """
+        Run the code-retrieval branch (Units A-D).
+
+        It has its own single ``wait_for`` and its own typed-failure degradation (US7). The
+        outcome/degraded labels and every pre-existing metric/log value are computed from this
+        branch only.
+        """
         bundle = ContextBundle()
         stats: dict[str, int] = {}
         outcome = "ok"
@@ -709,17 +718,7 @@ class ContextBuilderStep:
             code.error_extra,
         )
         if provider_task is not None:
-            provider = await provider_task
-            # Assembled only now so ids continue after the final code id
-            # (``item()`` for a code id is unchanged).
-            section = assemble_product_knowledge(
-                provider.items,
-                label=provider.display_name or "Product knowledge",
-                first_id=bundle.next_item_id(),
-            )
-            if section is not None:
-                bundle = bundle.model_copy(update={"product_knowledge": section})
-            self._finish_provider(parsed, job_id, provider, section)
+            bundle = await self._attach_provider_section(parsed, job_id, bundle, provider_task)
 
         item_count = len(bundle.items)
         # Sourced from `stats` (assemble_context_bundle's own already-computed
@@ -742,6 +741,40 @@ class ContextBuilderStep:
             **error_extra,
         }
 
+        self._record_and_log(job_id, outcome, duration_ms, bundle, log_extra)
+
+        return self._build_output(parsed, bundle)
+
+    async def _attach_provider_section(
+        self,
+        parsed: _ContextBuilderInput,
+        job_id: str,
+        bundle: ContextBundle,
+        provider_task: asyncio.Task[_ProviderTrace],
+    ) -> ContextBundle:
+        provider = await provider_task
+        # Assembled only now so ids continue after the final code id
+        # (``item()`` for a code id is unchanged).
+        section = assemble_product_knowledge(
+            provider.items,
+            label=provider.display_name or "Product knowledge",
+            first_id=bundle.next_item_id(),
+        )
+        if section is not None:
+            bundle = bundle.model_copy(update={"product_knowledge": section})
+        self._finish_provider(parsed, job_id, provider, section)
+        return bundle
+
+    @staticmethod
+    def _record_and_log(
+        job_id: str,
+        outcome: str,
+        duration_ms: int,
+        bundle: ContextBundle,
+        log_extra: dict[str, Any],
+    ) -> None:
+        item_count = len(bundle.items)
+        total_bytes = log_extra["context_bundle_total_bytes"]
         # US6 — recorded at the same point as the log line above, using the
         # real `outcome` literal ("ok" / "degraded_empty" / "degraded_error")
         # this method itself assigns, never a free-text value (Privacy NFR).
@@ -767,6 +800,8 @@ class ContextBuilderStep:
             ]
             logger.info("context_builder completed", extra=log_extra)
 
+    @staticmethod
+    def _build_output(parsed: _ContextBuilderInput, bundle: ContextBundle) -> ContextBuilderOutput:
         return ContextBuilderOutput(
             diff=parsed.diff,
             findings=parsed.findings,
@@ -792,9 +827,13 @@ class ContextBuilderStep:
     async def _run_provider_branch(
         self, parsed: _ContextBuilderInput, job_id: str
     ) -> _ProviderTrace:
-        """Never raises: every failure maps to a ``ProviderOutcome``. Bounded
-        by its own deadline (≤ the internal window), so a hung provider or a
-        hung settings read can neither delay nor fail the code branch."""
+        """
+        Run the provider branch; never raises.
+
+        Every failure maps to a ``ProviderOutcome``. Bounded by its own deadline (≤ the internal
+        window), so a hung provider or a hung settings read can neither delay nor fail the code
+        branch.
+        """
         trace_ = _ProviderTrace(started_ns=time.time_ns())
         start = time.monotonic()
         try:
@@ -924,8 +963,11 @@ class ContextBuilderStep:
         trace_: _ProviderTrace,
         remaining_seconds: float,
     ) -> list[ProviderItem]:
-        """Fetch the top ``FETCH_TOP_N`` in parallel; a failed, slow or
-        unusable fetch keeps that item's snippet (it never fails the job)."""
+        """
+        Fetch the top ``FETCH_TOP_N`` items in parallel.
+
+        A failed, slow or unusable fetch keeps that item's snippet (it never fails the job).
+        """
 
         async def one(item: ProviderItem) -> ProviderItem:
             try:
@@ -946,9 +988,12 @@ class ContextBuilderStep:
     async def _timed_call(
         self, operation: str, trace_: _ProviderTrace, awaitable: Awaitable[_T]
     ) -> _T:
-        """Awaits one provider call, recording ``call_total``/
-        ``call_duration_ms`` for it (the closed ``operation`` label) with the
-        call's own outcome."""
+        """
+        Await one provider call and record its telemetry.
+
+        Records ``call_total``/``call_duration_ms`` for it (the closed ``operation`` label) with
+        the call's own outcome.
+        """
         start = time.monotonic()
         try:
             result = await awaitable
@@ -983,9 +1028,12 @@ class ContextBuilderStep:
         trace_: _ProviderTrace,
         section: ProductKnowledgeSection | None,
     ) -> None:
-        """Job-level telemetry: one ``operation=job`` counter/duration pair,
-        one ``review.product_knowledge`` span (child of the step span) and one
-        log line. Closed-set labels and counts only — never content."""
+        """
+        Emit job-level telemetry for the provider branch.
+
+        One ``operation=job`` counter/duration pair, one ``review.product_knowledge`` span (child
+        of the step span) and one log line. Closed-set labels and counts only — never content.
+        """
         outcome = trace_.outcome
         item_count = len(section.items) if section is not None else 0
         total_bytes = (

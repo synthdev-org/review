@@ -1,5 +1,7 @@
-"""Integration tests for adapter.product_knowledge.conformance (plan Phase 5,
-US-PK17): the suite passes against the in-repo fake provider (both protocol
+"""
+Integration tests for adapter.product_knowledge.conformance (plan Phase 5, US-PK17).
+
+The suite passes against the in-repo fake provider (both protocol
 eras) and *fails* against a seeded-faulty fake for every check, proving each
 check can fail. ``test_live_endpoint_conforms`` is the opt-in live mode
 (``--pk-url`` / ``PK_URL``, token in ``PK_TOKEN``); it is skipped by default and

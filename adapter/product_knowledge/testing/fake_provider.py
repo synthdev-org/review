@@ -1,5 +1,7 @@
-"""adapter.product_knowledge.testing.fake_provider — a real, runnable fake
-product-knowledge MCP server for integration tests (plan Phase 4,
+"""
+A real, runnable fake product-knowledge MCP server for integration tests.
+
+``adapter.product_knowledge.testing.fake_provider`` (plan Phase 4,
 Assumption 12). **Test tooling only**: it lives outside the production
 client's import path, is removed from the runtime image (Dockerfile) and is
 excluded from mutation testing (``[tool.mutmut] do_not_mutate``).
@@ -206,6 +208,7 @@ class FakeProvider(AbstractAsyncContextManager["FakeProvider"]):
     # --- lifecycle -----------------------------------------------------
 
     async def __aenter__(self) -> FakeProvider:
+        """Start the fake server and return it once it is listening."""
         app = _Gate(
             self,
             self._build_server().streamable_http_app(
@@ -240,6 +243,7 @@ class FakeProvider(AbstractAsyncContextManager["FakeProvider"]):
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        """Stop the fake server and release its port."""
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:
@@ -368,7 +372,8 @@ class FakeProvider(AbstractAsyncContextManager["FakeProvider"]):
 
 
 class _InProcessServer(uvicorn.Server):
-    """A uvicorn server that does not touch process signal handlers.
+    """
+    A uvicorn server that does not touch process signal handlers.
 
     ``sse_starlette`` (used by the SDK's legacy-era GET stream) introspects
     the SIGTERM handler's owning uvicorn server and, once that server shuts

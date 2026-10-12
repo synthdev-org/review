@@ -1468,8 +1468,12 @@ async def test_us_pk4_no_provider_verification_request_body_is_byte_identical_to
 async def test_us_pk1_provider_only_bundle_verifies_a_finding_citing_a_provider_item(
     stub_llm_server: Callable[..., str],
 ) -> None:
-    """No code context at all, only provider items: the verifier still sees the
-    provider section, and a finding citing a provider id is verified."""
+    """
+    With no code context at all, only provider items, the verifier still sees them.
+
+    The verifier still sees the provider section, and a finding citing a provider id is
+    verified.
+    """
     captured_bodies: list[bytes] = []
     endpoint = stub_llm_server(
         lambda: (200, _canned_completion_json(_verdicts_response_json([_passing_verdict(0)]))),
@@ -1538,9 +1542,12 @@ async def test_us_pk4_empty_provider_section_leaves_request_body_byte_identical(
 
 @pytest.mark.asyncio
 async def test_pr_metadata_is_forwarded_to_the_real_output() -> None:
-    """Product-knowledge capture fields (Phase 1/2) are optional
-    ``JobIdentity`` fields and not auto-carried; they must reach
-    ``VerificationOutput``."""
+    """
+    Product-knowledge capture fields (Phase 1/2) reach ``VerificationOutput``.
+
+    They are optional ``JobIdentity`` fields and not auto-carried, so they must be forwarded
+    explicitly.
+    """
 
     @dataclass
     class _WithPr(_FakeReviewGenerationOutput):

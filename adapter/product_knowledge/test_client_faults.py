@@ -1,7 +1,9 @@
-"""Integration tests for adapter.product_knowledge.client against a real fake
-MCP provider process-equivalent (real uvicorn socket server on loopback, both
-protocol eras, FAULT injection) — plan Phase 4; US-PK5 (transport classes),
-US-PK6 (hostile metadata / error bodies).
+"""
+Integration tests for adapter.product_knowledge.client against a fake MCP provider.
+
+The provider is a real fake MCP provider process-equivalent (real uvicorn socket server on loopback,
+both protocol eras, FAULT injection) — plan Phase 4; US-PK5 (transport classes), US-PK6 (hostile
+metadata / error bodies).
 
 Shared helpers live in ``testing/client_harness.py``.
 """

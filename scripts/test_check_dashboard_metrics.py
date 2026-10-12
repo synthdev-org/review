@@ -301,9 +301,12 @@ class TestMainCLI:
 
 
 class TestShippedDashboardCoversProductKnowledge:
-    """US-PK14 / plan Phase 7b: the shipped dashboard's product-knowledge row
-    references only instruments the code registers (the existing guard, run
-    against the real dashboard and the real source tree)."""
+    """
+    US-PK14 / plan Phase 7b: the dashboard's product-knowledge row uses real instruments.
+
+    It references only instruments the code registers (the existing guard, run
+    against the real dashboard and the real source tree).
+    """
 
     def test_real_dashboard_references_the_product_knowledge_instruments_and_has_no_drift(
         self,

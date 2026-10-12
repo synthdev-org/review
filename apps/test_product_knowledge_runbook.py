@@ -1,7 +1,10 @@
-"""US-PK15's runbook half (plan Phase 9): the operator runbook carries the one
-egress-disclosure literal the Admin UI renders, and has a ``##`` entry for
-every provider ``outcome`` an operator can see - an assertion, not a
-link-check, so a copy edit on either side cannot silently drift.
+"""
+US-PK15's runbook half (plan Phase 9): the operator runbook stays in sync with the UI.
+
+The runbook carries the one egress-disclosure literal the Admin UI renders,
+and has a ``##`` entry for every provider ``outcome`` an operator can see - an
+assertion, not a link-check, so a copy edit on either side cannot silently
+drift.
 """
 
 from __future__ import annotations

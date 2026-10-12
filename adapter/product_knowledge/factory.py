@@ -1,5 +1,7 @@
-"""adapter.product_knowledge.factory — builds a per-endpoint provider client
-from already-parsed config (plan Assumption 4): the ``ProviderOpener`` the
+"""
+adapter.product_knowledge.factory — builds a per-endpoint provider client from parsed config.
+
+The config is already parsed (plan Assumption 4): this yields the ``ProviderOpener`` the
 Worker injects and the probe factory the Admin API's test-connection uses.
 
 The credential is resolved from the operator map by *name* here; the job-time
@@ -43,6 +45,7 @@ class ProviderClientFactory:
         inner_transport: httpx2.AsyncBaseTransport | None = None,
         **tuning: Unpack[FactoryTuning],
     ) -> None:
+        """Bind the operator credential map, egress policy and transport seams."""
         unknown = sorted(set(tuning) - FactoryTuning.__optional_keys__)
         if unknown:
             raise TypeError(f"unexpected keyword argument {unknown[0]!r}")

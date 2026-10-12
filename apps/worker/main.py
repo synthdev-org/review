@@ -545,12 +545,14 @@ def _log_model_routing_disabled_warning(settings: WorkerSettings, logger: loggin
 def _log_product_knowledge_disabled_warning(
     settings: WorkerSettings, logger: logging.Logger
 ) -> None:
-    """A one-time `warning`-level startup log when `product_knowledge_enabled`
-    is `False` (plan-deliver-product-knowledge.md Phase 6, US-PK13) —
-    mirrors `_log_memory_suppression_disabled_warning`: the kill switch is a
-    deliberate deviation from the shipped default and must be visible. No
-    provider client is constructed and no outbound call is made, even if
-    provider settings exist."""
+    """
+    A one-time `warning`-level startup log when `product_knowledge_enabled` is `False`.
+
+    (plan-deliver-product-knowledge.md Phase 6, US-PK13) — mirrors
+    `_log_memory_suppression_disabled_warning`: the kill switch is a deliberate deviation from the
+    shipped default and must be visible. No provider client is constructed and no outbound call is
+    made, even if provider settings exist.
+    """
     if not settings.product_knowledge_enabled:
         logger.warning(
             "product knowledge is disabled: no external provider will be queried "
@@ -562,10 +564,13 @@ def _log_product_knowledge_disabled_warning(
 def _log_product_knowledge_context_builder_disabled_warning(
     settings: WorkerSettings, enablement: StepEnablement, logger: logging.Logger
 ) -> None:
-    """A one-time `warning`-level startup log when provider credentials are
-    configured but the Context Builder cannot run (the provider is queried
-    only from inside that step), so the operator is not left wondering why a
-    configured provider is never called (plan Phase 7)."""
+    """
+    A one-time `warning`-level startup log when configured credentials cannot be used.
+
+    This fires when provider credentials are configured but the Context Builder cannot run (the
+    provider is queried only from inside that step), so the operator is not left wondering why a
+    configured provider is never called (plan Phase 7).
+    """
     if (
         settings.product_knowledge_enabled
         and settings.credential_map().refs
@@ -580,12 +585,14 @@ def _log_product_knowledge_context_builder_disabled_warning(
 
 @dataclass(frozen=True)
 class ProductKnowledgeWiring:
-    """What the Context Builder's provider branch is handed: the fail-open
-    effective-setting resolver and the per-endpoint client factory (a
-    `review.product_knowledge.ProviderOpener`). `opener` is `None` when the
-    kill switch is off: the resolver is still wired so a *configured*
-    provider is reported as `outcome=disabled` (a visible rollback signal,
-    not silence), but no client can ever be built."""
+    """
+    What the Context Builder's provider branch is handed.
+
+    The fail-open effective-setting resolver and the per-endpoint client factory (a
+    `review.product_knowledge.ProviderOpener`). `opener` is `None` when the kill switch is off: the
+    resolver is still wired so a *configured* provider is reported as `outcome=disabled` (a visible
+    rollback signal, not silence), but no client can ever be built.
+    """
 
     opener: ProviderClientFactory | None
     resolver: FailOpenProviderResolver
@@ -596,10 +603,13 @@ def _build_product_knowledge_wiring(
     setting_repository: PostgresSettingRepository,
     logger: logging.Logger,
 ) -> ProductKnowledgeWiring:
-    """With `product_knowledge_enabled=False` no client factory is built (so
-    no outbound call is possible even when settings exist); the resolver is
-    still wired for the `disabled` outcome. The credential map was already
-    validated by `WorkerSettings` (fail-fast), so parsing here cannot raise."""
+    """
+    With `product_knowledge_enabled=False` no client factory is built.
+
+    So no outbound call is possible even when settings exist; the resolver is still wired for the
+    `disabled` outcome. The credential map was already validated by `WorkerSettings` (fail-fast), so
+    parsing here cannot raise.
+    """
     resolver = FailOpenProviderResolver(setting_repository)
     if not settings.product_knowledge_enabled:
         return ProductKnowledgeWiring(opener=None, resolver=resolver)

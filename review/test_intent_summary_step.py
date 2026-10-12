@@ -463,9 +463,12 @@ async def test_success_logs_only_the_char_count_never_the_summary_text(
 
 @pytest.mark.asyncio
 async def test_pr_metadata_is_forwarded_to_the_real_output() -> None:
-    """Product-knowledge capture fields (Phase 1/2) survive this step: they
-    are optional ``JobIdentity`` fields and not auto-carried, so a dropped
-    forward would silently fail the A1 gate closed downstream."""
+    """
+    Product-knowledge capture fields (Phase 1/2) survive this step.
+
+    They are optional ``JobIdentity`` fields and not auto-carried, so a dropped forward would
+    silently fail the A1 gate closed downstream.
+    """
 
     @dataclass
     class _WithPr(_FakePrefilterOutput):
@@ -486,8 +489,11 @@ async def test_pr_metadata_is_forwarded_to_the_real_output() -> None:
 
 @pytest.mark.asyncio
 async def test_product_knowledge_content_never_reaches_the_intent_summary_request() -> None:
-    """The intent-summary prompt is built from the diff only: a bundle that
-    carries a provider section must not leak any of it into the LLM call."""
+    """
+    The intent-summary prompt is built from the diff only.
+
+    A bundle that carries a provider section must not leak any of it into the LLM call.
+    """
     marker = "PROVIDER-SECRET-MARKER-7f3a"
     bundle = ContextBundle(
         product_knowledge=ProductKnowledgeSection(

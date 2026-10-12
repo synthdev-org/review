@@ -363,10 +363,11 @@ class PostgresSettingRepository:
     async def list_rows_for_key(
         self, *, key: str, org_id: str | None, repo_id: str | None
     ) -> tuple[SettingRow, ...]:
-        """The platform row, the org row and the repo row (never team rows)
-        for one ``key`` - the keyed runtime read behind
-        ``tenancy.settings.resolve_setting``. Deliberately not
-        ``get_config_tree``: one indexed-by-key query, no hierarchy joins,
+        """
+        Read the platform, org and repo rows (never team rows) for one ``key``.
+
+        This is the keyed runtime read behind ``tenancy.settings.resolve_setting``.
+        Deliberately not ``get_config_tree``: one indexed-by-key query, no hierarchy joins,
         and no registry validation of stored values (the consumer validates
         what it uses, so an orphaned/odd row can never fail a read here).
         """

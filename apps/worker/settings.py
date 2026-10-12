@@ -446,10 +446,13 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
 
     @model_validator(mode="after")
     def _product_knowledge_credentials_and_timeouts_are_valid(self) -> WorkerSettings:
-        """Fail fast (naming the problem, never the value) on a malformed
-        credential map, and enforce ``call < deadline < internal`` when the
-        feature is in use (a non-empty credential map or endpoint allow-list
-        with the kill switch on)."""
+        """
+        Fail fast on a malformed credential map and enforce the deadline ordering.
+
+        Failures name the problem, never the value. Enforces ``call < deadline < internal`` when
+        the feature is in use (a non-empty credential map or endpoint allow-list with the kill
+        switch on).
+        """
         # Why gated, not unconditional: the provider *setting* lives in
         # Postgres (day-two Admin UI config), which settings construction
         # cannot read, so a non-empty credential map is the only bootstrap

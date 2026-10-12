@@ -1,5 +1,7 @@
-"""adapter.product_knowledge.client — the one generic MCP client for the
-optional product-knowledge contract (ADR-0013 decision 1, plan Phase 4).
+"""
+adapter.product_knowledge.client: the one generic MCP client for the product-knowledge contract.
+
+This is the optional product-knowledge contract's client (ADR-0013 decision 1, plan Phase 4).
 
 **The only module outside ``conformance.py`` (the in-package self-test)
 that imports ``mcp``.** It implements the consumer-defined
@@ -109,9 +111,12 @@ class ClientTimeouts:
 
 
 class NegotiationCache:
-    """Bounded TTL map of negotiation results with single-flight: concurrent
-    cold callers for one key trigger exactly one negotiation. Owned by the
-    composition root and passed in — not module state."""
+    """
+    Bounded TTL map of negotiation results with single-flight.
+
+    Concurrent cold callers for one key trigger exactly one negotiation. Owned by
+    the composition root and passed in — not module state.
+    """
 
     def __init__(
         self,
@@ -120,6 +125,7 @@ class NegotiationCache:
         max_entries: int = 64,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """Configure the cache bounds (TTL, entry count) and the clock."""
         self._ttl = ttl_seconds
         self._max = max_entries
         self._clock = clock
@@ -182,8 +188,10 @@ class NegotiationCache:
 
 
 class EndpointGate:
-    """Process-level per-endpoint concurrency bound plus the ``rate_limited``
-    cool-down (A3). Bounded in the number of endpoints it remembers.
+    """
+    Process-level per-endpoint concurrency bound plus the ``rate_limited`` cool-down (A3).
+
+    Bounded in the number of endpoints it remembers.
 
     The concurrency bound is keyed by *origin* (``scheme://host:port``, no
     path): it protects the server, which is the origin, so a path variation
@@ -191,7 +199,8 @@ class EndpointGate:
     ``(origin, credential_ref)``: a ``rate_limited`` answer to one tenant's
     credential must not starve another credential's calls to the same
     origin (the limit is usually per token), while a path variation cannot
-    dodge it."""
+    dodge it.
+    """
 
     def __init__(
         self,
@@ -200,6 +209,7 @@ class EndpointGate:
         max_endpoints: int = 256,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """Configure the per-origin concurrency bound, endpoint bound and clock."""
         self._max_in_flight = max_in_flight
         self._max_endpoints = max_endpoints
         self._clock = clock
@@ -262,12 +272,16 @@ class EndpointGate:
 
 
 def _silence_sdk_logging() -> None:
-    """The SDK logs response-parsing failures with ``logger.exception``,
+    """
+    Silence the SDK's own logger namespace.
+
+    The SDK logs response-parsing failures with ``logger.exception``,
     whose traceback carries the provider's raw bytes (pydantic ``input_value``).
     Provider content must never reach logs (US-PK6/PK14), so the SDK's own
     logger namespace is silenced; this adapter logs outcomes itself.
     Idempotent. ponytail: process-global; a per-record scrubber if operators
-    ever need SDK debug output."""
+    ever need SDK debug output.
+    """
     logging.getLogger("mcp").setLevel(logging.CRITICAL)
 
 
@@ -282,8 +296,12 @@ def _leaves(exc: BaseException) -> Iterator[BaseException]:
 
 
 def _typed_leaf_outcome(leaves: list[BaseException]) -> ProviderOutcome | None:
-    """Our own typed errors raised inside the SDK's task group arrive wrapped
-    in an ExceptionGroup; keep their specific outcome."""
+    """
+    Return the specific outcome of our own typed error, if one was raised.
+
+    Our own typed errors raised inside the SDK's task group arrive wrapped
+    in an ExceptionGroup; keep their specific outcome.
+    """
     for leaf in leaves:
         if isinstance(leaf, ProductKnowledgeError):
             return leaf.outcome
@@ -307,9 +325,12 @@ def _is_malformed(leaves: list[BaseException]) -> bool:
 
 
 class FactoryTuning(TypedDict, total=False):
-    """Keyword options shared by the client and its factory. Grouped as an
-    ``Unpack`` TypedDict (not a config object) so every call site keeps its
-    keyword spelling while ``__init__`` stays under the parameter limit."""
+    """
+    Keyword options shared by the client and its factory.
+
+    Grouped as an ``Unpack`` TypedDict (not a config object) so every call site
+    keeps its keyword spelling while ``__init__`` stays under the parameter limit.
+    """
 
     cache: NegotiationCache | None
     gate: EndpointGate | None
@@ -324,8 +345,12 @@ class ClientTuning(FactoryTuning, total=False):
 
 
 def _reject_unknown_tuning(tuning: Mapping[str, object]) -> None:
-    """``**tuning`` is not checked by the interpreter the way named keyword
-    parameters are: an unknown option must still be a ``TypeError``."""
+    """
+    Raise ``TypeError`` for an option ``**tuning`` should not have accepted.
+
+    ``**tuning`` is not checked by the interpreter the way named keyword
+    parameters are: an unknown option must still be a ``TypeError``.
+    """
     unknown = sorted(set(tuning) - ClientTuning.__optional_keys__)
     if unknown:
         raise TypeError(f"unexpected keyword argument {unknown[0]!r}")
@@ -334,9 +359,13 @@ def _reject_unknown_tuning(tuning: Mapping[str, object]) -> None:
 def _endpoint_identity(
     endpoint_url: str, credential_ref: str | None
 ) -> tuple[bool, str, str, CacheKey]:
-    """``(usable, host, origin, cache_key)``. Total: a malformed URL
-    ('host:abc', port > 65535, an unbalanced IPv6 bracket) is unusable and
-    every call then fails closed with ``blocked_egress`` instead of raising."""
+    """
+    Return ``(usable, host, origin, cache_key)`` for an endpoint URL.
+
+    Total: a malformed URL ('host:abc', port > 65535, an unbalanced IPv6
+    bracket) is unusable and every call then fails closed with
+    ``blocked_egress`` instead of raising.
+    """
     try:
         parts = urlsplit(endpoint_url)
         port = parts.port
@@ -349,7 +378,8 @@ def _endpoint_identity(
 
 
 class McpProductKnowledgeClient:
-    """Implements ``ProductKnowledgeProvider`` for one endpoint (+credential).
+    """
+    Implements ``ProductKnowledgeProvider`` for one endpoint (+credential).
 
     Constructed from already-parsed config only — no env or file reads.
     ``resolver`` and ``inner_transport`` are test seams (a fake resolver and a
@@ -370,6 +400,7 @@ class McpProductKnowledgeClient:
         inner_transport: httpx2.AsyncBaseTransport | None = None,
         **tuning: Unpack[ClientTuning],
     ) -> None:
+        """Bind one endpoint (+credential) from already-parsed config."""
         _reject_unknown_tuning(tuning)
         _silence_sdk_logging()
         self._url = endpoint_url
@@ -581,8 +612,11 @@ class McpProductKnowledgeClient:
                 return await body(sdk)
 
     def _status_outcome(self, transport: GuardedTransport, endpoint: str) -> ProviderOutcome | None:
-        """Outcome implied by the last HTTP error status, if any (a 429 also
-        starts the endpoint cool-down)."""
+        """
+        Return the outcome implied by the last HTTP error status, if any.
+
+        A 429 also starts the endpoint cool-down.
+        """
         status = transport.status
         if status in (401, 403):
             return ProviderOutcome.AUTH_FAILED

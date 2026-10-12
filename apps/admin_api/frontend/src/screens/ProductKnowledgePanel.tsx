@@ -24,7 +24,7 @@ type FieldName =
   | "credential_ref"
   | "allow_public_repos"
   | "issue_key_prefixes";
-const FIELD_ORDER: FieldName[] = [
+const FIELD_ORDER: readonly FieldName[] = [
   "enabled",
   "display_name",
   "endpoint_url",
@@ -83,21 +83,32 @@ const UNAUTHENTICATED_HOST_COPY =
 
 // 422 `detail` is either a write-time code (credential binding, team scope)
 // or the registry's "<field>: <message>; ..." string.
-function mapFieldErrors(detail: string): Partial<Record<FieldName, string>> {
-  const errors: Partial<Record<FieldName, string>> = {};
+type FieldErrors = ReadonlyMap<FieldName, string>;
+
+function mapFieldErrors(detail: string): FieldErrors {
+  const errors = new Map<FieldName, string>();
   if (detail === "unauthenticated_host_not_allowed") {
-    errors.endpoint_url = UNAUTHENTICATED_HOST_COPY;
+    errors.set("endpoint_url", UNAUTHENTICATED_HOST_COPY);
     return errors;
   }
   if (CREDENTIAL_CODES.has(detail)) {
-    errors.credential_ref = detail;
+    errors.set("credential_ref", detail);
     return errors;
   }
   for (const part of detail.split("; ")) {
     const parsed = parseFieldMessage(part);
-    if (parsed) errors[parsed.field] = errors[parsed.field] ?? parsed.message;
+    if (parsed && !errors.has(parsed.field)) errors.set(parsed.field, parsed.message);
   }
   return errors;
+}
+
+// Map lookup on a plain record: no computed property access on a variable key.
+function lookup<T>(record: Record<string, T>, key: string): T | undefined {
+  return new Map(Object.entries(record)).get(key);
+}
+
+function isFieldName(value: string): value is FieldName {
+  return (FIELD_ORDER as readonly string[]).includes(value);
 }
 
 const CREDENTIAL_CODES = new Set([
@@ -108,9 +119,14 @@ const CREDENTIAL_CODES = new Set([
 
 // One "<field>[.<n>]: <message>" segment of the registry's 422 detail.
 function parseFieldMessage(part: string): { field: FieldName; message: string } | null {
-  const match = /^(\w+)(?:\.\d+)?: (.*)$/.exec(part);
-  if (!match || !FIELD_ORDER.includes(match[1] as FieldName)) return null;
-  return { field: match[1] as FieldName, message: match[2] };
+  const sep = part.indexOf(": ");
+  if (sep < 0) return null;
+  const head = part.slice(0, sep);
+  const dot = head.indexOf(".");
+  const field = dot < 0 ? head : head.slice(0, dot);
+  const index = dot < 0 ? "0" : head.slice(dot + 1);
+  if (!isFieldName(field) || !/^\d+$/.test(index)) return null;
+  return { field, message: part.slice(sep + 2) };
 }
 
 // Failure of the test request itself, mapped to what the panel should do.
@@ -149,19 +165,19 @@ export function ProductKnowledgePanel({
 }: {
   node: ScopeSettings;
   support: ProductKnowledgeSupport;
-  onSaved: (scope: string, key: string) => void;
+  onSaved: (...saved: [scope: string, key: string]) => void;
 }): JSX.Element {
   const { isAdmin, handleSessionExpired } = useAuth();
-  const saved = node.settings[PRODUCT_KNOWLEDGE_PROVIDER_KEY];
+  const saved = lookup(node.settings, PRODUCT_KNOWLEDGE_PROVIDER_KEY);
   const savedKey = JSON.stringify(saved ?? null);
   const [form, setForm] = useState<FormState>(() => fromSaved(saved));
   const [saving, setSaving] = useState(false);
-  const [fieldErrors, setFieldErrors] = useState<Partial<Record<FieldName, string>>>({});
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>(new Map());
   const [generalError, setGeneralError] = useState<string | null>(null);
   const [testState, setTestState] = useState<TestState>({ kind: "idle" });
   const [focusRequest, setFocusRequest] = useState<{ field: FieldName } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const fieldRefs = useRef<Partial<Record<FieldName, HTMLElement | null>>>({});
+  const fieldRefs = useRef(new Map<FieldName, HTMLElement | null>());
   const id = `pk-${node.scope}`;
 
   const dirty = JSON.stringify(toValue(form)) !== JSON.stringify(toValue(fromSaved(saved)));
@@ -169,7 +185,7 @@ export function ProductKnowledgePanel({
   // Re-sync the form when the saved value changes underneath it (after save + reload).
   useEffect(() => {
     setForm(fromSaved(saved));
-    setFieldErrors({});
+    setFieldErrors(new Map());
     setGeneralError(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [savedKey]);
@@ -184,21 +200,22 @@ export function ProductKnowledgePanel({
   useEffect(() => () => abortRef.current?.abort(), []);
 
   useEffect(() => {
-    if (focusRequest) fieldRefs.current[focusRequest.field]?.focus();
+    if (focusRequest) fieldRefs.current.get(focusRequest.field)?.focus();
   }, [focusRequest]);
 
   function update<K extends keyof FormState>(field: K, value: FormState[K]): void {
     setForm((current) => ({ ...current, [field]: value }));
     setFieldErrors((current) => {
-      const { [field as FieldName]: _removed, ...rest } = current;
-      return rest;
+      const next = new Map(current);
+      next.delete(field);
+      return next;
     });
   }
 
-  function applyApiError(error: unknown, fallback: string): Partial<Record<FieldName, string>> | null {
+  function applyApiError(error: unknown, fallback: string): FieldErrors | null {
     if (error instanceof ApiError && error.status === 422) {
       const mapped = mapFieldErrors(error.detail);
-      if (Object.keys(mapped).length > 0) return mapped;
+      if (mapped.size > 0) return mapped;
       setGeneralError(error.detail);
       return null;
     }
@@ -206,17 +223,17 @@ export function ProductKnowledgePanel({
     return null;
   }
 
-  function showFieldErrors(mapped: Partial<Record<FieldName, string>> | null): void {
+  function showFieldErrors(mapped: FieldErrors | null): void {
     if (!mapped) return;
     setFieldErrors(mapped);
-    const first = FIELD_ORDER.find((f) => mapped[f] !== undefined);
+    const first = FIELD_ORDER.find((f) => mapped.has(f));
     if (first) setFocusRequest({ field: first });
   }
 
   async function handleSave(): Promise<void> {
     setSaving(true);
     setGeneralError(null);
-    setFieldErrors({});
+    setFieldErrors(new Map());
     try {
       await api.setConfig(node.scope, PRODUCT_KNOWLEDGE_PROVIDER_KEY, toValue(form));
       onSaved(node.scope, PRODUCT_KNOWLEDGE_PROVIDER_KEY);
@@ -267,7 +284,7 @@ export function ProductKnowledgePanel({
   }
 
   // --- effective preview (server-computed; never re-derived here) ---
-  const effective = node.effective?.[PRODUCT_KNOWLEDGE_PROVIDER_KEY];
+  const effective = node.effective && lookup(node.effective, PRODUCT_KNOWLEDGE_PROVIDER_KEY);
   let preview: string;
   if (!effective) {
     preview = "Not configured — reviews use the codebase only.";
@@ -275,7 +292,7 @@ export function ProductKnowledgePanel({
     const where =
       effective.source === node.scope
         ? "set at this scope"
-        : `inherited from ${support.scopeNames[effective.source] ?? effective.source}`;
+        : `inherited from ${lookup(support.scopeNames, effective.source) ?? effective.source}`;
     const name = typeof effective.value.display_name === "string" ? effective.value.display_name : "provider";
     preview =
       effective.value.enabled === false
@@ -294,13 +311,13 @@ export function ProductKnowledgePanel({
   const disabled = readOnly || saving;
   const errorId = (f: FieldName): string => `${id}-${f}-error`;
   const invalid = (f: FieldName): { "aria-invalid": boolean; "aria-describedby"?: string } => ({
-    "aria-invalid": fieldErrors[f] !== undefined,
-    ...(fieldErrors[f] !== undefined ? { "aria-describedby": errorId(f) } : {}),
+    "aria-invalid": fieldErrors.has(f),
+    ...(fieldErrors.has(f) ? { "aria-describedby": errorId(f) } : {}),
   });
   const fieldError = (f: FieldName): JSX.Element | null =>
-    fieldErrors[f] !== undefined ? (
+    fieldErrors.has(f) ? (
       <p id={errorId(f)} className="form-error">
-        {fieldErrors[f]}
+        {fieldErrors.get(f)}
       </p>
     ) : null;
 
@@ -320,10 +337,12 @@ export function ProductKnowledgePanel({
         <input
           type="checkbox"
           ref={(el) => {
-            fieldRefs.current.enabled = el;
+            fieldRefs.current.set("enabled", el);
           }}
           checked={form.enabled}
-          onChange={(event) => update("enabled", event.target.checked)}
+          onChange={(event) => {
+          update("enabled", event.target.checked);
+        }}
           disabled={disabled}
           {...invalid("enabled")}
         />
@@ -335,12 +354,14 @@ export function ProductKnowledgePanel({
       <input
         id={`${id}-display_name`}
         ref={(el) => {
-          fieldRefs.current.display_name = el;
+          fieldRefs.current.set("display_name", el);
         }}
         type="text"
         value={form.display_name}
         maxLength={40}
-        onChange={(event) => update("display_name", event.target.value)}
+        onChange={(event) => {
+          update("display_name", event.target.value);
+        }}
         disabled={disabled}
         {...invalid("display_name")}
       />
@@ -353,16 +374,18 @@ export function ProductKnowledgePanel({
       <input
         id={`${id}-endpoint_url`}
         ref={(el) => {
-          fieldRefs.current.endpoint_url = el;
+          fieldRefs.current.set("endpoint_url", el);
         }}
         type="url"
         value={form.endpoint_url}
         maxLength={512}
-        onChange={(event) => update("endpoint_url", event.target.value)}
+        onChange={(event) => {
+          update("endpoint_url", event.target.value);
+        }}
         disabled={disabled}
-        aria-invalid={fieldErrors.endpoint_url !== undefined}
+        aria-invalid={fieldErrors.has("endpoint_url")}
         aria-describedby={
-          fieldErrors.endpoint_url !== undefined
+          fieldErrors.has("endpoint_url")
             ? `${id}-disclosure ${errorId("endpoint_url")}`
             : `${id}-disclosure`
         }
@@ -373,10 +396,12 @@ export function ProductKnowledgePanel({
       <select
         id={`${id}-credential_ref`}
         ref={(el) => {
-          fieldRefs.current.credential_ref = el;
+          fieldRefs.current.set("credential_ref", el);
         }}
         value={form.credential_ref}
-        onChange={(event) => update("credential_ref", event.target.value)}
+        onChange={(event) => {
+          update("credential_ref", event.target.value);
+        }}
         disabled={disabled}
         {...invalid("credential_ref")}
       >
@@ -415,10 +440,12 @@ export function ProductKnowledgePanel({
         <input
           type="checkbox"
           ref={(el) => {
-            fieldRefs.current.allow_public_repos = el;
+            fieldRefs.current.set("allow_public_repos", el);
           }}
           checked={form.allow_public_repos}
-          onChange={(event) => update("allow_public_repos", event.target.checked)}
+          onChange={(event) => {
+          update("allow_public_repos", event.target.checked);
+        }}
           disabled={disabled}
           aria-describedby={`${id}-public-hint`}
           {...invalid("allow_public_repos")}
@@ -434,18 +461,22 @@ export function ProductKnowledgePanel({
       <input
         id={`${id}-issue_key_prefixes`}
         ref={(el) => {
-          fieldRefs.current.issue_key_prefixes = el;
+          fieldRefs.current.set("issue_key_prefixes", el);
         }}
         type="text"
         value={form.issue_key_prefixes}
         placeholder="HR, ENG"
-        onChange={(event) => update("issue_key_prefixes", event.target.value)}
+        onChange={(event) => {
+          update("issue_key_prefixes", event.target.value);
+        }}
         disabled={disabled}
         {...invalid("issue_key_prefixes")}
       />
       {fieldError("issue_key_prefixes")}
 
-      <button type="button" onClick={() => void handleSave()} disabled={disabled}>
+      <button type="button" onClick={() => {
+          void handleSave();
+        }} disabled={disabled}>
         {saving ? "Saving…" : "Save provider"}
       </button>
       {generalError && (
@@ -456,7 +487,9 @@ export function ProductKnowledgePanel({
 
       <button
         type="button"
-        onClick={() => void handleTest()}
+        onClick={() => {
+          void handleTest();
+        }}
         disabled={testDisabled}
         aria-disabled={testDisabled}
       >
@@ -487,7 +520,7 @@ export function ProductKnowledgePanel({
           </span>
         )}
       </div>
-      {testFailed && testState.kind === "result" && (
+      {testFailed && (
         <p role="alert" className="form-error">
           <span className="badge badge--warning">&#10007; {testState.result.status}</span>{" "}
           {testState.result.message}

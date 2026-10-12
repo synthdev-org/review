@@ -617,9 +617,13 @@ async def test_redaction_ceiling_one_over_drops_exactly_one_and_logs_warning(
 
 @pytest.mark.asyncio
 async def test_product_knowledge_capture_fields_are_forwarded_to_output() -> None:
-    """Phase 2 of docs/plans/plan-deliver-product-knowledge.md: optional
+    """
+    Optional ``JobIdentity`` fields must be forwarded explicitly at this site.
+
+    Phase 2 of docs/plans/plan-deliver-product-knowledge.md: optional
     ``JobIdentity`` fields are not auto-carried, so this hand-constructing
-    site must forward them explicitly."""
+    site must forward them explicitly.
+    """
     step = _static_analysis_step(
         diff_fetcher=_FakeDiffFetcher({}),
         gitleaks=_SleepingStaticAnalyzer("gitleaks", 0),

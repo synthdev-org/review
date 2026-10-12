@@ -1,6 +1,8 @@
-"""adapter.product_knowledge.transport — the connection-time egress guard
-(ADR-0013 decision 3, plan Phase 4 / Amendment A3, US-PK12) as an ``httpx2``
-transport, plus the 256 KiB response cap.
+"""
+adapter.product_knowledge.transport: the connection-time egress guard as an ``httpx2`` transport.
+
+The connection-time egress guard (ADR-0013 decision 3, plan Phase 4 / Amendment A3, US-PK12)
+as an ``httpx2`` transport, plus the 256 KiB response cap.
 
 The ``mcp`` v2 SDK's HTTP stack is ``httpx2`` (not ``httpx``), and it follows
 same-origin redirects on its own regardless of the client's
@@ -65,8 +67,11 @@ Resolver = Callable[[str, int], Awaitable[list[str]]]
 
 
 class EgressBlocked(httpx2.TransportError):
-    """The guard refused the request before any byte was sent (or refused to
-    follow a redirect). The message is a fixed string, never request data."""
+    """
+    The guard refused the request before any byte was sent (or refused to follow a redirect).
+
+    The message is a fixed string, never request data.
+    """
 
 
 class ResponseTooLarge(httpx2.TransportError):
@@ -85,14 +90,18 @@ class EgressPolicy:
 
 @dataclass(frozen=True)
 class ProviderCredential:
-    """One operator-provisioned credential: the token is only ever sent to a
-    host in ``allowed_hosts`` (ADR-0013 decision 2)."""
+    """
+    One operator-provisioned credential bound to a set of hosts.
+
+    The token is only ever sent to a host in ``allowed_hosts`` (ADR-0013 decision 2).
+    """
 
     ref: str
     token: SecretStr
     allowed_hosts: tuple[str, ...]
 
     def __repr__(self) -> str:  # never let a token reach a log via repr
+        """Redacted repr: only the ref, never the token."""
         return f"ProviderCredential(ref={self.ref!r})"
 
 
@@ -108,8 +117,12 @@ _MAX_DIGITS = 10
 
 
 def _is_digits(raw: str) -> bool:
-    """ASCII digits only: ``str.isdigit`` is true for ``'\xb2'``, which
-    ``int`` rejects (ValueError escaping the transport)."""
+    r"""
+    ASCII digits only.
+
+    ``str.isdigit`` is true for ``'\xb2'``, which ``int`` rejects (ValueError escaping the
+    transport).
+    """
     return raw.isascii() and raw.isdigit()
 
 
@@ -156,6 +169,7 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
         inner: httpx2.AsyncBaseTransport | None = None,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> None:
+        """Bind the transport to one endpoint origin, policy and optional credential."""
         # Total: a malformed URL (bad port, unbalanced IPv6 bracket) makes the
         # transport unusable (every request is refused), never raises here.
         port: int | None
@@ -193,8 +207,11 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
         return EgressBlocked(message)
 
     def _check_target(self, url: httpx2.URL) -> tuple[str, str, int]:
-        """``(scheme, canonical host, port)`` of the request, refusing anything
-        that is not the one bound endpoint origin."""
+        """
+        ``(scheme, canonical host, port)`` of the request.
+
+        Refuses anything that is not the one bound endpoint origin.
+        """
         scheme = url.scheme.lower()
         if scheme not in ("http", "https") or not self._usable:
             raise self._refuse(ProviderOutcome.BLOCKED_EGRESS, "scheme or endpoint not permitted")
@@ -229,8 +246,11 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
         port: int,
         classes: list[AddressClass],
     ) -> httpx2.Headers:
-        """Request headers with any caller-supplied ``Authorization`` dropped
-        and the bearer token attached only after the binding checks."""
+        """
+        Request headers with any caller-supplied ``Authorization`` dropped.
+
+        The bearer token is attached only after the binding checks.
+        """
         headers = httpx2.Headers(request.headers)
         headers.pop("authorization", None)
         headers["accept-encoding"] = "identity"
@@ -335,7 +355,10 @@ class GuardedTransport(httpx2.AsyncBaseTransport):
 
 
 def build_http_client(transport: GuardedTransport) -> httpx2.AsyncClient:
-    """The only way the adapter builds an HTTP client: guarded transport,
-    redirects off, environment (proxy vars, netrc, SSL_CERT_*) ignored, TLS
-    verification on (the inner transport's default)."""
+    """
+    The only way the adapter builds an HTTP client: a guarded transport.
+
+    Redirects are off, the environment (proxy vars, netrc, SSL_CERT_*) is ignored, and TLS
+    verification is on (the inner transport's default).
+    """
     return httpx2.AsyncClient(transport=transport, follow_redirects=False, trust_env=False)

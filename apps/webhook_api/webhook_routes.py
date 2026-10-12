@@ -217,8 +217,12 @@ def _build_webhook_event(envelope: GitHubWebhookEnvelope, *, delivery_id: str) -
 
 
 def _pr_is_fork(envelope: GitHubWebhookEnvelope) -> bool:
-    """Fail-closed fork derivation (A1(b)) over the envelope's head/base repo
-    objects; the base repo falls back to the envelope's own repository."""
+    """
+    Derive whether the PR is a fork, failing closed (A1(b)).
+
+    Works over the envelope's head/base repo objects; the base repo falls back
+    to the envelope's own repository.
+    """
     assert envelope.pull_request is not None and envelope.repository is not None
     head = envelope.pull_request.head
     base = envelope.pull_request.base

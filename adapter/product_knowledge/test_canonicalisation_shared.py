@@ -1,7 +1,10 @@
-"""One canonicaliser (egress.py docstring, plan Phase 6/7): the credential map
-and the Admin routes must normalise hosts through ``egress.canonicalize_host``
+"""
+One canonicaliser (egress.py docstring, plan Phase 6/7) serves every caller.
+
+The credential map and the Admin routes must normalise hosts through ``egress.canonicalize_host``
 so write-time, job-time and connect-time cannot disagree about what
-``WIKI.Example.com.`` or ``2130706433`` means. Pure: no network."""
+``WIKI.Example.com.`` or ``2130706433`` means. Pure: no network.
+"""
 
 from __future__ import annotations
 

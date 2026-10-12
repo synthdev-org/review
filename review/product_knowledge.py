@@ -1,6 +1,8 @@
-"""review.product_knowledge — the product-knowledge contract's wire models and
-limits (Unit A, US-PK16), per docs/plans/plan-deliver-product-knowledge.md's
-Phase 1 and docs/specs/spec-product-knowledge.md's "The contract (version 1)".
+"""
+The product-knowledge contract's wire models and limits (review.product_knowledge).
+
+Unit A, US-PK16, per docs/plans/plan-deliver-product-knowledge.md's Phase 1 and
+docs/specs/spec-product-knowledge.md's "The contract (version 1)".
 
 **These pydantic models are the source of truth for the wire contract.** The
 JSON Schemas committed under ``docs/reference/product-knowledge-contract/v1/``
@@ -237,7 +239,8 @@ class ProviderErrorDetail(BaseModel):
 
 
 class ProviderError(BaseModel):
-    """``structuredContent`` of a tool result with ``isError: true``.
+    """
+    ``structuredContent`` of a tool result with ``isError: true``.
 
     Unknown ``code`` values fail validation here (the set is closed for
     providers); a consumer classifies an unparseable error as
@@ -253,8 +256,10 @@ class ProviderError(BaseModel):
 
 
 class NegotiationResult(BaseModel):
-    """Outcome of ``product_knowledge_contract`` negotiation, adapter-neutral
-    so test-connection needs no adapter-specific entry point.
+    """
+    Outcome of ``product_knowledge_contract`` negotiation.
+
+    Adapter-neutral so test-connection needs no adapter-specific entry point.
 
     ``chosen_version`` is the highest major both sides support, or ``None``
     when there is no overlap (treated as "no provider"). ``supported_versions``
@@ -277,10 +282,13 @@ class NegotiationResult(BaseModel):
 
 
 class ProviderOutcome(StrEnum):
-    """Closed set of per-job provider-branch outcomes (the ``outcome`` metric
-    label). ``credential_unavailable``, ``blocked_egress``,
-    ``unsupported_version``, ``auth_failed`` and ``redaction_disabled`` are
-    config-class values: warned, not just counted."""
+    """
+    Closed set of per-job provider-branch outcomes (the ``outcome`` metric label).
+
+    ``credential_unavailable``, ``blocked_egress``, ``unsupported_version``,
+    ``auth_failed`` and ``redaction_disabled`` are config-class values: warned,
+    not just counted.
+    """
 
     OK = "ok"
     EMPTY = "empty"
@@ -304,11 +312,15 @@ class ProviderOutcome(StrEnum):
 
 
 class ProductKnowledgeError(Exception):
-    """Raised by a ``ProductKnowledgeProvider``/``ProviderOpener`` for any
-    failure; carries only the closed ``outcome`` — never provider text, so
-    nothing sensitive can ride an exception message or a log line."""
+    """
+    Raised by a ``ProductKnowledgeProvider``/``ProviderOpener`` for any failure.
+
+    Carries only the closed ``outcome`` — never provider text, so nothing
+    sensitive can ride an exception message or a log line.
+    """
 
     def __init__(self, outcome: ProviderOutcome, status_code: int | None = None) -> None:
+        """Record the closed ``outcome`` and the optional HTTP ``status_code``."""
         super().__init__(outcome.value)
         self.outcome = outcome
         # The provider's HTTP status when one was seen (a number, never text).
@@ -316,8 +328,11 @@ class ProductKnowledgeError(Exception):
 
 
 class EffectiveProvider(BaseModel):
-    """The resolved per-repo provider setting, in the shape the review domain
-    consumes (the ``tenancy``-backed resolver maps into it)."""
+    """
+    The resolved per-repo provider setting, in the shape the review domain consumes.
+
+    The ``tenancy``-backed resolver maps into it.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -330,40 +345,54 @@ class EffectiveProvider(BaseModel):
 
 
 class ProductKnowledgeProvider(Protocol):
-    """One negotiated connection to a provider endpoint. ``search``/``fetch``
-    return the provider's raw ``structuredContent`` (tolerant normalization
-    is this module's job) and raise ``ProductKnowledgeError`` on any failure.
-    ``related`` is deliberately absent (v1 never calls it)."""
+    """
+    One negotiated connection to a provider endpoint.
 
-    async def negotiate(self) -> NegotiationResult: ...
+    ``search``/``fetch`` return the provider's raw ``structuredContent``
+    (tolerant normalization is this module's job) and raise
+    ``ProductKnowledgeError`` on any failure. ``related`` is deliberately
+    absent (v1 never calls it).
+    """
 
-    async def search(self, query: str) -> object: ...
+    async def negotiate(self) -> NegotiationResult:
+        """Negotiate protocol capabilities with the provider."""
 
-    async def fetch(self, item_id: str) -> object: ...
+    async def search(self, query: str) -> object:
+        """Search the provider for ``query``."""
+
+    async def fetch(self, item_id: str) -> object:
+        """Fetch one item by id."""
 
 
 class ProviderOpener(Protocol):
-    """Builds a provider client for an endpoint. The credential is named by
-    ``credential_ref`` only — the token never enters this package; the
-    composition-root implementation resolves it (and re-checks the host
-    binding, raising ``credential_unavailable``)."""
+    """
+    Builds a provider client for an endpoint.
 
-    def __call__(
-        self, endpoint_url: str, credential_ref: str | None
-    ) -> ProductKnowledgeProvider: ...
+    The credential is named by ``credential_ref`` only — the token never enters
+    this package; the composition-root implementation resolves it (and
+    re-checks the host binding, raising ``credential_unavailable``).
+    """
+
+    def __call__(self, endpoint_url: str, credential_ref: str | None) -> ProductKnowledgeProvider:
+        """Open a provider client for ``endpoint_url``."""
 
 
 class EffectiveProviderResolver(Protocol):
-    """Resolves the effective provider setting for one repo (``None`` ⇒ not
-    configured). Implementations fail open; they never raise."""
+    """
+    Resolves the effective provider setting for one repo (``None`` ⇒ not configured).
 
-    async def resolve(self, org_id: str, repo_id: str) -> EffectiveProvider | None: ...
+    Implementations fail open; they never raise.
+    """
+
+    async def resolve(self, org_id: str, repo_id: str) -> EffectiveProvider | None:
+        """Return the effective provider setting, or ``None``."""
 
 
 def should_query(
     repo_private: bool, pr_is_fork: bool | None, setting: EffectiveProvider
 ) -> ProviderOutcome | None:
-    """The A1 exposure gate. ``None`` ⇒ proceed; otherwise the skip outcome.
+    """
+    The A1 exposure gate. ``None`` ⇒ proceed; otherwise the skip outcome.
 
     Public repos and fork PRs are skipped unless the setting opts in with
     ``allow_public_repos``. ``pr_is_fork is None`` (an old payload) is
@@ -379,13 +408,16 @@ def should_query(
 
 
 def formulate_query(title: str | None, issue_keys: Sequence[str]) -> str | None:
-    """Normalized title followed by the issue keys, at most 512 chars (whole
-    keys only); a key already present in the title is not repeated. ``None``
-    ⇒ nothing to ask (``no_query``). Deterministic, no I/O; redaction is the
-    caller's job (it is async/subprocess-backed). The whitespace
+    """
+    Build the query: normalized title followed by the issue keys, at most 512 chars.
+
+    Whole keys only; a key already present in the title is not repeated.
+    ``None`` ⇒ nothing to ask (``no_query``). Deterministic, no I/O; redaction
+    is the caller's job (it is async/subprocess-backed). The whitespace
     normalization here is defence in depth: callers may pass a title that
     redaction/masking has already touched, and the 512-char bound must hold
-    regardless."""
+    regardless.
+    """
     parts: list[str] = []
     length = 0
     normalized = " ".join(title.split()) if title else ""
@@ -416,8 +448,11 @@ _URL_SAFE: Final = "/%:@!$&'*+,;=~-._"
 
 
 def _clean_text(text: str, *, keep_newlines: bool = False) -> str:
-    """Replace control/format/surrogate/line-separator characters (incl.
-    ``\n``, ``\r``, U+2028/2029, bidi overrides) with a space."""
+    r"""
+    Replace control/format/surrogate/line-separator characters with a space.
+
+    Includes ``\n``, ``\r``, U+2028/2029 and bidi overrides.
+    """
     out: list[str] = []
     for ch in text:
         if unicodedata.category(ch) in _STRIP_CATEGORIES and not (keep_newlines and ch in "\n\t"):
@@ -432,8 +467,11 @@ def _clean_line(text: str, limit: int) -> str:
 
 
 def _parse_http_url(url: str) -> tuple[SplitResult, str, int | None] | None:
-    """``(parts, hostname, port)`` for an ``http``/``https`` URL with a host
-    and no userinfo; ``None`` otherwise (incl. a malformed port)."""
+    """
+    Return ``(parts, hostname, port)`` for an ``http``/``https`` URL with a host.
+
+    The URL must carry no userinfo; ``None`` otherwise (incl. a malformed port).
+    """
     try:
         parts = urlsplit(url)
         port = parts.port
@@ -468,7 +506,8 @@ def _rebuild_url(parts: SplitResult, host: str, port: int | None) -> str:
 
 
 def sanitize_url(url: object) -> str | None:
-    """The single URL sanitizer (normalization and citation both use it).
+    """
+    The single URL sanitizer (normalization and citation both use it).
 
     Returns a canonical, percent-encoded ``http``/``https`` URL, or ``None``
     when it is not a string, is too long, contains control characters, uses
@@ -490,8 +529,11 @@ def sanitize_url(url: object) -> str | None:
 
 
 def url_display(url: str | None) -> tuple[str, tuple[str, ...]] | None:
-    """``(host, flags)`` for a sanitized URL, ``None`` when it fails the
-    sanitizer. Flags name cleartext ``http`` and IP-literal hosts."""
+    """
+    Return ``(host, flags)`` for a sanitized URL, ``None`` when it fails the sanitizer.
+
+    Flags name cleartext ``http`` and IP-literal hosts.
+    """
     safe = sanitize_url(url)
     if safe is None:
         return None
@@ -578,9 +620,12 @@ def _normalize_item(raw: object) -> ProviderItem | None:
 
 
 def normalize_results(raw: object) -> NormalizedResults:
-    """Tolerant consumer of a ``product_knowledge_search`` payload: only the
-    first ``TOP_K`` results are considered; invalid items are dropped (some
-    ⇒ ``partial``, all ⇒ ``malformed``); over-long fields are truncated."""
+    """
+    Tolerant consumer of a ``product_knowledge_search`` payload.
+
+    Only the first ``TOP_K`` results are considered; invalid items are dropped
+    (some ⇒ ``partial``, all ⇒ ``malformed``); over-long fields are truncated.
+    """
     results = raw.get("results") if isinstance(raw, Mapping) else None
     if not isinstance(results, list):
         return NormalizedResults(outcome=ProviderOutcome.MALFORMED)
@@ -595,9 +640,12 @@ def normalize_results(raw: object) -> NormalizedResults:
 
 
 def normalize_fetch(raw: object, fallback: ProviderItem) -> ProviderItem:
-    """Replace ``fallback``'s snippet with the fetched content (capped); any
-    unusable fetch payload keeps the snippet. Identity fields (title, url,
-    source type) always come from the search result."""
+    """
+    Replace ``fallback``'s snippet with the fetched content (capped).
+
+    Any unusable fetch payload keeps the snippet. Identity fields (title, url,
+    source type) always come from the search result.
+    """
     content = raw.get("content") if isinstance(raw, Mapping) else None
     if not isinstance(content, str):
         return fallback
@@ -611,8 +659,12 @@ def normalize_fetch(raw: object, fallback: ProviderItem) -> ProviderItem:
 
 
 class ProductKnowledgeItem(ProviderItem):
-    """A provider item with its bundle-wide integer id (continues after the
-    last code item id, so ``context_ref_ids`` needs no schema change)."""
+    """
+    A provider item with its bundle-wide integer id.
+
+    Continues after the last code item id, so ``context_ref_ids`` needs no
+    schema change.
+    """
 
     id: int
 
@@ -627,8 +679,11 @@ class ProductKnowledgeSection(BaseModel):
 
 
 def product_knowledge_prompt_payload(item: ProductKnowledgeItem) -> dict[str, object]:
-    """What the LLM sees per item: title, source type, updated_at, content —
-    never the provider's own id or the URL."""
+    """
+    Return what the LLM sees per item: title, source type, updated_at, content.
+
+    Never the provider's own id or the URL.
+    """
     return {
         "id": item.id,
         "title": item.title,
@@ -647,8 +702,11 @@ def _payload_size(item: ProductKnowledgeItem) -> int:
 
 
 def _truncate_to_fit(item: ProductKnowledgeItem, budget: int) -> ProductKnowledgeItem:
-    """Longest content prefix of ``item`` whose payload fits ``budget`` bytes
-    (binary search; size is monotonic in prefix length)."""
+    """
+    Return the longest content prefix of ``item`` whose payload fits ``budget`` bytes.
+
+    Binary search; size is monotonic in prefix length.
+    """
     lo, hi = 0, len(item.content)
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -662,13 +720,16 @@ def _truncate_to_fit(item: ProductKnowledgeItem, budget: int) -> ProductKnowledg
 def assemble_product_knowledge(
     items: Sequence[ProviderItem], *, label: str, first_id: int
 ) -> ProductKnowledgeSection | None:
-    """Best-first ``items`` → a section of at most ``TOP_K`` items, content
-    capped (4,000 chars for the top ``FETCH_TOP_N``, 1,000 for the rest) and
-    the serialized total held to ``SECTION_MAX_BYTES`` by dropping the
-    lowest-ranked first; if the best item alone is still over, its content is
-    truncated to fit rather than the item being lost. Independent of the
+    """
+    Assemble best-first ``items`` into a section of at most ``TOP_K`` items.
+
+    Content is capped (4,000 chars for the top ``FETCH_TOP_N``, 1,000 for the
+    rest) and the serialized total held to ``SECTION_MAX_BYTES`` by dropping
+    the lowest-ranked first; if the best item alone is still over, its content
+    is truncated to fit rather than the item being lost. Independent of the
     diff-proportional code budget. ``None`` only for empty input (title is
-    bounded well under the ceiling, so a non-empty input never empties)."""
+    bounded well under the ceiling, so a non-empty input never empties).
+    """
     built: list[ProductKnowledgeItem] = []
     for rank, item in enumerate(items[:TOP_K]):
         cap = FETCH_CONTENT_MAX_CHARS if rank < FETCH_TOP_N else SNIPPET_MAX_CHARS

@@ -608,10 +608,13 @@ async def test_depends_on_static_analysis_reads_that_step_own_output_when_config
 async def test_us_pk3_finding_citing_provider_item_posts_product_knowledge_block(
     test_rsa_private_key_pem: str,
 ) -> None:
-    """US-PK3/US-PK6: a finding whose ``context_ref_ids`` resolve to a
-    provider item is posted with the platform-rendered, unescaped
-    ``**Product knowledge (<display>):**`` block — link, source type and
-    host only, never the provider's snippet."""
+    """
+    US-PK3/US-PK6: a provider-item finding gets the platform-rendered block.
+
+    A finding whose ``context_ref_ids`` resolve to a provider item is posted
+    with the platform-rendered, unescaped ``**Product knowledge (<display>):**``
+    block — link, source type and host only, never the provider's snippet.
+    """
     _mock_token_exchange()
     _mock_review_comments()
     reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))

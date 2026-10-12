@@ -1,7 +1,10 @@
-"""Unit tests for ``review.step.JobIdentity`` (product-knowledge Phase 2,
-docs/plans/plan-deliver-product-knowledge.md): every subclass carries the
-capture fields, and no model in the REVIEW chain forbids extra keys (which
-is what makes a Webhook-first rolling deploy safe)."""
+"""
+Unit tests for ``review.step.JobIdentity`` (product-knowledge Phase 2).
+
+See docs/plans/plan-deliver-product-knowledge.md: every subclass carries the capture fields, and no
+model in the REVIEW chain forbids extra keys (which is what makes a Webhook-first rolling deploy
+safe).
+"""
 
 from __future__ import annotations
 

@@ -1,6 +1,9 @@
-"""Unit tests (stub inner transport, no sockets) for the transport's
-unauthenticated-host rule (M1), port-aware binding (M2) and defensive header
-parsing (L2)."""
+"""
+Unit tests (stub inner transport, no sockets) for the transport policy rules.
+
+Covers the transport's unauthenticated-host rule (M1), port-aware binding (M2) and defensive header
+parsing (L2).
+"""
 
 from __future__ import annotations
 

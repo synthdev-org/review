@@ -1154,10 +1154,14 @@ def test_product_knowledge_context_builder_warning_absent_by_default_or_without_
 def test_product_knowledge_wiring_has_no_opener_when_the_kill_switch_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Kill switch: the resolver stays (so a configured provider reports
-    `outcome=disabled`) but no client factory exists to call anything."""
+    """
+    Kill switch: the resolver stays but no client factory exists.
+
+    A configured provider reports `outcome=disabled`, and there is nothing to
+    call anything with.
+    """
     monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
-    repository = cast("PostgresSettingRepository", object())
+    repository = cast(PostgresSettingRepository, object())
     logger = logging.getLogger("test")
 
     monkeypatch.setenv("REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED", "false")

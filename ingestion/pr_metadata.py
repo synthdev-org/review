@@ -1,6 +1,7 @@
-"""ingestion.pr_metadata — pure PR-metadata normalization for the
-product-knowledge capture (docs/plans/plan-deliver-product-knowledge.md,
-Phase 2, US-PK2 capture half / A1).
+"""
+ingestion.pr_metadata — pure PR-metadata normalization for the product-knowledge capture.
+
+Covers docs/plans/plan-deliver-product-knowledge.md, Phase 2, US-PK2 capture half / A1.
 
 No I/O, no adapter imports: ``apps/webhook_api/webhook_routes.py`` feeds it
 plain strings from the parsed webhook envelope. The PR **body** is read only
@@ -26,8 +27,11 @@ _HASH_RE = re.compile(r"(?<![A-Za-z0-9_&/#])#([0-9]{1,7})(?![A-Za-z0-9_])")
 
 
 def normalize_title(title: str | None) -> str | None:
-    """Whitespace-normalized title capped at ``TITLE_MAX_CHARS``; ``None`` when
-    absent or blank."""
+    """
+    Return the whitespace-normalized title capped at ``TITLE_MAX_CHARS``.
+
+    ``None`` when absent or blank.
+    """
     if title is None:
         return None
     normalized = " ".join(title.split())[:TITLE_MAX_CHARS]
@@ -35,8 +39,11 @@ def normalize_title(title: str | None) -> str | None:
 
 
 def normalize_head_ref(head_ref: str | None) -> str | None:
-    """``head_ref`` stripped and capped at ``HEAD_REF_MAX_CHARS``; ``None`` when
-    absent or blank."""
+    """
+    Return ``head_ref`` stripped and capped at ``HEAD_REF_MAX_CHARS``.
+
+    ``None`` when absent or blank.
+    """
     if head_ref is None:
         return None
     return head_ref.strip()[:HEAD_REF_MAX_CHARS] or None
@@ -45,8 +52,10 @@ def normalize_head_ref(head_ref: str | None) -> str | None:
 def extract_issue_keys(
     title: str | None, head_ref: str | None, body: str | None
 ) -> tuple[str, ...]:
-    """Issue keys (``PROJ-9``, ``#41``) found in title, then head ref, then
-    body — de-duplicated, order-stable, at most ``MAX_ISSUE_KEYS``.
+    """
+    Extract issue keys (``PROJ-9``, ``#41``) from title, then head ref, then body.
+
+    De-duplicated, order-stable, at most ``MAX_ISSUE_KEYS``.
 
     No prefix filtering here: the effective ``issue_key_prefixes`` setting is
     only known at job time (see ``filter_issue_keys``). ``body`` is only read,
@@ -67,9 +76,12 @@ def extract_issue_keys(
 
 
 def filter_issue_keys(keys: Iterable[str], prefixes: Iterable[str]) -> tuple[str, ...]:
-    """Keep only keys that start with one of ``prefixes`` (A1(c)); an empty
-    ``prefixes`` keeps every key. ``PROJ`` and ``PROJ-`` both match
-    ``PROJ-9`` but never ``PROJX-9``."""
+    """
+    Keep only keys that start with one of ``prefixes`` (A1(c)).
+
+    An empty ``prefixes`` keeps every key. ``PROJ`` and ``PROJ-`` both match
+    ``PROJ-9`` but never ``PROJX-9``.
+    """
     normalized = tuple(p if p.endswith("-") else p + "-" for p in prefixes if p)
     if not normalized:
         return tuple(keys)
@@ -82,7 +94,8 @@ def is_fork_pr(
     head_repo_fork: bool | None,
     base_repo_full_name: str | None,
 ) -> bool:
-    """Whether the PR comes from a fork — **fail closed** (A1(b)).
+    """
+    Return whether the PR comes from a fork — **fail closed** (A1(b)).
 
     ``True`` when the head repo is absent/null (a deleted fork), when GitHub
     flags it ``fork``, when the base repo is unknown, or when the head and base

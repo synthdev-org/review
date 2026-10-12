@@ -332,13 +332,16 @@ _CREDENTIAL_ENV_SUFFIX = "_PRODUCT_KNOWLEDGE_CREDENTIALS"
 
 
 def analyzer_env(environ: Mapping[str, str]) -> dict[str, str]:
-    """The child environment: ``environ`` minus the product-knowledge
-    credential map (``REVIEW_<ENTRYPOINT>_PRODUCT_KNOWLEDGE_CREDENTIALS``).
+    """
+    Return the child environment: ``environ`` minus the product-knowledge credential map.
+
+    The credential map is ``REVIEW_<ENTRYPOINT>_PRODUCT_KNOWLEDGE_CREDENTIALS``.
     Analyzers run over customer-controlled repo content (semgrep rules,
     custom configs) and must never inherit provider bearer tokens. Every
     other variable is kept so the tools keep finding PATH, HOME, etc.
     ponytail: deny-list of one name; an allow-list env if more secrets land
-    in the worker environment."""
+    in the worker environment.
+    """
     return {k: v for k, v in environ.items() if not k.endswith(_CREDENTIAL_ENV_SUFFIX)}
 
 

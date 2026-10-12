@@ -127,9 +127,11 @@ TEAM_SCOPE_UNSUPPORTED_KEYS: frozenset[str] = frozenset({PRODUCT_KNOWLEDGE_PROVI
 
 
 class ProductKnowledgeProviderSetting(BaseModel):
-    """Which external product-knowledge provider serves this scope (spec
-    ``spec-product-knowledge.md`` US-PK8). The whole object at the narrowest
-    scope wins - no field merging - and ``enabled: false`` at a narrower
+    """
+    Which external product-knowledge provider serves this scope.
+
+    See spec ``spec-product-knowledge.md`` US-PK8. The whole object at the
+    narrowest scope wins - no field merging - and ``enabled: false`` at a narrower
     scope opts that scope out of an inherited provider. The token is never
     part of this value: ``credential_ref`` only names an operator-provisioned
     bootstrap credential.
@@ -172,15 +174,18 @@ def _has_query_or_fragment(parts: SplitResult, value: str) -> bool:
 
 
 def validate_endpoint_url(value: str) -> str:
-    """Absolute ``http(s)`` URL, <= 512 chars, with a host and no userinfo,
-    fragment or query (a credential or secret must never ride the URL).
-    Returned unchanged; raises ``ValueError`` (with a fixed message, never the
-    value) otherwise."""
+    """
+    Validate an absolute ``http(s)`` URL of at most 512 chars and return it unchanged.
+
+    It must have a host and no userinfo, fragment or query (a credential or
+    secret must never ride the URL). Raises ``ValueError`` (with a fixed message,
+    never the value) otherwise.
+    """
     if not _is_printable_ascii_url(value):
         raise ValueError("endpoint_url must be a printable ASCII URL of at most 512 characters")
     try:
         parts = urlsplit(value)
-        parts.port  # noqa: B018 - raises ValueError on a malformed port
+        _ = parts.port  # raises ValueError on a malformed port
     except ValueError as exc:
         raise ValueError("endpoint_url is not a valid URL") from exc
     if not _has_http_scheme_and_host(parts):
@@ -278,8 +283,11 @@ def resolve_setting(
 
 
 class EffectiveSetting(BaseModel):
-    """One key's resolved value at a node plus the scope descriptor it was
-    inherited from (``"platform"``, ``"org:<id>"``, ``"repo:<org>:<repo>"``)."""
+    """
+    One key's resolved value at a node plus the scope descriptor it was inherited from.
+
+    The descriptor is one of ``"platform"``, ``"org:<id>"``, ``"repo:<org>:<repo>"``.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -294,12 +302,15 @@ def effective_settings(
     repo_id: str | None,
     team_id: str | None,
 ) -> dict[str, EffectiveSetting]:
-    """Every registry key's effective value at one node, via
-    ``resolve_setting`` (the single precedence implementation - the Admin UI
-    never re-derives it). Keys outside the registry (orphaned rows after a
+    """
+    Every registry key's effective value at one node, via ``resolve_setting``.
+
+    ``resolve_setting`` is the single precedence implementation - the Admin UI
+    never re-derives it. Keys outside the registry (orphaned rows after a
     code revert) are not resolved; keys in ``TEAM_SCOPE_UNSUPPORTED_KEYS``
     ignore team-scoped rows. A resolved row whose value fails its key's schema
-    is omitted (unconfigured), never shown as effective."""
+    is omitted (unconfigured), never shown as effective.
+    """
     effective: dict[str, EffectiveSetting] = {}
     for key in SETTING_KEY_REGISTRY:
         row = resolve_setting(
@@ -437,9 +448,12 @@ class SettingRepository(Protocol):
     async def list_rows_for_key(
         self, *, key: str, org_id: str | None, repo_id: str | None
     ) -> tuple[SettingRow, ...]:
-        """The platform, org and repo rows (never team rows) for one key -
-        the narrow keyed read a runtime resolver feeds ``resolve_setting``,
-        instead of loading the whole config tree."""
+        """
+        Return the platform, org and repo rows (never team rows) for one key.
+
+        This is the narrow keyed read a runtime resolver feeds ``resolve_setting``,
+        instead of loading the whole config tree.
+        """
         ...
 
     async def upsert(

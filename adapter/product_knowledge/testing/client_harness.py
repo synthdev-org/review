@@ -1,4 +1,5 @@
-"""Shared helpers for the MCP client integration tests (never in the runtime image).
+"""
+Shared helpers for the MCP client integration tests (never in the runtime image).
 
 The guard is the production code: the endpoint host resolves to a *private*
 address (``10.9.8.7``) and ``LoopbackTransport`` performs only the final

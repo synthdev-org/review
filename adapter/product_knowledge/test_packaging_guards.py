@@ -1,7 +1,10 @@
-"""Packaging guards for the fake MCP provider (plan Phase 4, Assumption 12):
-it is test tooling, so it must never be mutated and never ship in the runtime
+"""
+Packaging guards for the fake MCP provider (plan Phase 4, Assumption 12).
+
+It is test tooling, so it must never be mutated and never ship in the runtime
 image. A regression in either file would otherwise be silent. Pure: reads
-``pyproject.toml`` and ``Dockerfile`` from the repo root."""
+``pyproject.toml`` and ``Dockerfile`` from the repo root.
+"""
 
 from __future__ import annotations
 

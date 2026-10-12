@@ -524,9 +524,11 @@ def test_valid_map_is_parsed_and_token_stays_out_of_repr(monkeypatch: pytest.Mon
 
 
 def test_internal_timeout_of_8_with_no_map_starts_clean(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An operator who tuned the Context Builder window <= 10 s must still
-    upgrade cleanly: the ordering rule applies only when the feature is in
-    use."""
+    """
+    An operator who tuned the Context Builder window <= 10 s still upgrades cleanly.
+
+    The ordering rule applies only when the feature is in use.
+    """
     settings = _worker_settings(
         monkeypatch,
         CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS="8",
@@ -554,8 +556,12 @@ def test_internal_timeout_of_8_with_a_map_fails_naming_the_ordering(
 def test_internal_timeout_of_8_with_only_an_allowlist_fails_naming_the_ordering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unauthenticated-only provider (no credential map) is reachable only
-    via the allow-list, so a non-empty allow-list also means in use."""
+    """
+    An unauthenticated-only provider (no credential map) counts as in use.
+
+    It is reachable only via the allow-list, so a non-empty allow-list also
+    means in use.
+    """
     with pytest.raises(ValidationError) as excinfo:
         _worker_settings(
             monkeypatch,

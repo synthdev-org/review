@@ -1,6 +1,9 @@
-"""Unit tests for the fail-open provider-setting resolver with fakes (plan
-Phase 6, Assumption 6; US-PK8, US-PK13). The real-Postgres keyed read is
-covered in ``adapter/storage/test_tenancy.py``."""
+"""
+Unit tests for the fail-open provider-setting resolver with fakes.
+
+Covers plan Phase 6, Assumption 6; US-PK8, US-PK13. The real-Postgres keyed read is
+covered in ``adapter/storage/test_tenancy.py``.
+"""
 
 from __future__ import annotations
 

@@ -1,6 +1,10 @@
-"""Unit test: the Admin API test-connection probe records the shared
-``review.product_knowledge.*`` instruments with ``origin=test_connection``
-(US-PK14; the closed ``origin`` set is {worker, test_connection})."""
+"""
+Unit test: the Admin API test-connection probe records the shared instruments.
+
+It records the ``review.product_knowledge.*`` instruments with
+``origin=test_connection`` (US-PK14; the closed ``origin`` set is
+{worker, test_connection}).
+"""
 
 from __future__ import annotations
 
@@ -11,9 +15,6 @@ from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-from adapter.telemetry.conftest import (
-    reset_otel_global_providers as _reset_otel_global_providers,  # noqa: F401
-)
 from apps.admin_api.product_knowledge_routes import ProbeRequest, _probe
 from review.product_knowledge import NegotiationResult
 

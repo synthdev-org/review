@@ -1,5 +1,7 @@
-"""Integration tests for the connection-time egress guard
-(adapter.product_knowledge.transport) over real sockets — US-PK12, plan
+"""
+Integration tests for the connection-time egress guard over real sockets.
+
+The guard is ``adapter.product_knowledge.transport`` — US-PK12, plan
 Phase 4 / Amendment A3.
 
 The fake provider is a real server on loopback; the guard is the production

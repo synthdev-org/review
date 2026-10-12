@@ -1,6 +1,9 @@
-"""Runs ``charts/review/test-render.sh`` (helm lint/template assertions,
-including the product-knowledge ones) from pytest when helm is installed;
-CI also runs it directly in the ``helm-lint`` job."""
+"""
+Runs ``charts/review/test-render.sh`` from pytest when helm is installed.
+
+The script holds the helm lint/template assertions, including the product-knowledge ones; CI also
+runs it directly in the ``helm-lint`` job.
+"""
 
 from __future__ import annotations
 

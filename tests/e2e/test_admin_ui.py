@@ -414,13 +414,14 @@ def _assert_unsafe_provider_writes_refused(
 def test_product_knowledge_panel_round_trip_and_disclosure_in_built_bundle(
     admin_ui_stack: dict[str, str],
 ) -> None:
-    """Phase 8 (Unit H, US-PK8/PK10/PK15): the endpoints the Product knowledge
-    panel drives, against the real stack - save a provider, read back the
-    server-computed ``effective`` value, list credentials, and probe a target
-    no credential or allow-list covers (collapsed ``blocked_by_policy``, no
-    egress) - and the panel's shared egress-disclosure literal ships in the
-    real built bundle (read from the one TS constant the vitest assertion and
-    the runbook also match).
+    """
+    Phase 8 (Unit H, US-PK8/PK10/PK15): the endpoints the Product knowledge panel drives.
+
+    Run against the real stack - save a provider, read back the server-computed ``effective`` value,
+    list credentials, and probe a target no credential or allow-list covers (collapsed
+    ``blocked_by_policy``, no egress) - and the panel's shared egress-disclosure literal ships in
+    the real built bundle (read from the one TS constant the vitest assertion and the runbook also
+    match).
     """
     literal_match = re.search(r'"([^"]+)"', _DISCLOSURE_SOURCE.read_text().split("=", 1)[1])
     assert literal_match is not None

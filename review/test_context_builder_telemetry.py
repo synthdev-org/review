@@ -613,8 +613,11 @@ def _job_summary(caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
 
 
 def _pk_points(reader: InMemoryMetricReader, name: str) -> list[tuple[dict[str, object], float]]:
-    """Every data point of one ``review.product_knowledge.*`` instrument as
-    ``(attributes, value-or-sum)``."""
+    """
+    Return every data point of one ``review.product_knowledge.*`` instrument.
+
+    Each is ``(attributes, value-or-sum)``.
+    """
     data = reader.get_metrics_data()
     assert data is not None
     points: list[tuple[dict[str, object], float]] = []
@@ -722,7 +725,7 @@ async def test_provider_span_is_a_child_of_the_context_builder_step_span(
         name = "static_analysis"
         depends_on: tuple[str, ...] = ()
 
-        async def run(self, input: object, context: StepContext) -> _UpstreamOutput:
+        async def run(self, step_input: object, context: StepContext) -> _UpstreamOutput:
             return _pk_upstream()
 
     registry = StepRegistry(
@@ -742,8 +745,11 @@ async def test_provider_span_is_a_child_of_the_context_builder_step_span(
 
 
 async def test_prompt_sections_are_identical_with_and_without_provider_config() -> None:
-    """US-PK4: an unconfigured or disabled provider changes nothing the LLM
-    sees; a configured one adds exactly the provider section."""
+    """
+    US-PK4: an unconfigured or disabled provider changes nothing the LLM sees.
+
+    A configured one adds exactly the provider section.
+    """
     bare = ContextBuilderStep(
         _FakeDiffFetcher({_APP_PATH: _APP_POST_MODIFIED}),
         _FakeTreeFetcher({_APP_PATH: _APP_PRE}),

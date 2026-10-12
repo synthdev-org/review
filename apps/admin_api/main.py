@@ -141,8 +141,10 @@ def _check_embedding_model_startup(
 
 
 def _load_credential_map(settings: AdminAPISettings) -> CredentialMap | None:
-    """Parse the product-knowledge credential map, failing *open*: a
-    malformed map must not take down the config/audit UI (plan Assumption 14),
+    """
+    Parse the product-knowledge credential map, failing *open*.
+
+    A malformed map must not take down the config/audit UI (plan Assumption 14),
     so the problem is logged (value-free) and the product-knowledge routes
     report ``disabled`` / refuse credential references. ``None`` = unavailable.
     """
@@ -158,9 +160,12 @@ def _load_credential_map(settings: AdminAPISettings) -> CredentialMap | None:
 
 
 def _load_endpoint_allowlist(settings: AdminAPISettings) -> tuple[str, ...] | None:
-    """Parse the operator allow-list, failing *open* like the credential map:
-    a malformed value disables the product-knowledge routes (value-free log)
-    instead of taking down the config/audit UI. ``None`` = unavailable."""
+    """
+    Parse the operator allow-list, failing *open* like the credential map.
+
+    A malformed value disables the product-knowledge routes (value-free log)
+    instead of taking down the config/audit UI. ``None`` = unavailable.
+    """
     try:
         return settings.endpoint_allowlist()
     except CredentialMapError as exc:

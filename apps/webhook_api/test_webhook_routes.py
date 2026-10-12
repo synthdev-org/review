@@ -768,9 +768,12 @@ def _pr_metadata_payload(
 async def test_pr_metadata_is_captured_into_review_payload_without_body(
     migrated_engine: AsyncEngine,
 ) -> None:
-    """docs/plans/plan-deliver-product-knowledge.md Phase 2 (US-PK2 capture):
-    title, head ref, issue keys and the fork flag reach the queued REVIEW
-    payload; the PR body never does."""
+    """
+    docs/plans/plan-deliver-product-knowledge.md Phase 2 (US-PK2 capture).
+
+    Title, head ref, issue keys and the fork flag reach the queued REVIEW payload; the PR body never
+    does.
+    """
     client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
     body = _pr_metadata_payload(head_repo={"full_name": "acme/widgets", "fork": False})
 
@@ -2126,8 +2129,11 @@ async def test_non_reply_comments_do_not_consume_the_capture_ceiling(
 async def test_missing_base_repo_falls_back_to_envelope_repository_for_fork_check(
     migrated_engine: AsyncEngine,
 ) -> None:
-    """``base.repo`` omitted: the base repo falls back to the envelope's own
-    ``repository`` (acme/widgets), so a same-repo head is not a fork."""
+    """
+    ``base.repo`` omitted: the base repo falls back to the envelope's own ``repository``.
+
+    The envelope's ``repository`` (acme/widgets), so a same-repo head is not a fork.
+    """
     client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
     payload = json.loads(
         _pr_metadata_payload(head_repo={"full_name": "acme/widgets", "fork": False})

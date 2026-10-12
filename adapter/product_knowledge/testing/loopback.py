@@ -1,4 +1,5 @@
-"""Test seams for driving the real guard against a loopback fake provider.
+"""
+Test seams for driving the real guard against a loopback fake provider.
 
 The guard (rightly) refuses loopback, so tests resolve the endpoint host to a
 *private* address and let ``LoopbackTransport`` do the final connect to the
@@ -19,10 +20,14 @@ __all__ = ["LoopbackTransport", "fixed_resolver", "self_signed_cert", "sequence_
 
 
 class LoopbackTransport(httpx2.AsyncBaseTransport):
-    """Connects to ``127.0.0.1:<port>`` whatever address the guard pinned,
-    recording what the guard handed it."""
+    """
+    Transport that connects to the fake provider's loopback port, whatever the guard pinned.
+
+    Connects to ``127.0.0.1:<port>`` and records what the guard handed it.
+    """
 
     def __init__(self, port: int, *, verify: ssl.SSLContext | bool = True) -> None:
+        """Bind the transport to the fake's ``port`` and TLS ``verify`` trust anchor."""
         self._port = port
         # ``verify`` is only ever a *trust anchor* for a test's self-signed
         # listener (never ``False``): TLS tests prove verification is on.
@@ -49,9 +54,12 @@ class LoopbackTransport(httpx2.AsyncBaseTransport):
 
 
 def self_signed_cert(dns_name: str) -> tuple[bytes, bytes]:
-    """``(cert_pem, key_pem)`` for a throwaway self-signed certificate whose
-    only SAN is ``dns_name`` (no IP SAN, so IP-based verification cannot pass).
-    It is its own CA so a test can use it as the sole trust anchor."""
+    """
+    Return ``(cert_pem, key_pem)`` for a throwaway self-signed certificate.
+
+    Its only SAN is ``dns_name`` (no IP SAN, so IP-based verification cannot
+    pass). It is its own CA so a test can use it as the sole trust anchor.
+    """
     import datetime
 
     from cryptography import x509

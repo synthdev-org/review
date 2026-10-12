@@ -1,5 +1,8 @@
-"""Unit tests for adapter.product_knowledge.egress (US-PK12, plan Phase 4 /
-Amendment A3) — pure functions only, no sockets."""
+"""
+Unit tests for adapter.product_knowledge.egress: pure functions only, no sockets.
+
+Covers US-PK12, plan Phase 4 / Amendment A3.
+"""
 
 from __future__ import annotations
 
@@ -68,8 +71,6 @@ def test_deny_set_does_not_depend_on_stdlib_is_reserved(monkeypatch: pytest.Monk
     # The explicit network lists must carry the denial on their own: even if
     # the stdlib's notion of "reserved" were empty, the transition ranges
     # (NAT64, IPv4-compatible, Teredo, 6to4), 0.0.0.0/8 and class E stay denied.
-    import ipaddress
-
     monkeypatch.setattr(ipaddress.IPv4Address, "is_reserved", property(lambda self: False))
     monkeypatch.setattr(ipaddress.IPv6Address, "is_reserved", property(lambda self: False))
     for address in (
@@ -203,7 +204,7 @@ def test_parse_allow_entry(entry: str, expected: tuple[str, bool, int | None] | 
 
 
 def test_host_matches_allowlist_port_semantics() -> None:
-    from adapter.product_knowledge.egress import endpoint_origin, host_matches_allowlist
+    from adapter.product_knowledge.egress import endpoint_origin
 
     assert host_matches_allowlist("h.internal", ["h.internal:8443"], 8443)
     assert not host_matches_allowlist("h.internal", ["h.internal:8443"], 443)

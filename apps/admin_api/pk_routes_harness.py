@@ -1,6 +1,9 @@
-"""Shared harness for the product-knowledge test-connection integration tests
-(``test_product_knowledge_routes*.py``): one real Admin API app, one fake MCP
-provider and the loopback transports every probe built."""
+"""
+Shared harness for the product-knowledge test-connection integration tests.
+
+Used by ``test_product_knowledge_routes*.py``: one real Admin API app, one
+fake MCP provider and the loopback transports every probe built.
+"""
 
 from __future__ import annotations
 
@@ -44,10 +47,14 @@ FAST = ClientTimeouts(connect_seconds=1.0, call_seconds=1.0, teardown_grace_seco
 
 
 class Harness:
-    """One app, one fake provider, and the loopback transports every probe
-    built (to assert zero bytes on the wire)."""
+    """
+    One app, one fake provider, and the loopback transports every probe built.
+
+    The transports let tests assert zero bytes on the wire.
+    """
 
     def __init__(self, dsn: str, provider: FakeProvider, **settings: object) -> None:
+        """Build the app, fake provider and loopback transports."""
         self.provider = provider
         self.loopbacks: list[LoopbackTransport] = []
         self.probe_calls: list[tuple[str, str | None]] = []

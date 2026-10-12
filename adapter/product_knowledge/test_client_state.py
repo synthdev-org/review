@@ -1,6 +1,9 @@
-"""Unit tests for the client's in-process state and classification seams
-(no sockets): endpoint gate cool-down/eviction, negotiation cache key, and the
-exception-to-outcome mapping. Network behaviour is in ``test_client.py``."""
+"""
+Unit tests for the client's in-process state and classification seams.
+
+No sockets: endpoint gate cool-down/eviction, negotiation cache key, and the
+exception-to-outcome mapping. Network behaviour is in ``test_client.py``.
+"""
 
 from __future__ import annotations
 

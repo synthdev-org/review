@@ -107,8 +107,11 @@ async def session_factory(migrated_engine: AsyncEngine) -> async_sessionmaker[An
 async def hierarchy(
     session_factory: async_sessionmaker[Any],
 ) -> dict[str, uuid.UUID]:
-    """Two orgs (acme: repo widgets + other, team platform; globex: repo
-    gadgets) — enough to prove the keyed read never crosses scopes."""
+    """
+    Seed two orgs: acme (repo widgets + other, team platform) and globex (repo gadgets).
+
+    Enough to prove the keyed read never crosses scopes.
+    """
     async with session_factory() as session, session.begin():
         acme = Org(name="acme", slug=f"acme-{uuid.uuid4().hex}")
         globex = Org(name="globex", slug=f"globex-{uuid.uuid4().hex}")
@@ -295,9 +298,12 @@ async def test_a_hung_repository_cannot_stall_the_caller_past_the_resolver_timeo
 async def test_config_tree_tolerates_an_orphaned_key_and_reports_effective_values(
     session_factory: async_sessionmaker[Any], hierarchy: dict[str, uuid.UUID]
 ) -> None:
-    """F11: after a code revert (or a hand-written row) an unregistered key
-    must not break the tree read; ``effective`` resolves only registry keys,
-    server-side, with the scope each value came from."""
+    """
+    F11: an unregistered key after a code revert must not break the tree read.
+
+    This also covers a hand-written row. ``effective`` resolves only registry keys,
+    server-side, with the scope each value came from.
+    """
     acme, widgets, other = hierarchy["acme"], hierarchy["widgets"], hierarchy["other"]
     await _insert_raw(session_factory, org_id=None, key="retired_key", value={"x": 1})
     await _insert_raw(session_factory, org_id=acme, value=_value(display_name="Acme"))

@@ -1,6 +1,9 @@
-"""adapter.product_knowledge.egress — the pure half of the egress guard
-(ADR-0013 decision 3, plan Phase 4 / Amendment A3): host canonicalisation,
-resolved-address classification and the operator allow-list match.
+"""
+adapter.product_knowledge.egress: the pure half of the egress guard.
+
+Covers ADR-0013 decision 3, plan Phase 4 / Amendment A3: host
+canonicalisation, resolved-address classification and the operator
+allow-list match.
 
 No I/O and no infra imports (ADR-0005's pure-logic exemption — this module is
 exercised and mutation-tested through ``test_egress_pure.py``). The
@@ -109,7 +112,8 @@ def _split_unbracketed(value: str) -> tuple[str, str | None] | None:
 
 
 def split_host_port(value: str) -> tuple[str, str | None] | None:
-    """Splits ``host``, ``host:port``, ``[v6]`` or ``[v6]:port``.
+    """
+    Split ``host``, ``host:port``, ``[v6]`` or ``[v6]:port``.
 
     Returns ``None`` for anything that is not one of those (userinfo, a
     scheme, a path, whitespace, an IPv6 zone id, a non-numeric port).
@@ -147,10 +151,13 @@ def _canonical_dns_name(host: str) -> str | None:
 
 
 def canonicalize_host(value: str) -> str | None:
-    """Canonical form of a host (port, if any, is dropped): lowercase,
-    trailing dot stripped, IDNA/punycode, IPv6 compressed, legacy numeric IPv4
-    rewritten to dotted-quad. ``None`` means "not a valid host" and every
-    caller must treat it as a refusal."""
+    """
+    Return the canonical form of a host (port, if any, is dropped).
+
+    Lowercase, trailing dot stripped, IDNA/punycode, IPv6 compressed, legacy
+    numeric IPv4 rewritten to dotted-quad. ``None`` means "not a valid host" and
+    every caller must treat it as a refusal.
+    """
     parts = split_host_port(value.strip())
     if parts is None:
         return None
@@ -186,8 +193,11 @@ def _is_denied_v6(ip: ipaddress.IPv6Address) -> bool:
 
 
 def _unmap_v6(ip: ipaddress.IPv6Address) -> _IP | None:
-    """The address to keep classifying: the embedded IPv4 of a mapped
-    address, ``ip`` itself, or ``None`` when ``ip`` is denied outright."""
+    """
+    Return the address to keep classifying, or ``None`` when ``ip`` is denied outright.
+
+    That is the embedded IPv4 of a mapped address, or ``ip`` itself.
+    """
     if ip.ipv4_mapped is not None:
         return ip.ipv4_mapped
     return None if _is_denied_v6(ip) else ip
@@ -222,12 +232,16 @@ def classify_address(address: str | _IP) -> AddressClass:
 
 
 def parse_allow_entry(entry: str) -> tuple[str, bool, int | None] | None:
-    """Parse an allow-list / ``allowed_hosts`` entry: ``host``, ``*.suffix``,
-    optionally with ``:port`` (``[v6]:port`` for IPv6). Returns
-    ``(canonical host or suffix, is_wildcard, port)``; ``None`` is an unusable
-    entry (scheme, path, embedded ``*``, non-numeric or out-of-range port).
-    A bare ``host`` entry (port ``None``) matches that host on any port —
-    weaker than ``host:port`` and kept only for backward compatibility."""
+    """
+    Parse an allow-list / ``allowed_hosts`` entry.
+
+    Accepts ``host`` or ``*.suffix``, optionally with ``:port`` (``[v6]:port``
+    for IPv6). Returns ``(canonical host or suffix, is_wildcard, port)``; ``None``
+    is an unusable entry (scheme, path, embedded ``*``, non-numeric or
+    out-of-range port). A bare ``host`` entry (port ``None``) matches that host
+    on any port — weaker than ``host:port`` and kept only for backward
+    compatibility.
+    """
     item = entry.strip()
     wildcard = item.startswith("*.")
     body = item[2:] if wildcard else item
@@ -248,7 +262,8 @@ def parse_allow_entry(entry: str) -> tuple[str, bool, int | None] | None:
 
 
 def host_matches_allowlist(host: str, allowlist: Iterable[str], port: int | None = None) -> bool:
-    """True if ``host`` equals an entry or falls under a ``*.suffix`` entry.
+    """
+    Return True if ``host`` equals an entry or falls under a ``*.suffix`` entry.
 
     ``*.example.com`` matches ``a.example.com`` but never ``example.com``,
     ``evilexample.com`` or ``example.com.evil.tld``. An entry carrying a
@@ -273,8 +288,11 @@ def host_matches_allowlist(host: str, allowlist: Iterable[str], port: int | None
 
 
 def endpoint_origin(url: str) -> tuple[str, int] | None:
-    """``(canonical host, effective port)`` of an endpoint URL — the scheme's
-    default port applies when the URL omits one. ``None`` if unusable."""
+    """
+    Return ``(canonical host, effective port)`` of an endpoint URL, or ``None`` if unusable.
+
+    The scheme's default port applies when the URL omits one.
+    """
     try:
         parts = urlsplit(url)
         hostname, port = parts.hostname, parts.port

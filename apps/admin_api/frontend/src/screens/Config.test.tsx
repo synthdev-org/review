@@ -31,6 +31,11 @@ vi.mock("../auth/AuthContext", () => ({
   useAuth: () => ({ isAdmin: mockIsAdmin, handleSessionExpired: (...args: unknown[]) => handleSessionExpired(...args) }),
 }));
 
+// A promise that never settles (in-flight request stand-in).
+function never(): void {
+  return undefined;
+}
+
 const emptyTree: ConfigTree = { platform_settings: {}, orgs: [] };
 
 describe("ConfigScreen", () => {
@@ -45,7 +50,7 @@ describe("ConfigScreen", () => {
   });
 
   it("shows a loading state while the config tree is being fetched", () => {
-    getConfig.mockReturnValue(new Promise(() => {}));
+    getConfig.mockReturnValue(new Promise(never));
     render(<ConfigScreen />);
     expect(screen.getByText(/loading configuration/i)).toBeInTheDocument();
   });
@@ -240,7 +245,7 @@ describe("ProductKnowledgePanel", () => {
 
   it("the credential select stays enabled and None selectable while credentials load", async () => {
     getConfig.mockResolvedValue(platformTree(null));
-    getCredentials.mockReturnValue(new Promise(() => {}));
+    getCredentials.mockReturnValue(new Promise(never));
     render(<ConfigScreen />);
     await screen.findByText("Platform-wide");
     expect(await screen.findByText(/loading credentials/i)).toBeInTheDocument();
@@ -284,8 +289,9 @@ describe("ProductKnowledgePanel", () => {
     expect(endpointField()).toHaveValue("https://wiki.example.com/mcp");
 
     getCredentials.mockResolvedValue(credentials);
-    const alert = screen.getByText("creds down").closest("[role=alert]") as HTMLElement;
-    fireEvent.click(within(alert).getByRole("button", { name: /retry/i }));
+    const errorRegion = screen.getByText("creds down").closest<HTMLElement>("[role=alert]");
+    expect(errorRegion).not.toBeNull();
+    fireEvent.click(within(errorRegion!).getByRole("button", { name: /retry/i }));
     expect(await screen.findByRole("option", { name: /wiki-prod \(bound/ })).toBeInTheDocument();
     expect(getCredentials).toHaveBeenCalledTimes(2);
   });
@@ -328,8 +334,9 @@ describe("ProductKnowledgePanel", () => {
     const select = screen.getByLabelText("Credential");
     await waitFor(() => expect(select).toHaveAttribute("aria-invalid", "true"));
     expect(select).toHaveFocus();
-    const describedBy = select.getAttribute("aria-describedby") as string;
-    expect(document.getElementById(describedBy)).toHaveTextContent("credential_host_not_bound");
+    const describedBy = select.getAttribute("aria-describedby");
+    expect(describedBy).not.toBeNull();
+    expect(document.getElementById(describedBy!)).toHaveTextContent("credential_host_not_bound");
   });
 
   it("maps unauthenticated_host_not_allowed to the endpoint field on save, with friendly copy", async () => {
@@ -339,8 +346,9 @@ describe("ProductKnowledgePanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save provider" }));
     await waitFor(() => expect(endpointField()).toHaveAttribute("aria-invalid", "true"));
     expect(endpointField()).toHaveFocus();
-    const describedBy = endpointField().getAttribute("aria-describedby") as string;
-    const errorEl = document.getElementById(describedBy.split(" ").pop() as string);
+    const describedBy = endpointField().getAttribute("aria-describedby");
+    expect(describedBy).not.toBeNull();
+    const errorEl = document.getElementById(describedBy!.split(" ").pop()!);
     expect(errorEl).toHaveTextContent(/isn't allowed without a credential/i);
     expect(errorEl).not.toHaveTextContent("unauthenticated_host_not_allowed");
     expect(screen.getByLabelText("Credential")).toHaveAttribute("aria-invalid", "false");
@@ -385,32 +393,36 @@ describe("ProductKnowledgePanel", () => {
   });
 
   it("test-connection walks idle -> pending -> result and back to idle when the form goes dirty", async () => {
-    let resolve: (value: unknown) => void = () => {};
-    testConnection.mockReturnValue(new Promise((r) => (resolve = r)));
+    let resolve: (value: unknown) => void = never;
+    testConnection.mockReturnValue(
+      new Promise((r) => {
+        resolve = r;
+      })
+    );
     await renderPanel();
-    const region = screen.getAllByRole("status").find((n) => n.className.includes("pk-test-result")) as HTMLElement;
-    expect(region).toHaveTextContent("");
+    const statusRegion = screen.getAllByRole("status").find((n) => n.className.includes("pk-test-result"))!;
+    expect(statusRegion).toHaveTextContent("");
 
     fireEvent.click(testButton());
-    expect(region).toHaveTextContent(/testing connection/i);
+    expect(statusRegion).toHaveTextContent(/testing connection/i);
     expect(screen.getByRole("button", { name: /testing/i })).toBeDisabled();
     expect(testConnection).toHaveBeenCalledWith(
       "https://wiki.example.com/mcp", "wiki-prod", expect.any(AbortSignal)
     );
 
     resolve({ status: "ok", message: "Connected: fine.", negotiated_version: "1", latency_ms: 12 });
-    await waitFor(() => expect(region).toHaveTextContent("Connected: fine."));
-    expect(region).toHaveTextContent("ok");
+    await waitFor(() => expect(statusRegion).toHaveTextContent("Connected: fine."));
+    expect(statusRegion).toHaveTextContent("ok");
 
     fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Changed" } });
-    await waitFor(() => expect(region).toHaveTextContent(""));
+    await waitFor(() => expect(statusRegion).toHaveTextContent(""));
   });
 
   it("aborts the in-flight probe when the form goes dirty", async () => {
     let signal: AbortSignal | undefined;
-    testConnection.mockImplementation((_e: string, _c: string | null, s: AbortSignal) => {
-      signal = s;
-      return new Promise(() => {});
+    testConnection.mockImplementation((...args: [string, string | null, AbortSignal]) => {
+      signal = args[2];
+      return new Promise(never);
     });
     await renderPanel();
     fireEvent.click(testButton());
@@ -432,25 +444,25 @@ describe("ProductKnowledgePanel", () => {
 
   it("clears the test result and aborts the probe when the scope changes under the panel", async () => {
     let signal: AbortSignal | undefined;
-    testConnection.mockImplementation(async (_e: string, _c: string | null, s: AbortSignal) => {
-      signal = s;
-      return { status: "ok", message: "Connected: fine." };
+    testConnection.mockImplementation((...args: [string, string | null, AbortSignal]) => {
+      signal = args[2];
+      return Promise.resolve({ status: "ok", message: "Connected: fine." });
     });
-    const support = { credentials: { status: "success" as const, data: credentials }, onRetryCredentials: () => {}, scopeNames: {} };
+    const support = { credentials: { status: "success" as const, data: credentials }, onRetryCredentials: never, scopeNames: {} };
     const node = (scope: string) => ({ id: "x", name: "x", scope, settings: { [PK]: savedProvider }, using_platform_defaults: false });
-    const { rerender } = render(<ProductKnowledgePanel node={node("org:o1")} support={support} onSaved={() => {}} />);
+    const { rerender } = render(<ProductKnowledgePanel node={node("org:o1")} support={support} onSaved={never} />);
     fireEvent.click(testButton());
     expect(await screen.findByText("Connected: fine.")).toBeInTheDocument();
-    rerender(<ProductKnowledgePanel node={node("org:o2")} support={support} onSaved={() => {}} />);
+    rerender(<ProductKnowledgePanel node={node("org:o2")} support={support} onSaved={never} />);
     await waitFor(() => expect(screen.queryByText("Connected: fine.")).not.toBeInTheDocument());
     expect(signal?.aborted).toBe(true);
   });
 
   it("aborts the in-flight probe when the panel unmounts", async () => {
     let signal: AbortSignal | undefined;
-    testConnection.mockImplementation((_e: string, _c: string | null, s: AbortSignal) => {
-      signal = s;
-      return new Promise(() => {});
+    testConnection.mockImplementation((...args: [string, string | null, AbortSignal]) => {
+      signal = args[2];
+      return new Promise(never);
     });
     await renderPanel();
     fireEvent.click(testButton());
@@ -471,9 +483,9 @@ describe("ProductKnowledgePanel", () => {
     testConnection.mockResolvedValue({ status, message });
     await renderPanel();
     fireEvent.click(testButton());
-    const alert = await screen.findByText(message);
-    expect(alert.closest("[role=alert]")).not.toBeNull();
-    expect(alert.closest("[role=alert]")).toHaveTextContent(status);
+    const shown = await screen.findByText(message);
+    expect(shown.closest("[role=alert]")).not.toBeNull();
+    expect(shown.closest("[role=alert]")).toHaveTextContent(status);
   });
 
   it("renders deprecated_version as a success in the status region, not an alert", async () => {
@@ -496,8 +508,8 @@ describe("ProductKnowledgePanel", () => {
     testConnection.mockRejectedValue(new ApiError(500, "internal_error"));
     await renderPanel();
     fireEvent.click(testButton());
-    const alert = await screen.findByText("internal_error");
-    expect(alert.closest("[role=alert]")).not.toBeNull();
+    const shown = await screen.findByText("internal_error");
+    expect(shown.closest("[role=alert]")).not.toBeNull();
     expect(screen.queryByText(/too many connection tests/i)).not.toBeInTheDocument();
     expect(testButton()).toBeEnabled();
   });
@@ -515,19 +527,20 @@ describe("ProductKnowledgePanel", () => {
     testConnection.mockRejectedValue(new ApiError(429, "rate_limited"));
     await renderPanel();
     fireEvent.click(testButton());
-    const alert = await screen.findByText(/too many connection tests/i);
-    expect(alert.closest("[role=alert]")).not.toBeNull();
+    const shown = await screen.findByText(/too many connection tests/i);
+    expect(shown.closest("[role=alert]")).not.toBeNull();
   });
 
   it("renders a display name containing markup as text", async () => {
-    const hostile = { ...savedProvider, display_name: "<script>alert(1)</script>" };
+    const markupName = "<" + "script>alert(1)<" + "/script>";
+    const hostile = { ...savedProvider, display_name: markupName };
     getConfig.mockResolvedValue(platformTree(hostile));
     getCredentials.mockResolvedValue(credentials);
     const { container } = render(<ConfigScreen />);
     await screen.findByText("Platform-wide");
     expect(container.querySelector("script")).toBeNull();
-    expect(screen.getByTestId("pk-effective-preview")).toHaveTextContent("<script>alert(1)</script>");
-    expect(screen.getByLabelText("Display name")).toHaveValue("<script>alert(1)</script>");
+    expect(screen.getByTestId("pk-effective-preview")).toHaveTextContent(markupName);
+    expect(screen.getByLabelText("Display name")).toHaveValue(markupName);
   });
 
   it("Viewer: controls are disabled but values and preview still render", async () => {

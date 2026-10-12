@@ -1,8 +1,10 @@
-"""Docs-sync guard: ADR-0005 registers the pure, unit-tested modules by naming
-their functions. A public module-level function added to one of the
-product-knowledge pure modules without an ADR mention fails here, so the
-scope entries cannot silently drift from the code. Pure: reads source text
-and the ADR (read-only)."""
+"""
+Docs-sync guard: ADR-0005 registers the pure, unit-tested modules by naming their functions.
+
+A public module-level function added to one of the product-knowledge pure modules without an ADR
+mention fails here, so the scope entries cannot silently drift from the code. Pure: reads source
+text and the ADR (read-only).
+"""
 
 from __future__ import annotations
 

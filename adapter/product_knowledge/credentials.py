@@ -1,6 +1,8 @@
-"""adapter.product_knowledge.credentials — the operator-provisioned credential
-map (ADR-0013 decision 2, plan Phase 6, Assumption 14), parsed once and
-shared by the Worker and Admin API composition roots.
+"""
+adapter.product_knowledge.credentials: the operator-provisioned credential map.
+
+The operator-provisioned credential map (ADR-0013 decision 2, plan Phase 6, Assumption 14),
+parsed once and shared by the Worker and Admin API composition roots.
 
 The map is bootstrap config: one ``SecretStr`` holding
 ``{"<ref>": {"token": "...", "allowed_hosts": ["host", ...]}}``. A token is
@@ -47,8 +49,11 @@ BindingProblem = Literal[
 
 
 class CredentialMapError(ValueError):
-    """The credential map (or allow-list) is malformed. ``str(error)`` names
-    the problem and never a value."""
+    """
+    The credential map (or allow-list) is malformed.
+
+    ``str(error)`` names the problem and never a value.
+    """
 
 
 class _Entry(BaseModel):
@@ -75,10 +80,12 @@ def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _bound_host(entry: str) -> str | None:
-    """Canonical ``host`` / ``host:port`` for an ``allowed_hosts`` entry, else
-    ``None``. Wildcards, schemes and paths are never bindable: a token bound
-    to ``*`` or ``*.example.com`` is a token an Admin can aim anywhere. A
-    ``:port`` is kept: it pins the token to that port exactly."""
+    """
+    Canonical ``host`` / ``host:port`` for an ``allowed_hosts`` entry, else ``None``.
+
+    Wildcards, schemes and paths are never bindable: a token bound to ``*`` or ``*.example.com`` is
+    a token an Admin can aim anywhere. A ``:port`` is kept: it pins the token to that port exactly.
+    """
     parsed = parse_allow_entry(entry)
     if parsed is None or parsed[1]:
         return None
@@ -99,6 +106,7 @@ class CredentialMap:
         return cls({})
 
     def __bool__(self) -> bool:
+        """Truthy when at least one credential is provisioned."""
         return bool(self._by_ref)
 
     def get(self, ref: str) -> ProviderCredential | None:
@@ -116,8 +124,11 @@ class CredentialMap:
         return tuple(dict.fromkeys(h for c in self._by_ref.values() for h in c.allowed_hosts))
 
     def any_binds(self, host: str, port: int | None = None) -> bool:
-        """True if some credential is bound to ``host`` (test-connection's
-        "is this a target the operator provisioned" check)."""
+        """
+        True if some credential is bound to ``host``.
+
+        This is test-connection's "is this a target the operator provisioned" check.
+        """
         return any(
             host_matches_allowlist(host, c.allowed_hosts, port) for c in self._by_ref.values()
         )
@@ -128,7 +139,8 @@ class CredentialMap:
         endpoint_url: str,
         endpoint_allowlist: Iterable[str] = (),
     ) -> BindingProblem | None:
-        """The write-time / test-time / job-time check.
+        """
+        The write-time / test-time / job-time check.
 
         With a ``ref``: it must exist and be bound to the endpoint's host
         (and port, when the entry carries one). With ``ref=None``
@@ -226,7 +238,8 @@ def _parse_credential(index: int, ref: str, body: object) -> ProviderCredential:
 
 
 def parse_credential_map(raw: SecretStr | str | None) -> CredentialMap:
-    """Parse and validate the bootstrap credential map.
+    """
+    Parse and validate the bootstrap credential map.
 
     ``None`` and empty/whitespace-only input are *unset* (``.env.example``,
     Compose ``${VAR:-}`` and Helm ``value: ""`` all produce the latter).
@@ -243,11 +256,13 @@ def parse_credential_map(raw: SecretStr | str | None) -> CredentialMap:
 
 
 def parse_endpoint_allowlist(raw: str) -> tuple[str, ...]:
-    """Comma-separated operator allow-list (``host``, ``*.suffix``, each with
-    an optional ``:port``). Empty ⇒ no allow-list. Raises
-    ``CredentialMapError`` on an unusable entry (these are not secrets, so
-    the entry may be named). An entry with a port matches that port exactly;
-    one without matches any port (weaker — prefer ``host:port``)."""
+    """
+    Comma-separated operator allow-list (``host``, ``*.suffix``, each with an optional ``:port``).
+
+    Empty ⇒ no allow-list. Raises ``CredentialMapError`` on an unusable entry (these are not
+    secrets, so the entry may be named). An entry with a port matches that port exactly; one without
+    matches any port (weaker — prefer ``host:port``).
+    """
     entries: list[str] = []
     for part in raw.split(","):
         item = part.strip()

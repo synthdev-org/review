@@ -1,5 +1,8 @@
-"""adapter.product_knowledge.conformance — the runnable "does my server
-implement the product-knowledge contract?" check (plan Phase 5, US-PK17).
+"""
+adapter.product_knowledge.conformance: the runnable product-knowledge contract check.
+
+It answers "does my server implement the product-knowledge contract?" (plan
+Phase 5, US-PK17).
 
 Point it at any MCP endpoint::
 
@@ -425,8 +428,12 @@ async def _run_checks(run: _Run) -> list[CheckResult]:
 
 
 async def run_conformance(target: ConformanceTarget) -> list[CheckResult]:
-    """Run every check against ``target``; never raises for a non-conforming
-    or unreachable server — that is a ``FAIL`` result."""
+    """
+    Run every check against ``target``.
+
+    Never raises for a non-conforming or unreachable server — that is a ``FAIL``
+    result.
+    """
     logging.getLogger("mcp").setLevel(logging.CRITICAL)  # SDK logs carry provider bytes
     token = target.token.get_secret_value() if target.token else None
     try:

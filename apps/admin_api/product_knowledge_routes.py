@@ -1,6 +1,8 @@
-"""apps.admin_api.product_knowledge_routes — the Admin surface of the optional
-external product-knowledge provider (plan ``plan-deliver-product-knowledge.md``
-Phase 6 / 6b; US-PK9, US-PK10, US-PK11; Amendments A2 and A4).
+"""
+apps.admin_api.product_knowledge_routes: the Admin surface of the product-knowledge provider.
+
+The Admin surface of the optional external product-knowledge provider (plan ``plan-deliver-product-
+knowledge.md`` Phase 6 / 6b; US-PK9, US-PK10, US-PK11; Amendments A2 and A4).
 
 * ``GET /api/v1/product-knowledge/credentials`` — ``require_session`` (Viewer
   parity). Credential *names* always; the hosts each is bound to only to an
@@ -132,19 +134,23 @@ _OUTCOME_STATUS: Final[dict[ProviderOutcome, ProbeStatus]] = {
 
 
 class ProbeFactory(Protocol):
-    """Builds the probe client for an endpoint (cache-bypassing). Wired at
-    ``apps/admin_api/main.py``; this module never imports the adapter's
-    client."""
+    """
+    Builds the probe client for an endpoint (cache-bypassing).
 
-    def __call__(
-        self, endpoint_url: str, credential_ref: str | None
-    ) -> ProductKnowledgeProvider: ...
+    Wired at ``apps/admin_api/main.py``; this module never imports the adapter's client.
+    """
+
+    def __call__(self, endpoint_url: str, credential_ref: str | None) -> ProductKnowledgeProvider:
+        """Build the probe client for ``endpoint_url``."""
 
 
 class _SlidingWindow:
-    """Per-instance sliding-window limiter. A small local copy of
-    ``apps/webhook_api/rate_limiter.InMemoryRateLimiter``'s core: importing it
-    would make one entrypoint package depend on another (architecture.md)."""
+    """
+    Per-instance sliding-window limiter.
+
+    A small local copy of ``apps/webhook_api/rate_limiter.InMemoryRateLimiter``'s core: importing it
+    would make one entrypoint package depend on another (architecture.md).
+    """
 
     def __init__(
         self,
@@ -217,7 +223,8 @@ def create_provider_write_validator(
     credentials: CredentialMap | None,
     endpoint_allowlist: tuple[str, ...] = (),
 ) -> Callable[[str, dict[str, object]], Awaitable[None]]:
-    """The write-time hook for ``product_knowledge_provider`` (A2/US-PK9).
+    """
+    The write-time hook for ``product_knowledge_provider`` (A2/US-PK9).
 
     Receives the scope descriptor and the registry-validated value. Rejects a
     team-scope write, an unknown ``credential_ref`` and a ``credential_ref``
@@ -258,8 +265,11 @@ def create_provider_write_validator(
 
 @dataclass(frozen=True, slots=True)
 class ProductKnowledgeRouterConfig:
-    """What the test-connection probe runs against. ``credentials=None`` means
-    the map was malformed at startup."""
+    """
+    What the test-connection probe runs against.
+
+    ``credentials=None`` means the map was malformed at startup.
+    """
 
     credentials: CredentialMap | None
     enabled: bool
@@ -275,8 +285,11 @@ def create_product_knowledge_router(
     require_admin_role: RequireAdminRoleDependency,
     clock: Callable[[], float] = time.monotonic,
 ) -> APIRouter:
-    """``credentials=None`` means the map was malformed at startup: the
-    routes stay mounted (the UI needs a clear answer) but report disabled."""
+    """
+    Build the product-knowledge router; ``credentials=None`` means the map was malformed at startup.
+
+    The routes stay mounted (the UI needs a clear answer) but report disabled.
+    """
     credentials = config.credentials
     router = APIRouter(prefix="/api/v1/product-knowledge")
     session_limiter = _SlidingWindow(limit=SESSION_LIMIT_PER_MINUTE, clock=clock)
