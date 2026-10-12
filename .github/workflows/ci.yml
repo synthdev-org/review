@@ -54,6 +54,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # The Docker image bakes this model in; host-run tests import apps
+      # that exit at startup without it (the embedding startup check).
+      - name: Fetch embedding model
+        run: |
+          sudo mkdir -p /app/models
+          sudo chown "$USER" /app/models
+          scripts/fetch-embedding-model.sh
+
       # adapter/analyzers/test_semgrep.py runs the real Semgrep CLI, which
       # lives in its own locked environment (tools/semgrep, ADR-0013).
       - name: Install Semgrep (isolated environment)
@@ -94,6 +102,14 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked
+
+      # The Docker image bakes this model in; host-run tests import apps
+      # that exit at startup without it (the embedding startup check).
+      - name: Fetch embedding model
+        run: |
+          sudo mkdir -p /app/models
+          sudo chown "$USER" /app/models
+          scripts/fetch-embedding-model.sh
 
       # Semgrep lives in its own locked environment (tools/semgrep) because
       # it conflicts with the main project's `mcp` pin (ADR-0013); the
