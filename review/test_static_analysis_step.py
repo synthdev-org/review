@@ -250,6 +250,12 @@ class _FakePrefilterOutput:
     repo_full_name: str = "acme/widgets"
     pr_number: int = 42
     head_sha: str = "deadbeef"
+    base_sha: str | None = None
+    pr_title: str | None = None
+    pr_head_ref: str | None = None
+    pr_issue_keys: tuple[str, ...] = ()
+    pr_is_fork: bool | None = None
+    private: bool = False
 
 
 class _FakePrefilterStep:
@@ -607,3 +613,34 @@ async def test_redaction_ceiling_one_over_drops_exactly_one_and_logs_warning(
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
     assert warnings[0].dropped_count == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_product_knowledge_capture_fields_are_forwarded_to_output() -> None:
+    """Phase 2 of docs/plans/plan-deliver-product-knowledge.md: optional
+    ``JobIdentity`` fields are not auto-carried, so this hand-constructing
+    site must forward them explicitly."""
+    step = _static_analysis_step(
+        diff_fetcher=_FakeDiffFetcher({}),
+        gitleaks=_SleepingStaticAnalyzer("gitleaks", 0),
+        semgrep=_SleepingStaticAnalyzer("semgrep", 0),
+        redactor=_RecordingTextRedactor(),
+    )
+    upstream = _FakePrefilterOutput(
+        diff=Diff(files=()),
+        base_sha="base-1",
+        pr_title="Fix PROJ-9",
+        pr_head_ref="bugfix/PROJ-9",
+        pr_issue_keys=("PROJ-9", "#41"),
+        pr_is_fork=False,
+        private=True,
+    )
+
+    output = await step.run(upstream, _context())
+
+    assert output.base_sha == "base-1"
+    assert output.pr_title == "Fix PROJ-9"
+    assert output.pr_head_ref == "bugfix/PROJ-9"
+    assert output.pr_issue_keys == ("PROJ-9", "#41")
+    assert output.pr_is_fork is False
+    assert output.private is True  # fail-closed field: a dropped forward kills the feature

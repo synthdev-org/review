@@ -48,6 +48,10 @@ from fastapi import FastAPI
 from adapter.auth.argon2_hasher import Argon2PasswordHasher
 from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
 from adapter.embedding.startup_check import check_embedding_model_loaded
+from adapter.product_knowledge.client import ClientTimeouts
+from adapter.product_knowledge.credentials import CredentialMap, CredentialMapError
+from adapter.product_knowledge.factory import ProviderClientFactory
+from adapter.product_knowledge.transport import EgressPolicy
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.iam import (
     PostgresAuditLogRepository,
@@ -73,6 +77,11 @@ from apps.admin_api.frontend_routes import create_frontend_router
 from apps.admin_api.logging_config import configure_logging
 from apps.admin_api.memory_routes import create_memory_router
 from apps.admin_api.model_routing_routes import create_model_routing_router
+from apps.admin_api.product_knowledge_routes import (
+    ProbeFactory,
+    create_product_knowledge_router,
+    create_provider_write_validator,
+)
 from apps.admin_api.settings import AdminAPISettings
 from apps.admin_api.stats_routes import create_stats_router
 from apps.admin_api.usage_routes import create_usage_router
@@ -130,6 +139,38 @@ def _check_embedding_model_startup(
     )
 
 
+def _load_credential_map(settings: AdminAPISettings) -> CredentialMap | None:
+    """Parse the product-knowledge credential map, failing *open*: a
+    malformed map must not take down the config/audit UI (plan Assumption 14),
+    so the problem is logged (value-free) and the product-knowledge routes
+    report ``disabled`` / refuse credential references. ``None`` = unavailable.
+    """
+    try:
+        return settings.credential_map()
+    except CredentialMapError as exc:
+        logger.error(
+            "product-knowledge credential map is invalid; product-knowledge features are "
+            "unavailable on the Admin API",
+            extra={"problem": str(exc)},
+        )
+        return None
+
+
+def _load_endpoint_allowlist(settings: AdminAPISettings) -> tuple[str, ...] | None:
+    """Parse the operator allow-list, failing *open* like the credential map:
+    a malformed value disables the product-knowledge routes (value-free log)
+    instead of taking down the config/audit UI. ``None`` = unavailable."""
+    try:
+        return settings.endpoint_allowlist()
+    except CredentialMapError as exc:
+        logger.error(
+            "product-knowledge endpoint allow-list is invalid; product-knowledge features "
+            "are unavailable on the Admin API",
+            extra={"problem": str(exc)},
+        )
+        return None
+
+
 def _build_lifespan(
     *,
     telemetry_enabled: bool,
@@ -155,7 +196,10 @@ def _build_lifespan(
 
 
 def create_app(
-    settings: AdminAPISettings, *, frontend_dist_dir: Path = _DEFAULT_FRONTEND_DIST_DIR
+    settings: AdminAPISettings,
+    *,
+    frontend_dist_dir: Path = _DEFAULT_FRONTEND_DIST_DIR,
+    probe_factory: ProbeFactory | None = None,
 ) -> FastAPI:
     """Build the Admin API's FastAPI application from parsed settings.
 
@@ -164,6 +208,12 @@ def create_app(
     ``apps/admin_api/test_frontend_routes.py`` to point at a fixture
     directory instead, without needing a real ``npm run build`` in the
     Python test tier.
+
+    ``probe_factory`` is a test seam for the product-knowledge
+    test-connection route: production leaves it ``None`` and gets a real
+    ``ProviderClientFactory``; tests inject one whose resolver/inner
+    transport redirect only the *last hop* to a loopback fake provider, so
+    every guard decision is still the production code path.
     """
     telemetry_enabled = init_telemetry(
         otlp_endpoint=settings.otel_exporter_otlp_endpoint,
@@ -265,15 +315,47 @@ def create_app(
     # the same "no off-by-default state" posture every other route module
     # here already takes.
     setting_repository = PostgresSettingRepository(session_factory)
+    credential_map = _load_credential_map(settings)
+    endpoint_allowlist = _load_endpoint_allowlist(settings)
     app.include_router(
         create_config_router(
             repository=setting_repository,
             audit_log_repository=audit_log_repository,
             require_session=require_session,
             require_admin_role=require_admin_role,
+            provider_write_validator=create_provider_write_validator(
+                credential_map, endpoint_allowlist or ()
+            ),
         )
     )
     logger.info("config routes registered")
+
+    # Optional product-knowledge provider admin surface (plan Phase 6/6b) —
+    # same adapter path as the Worker (cache bypassed), never a second probe.
+    app.include_router(
+        create_product_knowledge_router(
+            credentials=credential_map,
+            enabled=settings.product_knowledge_enabled and endpoint_allowlist is not None,
+            endpoint_allowlist=endpoint_allowlist or (),
+            probe_factory=probe_factory
+            or ProviderClientFactory(
+                credentials=credential_map or CredentialMap.empty(),
+                policy=EgressPolicy(
+                    allow_private_networks=settings.product_knowledge_allow_private_networks,
+                    endpoint_allowlist=endpoint_allowlist or (),
+                ),
+                timeouts=ClientTimeouts(
+                    call_seconds=float(settings.product_knowledge_call_timeout_seconds)
+                ),
+                bypass_cache=True,
+                top_k=1,
+            ),
+            audit_log_repository=audit_log_repository,
+            require_session=require_session,
+            require_admin_role=require_admin_role,
+        )
+    )
+    logger.info("product knowledge routes registered")
 
     # Model routing (docs/plans/plan-deliver-admin-gui.md's Phase 5
     # section, Unit F, US-A14/US-A15/US-A16, Assumption 3) — registered

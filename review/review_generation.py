@@ -83,7 +83,11 @@ from findings.redact import TextRedactor, apply_redaction_ceiling, redact_findin
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
 from llmgateway.routing import FallbackModelRoutingResolver
-from review.context_bundle import ContextBundle, render_context_bundle_section
+from review.context_bundle import (
+    ContextBundle,
+    render_context_bundle_section,
+    render_product_knowledge_section,
+)
 from review.diff_prompt import INERT_REFERENCE_DATA_FRAMING, render_and_truncate_diff
 from review.llm_response import build_completion_request, parse_llm_json_envelope
 from review.llm_telemetry import record_llm_token_usage
@@ -323,6 +327,7 @@ def _build_user_message(
         f"{context_json}\n\n"
         f"Diff:\n{diff_text}"
         f"{context_bundle_section}"
+        f"{render_product_knowledge_section(context_bundle)}"
     )
 
 

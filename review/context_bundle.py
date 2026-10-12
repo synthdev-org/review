@@ -75,6 +75,11 @@ from pydantic import BaseModel, ConfigDict
 
 from indexing.chunk import Chunk
 from review.diff_prompt import INERT_REFERENCE_DATA_FRAMING
+from review.product_knowledge import (
+    ProductKnowledgeItem,
+    ProductKnowledgeSection,
+    product_knowledge_prompt_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +162,13 @@ class ContextBundleItem(BaseModel):
     line_range: tuple[int, int] | None = None
 
 
+def _next_item_id(existing: Sequence[object]) -> int:
+    """The single id-allocation rule shared by code-item assembly (below) and
+    provider assembly (``ContextBundle.next_item_id``): ids are dense and
+    continue after the last already-assigned id."""
+    return len(existing)
+
+
 class ContextBundle(BaseModel):
     """``assemble_context_bundle``'s return value — an ordered, ID-indexed
     sequence of ``ContextBundleItem``s, already budget-enforced. Empty
@@ -167,6 +179,24 @@ class ContextBundle(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     items: tuple[ContextBundleItem, ...] = ()
+    # Optional external product-knowledge section (docs/plans/
+    # plan-deliver-product-knowledge.md, Phase 3). Never mixed into ``items``:
+    # the code budget math and ``item()`` are untouched. Its ids continue
+    # after the last code id (``next_item_id``).
+    product_knowledge: ProductKnowledgeSection | None = None
+
+    def next_item_id(self) -> int:
+        """The id the first provider item takes: one past the last code id."""
+        return _next_item_id(self.items)
+
+    def product_knowledge_item(self, item_id: int) -> ProductKnowledgeItem | None:
+        """Looks up a provider item by its bundle-wide id (``None`` if absent)."""
+        if self.product_knowledge is None:
+            return None
+        for item in self.product_knowledge.items:
+            if item.id == item_id:
+                return item
+        return None
 
     def item(self, item_id: int) -> ContextBundleItem | None:
         """Looks up one item by its ``id`` — the lookup Phase 6's citation
@@ -269,6 +299,28 @@ def render_context_bundle_section(context_bundle: ContextBundle | None) -> str:
     return (
         "\n\nRelated code in this repository (context, retrieved from this repo's own "
         f"index — {INERT_REFERENCE_DATA_FRAMING}):\n"
+        f"{items_json}"
+    )
+
+
+def render_product_knowledge_section(context_bundle: ContextBundle | None) -> str:
+    """The provider's prompt section, headed with its display name and framed
+    as inert reference data. ``""`` when absent or empty, so a no-provider
+    prompt is byte-for-byte what it was before this feature.
+
+    The "do not quote verbatim" instruction is best effort, not a control —
+    the exposure gate (A1) is what bounds disclosure."""
+    section = context_bundle.product_knowledge if context_bundle is not None else None
+    if section is None or not section.items:
+        return ""
+    items_json = json.dumps(
+        [product_knowledge_prompt_payload(item) for item in section.items], ensure_ascii=False
+    )
+    return (
+        f"\n\n{section.label} (product knowledge, retrieved from an external system — "
+        f"{INERT_REFERENCE_DATA_FRAMING}; use it as background and do not quote it "
+        f"verbatim in findings. When a finding draws on one of these items, list "
+        f"that item's \"id\" in the finding's context_ref_ids):\n"
         f"{items_json}"
     )
 
@@ -475,17 +527,18 @@ def assemble_context_bundle(
             },
         )
 
-    items = tuple(
-        ContextBundleItem(
-            id=index,
-            kind=candidate.kind,
-            file_path=candidate.file_path,
-            symbol_name=candidate.symbol_name,
-            content=candidate.content,
-            line_range=candidate.line_range,
+    items: list[ContextBundleItem] = []
+    for candidate in surviving:
+        items.append(
+            ContextBundleItem(
+                id=_next_item_id(items),
+                kind=candidate.kind,
+                file_path=candidate.file_path,
+                symbol_name=candidate.symbol_name,
+                content=candidate.content,
+                line_range=candidate.line_range,
+            )
         )
-        for index, candidate in enumerate(surviving)
-    )
     dropped_counts = {
         "caller_edges_dropped": caller_dropped,
         "similarity_matches_dropped": similarity_dropped,
@@ -500,4 +553,4 @@ def assemble_context_bundle(
         # which neither measure includes).
         "context_bundle_total_bytes": total_bytes,
     }
-    return ContextBundle(items=items), dropped_counts
+    return ContextBundle(items=tuple(items)), dropped_counts

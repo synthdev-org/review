@@ -34,9 +34,15 @@ from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.posting import GitHubFindingsPublisher
 from findings.models import Finding
 from memory.models import PostedComment
-from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
+from review.context_bundle import (
+    ContextBundle,
+    ContextBundleItem,
+    ContextItemKind,
+    render_product_knowledge_section,
+)
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
+from review.product_knowledge import ProductKnowledgeItem, ProductKnowledgeSection
 from review.step import StepContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -596,3 +602,62 @@ async def test_depends_on_static_analysis_reads_that_step_own_output_when_config
     assert check_run_route.call_count == 1
     assert outcomes["output"].status == "success"
     assert outcomes["output"].output.comment_count == 1
+
+
+@respx.mock
+async def test_us_pk3_finding_citing_provider_item_posts_product_knowledge_block(
+    test_rsa_private_key_pem: str,
+) -> None:
+    """US-PK3/US-PK6: a finding whose ``context_ref_ids`` resolve to a
+    provider item is posted with the platform-rendered, unescaped
+    ``**Product knowledge (<display>):**`` block — link, source type and
+    host only, never the provider's snippet."""
+    _mock_token_exchange()
+    _mock_review_comments()
+    reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
+    respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
+    context_bundle = ContextBundle(
+        items=(
+            ContextBundleItem(
+                id=0,
+                kind=ContextItemKind.CALLER,
+                file_path="src/caller.ts",
+                symbol_name="caller",
+                content="function caller() {}",
+                line_range=(10, 12),
+            ),
+        ),
+        product_knowledge=ProductKnowledgeSection(
+            label="Acme Wiki",
+            items=(
+                ProductKnowledgeItem(
+                    id=1,
+                    provider_item_id="doc-1",
+                    title="Refund *policy*",
+                    source_type="confluence",
+                    url="https://wiki.example.com/refunds",
+                    content="PROVIDER-SNIPPET-MUST-NOT-BE-ECHOED",
+                ),
+            ),
+        ),
+    )
+    finding = _finding(
+        file="app.py", line=2, message="llm finding", source="llm", context_ref_ids=(0, 1)
+    )
+    upstream = _FakeUpstreamStep(
+        output=_FakeUpstreamOutput(findings=[finding], context_bundle=context_bundle)
+    )
+    registry = _registry(upstream, _publisher(test_rsa_private_key_pem))
+    # The generator can only cite what the wire section tells it to cite.
+    wire_section = render_product_knowledge_section(context_bundle)
+    assert "context_ref_ids" in wire_section and '"id": 1' in wire_section
+
+    await registry.run(_SEED_INPUT, _context())
+
+    assert reviews_route.call_count == 1
+    posted_body = json.dumps(json.loads(reviews_route.calls.last.request.content))
+    assert "**Context:**" in posted_body
+    assert "**Product knowledge (Acme Wiki):**" in posted_body
+    assert "[Refund \\\\*policy\\\\*](https://wiki.example.com/refunds)" in posted_body
+    assert "confluence" in posted_body
+    assert "PROVIDER-SNIPPET-MUST-NOT-BE-ECHOED" not in posted_body

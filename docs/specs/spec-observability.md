@@ -365,6 +365,37 @@ aspirational design.
   be useful per-repo) — this is the same tenancy-scoping data already
   visible in every structured log line today (`job_id`, `org_id`,
   `repo_id`, `repo_full_name`), not new exposure.
+- **Product-knowledge instruments (added by
+  [`plan-deliver-product-knowledge.md`](../plans/plan-deliver-product-knowledge.md)
+  Phase 7; no new user story — the stories are US-PK14 in
+  [`spec-product-knowledge.md`](spec-product-knowledge.md)).** Registered
+  with literal names in `review/context_builder.py` (and
+  `adapter/product_knowledge/provider_resolver.py` for the config counter),
+  covered by the US11/US13 dashboard drift guard. Fixed, reviewed allow-list:
+
+  | Signal | Name | Attributes (closed sets) |
+  | --- | --- | --- |
+  | Counter | `review.product_knowledge.call_total` | `operation` ∈ {`contract`, `search`, `fetch`, `job`}; `outcome` ∈ the `ProviderOutcome` enum (`ok`, `empty`, `partial`, `no_query`, `not_configured`, `disabled`, `redaction_disabled`, `skipped_public_repo`, `skipped_fork`, `timeout`, `unreachable`, `auth_failed`, `blocked_egress`, `credential_unavailable`, `unsupported_version`, `deprecated_version`, `malformed`, `oversized`, `provider_error`); `contract_version` ∈ {`1`, `none`, `unsupported`}; `origin` ∈ {`worker`, `test_connection`} |
+  | Histogram | `review.product_knowledge.call_duration_ms` | same four |
+  | Histogram | `review.product_knowledge.item_count`, `review.product_knowledge.bytes` | `outcome` |
+  | Counter | `review.product_knowledge.config_resolution_total` | `source` ∈ {`platform`, `org`, `repo`, `not_configured`, `invalid`, `fallback_on_error`} |
+  | Span | `review.product_knowledge` (child of the Context Builder step span) | `outcome`, `item_count`, `contract_version`, `duration_ms` |
+
+  A provider-declared version outside the host's supported set is reported as
+  `unsupported`, never as the raw provider value. Org and repo ids, the
+  credential ref and the endpoint host are **log fields only**; a query,
+  title, snippet, URL path, token or provider error body is never a metric,
+  span attribute or log field. `review/test_context_builder_step.py`
+  asserts the attribute set against this table with an in-memory reader.
+
+**Citation-quality and config-write counters (post-Phase 7 addition).**
+Registered with literal names, covered by the US13 dashboard drift guard:
+
+| Signal | Name | Attributes (closed sets) |
+| --- | --- | --- |
+| Counter | `review.citation.ref_total` (`review/citation.py`) | `kind` ∈ {`code`, `product_knowledge`, `unknown`} (`unknown` only with `result=unresolved`, since an unresolved id has no id space); `result` ∈ {`rendered`, `unresolved`} |
+| Counter | `review.citation.findings_total` (`review/output.py`) | `cited` ∈ {`true`, `false`}; only findings carrying `context_ref_ids` are counted |
+| Counter | `review.config.write_total` (`apps/admin_api/config_routes.py`) | `key` ∈ the settings registry keys, or `unknown` for an unregistered key; `outcome` ∈ {`ok`, `validation_rejected`, `store_error`} |
 
 ### Observability
 

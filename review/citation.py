@@ -59,17 +59,46 @@ pure, zero-infra-import function, so importing it here doesn't add an infra
 dependency — the same ordinary domain-to-domain import shape Assumption 4
 already establishes for this plan's other cross-package imports.
 
+**Product-knowledge items** (docs/plans/plan-deliver-product-knowledge.md,
+Phase 3, US-PK3) get their own block after the code list:
+``**Product knowledge (<display name>):**`` with one
+``[<title>](<url>) — <source_type> · <host>`` line per cited item, in id
+order, at most ``TOP_K`` lines. Title, display name, source type and host
+pass through ``escape_markdown``; the URL comes from the single sanitizer in
+``review.product_knowledge`` (no URL ⇒ plain escaped title); cleartext/IP
+hosts are flagged; **no snippet or content is ever echoed**.
+
 Zero infra imports, per architecture.md's domain-package rule.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import Counter
+
+from opentelemetry import metrics
 
 from findings.markdown import escape_markdown
+from review._telemetry import suppress_telemetry_errors
 from review.context_bundle import ContextBundle, ContextBundleItem
+from review.product_knowledge import TOP_K, ProductKnowledgeItem, sanitize_url, url_display
 
 logger = logging.getLogger(__name__)
+
+meter = metrics.get_meter("review.citation")
+
+_ref_total = meter.create_counter(
+    "review.citation.ref_total",
+    description="Context ref ids the LLM cited, by id space and whether they resolved.",
+)
+
+
+def _record_ref_counts(counts: Counter[tuple[str, str]]) -> None:
+    with suppress_telemetry_errors(
+        logger, "citation ref telemetry recording failed (citation unaffected)"
+    ):
+        for (kind, result), count in counts.items():
+            _ref_total.add(count, {"kind": kind, "result": result})
 
 
 def _render_location(item: ContextBundleItem, *, job_id: str) -> str:
@@ -102,6 +131,20 @@ def _render_item(item: ContextBundleItem, *, job_id: str) -> str:
     return f"- `{location}`"
 
 
+def _render_product_knowledge_item(item: ProductKnowledgeItem) -> str:
+    title = escape_markdown(item.title)
+    source = escape_markdown(item.source_type)
+    safe_url = sanitize_url(item.url)
+    display = url_display(safe_url)
+    if safe_url is None or display is None:
+        return f"- {title} — {source}"
+    host, flags = display
+    line = f"- [{title}]({safe_url}) — {source} · {escape_markdown(host)}"
+    if flags:
+        line += f" ({', '.join(flags)})"
+    return line
+
+
 def render_citation(ref_ids: list[int], bundle: ContextBundle, *, job_id: str) -> str | None:
     """Renders a citation section from ``bundle``'s own already-retrieved
     data for exactly the items named in ``ref_ids``, per this module's own
@@ -119,13 +162,20 @@ def render_citation(ref_ids: list[int], bundle: ContextBundle, *, job_id: str) -
     """
 
     lines: list[str] = []
+    product_items: dict[int, ProductKnowledgeItem] = {}
     seen_ids: set[int] = set()
+    ref_counts: Counter[tuple[str, str]] = Counter()
     for ref_id in ref_ids:
         if ref_id in seen_ids:
             continue
         seen_ids.add(ref_id)
         item = bundle.item(ref_id)
+        if item is None and (pk_item := bundle.product_knowledge_item(ref_id)) is not None:
+            product_items[ref_id] = pk_item
+            ref_counts[("product_knowledge", "rendered")] += 1
+            continue
         if item is None:
+            ref_counts[("unknown", "unresolved")] += 1
             logger.warning(
                 "citation: unknown context_ref_id; dropping from citation "
                 "(possibly a hallucinated or budget-truncated reference)",
@@ -133,8 +183,20 @@ def render_citation(ref_ids: list[int], bundle: ContextBundle, *, job_id: str) -
             )
             continue
         lines.append(_render_item(item, job_id=job_id))
+        ref_counts[("code", "rendered")] += 1
+    _record_ref_counts(ref_counts)
 
-    if not lines:
+    blocks: list[str] = []
+    if lines:
+        blocks.append("**Context:**\n" + "\n".join(lines))
+    if product_items and bundle.product_knowledge is not None:
+        pk_lines = [
+            _render_product_knowledge_item(product_items[i]) for i in sorted(product_items)[:TOP_K]
+        ]
+        label = escape_markdown(bundle.product_knowledge.label)
+        blocks.append(f"**Product knowledge ({label}):**\n" + "\n".join(pk_lines))
+
+    if not blocks:
         return None
 
-    return "**Context:**\n" + "\n".join(lines)
+    return "\n\n".join(blocks)

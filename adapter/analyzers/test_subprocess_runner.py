@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from adapter.analyzers.exceptions import (
     PathTraversalError,
 )
 from adapter.analyzers.subprocess_runner import (
+    analyzer_env,
     materialize_files,
     run_analyzer_subprocess,
     validate_relative_path,
@@ -277,3 +279,51 @@ async def test_double_dash_separator_reaches_the_child_process_as_a_literal_argu
     )
 
     assert json.loads(output) == ["-weird-name.py", "normal.py"]
+
+
+# ---------------------------------------------------------------------------
+# L7: the product-knowledge credential map never reaches an analyzer child
+# ---------------------------------------------------------------------------
+
+
+def test_analyzer_env_drops_only_the_credential_map() -> None:
+    env = analyzer_env(
+        {
+            "PATH": "/usr/bin",
+            "HOME": "/root",
+            "REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS": '{"w": {"token": "t"}}',
+            "REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS": "x",
+            "REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST": "wiki",
+        }
+    )
+
+    assert env == {
+        "PATH": "/usr/bin",
+        "HOME": "/root",
+        "REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST": "wiki",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_child_process_does_not_inherit_the_credential_map_but_keeps_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS", "CANARY-TOKEN-xyz")
+    monkeypatch.setenv("PATH", os.environ.get("PATH", "/usr/bin"))
+
+    output = await run_analyzer_subprocess(
+        [
+            sys.executable,
+            "-c",
+            "import os;print('cred=' + repr(os.environ.get("
+            "'REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS')));"
+            "print('path=' + str(bool(os.environ.get('PATH'))))",
+        ],
+        cwd=tmp_path,
+        timeout=10.0,
+    )
+
+    assert b"cred=None" in output
+    assert b"CANARY" not in output
+    assert b"path=True" in output

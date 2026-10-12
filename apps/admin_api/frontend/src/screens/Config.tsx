@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import * as api from "../api/endpoints";
 import { ApiError, isSessionExpiredError } from "../api/client";
@@ -7,7 +7,8 @@ import { Notice } from "../components/Notice";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { useAsyncData } from "../hooks/useAsyncData";
 import { useNotice } from "../hooks/useNotice";
-import type { ScopeSettings, SettingKey } from "../api/types";
+import type { ConfigTree, ScopeSettings, SettingKey } from "../api/types";
+import { ProductKnowledgePanel, type ProductKnowledgeSupport } from "./ProductKnowledgePanel";
 
 const SEVERITY_OPTIONS = ["low", "medium", "high", "critical"] as const;
 
@@ -106,10 +107,12 @@ function ScopeCard({
   title,
   node,
   onSaved,
+  support,
 }: {
   title: string;
   node: ScopeSettings;
   onSaved: (scope: string, key: string) => void;
+  support: ProductKnowledgeSupport;
 }): JSX.Element {
   const entries = Object.entries(node.settings);
   return (
@@ -130,8 +133,21 @@ function ScopeCard({
         </dl>
       )}
       <SettingForm scope={node.scope} onSaved={onSaved} />
+      {/* Provider settings are team-scope-unsupported (tenancy.settings). */}
+      {!node.scope.startsWith("team:") && (
+        <ProductKnowledgePanel node={node} support={support} onSaved={onSaved} />
+      )}
     </div>
   );
+}
+
+function scopeNamesOf(tree: ConfigTree | null): Record<string, string> {
+  const names: Record<string, string> = { platform: "platform" };
+  for (const org of tree?.orgs ?? []) {
+    names[org.scope] = `org ${org.name}`;
+    for (const repo of org.repos) names[repo.scope] = `repo ${repo.name}`;
+  }
+  return names;
 }
 
 // Unit E (US-A12, US-A13): org → repo → team configuration tree, per
@@ -139,7 +155,19 @@ function ScopeCard({
 export function ConfigScreen(): JSX.Element {
   const fetcher = useCallback(() => api.getConfig(), []);
   const { state, reload } = useAsyncData(fetcher);
+  // Independent of the tree fetch so a credentials failure never blanks the forms.
+  const credentialsFetcher = useCallback(() => api.getProductKnowledgeCredentials(), []);
+  const { state: credentials, reload: reloadCredentials } = useAsyncData(credentialsFetcher);
   const { notice, showSuccess, dismiss } = useNotice();
+  const tree = state.status === "success" ? state.data : null;
+  const support: ProductKnowledgeSupport = useMemo(
+    () => ({
+      credentials,
+      onRetryCredentials: reloadCredentials,
+      scopeNames: scopeNamesOf(tree),
+    }),
+    [credentials, reloadCredentials, tree]
+  );
 
   function handleSaved(_scope: string, key: string): void {
     showSuccess(`Saved ${key}.`);
@@ -165,8 +193,10 @@ export function ConfigScreen(): JSX.Element {
                 scope: "platform",
                 settings: state.data.platform_settings,
                 using_platform_defaults: false,
+                effective: state.data.platform_effective,
               }}
               onSaved={handleSaved}
+              support={support}
             />
           </section>
 
@@ -180,12 +210,12 @@ export function ConfigScreen(): JSX.Element {
             ) : (
               state.data.orgs.map((org) => (
                 <div key={org.id} className="org-block">
-                  <ScopeCard title={`Org: ${org.name}`} node={org} onSaved={handleSaved} />
+                  <ScopeCard title={`Org: ${org.name}`} node={org} onSaved={handleSaved} support={support} />
                   {org.repos.map((repo) => (
-                    <ScopeCard key={repo.id} title={`Repo: ${repo.name}`} node={repo} onSaved={handleSaved} />
+                    <ScopeCard key={repo.id} title={`Repo: ${repo.name}`} node={repo} onSaved={handleSaved} support={support} />
                   ))}
                   {org.teams.map((team) => (
-                    <ScopeCard key={team.id} title={`Team: ${team.name}`} node={team} onSaved={handleSaved} />
+                    <ScopeCard key={team.id} title={`Team: ${team.name}`} node={team} onSaved={handleSaved} support={support} />
                   ))}
                 </div>
               ))

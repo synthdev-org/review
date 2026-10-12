@@ -231,6 +231,41 @@ adminApi:
       name: ""
       key: ""
 
+# Optional external product-knowledge provider (docs/plans/
+# plan-deliver-product-knowledge.md, Phase 6). The provider itself
+# (endpoint, display name, credential reference) is day-two config set in
+# the Admin UI; only the bearer *tokens* and the network policy are
+# bootstrap config here. `credentials.value` is a JSON object
+#   {"<ref>": {"token": "...", "allowed_hosts": ["host", ...]}}
+# and follows the shared credential-field shape above. It is rendered into
+# BOTH the Worker and the Admin API Deployments (the Admin API validates a
+# provider's `credential_ref` and host binding against it), and **only when
+# `value` or `existingSecret.name` is set** — an unset map renders no env
+# var and no secretKeyRef, so an existing install upgrades with nothing to
+# configure. NOTE: the chart adds no checksum annotation for this
+# credential map, so rotating it (the chart-managed Secret OR the Secret an
+# `existingSecret` points at) does NOT roll pods. Restart the Worker and the
+# Admin API (`kubectl rollout restart`) after a rotation, or add a checksum
+# annotation to your own pod template via your secret-backend's reloader.
+productKnowledge:
+  # Kill switch (needs a pod restart to flip): false => no provider is
+  # ever queried, even with provider settings present.
+  enabled: true
+  callTimeoutSeconds: 5
+  # Worker only: whole provider branch, must stay below the Context
+  # Builder's internal timeout when the feature is in use.
+  deadlineSeconds: 10
+  # RFC1918/ULA ranges are allowed by default so an in-cluster provider
+  # works; loopback/link-local/cloud-metadata are always refused.
+  allowPrivateNetworks: true
+  # Comma-separated `host` / `*.suffix` entries; empty = no allow-list.
+  endpointAllowlist: ""
+  credentials:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+
 # Chart-managed Ingress (US-A21) — new as of Phase 9; the chart had no
 # Ingress template before this phase. Routes to both the Admin UI
 # (`adminApi.service`) and Webhook API (`webhookApi.service`) Services.

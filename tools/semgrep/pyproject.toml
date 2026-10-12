@@ -1,0 +1,16 @@
+[project]
+name = "review-semgrep-tool"
+version = "0.0.0"
+description = "Isolated environment for the Semgrep CLI (adapter/analyzers/semgrep.py)."
+requires-python = ">=3.12,<3.13"
+# Semgrep hard-pins mcp 1.x and imports mcp.server.fastmcp, which conflicts
+# with the main project's mcp>=2.3,<3 (ADR-0013). It is only ever run as a
+# subprocess (`semgrep` on PATH), so it lives in its own locked environment
+# instead of the main dependency group. Install:
+#   uv sync --project tools/semgrep --locked   (-> tools/semgrep/.venv)
+# and put tools/semgrep/.venv/bin/semgrep on PATH (the Dockerfile's
+# `semgrep-tool` stage does exactly this for the dev and runtime images).
+dependencies = ["semgrep>=1.85,<2"]
+
+[tool.uv]
+package = false

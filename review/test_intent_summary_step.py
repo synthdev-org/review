@@ -36,6 +36,7 @@ from llmgateway.routing import (
 )
 from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.intent_summary import MAX_INTENT_SUMMARY_CHARS, IntentSummaryStep
+from review.product_knowledge import ProductKnowledgeItem, ProductKnowledgeSection
 from review.step import StepContext
 
 # --- Shared fixtures/helpers -------------------------------------------------
@@ -458,3 +459,59 @@ async def test_success_logs_only_the_char_count_never_the_summary_text(
     )
     for record in caplog.records:
         assert secret_looking_summary not in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_pr_metadata_is_forwarded_to_the_real_output() -> None:
+    """Product-knowledge capture fields (Phase 1/2) survive this step: they
+    are optional ``JobIdentity`` fields and not auto-carried, so a dropped
+    forward would silently fail the A1 gate closed downstream."""
+
+    @dataclass
+    class _WithPr(_FakePrefilterOutput):
+        pr_title: str | None = "Fix PROJ-9"
+        pr_head_ref: str | None = "bugfix/PROJ-9"
+        pr_issue_keys: tuple[str, ...] = ("PROJ-9", "#41")
+        pr_is_fork: bool | None = False
+
+    step = _intent_summary_step(llm_client=_FakeLLMClient())
+
+    output = await step.run(_WithPr(diff=_diff_with_patch()), _context())
+
+    assert output.pr_title == "Fix PROJ-9"
+    assert output.pr_head_ref == "bugfix/PROJ-9"
+    assert output.pr_issue_keys == ("PROJ-9", "#41")
+    assert output.pr_is_fork is False
+
+
+@pytest.mark.asyncio
+async def test_product_knowledge_content_never_reaches_the_intent_summary_request() -> None:
+    """The intent-summary prompt is built from the diff only: a bundle that
+    carries a provider section must not leak any of it into the LLM call."""
+    marker = "PROVIDER-SECRET-MARKER-7f3a"
+    bundle = ContextBundle(
+        product_knowledge=ProductKnowledgeSection(
+            label="Wiki-Label-Marker",
+            items=(
+                ProductKnowledgeItem(
+                    id=0,
+                    provider_item_id="doc-1",
+                    title=f"Title {marker}",
+                    source_type="confluence",
+                    url=f"https://wiki.example.com/{marker}",
+                    content=f"Body {marker}",
+                ),
+            ),
+        )
+    )
+    llm_client = _FakeLLMClient()
+    step = _intent_summary_step(llm_client=llm_client)
+
+    await step.run(
+        _FakeContextBuilderOutput(diff=_diff_with_patch(), context_bundle=bundle), _context()
+    )
+
+    (request,) = llm_client.calls
+    sent = request.model_dump_json()
+    assert marker not in sent
+    assert "Wiki-Label-Marker" not in sent

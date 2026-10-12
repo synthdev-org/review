@@ -107,3 +107,304 @@ event can never correlate back to a specific posted finding comment (only
 `pull_request_review_comment`'s `in_reply_to_id` can), so subscribing to
 it would only add unused webhook volume with no corresponding capture
 capability.
+
+## Product-knowledge provider configured but not contributing? Read the `outcome` of `review.product_knowledge.call_total`
+
+Added by Phase 7 of
+[`plan-deliver-product-knowledge.md`](../plans/plan-deliver-product-knowledge.md)
+(the optional external product-knowledge augmentation,
+[ADR-0013](../adr/0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md)).
+The per-outcome entries below (one `##` heading per operator-visible
+`outcome`) complete it.
+
+**What is sent, and where (the data-egress statement).** The Admin UI shows
+exactly this sentence next to the endpoint field:
+
+> Sent to this endpoint on each review: the secret-redacted pull request title and linked issue keys. Never sent: code, the diff, or the pull request description.
+
+With a provider configured and enabled for a repo, each review job sends the
+configured endpoint **the redacted PR title and the linked issue keys** (at
+most 10), and nothing else: never source code, the diff, file paths or the PR
+description. The provider's results then travel to your configured LLM
+endpoint as part of the review prompt, the same path the diff already takes.
+review never contacts any endpoint on its own initiative: only the endpoint
+an operator configured, and only from the Worker (the Admin API contacts it
+only for an explicit test-connection).
+
+**Reading the signal.** Every job that reaches the provider branch records
+one `review.product_knowledge.call_total` with `operation="job"` and a closed
+`outcome`; the shipped dashboard's "Product knowledge" row splits the non-`ok`
+rate by outcome. Config-class outcomes are also logged at `warning`
+(`product_knowledge degraded`, with `provider_ref` and `endpoint_host`):
+`credential_unavailable` (credential ref missing or not bound to the endpoint
+host), `blocked_egress` (the egress guard refused the address),
+`unsupported_version` (no contract major in common), `auth_failed`,
+`redaction_disabled` (see below). Transient outcomes (`timeout`,
+`unreachable`, `provider_error`, `malformed`, `oversized`) and the benign ones
+(`empty`, `no_query`, `skipped_public_repo`, `skipped_fork`, `disabled`) are
+logged at `info`. **A provider failure never fails or delays a review beyond
+`REVIEW_WORKER_PRODUCT_KNOWLEDGE_DEADLINE_SECONDS`** and never changes the
+code-context outcome (`review.context_builder.outcome_total`).
+
+`not_configured` (no provider setting for the repo; the steady state for most
+repos) is deliberately logged at `debug` only, and the dashboard panel
+excludes it (`outcome!~"ok|not_configured"`), so it neither floods the logs
+nor buries the actionable outcomes; it is still counted on
+`call_total{operation="job"}` if you need the adoption ratio.
+
+**Every job does one settings read.** The provider resolver is wired
+unconditionally whenever the feature is enabled, so each review job performs
+one keyed `product_knowledge_provider` settings read (bounded by its own 2 s
+cap and the branch deadline; a failed or slow read never affects the review's
+code path). This is intentional: a provider may be defined only in the
+database with `credential_ref` null, which is valid and must not be skipped by
+checking the credential map first.
+
+No alert rules ship (this repo ships none by convention). A starting point to
+watch for config-class breakage:
+
+```promql
+sum by (outcome) (rate(review_product_knowledge_call_total{operation="job",origin="worker",outcome=~"credential_unavailable|blocked_egress|unsupported_version|auth_failed|redaction_disabled"}[15m])) > 0
+```
+
+**Why is it skipped?** `skipped_public_repo` / `skipped_fork` is the
+exposure gate working: provider content is only used on private repos and
+non-fork PRs unless the provider setting opts in with `allow_public_repos`
+(a public PR's title is attacker-controlled, and findings are posted as
+world-readable comments). `redaction_disabled` means
+`REVIEW_WORKER_SECRET_REDACTION_ENABLED=false`: the PR title cannot be
+redacted, so the provider is never called. The provider is only queried from
+inside the Context Builder step; a startup warning is logged if credentials
+are configured while that step is disabled.
+
+**Turning it off.**
+
+- Whole fleet, needs a restart: `REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED=false`
+  (a startup `warning` states it; no client is built and nothing is called
+  even if provider settings exist; jobs with a configured provider record
+  `outcome=disabled`).
+- No restart: set the `product_knowledge_provider` setting with
+  `enabled: false` at platform scope (fleet) or at the org/repo scope (that
+  scope only; the narrowest configured scope wins). Restores exactly the
+  behavior without the feature.
+
+### Rotating a credential
+
+Tokens live only in the operator-provisioned
+credential map (`REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS` /
+`REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS`, or Helm
+`productKnowledge.credentials`), never in Postgres. Update the Secret, then
+**roll both the Worker and the Admin API** (a new ref visible to only one of
+them yields `unknown_credential_ref` on config writes or
+`credential_unavailable` at job time during the rollout). Each token is bound
+to its `allowed_hosts`; the credential ref is global across orgs (a single
+trust domain, ADR-0004).
+
+**Pin ports.** An `allowed_hosts` entry and an endpoint allow-list entry may
+carry a port (`wiki.internal:8443`, `[::1]:9000`, `*.corp.example:443`); a
+URL without a port uses the scheme default (443 for `https`, 80 for `http`).
+An entry **with** a port matches that port exactly. An entry **without** one
+matches the host on *any* port: this is weaker (another service on the same
+host can receive the token), kept for backward compatibility, and
+**`host:port` is recommended for every entry**. Entries are validated at
+startup (port 1-65535, no scheme, path or userinfo; `allowed_hosts` also no
+wildcard).
+
+**Unauthenticated providers need an allow-list entry.** A provider with no
+`credential_ref` is not unconstrained: its endpoint must match
+`REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST` (or some credential's
+`allowed_hosts`). Otherwise the config write is a 422
+`unauthenticated_host_not_allowed`, test-connection answers
+`blocked_by_policy`, and at job time the call fails closed
+(`credential_unavailable`) with zero bytes sent. An in-cluster
+network-policy-protected provider therefore needs an entry such as
+`knowhow.svc.cluster.local:8080` in the allow-list (set it on the Worker and
+the Admin API).
+
+**Transport notes.** (a) Cleartext `http` is allowed to *private* addresses,
+and a bearer token is sent in clear there; only a public address refuses the
+token over `http`. Use `https`, or accept that anyone on that network path can
+read the token. (b) There is no option to trust an internal CA: TLS
+verification uses the system trust store only and `SSL_CERT_FILE` /
+`SSL_CERT_DIR` are deliberately ignored, so an `https` provider behind a
+private CA is unreachable until the CA is in the image's system store (build a
+derived image). (c) The `endpoint_url` **path must not carry a secret**:
+the stored setting is readable by Viewers through `GET /api/v1/config` (the
+audit log records only the host), and userinfo, query and fragment are
+rejected at write time. Put secrets in the credential map, never in the URL.
+
+### Accepted limitations (stated, not bugs)
+
+- `credential_ref` is global: an Admin can point org A's repo at org B's
+  credential. review has a single trust domain (ADR-0004); scope each token to
+  the least data its provider account can read.
+- Viewers can read the stored `endpoint_url` (full path) through
+  `GET /api/v1/config`; it is not redacted. Do not encode anything secret in it.
+- `GET /api/v1/product-knowledge/credentials` lists credential **names** to
+  Viewers (bound hosts to Admins only); tokens are never returned.
+- The whole credential map is in both the Worker's and the Admin API's pod
+  environment (the Admin API holds provider tokens so it can validate bindings
+  and run test-connection).
+- The PR title is stored un-redacted in `job_queue.payload` (the customer's own
+  Postgres); only the outbound query is redacted.
+- Provider content can reach the PR comment if an attacker-controlled PR
+  prompts the model to quote it. The controls are the exposure gate (below),
+  the optional `issue_key_prefixes` allow-list and per-repo opt-out, not the
+  prompt's "do not quote verbatim" request.
+
+**First-line diagnostic: test-connection.** In the Admin UI's Product
+knowledge panel (or `POST /api/v1/product-knowledge/test-connection`, Admin
+only, 6/min per session, 6/min per user across sessions and 30/min per Admin API pod), run it against the *saved*
+values. It uses the same adapter path as the Worker and returns one of `ok`,
+`blocked_by_policy`, `disabled`, `unreachable`, `no_contract`, `malformed`,
+`auth_failed`, `unsupported_version`, `deprecated_version`, `timeout`. A target no credential's
+`allowed_hosts` or the operator allow-list covers is always the collapsed
+`blocked_by_policy`, with no timing, by design. A provider with no credential
+(`credential_ref` null) is bound to no `allowed_hosts`, so it is testable only
+when its host (and port, if the entry has one) matches the operator allow-list
+(`..._ENDPOINT_ALLOWLIST`) or some credential's `allowed_hosts`; otherwise it
+is `blocked_by_policy`. The 30/min
+global limit is counted per Admin API pod (in memory), not cluster-wide, so N
+replicas allow up to N x 30/min. A malformed `REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST`
+does not stop the Admin API: it logs the problem at startup (see the
+`endpoint allow-list is invalid` error) and reports `disabled` until fixed;
+the Worker, by contrast, refuses to start.
+
+**Rotating a credential map does not roll pods.** The chart adds no checksum
+annotation for the product-knowledge Secret, whether chart-managed or an
+`existingSecret`; restart the Worker and the Admin API after any rotation.
+
+**Why the Worker's `call < deadline < internal` timeout check is conditional.**
+It is enforced only when the kill switch is on and the credential map or the
+endpoint allow-list is non-empty (`in_use`): the provider setting itself lives
+in Postgres, which settings construction cannot read, so those two are the
+bootstrap signals (an unauthenticated provider is reachable only through the
+allow-list). Enforcing it unconditionally would make default-tuned installs
+that never use product knowledge fail to start.
+
+## Provider outcome `unsupported_version` or `deprecated_version`? The provider and review share no contract major
+
+review supports the current and previous contract major and picks the
+highest both sides declare via the provider's `product_knowledge_contract`
+tool. `unsupported_version` (config-class, `warning`) means there is no
+overlap: upgrade the provider (or review), then re-run test-connection.
+`deprecated_version` means a shared major exists but is scheduled for removal
+(at least 12 months after its successor ships); the review is unaffected.
+The negotiation result is cached for about 10 minutes per endpoint, so a
+fixed provider is picked up without a restart.
+
+## Provider outcome `blocked_egress`? The egress guard refused the address
+
+The connection-time guard refused the resolved address before any byte was
+sent: loopback, link-local, unspecified, multicast and cloud-metadata
+(`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`, `168.63.129.16`,
+`192.0.0.192`) addresses, NAT64/6to4/IPv4-compatible forms, or a non-`http(s)`
+scheme are always denied. Private ranges are allowed unless
+`REVIEW_WORKER_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS=false`; when an
+endpoint allow-list (`REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST`) is
+set, the host (and port, when the entry carries one) must match it, and an
+unauthenticated provider must match it (or a credential's `allowed_hosts`)
+even when it is empty. Fix the endpoint hostname or the operator policy.
+Redirects are never followed, so an endpoint that answers `3xx` is also
+reported here or as `provider_error`: point the setting at the final URL. A
+`NetworkPolicy` in the cluster remains the outer control; this guard is
+defense in depth.
+
+## Provider outcome `credential_unavailable`? The credential ref is missing or not bound to the endpoint host
+
+At job time the Worker re-checks that `credential_ref` exists in its
+credential map **and** that the endpoint host (and port, if the entry has
+one) is in that credential's `allowed_hosts`. For a null `credential_ref` it
+re-checks that the endpoint matches the operator allow-list or some
+credential's `allowed_hosts`; failing either, no request is made (the token is never
+sent). Typical causes: the Worker's map lacks a ref the Admin API has (a
+rollout that rolled only one of them), or the endpoint host was changed
+without updating `allowed_hosts`. Update the Secret and roll **both** the
+Worker and the Admin API.
+
+## Provider outcome `auth_failed`? The provider rejected the token
+
+The provider answered 401/403. The token in the map is wrong, expired or
+lacks access: rotate it (see "Rotating a credential" above), then run
+test-connection. If `credential_ref` is null the provider received no token.
+
+## Provider outcome `timeout` or `unreachable`? The provider is slow or down
+
+Transient and `info`-level: the review ran without provider context and was
+not failed or delayed beyond
+`REVIEW_WORKER_PRODUCT_KNOWLEDGE_DEADLINE_SECONDS` (default 10 s; per-call
+limit `..._CALL_TIMEOUT_SECONDS`, default 5 s). There is no retry or circuit
+breaker in v1. Persistent `timeout` means the provider's search is slower than
+the per-call limit; persistent `unreachable` means DNS/TLS/connect failure
+from the Worker pod (check from the Worker's network, not your laptop).
+`rate_limited` answers from the provider put that endpoint in a short
+in-process cool-down.
+
+## Provider outcome `provider_error`? The provider answered with an error, or an internal step failed
+
+Either the provider returned a tool error (`internal`, `unavailable`, an
+unexpected status, a redirect) or a local step inside the branch (for example
+the secret redactor) failed. The review is unaffected and the provider's error
+text is deliberately never logged. Run test-connection; if it is `ok`, the
+failure is intermittent on the provider side. Worker logs name only the
+credential ref and endpoint host.
+
+## Provider outcome `malformed` or `oversized`? The provider's response broke the contract
+
+`malformed`: the response did not parse or validate against the v1 schemas
+(wrong field types, no `title`, nesting too deep). `oversized`: more than
+256 KiB. review drops invalid items and truncates over-long fields, so
+`partial` is the more common symptom; these two mean nothing usable came back.
+Run the conformance suite against the provider (see the
+[provider-implementer guide](product-knowledge-contract/v1/README.md)) to find
+the violating check.
+
+## Provider outcome `skipped_public_repo` or `skipped_fork`? The exposure gate is working
+
+By default provider content is only used on **private repos** and on PRs from
+the same repo (not forks): on a public repo or a fork PR the title and head ref
+are attacker-controlled, and findings are world-readable comments. To allow a
+public repo, set `allow_public_repos: true` on that scope's
+`product_knowledge_provider` setting (an explicit, audited opt-in); the same
+flag lifts the fork skip. A repo that is itself a fork (GitHub's
+`head.repo.fork=true`) is skipped the same way unless `allow_public_repos` is
+set, even when the PR's head and base are the same repo. Consider `issue_key_prefixes` (e.g. `["HR"]`) so only
+keys of your tracker are ever queried. When it is set, the allow-list is a
+content restriction: only matching keys are sent as the query and the PR title
+text is not; a PR with no matching key makes no provider request.
+
+## Provider outcome `redaction_disabled`? Secret redaction is off, so the provider is never called
+
+`REVIEW_WORKER_SECRET_REDACTION_ENABLED=false`: the PR title cannot be
+redacted, and redaction of the outbound query is a precondition of the
+feature, not best effort. Re-enable redaction, or leave the provider off. A
+redactor *failure* inside the branch is reported as `provider_error` and the
+review continues.
+
+## Rolling back, or cleaning up orphaned `product_knowledge_provider` rows after a code revert
+
+The rollback is the setting, not a code revert: `REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED=false`
+(restart) or an `enabled: false` row at platform/org/repo scope (no restart).
+If the code *was* reverted, rows for the now-unknown key remain and the config
+API can no longer edit or delete them (writes validate against the registry).
+Remove them directly:
+
+```sql
+DELETE FROM org_repo_team_setting WHERE key = 'product_knowledge_provider';
+```
+
+Take a backup first; this removes every scope's provider configuration.
+
+## Worker will not start after setting the product-knowledge credential map?
+
+`REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS` must be a JSON object
+`{"<ref>": {"token": "...", "allowed_hosts": ["host", ...]}}`: refs match
+`[a-z0-9_-]{1,64}`, every entry needs a non-empty token and a non-empty
+`allowed_hosts` of exact hostnames, optionally with `:port` (no `*`, no
+scheme), and no ref repeats.
+The Worker fails fast naming the problem (never the value); the Admin API
+instead logs it and disables the product-knowledge routes so the config UI
+stays up. An empty value means "not configured". With the feature in use,
+`REVIEW_WORKER_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS` <
+`..._DEADLINE_SECONDS` < `REVIEW_WORKER_CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS`
+must hold.

@@ -245,3 +245,85 @@ def test_viewer_session_reads_the_session_endpoint_identically_to_an_admin_sessi
 
         assert response.status_code == 200
         assert response.json() == {"username": _VIEWER_USERNAME, "role": "viewer"}
+
+
+# --- plan-deliver-product-knowledge.md Phase 6: US-PK11 ---------------------------
+
+_PK_TOKEN = "CANARY-ROLE-PK-TOKEN-1f3870be274f6c49"
+
+
+def _pk_settings(dsn: str) -> AdminAPISettings:
+    return AdminAPISettings(
+        environment="development",
+        database_url=SecretStr(dsn),
+        admin_bootstrap_username=_BOOTSTRAP_USERNAME,
+        admin_bootstrap_password=SecretStr(_BOOTSTRAP_PASSWORD),
+        admin_csrf_secret=SecretStr("integration-test-csrf-secret"),
+        session_cookie_secure=False,
+        product_knowledge_credentials=SecretStr(
+            '{"wiki": {"token": "' + _PK_TOKEN + '", "allowed_hosts": ["wiki.internal"]}}'
+        ),
+        _env_file=None,
+    )
+
+
+def test_viewer_is_403_on_provider_config_put_and_test_connection_but_can_read(
+    migrated_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    from apps.admin_api.dependencies import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+
+    dsn = str(migrated_engine.url.render_as_string(hide_password=False))
+    _seed_viewer(dsn)
+    app = create_app(_pk_settings(dsn), frontend_dist_dir=tmp_path / "does-not-exist")
+    provider_value = {
+        "enabled": True,
+        "display_name": "Wiki",
+        "endpoint_url": "https://wiki.internal/mcp",
+        "credential_ref": "wiki",
+    }
+
+    with TestClient(app) as client:
+        client.post(
+            "/api/v1/auth/login",
+            json={"username": _VIEWER_USERNAME, "password": _VIEWER_PASSWORD},
+        )
+        csrf = {CSRF_HEADER_NAME: str(client.cookies[CSRF_COOKIE_NAME])}
+
+        put = client.put(
+            "/api/v1/config/platform/product_knowledge_provider",
+            json={"value": provider_value},
+            headers=csrf,
+        )
+        probe = client.post(
+            "/api/v1/product-knowledge/test-connection",
+            json={"endpoint_url": "https://wiki.internal/mcp", "credential_ref": "wiki"},
+            headers=csrf,
+        )
+        config = client.get("/api/v1/config")
+        credentials = client.get("/api/v1/product-knowledge/credentials")
+
+    assert put.status_code == 403
+    assert probe.status_code == 403
+    assert config.status_code == 200
+    assert config.json()["platform_settings"] == {}  # the 403 stored nothing
+    assert credentials.status_code == 200
+    # Names always; bound hosts are an Admin-only detail; never a token.
+    assert credentials.json() == [{"ref": "wiki", "allowed_hosts": None}]
+    assert _PK_TOKEN not in credentials.text + config.text
+
+
+def test_admin_sees_bound_hosts_in_the_credentials_list(
+    migrated_engine: AsyncEngine, tmp_path: Path
+) -> None:
+    dsn = str(migrated_engine.url.render_as_string(hide_password=False))
+    app = create_app(_pk_settings(dsn), frontend_dist_dir=tmp_path / "does-not-exist")
+
+    with TestClient(app) as client:
+        client.post(
+            "/api/v1/auth/login",
+            json={"username": _BOOTSTRAP_USERNAME, "password": _BOOTSTRAP_PASSWORD},
+        )
+        response = client.get("/api/v1/product-knowledge/credentials")
+
+    assert response.status_code == 200
+    assert response.json() == [{"ref": "wiki", "allowed_hosts": ["wiki.internal"]}]

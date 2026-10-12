@@ -42,9 +42,11 @@ story's own Given/When/Then never mentions.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 
 import asyncpg
 import httpx
@@ -53,12 +55,24 @@ import pytest
 from tests.e2e.conftest import base_compose_env, compose, compose_down, wait_for_healthy
 
 _ASSET_SCRIPT_RE = re.compile(r'src="\./assets/index-[\w-]+\.js"')
+_DISCLOSURE_SOURCE = (
+    Path(__file__).resolve().parents[2]
+    / "apps/admin_api/frontend/src/screens/productKnowledgeCopy.ts"
+)
 _NONEXISTENT_ENTRY_ID = "00000000-0000-0000-0000-000000000000"
 
 
 @pytest.fixture
 def admin_ui_stack() -> Iterator[dict[str, str]]:
-    env = base_compose_env()
+    # A credential map (token + host binding) so the Product knowledge panel
+    # test can save a credentialed provider for wiki.invalid: an
+    # unauthenticated provider must match the allow-list or a credential
+    # host, and this stack configures no allow-list.
+    env = base_compose_env(
+        REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS=json.dumps(
+            {"e2e": {"token": "x", "allowed_hosts": ["wiki.invalid"]}}
+        )
+    )
     compose_down(env)  # clean slate: no volume/container left by a prior run
     # Scoped to admin_api + its own dependency chain (postgres, migrate) —
     # Compose resolves `depends_on` automatically, so naming only
@@ -334,3 +348,95 @@ def test_bulk_approve_and_reject_round_trip_over_the_real_api(
             "/api/v1/memory-entries/bulk-reject", json={"entry_ids": [entry_ids[0]]}
         )
         assert unauthenticated_bulk.status_code == 403
+
+
+def test_product_knowledge_panel_round_trip_and_disclosure_in_built_bundle(
+    admin_ui_stack: dict[str, str],
+) -> None:
+    """Phase 8 (Unit H, US-PK8/PK10/PK15): the endpoints the Product knowledge
+    panel drives, against the real stack - save a provider, read back the
+    server-computed ``effective`` value, list credentials, and probe a target
+    no credential or allow-list covers (collapsed ``blocked_by_policy``, no
+    egress) - and the panel's shared egress-disclosure literal ships in the
+    real built bundle (read from the one TS constant the vitest assertion and
+    the runbook also match).
+    """
+    literal_match = re.search(r'"([^"]+)"', _DISCLOSURE_SOURCE.read_text().split("=", 1)[1])
+    assert literal_match is not None
+    disclosure = literal_match.group(1)
+
+    env = admin_ui_stack
+    with httpx.Client(base_url=_base_url(env)) as client:
+        index = client.get("/").text
+        asset = _ASSET_SCRIPT_RE.search(index)
+        assert asset is not None
+        bundle = client.get(asset.group(0).split('"')[1].removeprefix(".")).text
+        assert disclosure in bundle
+
+        login = client.post(
+            "/api/v1/auth/login",
+            json={
+                "username": env["REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME"],
+                "password": env["REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD"],
+            },
+        )
+        assert login.status_code == 200
+        csrf = {"X-CSRF-Token": client.cookies["review_admin_csrf"]}
+
+        value = {
+            "enabled": True,
+            "display_name": "E2E Wiki",
+            "endpoint_url": "http://wiki.invalid/mcp",
+            "credential_ref": "e2e",
+            "allow_public_repos": False,
+            "issue_key_prefixes": ["HR"],
+        }
+        put = client.put(
+            "/api/v1/config/platform/product_knowledge_provider",
+            json={"value": value},
+            headers=csrf,
+        )
+        assert put.status_code == 200, put.text
+
+        tree = client.get("/api/v1/config").json()
+        effective = tree["platform_effective"]["product_knowledge_provider"]
+        assert effective["source"] == "platform"
+        assert effective["value"]["display_name"] == "E2E Wiki"
+
+        # A write the panel would map to a field: unknown credential ref.
+        bad = client.put(
+            "/api/v1/config/platform/product_knowledge_provider",
+            json={"value": {**value, "credential_ref": "nope"}},
+            headers=csrf,
+        )
+        assert bad.status_code == 422
+        assert bad.json()["detail"] == "unknown_credential_ref"
+
+        # An unauthenticated provider on a host no allow-list/credential
+        # host covers is refused at write time.
+        unlisted = client.put(
+            "/api/v1/config/platform/product_knowledge_provider",
+            json={
+                "value": {
+                    **value,
+                    "endpoint_url": "http://other.invalid/mcp",
+                    "credential_ref": None,
+                }
+            },
+            headers=csrf,
+        )
+        assert unlisted.status_code == 422
+        assert unlisted.json()["detail"] == "unauthenticated_host_not_allowed"
+
+        credentials = client.get("/api/v1/product-knowledge/credentials")
+        assert credentials.status_code == 200
+        assert isinstance(credentials.json(), list)
+
+        probe = client.post(
+            "/api/v1/product-knowledge/test-connection",
+            json={"endpoint_url": "http://other.invalid/mcp", "credential_ref": None},
+            headers=csrf,
+        )
+        assert probe.status_code == 200, probe.text
+        assert probe.json()["status"] == "blocked_by_policy"
+        assert probe.json()["message"]

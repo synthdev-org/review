@@ -87,6 +87,10 @@ _FRAMEWORK_MODULES = frozenset(
         "context_symbols",
         "context_bundle",
         "citation",
+        # Pure product-knowledge wire models/logic (plan-deliver-product-
+        # knowledge.md): a shared helper `context_builder` (provider branch)
+        # and `context_bundle`/`citation` import, no `Step` of its own.
+        "product_knowledge",
         "diff_prompt",
         "llm_response",
         "llm_telemetry",

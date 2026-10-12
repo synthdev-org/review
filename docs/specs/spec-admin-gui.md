@@ -703,6 +703,33 @@ Per `testing.md`'s pyramid.
 | US-A22 | Admin UI Deployment has liveness/readiness probes and resource requests/limits matching the Webhook API's own pattern | `charts/review/tests/` | Integration (Helm template rendering) |
 | Phase 5 exit scenario | Full Docker Compose stack: an admin logs in, configures a repo, approves a pending Memory entry, and changes review-generation's model — all through the real UI against the real backend | `tests/e2e/test_admin_ui.py` (new) | E2E |
 
+## Amendment 2026-10-11 — Phase 7 product-knowledge provider configuration
+
+*Added by [`spec-product-knowledge.md`](spec-product-knowledge.md); the
+stories above are unchanged. This block only records what that spec adds to
+this one's surface.*
+
+- **Scope → In scope, "Org/repo/team configuration screens" (US-A12/US-A13):**
+  the closed `SETTING_KEY_REGISTRY` gains one key,
+  `product_knowledge_provider` (`enabled`, `display_name`, `endpoint_url`,
+  `credential_ref`, `allow_public_repos`, `issue_key_prefixes`). Written through the existing
+  `PUT /api/v1/config/{scope}/{key}` (Admin-only, audit-logged, 422 on
+  invalid, platform < org < repo precedence). Team scope is rejected for this
+  key.
+- **New routes** (Admin API): `GET /api/v1/product-knowledge/credentials`
+  (credential reference names, never tokens; Viewer-readable via
+  `require_session`; the bound hosts are returned to Admins only) and `POST /api/v1/product-knowledge/test-connection`
+  (Admin-only via `require_admin_role`; audit-logged).
+- **UX & Design → Config screen:** one new "Product knowledge" panel
+  (fields, effective-config preview, Test connection, inline data-egress
+  disclosure) at platform/org/repo scope; states and permission-denied
+  behavior follow this spec's existing rules.
+- **RBAC (US-A5):** unchanged rule applied — write and the side-effecting
+  test probe are Admin-only; reads are Viewer-visible.
+- **Non-Functional → Security:** a new bootstrap credential map is read by
+  `apps/admin_api` as well as the Worker (test-connection); tokens never
+  appear in any Admin API response or audit record.
+
 ## Open items requiring validation
 
 These were resolved as **assumptions pending validation** during this

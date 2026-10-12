@@ -298,3 +298,35 @@ class TestMainCLI:
         captured = capsys.readouterr()
         assert exit_code == 1
         assert "review_totally_unregistered_total" in captured.err
+
+
+class TestShippedDashboardCoversProductKnowledge:
+    """US-PK14 / plan Phase 7b: the shipped dashboard's product-knowledge row
+    references only instruments the code registers (the existing guard, run
+    against the real dashboard and the real source tree)."""
+
+    def test_real_dashboard_references_the_product_knowledge_instruments_and_has_no_drift(
+        self,
+    ) -> None:
+        dashboard = check_dashboard_metrics.DEFAULT_DASHBOARD_PATH
+        tokens = check_dashboard_metrics.dashboard_metric_tokens(dashboard)
+
+        assert "review_product_knowledge_call_total" in tokens
+        assert "review_product_knowledge_call_duration_ms_milliseconds_bucket" in tokens
+        check_dashboard_metrics.check()  # raises DriftError on any drift
+
+    def test_job_outcome_panel_splits_by_outcome_and_excludes_ok_and_not_configured(self) -> None:
+        dashboard = json.loads(check_dashboard_metrics.DEFAULT_DASHBOARD_PATH.read_text())
+        exprs = [
+            target["expr"]
+            for panel in dashboard["panels"]
+            for target in panel.get("targets", [])
+            if "review_product_knowledge_call_total" in target.get("expr", "")
+            and 'operation="job"' in target["expr"]
+        ]
+
+        assert len(exprs) == 1
+        assert "by (outcome)" in exprs[0]
+        # not_configured is the steady state for most repos; plotting it
+        # would bury the actionable config-class outcomes.
+        assert 'outcome!~"ok|not_configured"' in exprs[0]

@@ -54,6 +54,17 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # adapter/analyzers/test_semgrep.py runs the real Semgrep CLI, which
+      # lives in its own locked environment (tools/semgrep, ADR-0013).
+      - name: Install Semgrep (isolated environment)
+        run: |
+          set -euo pipefail
+          uv sync --project tools/semgrep --locked
+          mkdir -p "$HOME/.local/semgrep-bin"
+          ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
+          echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
+          semgrep --version
+
       # No `-m integration` here on purpose: integration tests (Phase 2
       # onward, tagged @pytest.mark.integration) run on every PR, not every
       # push, per docs/rules/testing.md's CI-gating section. Plain `pytest`
@@ -84,8 +95,19 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      # Semgrep is already covered by uv sync --locked above (a
-      # pyproject.toml dependency, Phase 5). Gitleaks is not (a Go binary
+      # Semgrep lives in its own locked environment (tools/semgrep) because
+      # it conflicts with the main project's `mcp` pin (ADR-0013); the
+      # adapter runs it as a `semgrep` subprocess found on PATH.
+      - name: Install Semgrep (isolated environment)
+        run: |
+          set -euo pipefail
+          uv sync --project tools/semgrep --locked
+          mkdir -p "$HOME/.local/semgrep-bin"
+          ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
+          echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
+          semgrep --version
+
+      # Gitleaks is not (a Go binary
       # with no first-party Python packaging, per the plan's Assumptions
       # section) — this job runs `pytest -m integration` directly on the
       # runner, not inside the built Docker image (which vendors Gitleaks

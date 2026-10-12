@@ -224,6 +224,17 @@ services:
       # not running, per that phase's own Observability & rollback section.
       REVIEW_ADMIN_API_PROMETHEUS_BASE_URL: >-
         ${REVIEW_ADMIN_API_PROMETHEUS_BASE_URL:-http://prometheus:9090}
+      # Product knowledge (plan-deliver-product-knowledge.md Phase 6) — the
+      # same credential map as the worker's; empty/unset means none. See
+      # .env.example for the shape and the kill switch.
+      REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS: ${REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS:-}
+      REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENABLED: ${REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENABLED:-true}
+      REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS: >-
+        ${REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS:-5}
+      REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS: >-
+        ${REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS:-true}
+      REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST: >-
+        ${REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST:-}
       # See webhook_api's own identical entry above for why this is a bare
       # pass-through (`KEY:`, no `:-` default) rather than
       # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}`.
@@ -284,6 +295,19 @@ services:
       REVIEW_WORKER_GITHUB_API_BASE_URL: ${REVIEW_WORKER_GITHUB_API_BASE_URL:-https://api.github.com}
       REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: ${REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS:-10}
       REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: ${REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS:-3}
+      # Product knowledge (plan-deliver-product-knowledge.md Phase 6) —
+      # optional external provider; empty/unset credentials means none. See
+      # .env.example for the shape, the kill switch and the egress policy.
+      REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS: ${REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS:-}
+      REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED: ${REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED:-true}
+      REVIEW_WORKER_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS: >-
+        ${REVIEW_WORKER_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS:-5}
+      REVIEW_WORKER_PRODUCT_KNOWLEDGE_DEADLINE_SECONDS: >-
+        ${REVIEW_WORKER_PRODUCT_KNOWLEDGE_DEADLINE_SECONDS:-10}
+      REVIEW_WORKER_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS: >-
+        ${REVIEW_WORKER_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS:-true}
+      REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST: >-
+        ${REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST:-}
       # See webhook_api's own identical entry above for why this is a bare
       # pass-through (`KEY:`, no `:-` default) rather than
       # `${OTEL_EXPORTER_OTLP_ENDPOINT:-}`.

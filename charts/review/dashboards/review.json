@@ -770,6 +770,193 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 24,
+      "type": "row",
+      "title": "Product knowledge (optional external augmentation)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "panels": []
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Provider job outcomes (non-ok, by outcome)",
+      "description": "review.product_knowledge.call_total at operation=job, every outcome except ok and not_configured (the steady state for repos with no provider), split by outcome so config-class failures (credential_unavailable, blocked_egress, unsupported_version, auth_failed, redaction_disabled) stand out from empty/no_query. No alert rules ship; see docs/reference/operations.md.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 53
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_product_knowledge_call_total{operation=\"job\",origin=\"worker\",outcome!~\"ok|not_configured\"}[5m])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Provider call rate by operation and outcome",
+      "description": "review.product_knowledge.call_total for the tool calls (contract/search/fetch) only; job-level outcomes are on the left.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 53
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_product_knowledge_call_total{operation!=\"job\",origin=\"worker\"}[5m])) by (operation, outcome)",
+          "legendFormat": "{{operation}} {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Provider call duration (p95)",
+      "description": "review.product_knowledge.call_duration_ms p95 per tool call.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 53
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_product_knowledge_call_duration_ms_milliseconds_bucket{operation!=\"job\",origin=\"worker\"}[5m])) by (le, operation))",
+          "legendFormat": "{{operation}} p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Citation refs unresolved (ratio)",
+      "description": "review.citation.ref_total: share of LLM-cited context ref ids that did not resolve against the job's bundle. A jump after a deploy points at an id-allocation (code vs product-knowledge id space) or prompt regression; a steady trickle is ordinary hallucination.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 35
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_citation_ref_total{result=\"unresolved\"}[15m])) / clamp_min(sum(rate(review_citation_ref_total[15m])), 1e-9)",
+          "legendFormat": "unresolved share"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Product knowledge config resolution failures",
+      "description": "review.product_knowledge.config_resolution_total at source=invalid|fallback_on_error: a bad or unreadable provider setting is silently degrading to not-configured. Zero is the healthy state.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 61
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_product_knowledge_config_resolution_total{source=~\"invalid|fallback_on_error\"}[5m])) by (source)",
+          "legendFormat": "{{source}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Admin config write rejections",
+      "description": "review.config.write_total with outcome != ok, by registry key. Repeated product_knowledge_provider rejections mean an admin cannot save the provider (egress allowlist or credential-ref misconfiguration).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 61
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(review_config_write_total{outcome!=\"ok\"}[1h])) by (key, outcome)",
+          "legendFormat": "{{key}} / {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
     }
   ]
 }

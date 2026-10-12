@@ -16,13 +16,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import SettingsConfigDict
 
+from adapter.product_knowledge.settings import ProductKnowledgeSettingsMixin
 from adapter.telemetry.sdk import OtelSettingsMixin
 
 
-class AdminAPISettings(OtelSettingsMixin):
+class AdminAPISettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     """Bootstrap settings for the Admin API process."""
 
     model_config = SettingsConfigDict(
@@ -130,3 +131,11 @@ class AdminAPISettings(OtelSettingsMixin):
     prometheus_base_url: str = "http://prometheus:9090"
     prometheus_timeout_seconds: float = 5.0
     prometheus_retry_max_attempts: int = 2
+
+    @field_validator("product_knowledge_endpoint_allowlist")
+    @classmethod
+    def _allowlist_is_valid(cls, value: str) -> str:
+        # Overrides the mixin's fail-fast check: the Admin API fails *open*
+        # (like the credential map) - the composition root catches the
+        # parse error, logs it value-free and disables product knowledge.
+        return value

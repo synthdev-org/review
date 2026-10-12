@@ -100,10 +100,11 @@ from typing import Literal
 from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import SettingsConfigDict
 
+from adapter.product_knowledge.settings import ProductKnowledgeSettingsMixin
 from adapter.telemetry.sdk import OtelSettingsMixin
 
 
-class WorkerSettings(OtelSettingsMixin):
+class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     """Bootstrap settings for the Worker process.
 
     `environment` has no default on purpose: an entrypoint that silently
@@ -351,6 +352,17 @@ class WorkerSettings(OtelSettingsMixin):
     # Worker restart to flip, unlike a routing config change itself.
     model_routing_config_enabled: bool = True
 
+    # --- Product knowledge (plan-deliver-product-knowledge.md, Phase 6) ---
+    # The shared fields (credential map, kill switch, call timeout, private-
+    # network switch, allow-list) come from `ProductKnowledgeSettingsMixin`.
+    # `product_knowledge_deadline_seconds` bounds the whole provider branch
+    # (resolve + negotiate + search + fetch) and is Worker-only. Ordering
+    # `call < deadline < context_builder_internal_timeout_seconds` is
+    # enforced only when the feature is actually in use (enabled with a
+    # credential map), so an operator who tuned the internal timeout to
+    # <= 10 s still starts clean on upgrade with nothing configured.
+    product_knowledge_deadline_seconds: int = 10
+
     # --- Findings-merge-and-output step (Phase 7, review/output.py) ---
     # A single bootstrap-config kill-switch: when set, the full pipeline
     # still runs (including this step's own merge/redaction-consuming
@@ -429,5 +441,39 @@ class WorkerSettings(OtelSettingsMixin):
                 "timeout must leave a real margin over the internal orchestration "
                 "timeout, or the outer StepRegistry could time out the whole step before "
                 "its own internal timeout ever gets a chance to degrade gracefully"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _product_knowledge_credentials_and_timeouts_are_valid(self) -> WorkerSettings:
+        """Fail fast (naming the problem, never the value) on a malformed
+        credential map, and enforce ``call < deadline < internal`` when the
+        feature is in use (a non-empty credential map or endpoint allow-list
+        with the kill switch on)."""
+        # Why gated, not unconditional: the provider *setting* lives in
+        # Postgres (day-two Admin UI config), which settings construction
+        # cannot read, so a non-empty credential map is the only bootstrap
+        # signal that the feature is in use, and a non-empty endpoint
+        # allow-list is the one for an unauthenticated-only provider (it
+        # cannot be reached without a credential or an allow-list entry).
+        # Validating unconditionally would make the default 5/10/20 s
+        # relationship (and any operator tuning of the Context Builder
+        # timeout for other reasons) fatal for every install that never
+        # enables product knowledge.
+        in_use = self.product_knowledge_enabled and bool(
+            self.credential_map() or self.endpoint_allowlist()
+        )
+        if in_use and not (
+            self.product_knowledge_call_timeout_seconds
+            < self.product_knowledge_deadline_seconds
+            < self.context_builder_internal_timeout_seconds
+        ):
+            raise ValueError(
+                "product_knowledge_call_timeout_seconds "
+                f"({self.product_knowledge_call_timeout_seconds}) must be less than "
+                f"product_knowledge_deadline_seconds ({self.product_knowledge_deadline_seconds}), "
+                "which must be less than context_builder_internal_timeout_seconds "
+                f"({self.context_builder_internal_timeout_seconds}) - the provider branch "
+                "must finish inside the Context Builder's own window"
             )
         return self

@@ -15,9 +15,11 @@ import type {
   ListUsersResponse,
   MemoryEntry,
   ModelRoutingView,
+  ProductKnowledgeCredential,
   Role,
   SessionInfo,
   SettingRow,
+  TestConnectionResult,
   UsageView,
 } from "./types";
 
@@ -135,6 +137,24 @@ export function setConfig(
     `/config/${encodeURIComponent(scope)}/${encodeURIComponent(key)}`,
     { method: "PUT", body: { value } }
   );
+}
+
+// --- Product knowledge provider (Unit H) ---
+
+export function getProductKnowledgeCredentials(): Promise<ProductKnowledgeCredential[]> {
+  return apiRequest<ProductKnowledgeCredential[]>("/product-knowledge/credentials");
+}
+
+export function testProductKnowledgeConnection(
+  endpointUrl: string,
+  credentialRef: string | null,
+  signal?: AbortSignal
+): Promise<TestConnectionResult> {
+  return apiRequest<TestConnectionResult>("/product-knowledge/test-connection", {
+    method: "POST",
+    body: { endpoint_url: endpointUrl, credential_ref: credentialRef },
+    signal,
+  });
 }
 
 // --- Model routing (Unit F) ---

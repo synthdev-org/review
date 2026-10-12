@@ -16,6 +16,27 @@ external augmentation is optional and non-code-scoped, results stay
 distinctly labeled) is unchanged; what changes is that the integration
 contract is now review's own, not knowhow's.
 
+**Amended 2026-10-11**: the open questions below are resolved by
+[`docs/specs/spec-product-knowledge.md`](../specs/spec-product-knowledge.md)
+and [ADR-0013](0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md),
+again in place (nothing has shipped against this contract). Three substantive
+changes to the text above, none altering the decision's direction:
+
+* **The contract gains fields it was missing for deterministic citations:**
+  every result item carries a required `title`, and search/related items carry
+  an optional `updated_at`; `url` and `score` are optional-nullable. A fourth
+  tool, `product_knowledge_contract`, is how a provider declares the contract
+  version(s) it implements (the "negotiated at connection time" mechanism).
+  `product_knowledge_related` is optional for providers.
+* **The credential is held by reference.** The per-org/repo day-two config
+  stores the endpoint, display name, and a credential *reference*; the token
+  itself is bootstrap config (a Kubernetes `Secret`, `existingSecret`-
+  compatible) bound to specific hosts, consistent with design goal 7.
+* **The "works out of the box" claim for knowhow is not yet true:** knowhow
+  currently exposes `knowhow_search`/`knowhow_fetch`/`knowhow_related` with
+  different arguments and encoding. It becomes true when knowhow registers the
+  contract tools; the conformance suite is the acceptance check.
+
 ## RACI
 
 | Who | Role | RACI |
@@ -234,26 +255,22 @@ provider's roadmap, knowhow's included.
 
 ## Open questions
 
-* Exact UX/prompt design for presenting dual-sourced context to the
-  review-generation LLM call, and how citations back to provider-sourced
-  content should render in a posted PR comment, including how the
-  provider's display name is surfaced.
-* Whether review's per-team Memory store (learnings, dismissed-finding
-  filtering) stays entirely review-owned, or also feeds back into a
-  configured provider's own knowledge layer (e.g. knowhow's
-  `fact_context`) so other surfaces of that provider benefit too — this is
-  now a per-provider integration question, not something review can assume
-  generically.
-* **Review's own contract versioning/deprecation policy** — how a new
-  contract version is introduced without breaking existing provider
-  configurations, and how long an old version stays supported. This
-  replaces the original open question about knowhow's own policy; review
-  now owns this decision instead of inheriting it.
-* Whether a lightweight conformance check (a test harness review ships that
-  any provider implementer, including knowhow, can run against their MCP
-  server) is worth building before this ships as a supported feature, given
-  review has no other way to verify a third-party implementation behaves
-  correctly.
+All four original open questions are resolved (2026-10-11):
+
+* **Context-fusion/citation UX** — resolved in
+  [`spec-product-knowledge.md`](../specs/spec-product-knowledge.md): a
+  separate labeled prompt section and a separate bundle budget; citations
+  rendered by the platform as `[title](url) — source_type · host` under a
+  label naming the provider's display name.
+* **Feeding Memory back to a provider** — decided **out of scope**: the
+  contract is read-only and Memory stays review-owned and human-approved
+  (design goal 9). Revisit only as a new optional tool under its own ADR.
+* **Contract versioning/deprecation policy** — decided in
+  [ADR-0013](0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md)
+  decision 4: integer majors, additive-only within a major, current and
+  previous major supported, 12-month minimum deprecation window.
+* **Conformance harness** — decided **yes**, shipped with Phase 7 as a
+  pytest-runnable suite plus an in-repo fake provider.
 
 ## Related
 
@@ -263,6 +280,10 @@ provider's roadmap, knowhow's included.
   provider-agnostic terms.
 * [`docs/roadmap.md`](../roadmap.md) — Phase 7, which delivers this
   contract and its reference (knowhow) configuration.
+* [`docs/specs/spec-product-knowledge.md`](../specs/spec-product-knowledge.md)
+  and [ADR-0013](0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md)
+  — the wire contract, configuration, security model, and client
+  implementation decisions for Phase 7.
 * [`docs/adr/0001-self-hosted-kubernetes-deployment.md`](0001-self-hosted-kubernetes-deployment.md)
   — the self-hosted trust/simplicity story this decision preserves for
   review-only deployments.

@@ -37,7 +37,7 @@ OutputT = TypeVar("OutputT", covariant=True)
 
 
 class JobIdentity(BaseModel):
-    """The six job-identifying fields (which org/repo/installation/PR a job
+    """The job-identifying fields (which org/repo/installation/PR a job
     is for) that every macro step's own Input and Output model carries
     forward, per ``review.pipeline.StepRegistry``'s single-dependency-input
     design: each step's ``Output`` becomes the next step's ``Input``, so
@@ -49,7 +49,7 @@ class JobIdentity(BaseModel):
     for why.
 
     A concrete step's own Input/Output model inherits this instead of
-    repeating the same six fields six times across three files — previously
+    repeating the same fields across three files — previously
     duplicated byte-for-byte in ``review/prefilter.py``,
     ``review/static_analysis.py``, and ``review/review_generation.py``. Living in
     ``review/step.py`` (a framework module every step module already
@@ -59,12 +59,12 @@ class JobIdentity(BaseModel):
 
     ``base_sha`` (added by
     docs/plans/plan-deliver-context-builder.md's Phase 1 section) is
-    **optional** (``str | None = None``), unlike the six required fields
+    **optional** (``str | None = None``), unlike the required fields
     above — a required field here would raise a pydantic ``ValidationError``
     on ``PrefilterStep.run``'s very first ``PrefilterOutput(...)``
     construction for every job, since GitHub's payload can genuinely omit
     ``pull_request.base.sha``. Because it's optional, it is **not**
-    automatically carried forward the way the six required fields are — each
+    automatically carried forward the way the required fields are — each
     step's own ``Output`` construction that should carry it forward must
     still forward it explicitly (``base_sha=input.base_sha``), per that
     plan's Assumption 2.
@@ -77,13 +77,28 @@ class JobIdentity(BaseModel):
     pr_number: int
     head_sha: str
     base_sha: str | None = None
+    # Product-knowledge capture (docs/plans/plan-deliver-product-knowledge.md
+    # Phase 2, US-PK2/A1). Optional for the same reason ``base_sha`` is, and
+    # likewise not auto-carried: hand-constructing sites forward them
+    # explicitly. ``pr_is_fork is None`` (old payload) must be treated as
+    # "fork" by the exposure gate (fail closed). The PR body is never carried.
+    pr_title: str | None = None
+    pr_head_ref: str | None = None
+    pr_issue_keys: tuple[str, ...] = ()
+    pr_is_fork: bool | None = None
+    # Whether the repo is private on GitHub — the REVIEW payload's existing
+    # ``private`` key (also read by ``apps/worker/dispatch.py`` for usage
+    # metering). Defaults to ``False`` so an absent value fails closed at the
+    # product-knowledge exposure gate (A1): a repo is only ever treated as
+    # private when the webhook said so.
+    private: bool = False
 
 
 def job_identity_fields(source: JobIdentity) -> dict[str, Any]:
-    """``source``'s own seven ``JobIdentity`` fields, as a dict keyed by
+    """``source``'s own ``JobIdentity`` fields, as a dict keyed by
     field name — for a step's own Output construction that forwards every
     ``JobIdentity`` field unchanged from its parsed input, without
-    hand-listing each of the seven keyword arguments. Previously duplicated
+    hand-listing each keyword argument. Previously duplicated
     byte-for-byte across ``review/review_generation.py``,
     ``review/intent_summary.py``, and ``review/verification.py``'s own
     Output-construction return statements; living here for the same

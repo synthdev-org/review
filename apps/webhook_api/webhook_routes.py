@@ -76,6 +76,12 @@ from adapter.storage.queue import JobQueueRepository
 from adapter.telemetry.sdk import suppress_telemetry_errors
 from apps.webhook_api.rate_limiter import InMemoryRateLimiter
 from findings.redact import TextRedactor
+from ingestion.pr_metadata import (
+    extract_issue_keys,
+    is_fork_pr,
+    normalize_head_ref,
+    normalize_title,
+)
 from memory.reaction_poll import run_memory_reaction_poll_job
 from memory.store import MemorySignalRecorder, MemoryStoreError, ReactionDedupStore, ReactionFetcher
 from tenancy.resolution import ResolutionResult, TenancyStore, WebhookEvent, resolve_installation
@@ -189,6 +195,43 @@ def _build_webhook_event(envelope: GitHubWebhookEnvelope, *, delivery_id: str) -
             else None
         ),
         repo_private=envelope.repository.private,
+        pr_title=normalize_title(pull_request.title) if pull_request is not None else None,
+        pr_head_ref=(
+            normalize_head_ref(pull_request.head.ref)
+            if pull_request is not None and pull_request.head is not None
+            else None
+        ),
+        # The PR body is read only inside `extract_issue_keys` and dropped
+        # here; it is never placed on the event or the job payload.
+        pr_issue_keys=(
+            extract_issue_keys(
+                pull_request.title,
+                pull_request.head.ref if pull_request.head is not None else None,
+                pull_request.body,
+            )
+            if pull_request is not None
+            else ()
+        ),
+        pr_is_fork=_pr_is_fork(envelope) if pull_request is not None else None,
+    )
+
+
+def _pr_is_fork(envelope: GitHubWebhookEnvelope) -> bool:
+    """Fail-closed fork derivation (A1(b)) over the envelope's head/base repo
+    objects; the base repo falls back to the envelope's own repository."""
+    assert envelope.pull_request is not None and envelope.repository is not None
+    head = envelope.pull_request.head
+    base = envelope.pull_request.base
+    head_repo = head.repo if head is not None else None
+    base_repo = base.repo if base is not None else None
+    return is_fork_pr(
+        head_repo_full_name=head_repo.full_name if head_repo is not None else None,
+        head_repo_fork=head_repo.fork if head_repo is not None else None,
+        base_repo_full_name=(
+            base_repo.full_name
+            if base_repo is not None and base_repo.full_name is not None
+            else envelope.repository.full_name
+        ),
     )
 
 
@@ -249,6 +292,12 @@ def _review_enqueue_payload(
         # missing-required-field rejection the way `pr_number`/`head_sha`
         # above are).
         "base_sha": event.base_sha,
+        # Product-knowledge capture (docs/plans/plan-deliver-product-knowledge.md
+        # Phase 2, A1): REVIEW only. No PR body is ever included.
+        "pr_title": event.pr_title,
+        "pr_head_ref": event.pr_head_ref,
+        "pr_issue_keys": list(event.pr_issue_keys),
+        "pr_is_fork": event.pr_is_fork,
     }
 
 

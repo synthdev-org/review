@@ -335,3 +335,28 @@ async def test_no_funnel_counter_carries_any_attribute(
     assert set(found) == set(_FUNNEL_METRIC_NAMES)
     for _value, attributes in found.values():
         assert attributes == {}
+
+
+@pytest.mark.asyncio
+async def test_product_knowledge_capture_fields_are_forwarded_to_output() -> None:
+    """Phase 2 of docs/plans/plan-deliver-product-knowledge.md: the optional
+    ``JobIdentity`` fields must be explicitly forwarded by this step."""
+    step = PrefilterStep(_FakeDiffFetcher(Diff(files=(_file("app.py"),))))
+    job_input = {
+        **_INPUT,
+        "base_sha": "base-1",
+        "pr_title": "Fix PROJ-9",
+        "pr_head_ref": "bugfix/PROJ-9",
+        "pr_issue_keys": ["PROJ-9", "#41"],
+        "pr_is_fork": True,
+        "private": True,
+    }
+
+    output = await step.run(job_input, _context())
+
+    assert output.base_sha == "base-1"
+    assert output.pr_title == "Fix PROJ-9"
+    assert output.pr_head_ref == "bugfix/PROJ-9"
+    assert output.pr_issue_keys == ("PROJ-9", "#41")
+    assert output.pr_is_fork is True
+    assert output.private is True  # fail-closed field: a dropped forward kills the feature

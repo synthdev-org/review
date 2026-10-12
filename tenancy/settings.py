@@ -24,9 +24,10 @@ boundary the way most other Protocols in this plan are.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 
 class SettingRow(BaseModel):
@@ -94,15 +95,13 @@ class ScopeDescriptorError(Exception):
 
 # --- Closed setting-key registry -------------------------------------------
 #
-# Nothing yet reads `OrgRepoTeamSetting` for runtime pipeline behavior (this
-# phase only builds the admin round-trip — see the plan's own "Observability
-# & rollback" bullet), so the two keys below are this phase's own
-# placeholder registry, not a commitment any later phase's runtime read path
-# is bound to: whichever real per-org/repo/team toggles a future phase
-# actually wires up register their own pydantic model here, following this
-# same shape. What matters for US-A13 today is that the registry is closed
-# (an unknown key is always rejected, never silently accepted) and that each
-# known key's value has a real schema (never a bare, unchecked `dict`).
+# The registry is closed (an unknown key is always rejected, never silently
+# accepted) and each known key's value has a real schema (never a bare,
+# unchecked `dict`). The first two keys are the admin round-trip's
+# placeholder toggles; `product_knowledge_provider` is the first key with a
+# runtime reader (`adapter/product_knowledge/provider_resolver.py`, plan
+# `plan-deliver-product-knowledge.md` Phase 6) - whichever further keys a
+# phase wires up register their own pydantic model here, same shape.
 
 
 class MemorySuppressionSetting(BaseModel):
@@ -119,9 +118,65 @@ class FindingsSeverityThresholdSetting(BaseModel):
     threshold: Literal["low", "medium", "high", "critical"]
 
 
+PRODUCT_KNOWLEDGE_PROVIDER_KEY = "product_knowledge_provider"
+
+# Keys whose value is meaningful at platform/org/repo scope only: a team is a
+# sibling of repos, not an ancestor, so a review job has no team to resolve.
+# Writes at team scope are rejected and any orphaned team row is ignored.
+TEAM_SCOPE_UNSUPPORTED_KEYS: frozenset[str] = frozenset({PRODUCT_KNOWLEDGE_PROVIDER_KEY})
+
+
+class ProductKnowledgeProviderSetting(BaseModel):
+    """Which external product-knowledge provider serves this scope (spec
+    ``spec-product-knowledge.md`` US-PK8). The whole object at the narrowest
+    scope wins - no field merging - and ``enabled: false`` at a narrower
+    scope opts that scope out of an inherited provider. The token is never
+    part of this value: ``credential_ref`` only names an operator-provisioned
+    bootstrap credential.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    display_name: str = Field(pattern=r"^[A-Za-z0-9 ._()-]{1,40}$")
+    endpoint_url: str
+    credential_ref: str | None = Field(default=None, pattern=r"^[a-z0-9_-]{1,64}$")
+    allow_public_repos: bool = False
+    issue_key_prefixes: list[Annotated[str, Field(pattern=r"^[A-Z][A-Z0-9]{1,9}$")]] = Field(
+        default_factory=list, max_length=20
+    )
+
+    @field_validator("endpoint_url")
+    @classmethod
+    def _endpoint_url_is_plain_http(cls, value: str) -> str:
+        return validate_endpoint_url(value)
+
+
+def validate_endpoint_url(value: str) -> str:
+    """Absolute ``http(s)`` URL, <= 512 chars, with a host and no userinfo,
+    fragment or query (a credential or secret must never ride the URL).
+    Returned unchanged; raises ``ValueError`` (with a fixed message, never the
+    value) otherwise."""
+    if len(value) > 512 or not value.isascii() or any(c.isspace() or ord(c) < 32 for c in value):
+        raise ValueError("endpoint_url must be a printable ASCII URL of at most 512 characters")
+    try:
+        parts = urlsplit(value)
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError as exc:
+        raise ValueError("endpoint_url is not a valid URL") from exc
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("endpoint_url must be an absolute http(s) URL with a host")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("endpoint_url must not contain userinfo")
+    if parts.query or parts.fragment or "?" in value or "#" in value:
+        raise ValueError("endpoint_url must not contain a query or fragment")
+    return value
+
+
 SETTING_KEY_REGISTRY: dict[str, type[BaseModel]] = {
     "memory_suppression_enabled": MemorySuppressionSetting,
     "findings_severity_threshold": FindingsSeverityThresholdSetting,
+    PRODUCT_KNOWLEDGE_PROVIDER_KEY: ProductKnowledgeProviderSetting,
 }
 """The small, closed registry Phase 4's own plan section calls for —
 ``PostgresSettingRepository.upsert`` validates every write against this
@@ -144,7 +199,13 @@ def validate_setting_value(key: str, raw_value: dict[str, object]) -> dict[str, 
     try:
         validated = model_cls.model_validate(raw_value)
     except ValidationError as exc:
-        raise SettingValidationError(key=key, detail=str(exc)) from exc
+        # Field locations and messages only: the offered value is never
+        # echoed (a pasted URL may carry userinfo or a token).
+        detail = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or 'value'}: {err['msg']}"
+            for err in exc.errors(include_input=False, include_url=False, include_context=False)
+        )
+        raise SettingValidationError(key=key, detail=detail) from exc
     return validated.model_dump(mode="json")
 
 
@@ -195,6 +256,55 @@ def resolve_setting(
         if row is not None:
             return row
     return None
+
+
+class EffectiveSetting(BaseModel):
+    """One key's resolved value at a node plus the scope descriptor it was
+    inherited from (``"platform"``, ``"org:<id>"``, ``"repo:<org>:<repo>"``)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    value: dict[str, object]
+    source: str
+
+
+def effective_settings(
+    rows: Sequence[SettingRow],
+    *,
+    org_id: str | None,
+    repo_id: str | None,
+    team_id: str | None,
+) -> dict[str, EffectiveSetting]:
+    """Every registry key's effective value at one node, via
+    ``resolve_setting`` (the single precedence implementation - the Admin UI
+    never re-derives it). Keys outside the registry (orphaned rows after a
+    code revert) are not resolved; keys in ``TEAM_SCOPE_UNSUPPORTED_KEYS``
+    ignore team-scoped rows. A resolved row whose value fails its key's schema
+    is omitted (unconfigured), never shown as effective."""
+    effective: dict[str, EffectiveSetting] = {}
+    for key in SETTING_KEY_REGISTRY:
+        row = resolve_setting(
+            key,
+            rows,
+            org_id=org_id,
+            repo_id=repo_id,
+            team_id=None if key in TEAM_SCOPE_UNSUPPORTED_KEYS else team_id,
+        )
+        if row is not None:
+            try:
+                validate_setting_value(key, row.value)
+            except SettingValidationError:
+                # A stored value its own schema rejects is unusable: consumers
+                # treat it as not configured (no fall-through to a parent), so
+                # it must not be presented as the effective value.
+                continue
+            effective[key] = EffectiveSetting(
+                value=row.value,
+                source=format_scope_descriptor(
+                    org_id=row.org_id, repo_id=row.repo_id, team_id=row.team_id
+                ),
+            )
+    return effective
 
 
 def format_scope_descriptor(*, org_id: str | None, repo_id: str | None, team_id: str | None) -> str:
@@ -266,6 +376,9 @@ class ScopeSettings(BaseModel):
     scope: str
     settings: dict[str, dict[str, object]]
     using_platform_defaults: bool
+    # Resolved (inherited) values per registry key, computed server-side by
+    # ``effective_settings``; ``settings`` above stays the literal own rows.
+    effective: dict[str, EffectiveSetting] = Field(default_factory=dict)
 
 
 class OrgConfig(ScopeSettings):
@@ -286,6 +399,7 @@ class ConfigTree(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     platform_settings: dict[str, dict[str, object]]
+    platform_effective: dict[str, EffectiveSetting] = Field(default_factory=dict)
     orgs: tuple[OrgConfig, ...]
 
 
@@ -300,6 +414,14 @@ class SettingRepository(Protocol):
     """
 
     async def get_config_tree(self) -> ConfigTree: ...
+
+    async def list_rows_for_key(
+        self, *, key: str, org_id: str | None, repo_id: str | None
+    ) -> tuple[SettingRow, ...]:
+        """The platform, org and repo rows (never team rows) for one key -
+        the narrow keyed read a runtime resolver feeds ``resolve_setting``,
+        instead of loading the whole config tree."""
+        ...
 
     async def upsert(
         self,

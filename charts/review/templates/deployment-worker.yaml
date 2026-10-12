@@ -28,5 +28,11 @@ spec:
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WORKER_LLM_API_KEY" "field" .Values.llm.apiKey "secretName" (include "review.secretName" .) "secretKey" "llm-api-key") | nindent 12 }}
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY" "field" .Values.github.appPrivateKey "secretName" (include "review.secretName" .) "secretKey" "github-app-private-key") | nindent 12 }}
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_DATABASE_URL" "field" .Values.database.url "secretName" (include "review.secretName" .) "secretKey" "database-url") | nindent 12 }}
+            {{- /* Only rendered when a credential map is configured: an
+                   unconditional secretKeyRef would break every existing
+                   install on upgrade (the key would not exist). */}}
+            {{- if or .Values.productKnowledge.credentials.value .Values.productKnowledge.credentials.existingSecret.name }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS" "field" .Values.productKnowledge.credentials "secretName" (include "review.secretName" .) "secretKey" "product-knowledge-credentials") | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}

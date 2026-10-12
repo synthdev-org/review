@@ -25,11 +25,11 @@ an adapter as a general rule.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import date, datetime, timedelta
 from typing import TypeVar, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -50,6 +50,7 @@ from tenancy.settings import (
     ScopeSettings,
     SettingRow,
     SettingStoreError,
+    effective_settings,
     format_scope_descriptor,
     validate_setting_value,
 )
@@ -231,6 +232,7 @@ def _scope_node(
     settings_by_scope: dict[
         tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None], dict[str, dict[str, object]]
     ],
+    all_rows: Sequence[SettingRow],
 ) -> ScopeSettings:
     """Builds one repo/team node for ``GET /api/v1/config``'s response
     tree — shared by ``PostgresSettingRepository.get_config_tree`` for both
@@ -248,6 +250,12 @@ def _scope_node(
         ),
         settings=own_settings,
         using_platform_defaults=not own_settings,
+        effective=effective_settings(
+            all_rows,
+            org_id=str(org_id),
+            repo_id=str(repo_id) if repo_id is not None else None,
+            team_id=str(team_id) if team_id is not None else None,
+        ),
     )
 
 
@@ -283,6 +291,7 @@ class PostgresSettingRepository:
             repos = (await session.execute(select(Repo).order_by(Repo.name))).scalars().all()
             teams = (await session.execute(select(Team).order_by(Team.name))).scalars().all()
             setting_rows = (await session.execute(select(OrgRepoTeamSetting))).scalars().all()
+            domain_rows = [_to_setting_row(r) for r in setting_rows]
 
             settings_by_scope: dict[
                 tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None],
@@ -311,6 +320,9 @@ class PostgresSettingRepository:
                         ),
                         settings=org_settings,
                         using_platform_defaults=not org_settings,
+                        effective=effective_settings(
+                            domain_rows, org_id=str(org.id), repo_id=None, team_id=None
+                        ),
                         repos=tuple(
                             _scope_node(
                                 entity_id=repo.id,
@@ -319,6 +331,7 @@ class PostgresSettingRepository:
                                 repo_id=repo.id,
                                 team_id=None,
                                 settings_by_scope=settings_by_scope,
+                                all_rows=domain_rows,
                             )
                             for repo in repos_by_org.get(org.id, [])
                         ),
@@ -330,6 +343,7 @@ class PostgresSettingRepository:
                                 repo_id=None,
                                 team_id=team.id,
                                 settings_by_scope=settings_by_scope,
+                                all_rows=domain_rows,
                             )
                             for team in teams_by_org.get(org.id, [])
                         ),
@@ -338,10 +352,68 @@ class PostgresSettingRepository:
 
             return ConfigTree(
                 platform_settings=settings_by_scope.get((None, None, None), {}),
+                platform_effective=effective_settings(
+                    domain_rows, org_id=None, repo_id=None, team_id=None
+                ),
                 orgs=tuple(org_configs),
             )
 
         return await self._run(operation="get_config_tree", fn=_read)
+
+    async def list_rows_for_key(
+        self, *, key: str, org_id: str | None, repo_id: str | None
+    ) -> tuple[SettingRow, ...]:
+        """The platform row, the org row and the repo row (never team rows)
+        for one ``key`` - the keyed runtime read behind
+        ``tenancy.settings.resolve_setting``. Deliberately not
+        ``get_config_tree``: one indexed-by-key query, no hierarchy joins,
+        and no registry validation of stored values (the consumer validates
+        what it uses, so an orphaned/odd row can never fail a read here).
+        """
+        try:
+            org_uuid = uuid.UUID(org_id) if org_id is not None else None
+            repo_uuid = uuid.UUID(repo_id) if repo_id is not None else None
+        except ValueError as exc:
+            raise SettingStoreError(operation="list_rows_for_key", detail="malformed id") from exc
+
+        async def _read(session: AsyncSession) -> tuple[SettingRow, ...]:
+            scopes = [
+                and_(
+                    OrgRepoTeamSetting.org_id.is_(None),
+                    OrgRepoTeamSetting.repo_id.is_(None),
+                    OrgRepoTeamSetting.team_id.is_(None),
+                )
+            ]
+            if org_uuid is not None:
+                scopes.append(
+                    and_(
+                        OrgRepoTeamSetting.org_id == org_uuid,
+                        OrgRepoTeamSetting.repo_id.is_(None),
+                        OrgRepoTeamSetting.team_id.is_(None),
+                    )
+                )
+                if repo_uuid is not None:
+                    scopes.append(
+                        and_(
+                            OrgRepoTeamSetting.org_id == org_uuid,
+                            OrgRepoTeamSetting.repo_id == repo_uuid,
+                            OrgRepoTeamSetting.team_id.is_(None),
+                        )
+                    )
+            found = (
+                (
+                    await session.execute(
+                        select(OrgRepoTeamSetting).where(
+                            OrgRepoTeamSetting.key == key, or_(*scopes)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return tuple(_to_setting_row(r) for r in found)
+
+        return await self._run(operation="list_rows_for_key", fn=_read)
 
     async def upsert(
         self,

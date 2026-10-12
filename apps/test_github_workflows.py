@@ -98,3 +98,23 @@ def test_e2e_workflow_runs_the_compose_e2e_suite() -> None:
     runs = _job_step_runs(job)
 
     assert any("pytest tests/e2e" in run for run in runs)
+
+
+def test_live_product_knowledge_conformance_step_is_nightly_only_and_non_gating() -> None:
+    steps = [
+        step
+        for step in _load("e2e.yml")["jobs"]["e2e"]["steps"]
+        if "adapter.product_knowledge.conformance" in step.get("run", "")
+    ]
+
+    assert len(steps) == 1, "e2e.yml must carry exactly one live conformance step"
+    step = steps[0]
+    condition = step.get("if", "")
+    # e2e.yml also triggers on push to main: the event guard keeps the live
+    # run off merges, PK_LIVE_URL opts a repo in, and a red run never gates.
+    assert "github.event_name == 'schedule'" in condition
+    assert "github.event_name == 'workflow_dispatch'" in condition
+    assert "PK_LIVE_URL" in condition
+    assert step.get("continue-on-error") is True
+    assert "PK_LIVE_URL" not in (WORKFLOWS_DIR / "ci.yml").read_text()
+    assert "adapter.product_knowledge.conformance" not in (WORKFLOWS_DIR / "ci.yml").read_text()

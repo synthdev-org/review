@@ -29,6 +29,15 @@ FROM deps AS dev-deps
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project
 
+# --- semgrep-tool: Semgrep in its own locked environment (tools/semgrep).
+# Semgrep hard-pins mcp 1.x, which conflicts with the main project's
+# `mcp>=2.3,<3` (ADR-0013), so it is not in the main dependency group; the
+# adapter only ever runs it as a `semgrep` subprocess found on PATH.
+FROM base AS semgrep-tool
+COPY tools/semgrep/pyproject.toml tools/semgrep/uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    UV_PROJECT_ENVIRONMENT=/opt/semgrep uv sync --locked --no-install-project
+
 # Gitleaks — vendored, not a PyPI dependency (a Go binary with no
 # first-party Python packaging), pinned to an explicit tag, per the plan's
 # Assumptions section ("Analyzer binary packaging"). Used in both the
@@ -96,6 +105,8 @@ RUN npm run build
 # that possible without network access from inside the `dev` container.
 FROM dev-deps AS dev
 COPY --from=gitleaks /usr/bin/gitleaks /usr/local/bin/gitleaks
+COPY --from=semgrep-tool /opt/semgrep /opt/semgrep
+RUN ln -s /opt/semgrep/bin/semgrep /usr/local/bin/semgrep
 COPY --from=embedding-model /model /app/models/all-MiniLM-L6-v2
 COPY . .
 ENV PATH="/app/.venv/bin:${PATH}"
@@ -104,6 +115,8 @@ ENV PATH="/app/.venv/bin:${PATH}"
 FROM base AS runtime
 COPY --from=deps /app/.venv /app/.venv
 COPY --from=gitleaks /usr/bin/gitleaks /usr/local/bin/gitleaks
+COPY --from=semgrep-tool /opt/semgrep /opt/semgrep
+RUN ln -s /opt/semgrep/bin/semgrep /usr/local/bin/semgrep
 COPY --from=embedding-model /model /app/models/all-MiniLM-L6-v2
 ENV PATH="/app/.venv/bin:${PATH}"
 COPY ingestion ./ingestion
@@ -115,6 +128,9 @@ COPY memory ./memory
 COPY tenancy ./tenancy
 COPY iam ./iam
 COPY adapter ./adapter
+# The fake MCP provider (fault injection) is test tooling: never in the
+# production image (plan Phase 4, Assumption 12).
+RUN rm -rf ./adapter/product_knowledge/testing
 COPY apps ./apps
 COPY pyproject.toml alembic.ini ./
 
@@ -136,6 +152,11 @@ COPY --from=frontend-build /frontend/dist ./apps/admin_api/frontend/dist
 # gets the same reduced privileges, not just the Worker's own analyzer
 # subprocesses.
 RUN useradd --system --no-create-home worker
+# Semgrep writes a log and a settings file under $HOME at start-up, and the
+# `worker` user has no home directory (it exits with PermissionError on
+# /home/worker otherwise) — point both at /tmp.
+ENV SEMGREP_LOG_FILE=/tmp/semgrep.log \
+    SEMGREP_SETTINGS_FILE=/tmp/semgrep-settings.yml
 USER worker
 
 # Default command runs the Webhook API; Compose/Helm override `command:` to

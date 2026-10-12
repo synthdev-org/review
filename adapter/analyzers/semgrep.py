@@ -1,7 +1,9 @@
 """adapter.analyzers.semgrep — the concrete ``StaticAnalyzer`` implementation
-backed by the ``semgrep`` PyPI package (added to ``pyproject.toml``'s main
-dependencies, per the plan's Assumptions section — "Semgrep ships a proper
-PyPI wheel ... added like any other library"), run against the vendored,
+backed by the ``semgrep`` CLI. Semgrep is **not** in the main dependency
+group (it hard-pins ``mcp`` 1.x, which conflicts with the product-knowledge
+adapter's ``mcp>=2.3``, ADR-0013); it is installed from its own locked
+environment (``tools/semgrep``) and found as ``semgrep`` on ``PATH`` — the
+Dockerfile's ``semgrep-tool`` stage and ci.yml set that up. It is run against the vendored,
 pinned ruleset (``adapter/analyzers/semgrep_ruleset.yaml`` — see that file's
 own header comment for the full "why not a live registry pack" reasoning).
 

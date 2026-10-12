@@ -13,6 +13,10 @@ metadata:
   labels:
     {{- include "review.labels" . | nindent 4 }}
 data:
+  # Long values are deliberately kept on one line, not folded with `>-`: a
+  # folded block scalar does not interpret quotes, so `>-` + `| quote` would
+  # render literal quote characters into the value. test-render.sh asserts no
+  # ConfigMap value is a block scalar; do not "tidy" these back.
   # --- Webhook API (apps/webhook_api/settings.py) ---
   REVIEW_WEBHOOK_API_ENVIRONMENT: {{ .Values.webhookApi.environment | quote }}
   REVIEW_WEBHOOK_API_LOG_LEVEL: {{ .Values.webhookApi.logLevel | quote }}
@@ -47,20 +51,27 @@ data:
   REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: {{ .Values.worker.github.apiTimeoutSeconds | quote }}
   REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: {{ .Values.worker.github.retryMaxAttempts | quote }}
 
+  # --- Product knowledge (non-secret; the token map is in secret.yaml) ---
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED: {{ .Values.productKnowledge.enabled | quote }}
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS: {{ .Values.productKnowledge.callTimeoutSeconds | quote }}
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_DEADLINE_SECONDS: {{ .Values.productKnowledge.deadlineSeconds | quote }}
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS: {{ .Values.productKnowledge.allowPrivateNetworks | quote }}
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST: {{ .Values.productKnowledge.endpointAllowlist | quote }}
+  REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENABLED: {{ .Values.productKnowledge.enabled | quote }}
+  REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS: {{ .Values.productKnowledge.callTimeoutSeconds | quote }}
+  REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS: {{ .Values.productKnowledge.allowPrivateNetworks | quote }}
+  REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST: {{ .Values.productKnowledge.endpointAllowlist | quote }}
+
   # --- Admin API (apps/admin_api/settings.py) — Phase 9 ---
   REVIEW_ADMIN_API_ENVIRONMENT: {{ .Values.adminApi.environment | quote }}
   REVIEW_ADMIN_API_LOG_LEVEL: {{ .Values.adminApi.logLevel | quote }}
   REVIEW_ADMIN_API_SESSION_COOKIE_SECURE: {{ .Values.adminApi.sessionCookieSecure | quote }}
-  REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES: >-
-    {{ .Values.adminApi.sessionIdleTimeoutMinutes | quote }}
+  REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES: {{ .Values.adminApi.sessionIdleTimeoutMinutes | quote }}
   REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_ATTEMPTS: {{ .Values.adminApi.loginRateLimit.attempts | quote }}
-  REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_WINDOW_MINUTES: >-
-    {{ .Values.adminApi.loginRateLimit.windowMinutes | quote }}
+  REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_WINDOW_MINUTES: {{ .Values.adminApi.loginRateLimit.windowMinutes | quote }}
   REVIEW_ADMIN_API_MIN_PASSWORD_LENGTH: {{ .Values.adminApi.minPasswordLength | quote }}
   REVIEW_ADMIN_API_LLM_MODEL: {{ .Values.adminApi.llmModel | quote }}
   REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH: {{ .Values.adminApi.embeddingModelPath | quote }}
   REVIEW_ADMIN_API_PROMETHEUS_BASE_URL: {{ .Values.adminApi.prometheus.baseUrl | quote }}
-  REVIEW_ADMIN_API_PROMETHEUS_TIMEOUT_SECONDS: >-
-    {{ .Values.adminApi.prometheus.timeoutSeconds | quote }}
-  REVIEW_ADMIN_API_PROMETHEUS_RETRY_MAX_ATTEMPTS: >-
-    {{ .Values.adminApi.prometheus.retryMaxAttempts | quote }}
+  REVIEW_ADMIN_API_PROMETHEUS_TIMEOUT_SECONDS: {{ .Values.adminApi.prometheus.timeoutSeconds | quote }}
+  REVIEW_ADMIN_API_PROMETHEUS_RETRY_MAX_ATTEMPTS: {{ .Values.adminApi.prometheus.retryMaxAttempts | quote }}

@@ -46,6 +46,12 @@ spec:
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME" "field" .Values.adminApi.bootstrapUsername "secretName" (include "review.secretName" .) "secretKey" "admin-bootstrap-username") | nindent 12 }}
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD" "field" .Values.adminApi.bootstrapPassword "secretName" (include "review.secretName" .) "secretKey" "admin-bootstrap-password") | nindent 12 }}
             {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_ADMIN_CSRF_SECRET" "field" .Values.adminApi.csrfSecret "secretName" (include "review.secretName" .) "secretKey" "admin-csrf-secret") | nindent 12 }}
+            {{- /* Only rendered when a credential map is configured: an
+                   unconditional secretKeyRef would break every existing
+                   install on upgrade (the key would not exist). */}}
+            {{- if or .Values.productKnowledge.credentials.value .Values.productKnowledge.credentials.existingSecret.name }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS" "field" .Values.productKnowledge.credentials "secretName" (include "review.secretName" .) "secretKey" "product-knowledge-credentials") | nindent 12 }}
+            {{- end }}
           # Fresh probe blocks — no existing probe pattern to mirror in this
           # chart (Assumption 10: neither deployment-webhook-api.yaml nor
           # deployment-worker.yaml has one today, and that pre-existing gap

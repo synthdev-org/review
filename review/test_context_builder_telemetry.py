@@ -22,6 +22,9 @@ changed-function symbol via the real (pure, no-I/O) tree-sitter chunker.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 from collections.abc import Iterator, Sequence
 
 import pytest
@@ -29,13 +32,29 @@ from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import Histogram, InMemoryMetricReader, Sum
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+import review.context_builder as context_builder_module
+from findings.redact import NoOpTextRedactor, TextRedactor
 from indexing.chunk import Chunk
 from indexing.embedding import EmbeddingVector
 from indexing.tree import RepoTreeEntry
 from ingestion.diff import Diff, DiffContentUnavailableError, DiffFetcher, DiffFile
 from review.context_builder import CallerHit, ContextBuilderStep, GraphQuery, SimilarityQuery
-from review.context_bundle import serialized_item_size
+from review.context_bundle import (
+    render_context_bundle_section,
+    render_product_knowledge_section,
+    serialized_item_size,
+)
+from review.pipeline import FailurePolicy, StepRegistry
+from review.product_knowledge import (
+    EffectiveProvider,
+    NegotiationResult,
+    ProductKnowledgeError,
+    ProviderOutcome,
+)
 from review.step import StepContext
 
 pytestmark = pytest.mark.asyncio
@@ -352,3 +371,399 @@ async def test_no_metric_attribute_ever_carries_anything_beyond_the_outcome_lite
     for _value, attributes in found.values():
         assert set(attributes) == {"outcome"}
         assert attributes["outcome"] in {"ok", "degraded_empty", "degraded_error"}
+
+
+# ---------------------------------------------------------------------------
+# Product-knowledge provider branch (plan Phase 7, US-PK14): span + metric
+# isolation, at Unit tier against fakes at the three provider Protocols.
+# ---------------------------------------------------------------------------
+
+
+class _FakeProvider:
+    def __init__(
+        self,
+        *,
+        fail_with: ProviderOutcome | None = None,
+        status_code: int | None = None,
+        hang_fetch: bool = False,
+        chosen_version: str | None = "1",
+        deprecated: bool = False,
+        negotiate_delay: float = 0.0,
+    ) -> None:
+        self._chosen_version = chosen_version
+        self._deprecated = deprecated
+        self._negotiate_delay = negotiate_delay
+        self._fail_with = fail_with
+        self._status_code = status_code
+        self._hang_fetch = hang_fetch
+        self.queries: list[str] = []
+
+    async def negotiate(self) -> NegotiationResult:
+        if self._negotiate_delay:
+            await asyncio.sleep(self._negotiate_delay)
+        return NegotiationResult(
+            chosen_version=self._chosen_version,
+            supported_versions=[self._chosen_version] if self._chosen_version else [],
+            tools_present=[],
+            deprecated=self._deprecated,
+        )
+
+    async def search(self, query: str) -> object:
+        self.queries.append(query)
+        if self._fail_with is not None:
+            raise ProductKnowledgeError(self._fail_with, status_code=self._status_code)
+        return {
+            "results": [
+                {
+                    "id": "DOC-1",
+                    "title": "Billing retry design",
+                    "snippet": "How retries work.",
+                    "source_type": "wiki",
+                    "url": "https://wiki.example.com/secret/path",
+                }
+            ]
+        }
+
+    async def fetch(self, item_id: str) -> object:
+        if self._hang_fetch:
+            await asyncio.sleep(3600)
+        return {"content": "Full text of the billing retry design."}
+
+
+class _FakeResolver:
+    def __init__(self, prefixes: tuple[str, ...] = (), *, configured: bool = True) -> None:
+        self._prefixes = prefixes
+        self._configured = configured
+
+    async def resolve(self, org_id: str, repo_id: str) -> EffectiveProvider | None:
+        if not self._configured:
+            return None
+        return EffectiveProvider(
+            display_name="Company Wiki",
+            endpoint_url="https://wiki.example.com/mcp",
+            issue_key_prefixes=self._prefixes,
+        )
+
+
+class _IdentityRedactor:
+    async def redact(self, text: str) -> str:
+        return text
+
+
+def _pk_step(
+    provider: _FakeProvider,
+    *,
+    prefixes: tuple[str, ...] = (),
+    deadline: float = 10.0,
+    configured: bool = True,
+    redactor: TextRedactor | None = None,
+    wire_opener: bool = True,
+) -> ContextBuilderStep:
+    redactor = redactor if redactor is not None else _IdentityRedactor()
+    return ContextBuilderStep(
+        _FakeDiffFetcher({_APP_PATH: _APP_POST_MODIFIED}),
+        _FakeTreeFetcher({_APP_PATH: _APP_PRE}),
+        _NonEmptyGraphQuery(),
+        _NonEmptySimilarityQuery(),
+        _ZeroVectorEmbeddingClient(),
+        internal_timeout_seconds=25.0,
+        max_total_bytes=200_000,
+        provider_resolver=_FakeResolver(prefixes, configured=configured),
+        provider_deadline_seconds=deadline,
+        provider_opener=(lambda endpoint, ref: provider) if wire_opener else None,
+        provider_redactor=redactor,
+    )
+
+
+def _pk_upstream() -> _UpstreamOutput:
+    upstream = _UpstreamOutput(_diff())
+    upstream.pr_title = "Fix SECRET-TITLE-TEXT"  # type: ignore[attr-defined]
+    upstream.pr_issue_keys = ("PROJ-9",)  # type: ignore[attr-defined]
+    upstream.pr_is_fork = False  # type: ignore[attr-defined]
+    upstream.private = True  # type: ignore[attr-defined]
+    return upstream
+
+
+@pytest.fixture
+def in_memory_span_exporter(
+    reset_otel_global_providers: None, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[InMemorySpanExporter]:
+    # `ProxyTracer` caches its resolved tracer permanently; reset it so this
+    # test's provider is picked up (same approach as review/test_step_registry.py).
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    from opentelemetry import trace
+
+    trace.set_tracer_provider(provider)
+    monkeypatch.setattr(context_builder_module._pk_tracer, "_real_tracer", None, raising=False)
+    yield exporter
+    provider.shutdown()
+
+
+async def test_provider_span_carries_only_the_allow_listed_attributes(
+    in_memory_span_exporter: InMemorySpanExporter,
+) -> None:
+    provider = _FakeProvider()
+    output = await _pk_step(provider).run(_pk_upstream(), _context())
+
+    assert output.context_bundle.product_knowledge is not None
+    spans = [
+        s
+        for s in in_memory_span_exporter.get_finished_spans()
+        if s.name == "review.product_knowledge"
+    ]
+    assert len(spans) == 1
+    attributes = dict(spans[0].attributes or {})
+    assert set(attributes) == {"outcome", "item_count", "contract_version", "duration_ms"}
+    assert attributes["outcome"] == "ok"
+    assert attributes["item_count"] == 1
+    assert attributes["contract_version"] == "1"
+    blob = repr(attributes)
+    for forbidden in ("SECRET-TITLE-TEXT", "wiki.example.com", "Billing retry", "PROJ-9"):
+        assert forbidden not in blob
+    assert provider.queries == ["Fix SECRET-TITLE-TEXT PROJ-9"]
+
+
+async def test_provider_failure_leaves_the_four_code_metrics_unchanged(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    step = _pk_step(_FakeProvider(fail_with=ProviderOutcome.TIMEOUT))
+
+    output = await step.run(_pk_upstream(), _context())
+
+    assert output.context_bundle.product_knowledge is None
+    assert output.context_bundle.items != ()
+    found = _recorded(in_memory_metric_reader)
+    assert set(found) == set(_METRIC_NAMES)
+    for _value, attributes in found.values():
+        assert attributes == {"outcome": "ok"}
+    assert found["review.context_builder.outcome_total"][0] == 1
+    assert found["review.context_builder.item_count"][0] == len(output.context_bundle.items)
+
+
+async def test_issue_key_allow_list_sends_only_matching_keys_and_no_title_text() -> None:
+    provider = _FakeProvider()
+    upstream = _pk_upstream()
+    upstream.pr_title = "Fix HR-77 login #12 for PROJ-9"  # type: ignore[attr-defined]
+    upstream.pr_issue_keys = ("HR-77", "#12", "PROJ-9")  # type: ignore[attr-defined]
+
+    await _pk_step(provider, prefixes=("PROJ",)).run(upstream, _context())
+
+    assert provider.queries == ["PROJ-9"]
+
+
+async def test_issue_key_allow_list_without_a_matching_key_makes_no_request() -> None:
+    provider = _FakeProvider()
+    upstream = _pk_upstream()
+    upstream.pr_title = "Executive salary bands 2026"  # type: ignore[attr-defined]
+    upstream.pr_issue_keys = ()  # type: ignore[attr-defined]
+
+    output = await _pk_step(provider, prefixes=("PROJ",)).run(upstream, _context())
+
+    assert provider.queries == []
+    assert output.context_bundle.product_knowledge is None
+
+
+async def test_hanging_fetch_keeps_the_search_snippet_instead_of_losing_the_branch() -> None:
+    provider = _FakeProvider(hang_fetch=True)
+
+    start = time.monotonic()
+    output = await _pk_step(provider, deadline=1.0).run(_pk_upstream(), _context())
+
+    assert time.monotonic() - start < 3.0
+    section = output.context_bundle.product_knowledge
+    assert section is not None
+    assert "How retries work." in section.items[0].model_dump_json()
+
+
+@pytest.mark.parametrize(("status", "expected"), [(None, None), (503, 503)])
+async def test_job_log_line_carries_status_code(
+    caplog: pytest.LogCaptureFixture, status: int | None, expected: int | None
+) -> None:
+    # Other tests' logging config can leave this logger disabled.
+    logging.getLogger("review.context_builder").disabled = False
+    caplog.set_level(logging.DEBUG, logger="review.context_builder")
+    provider = _FakeProvider(
+        fail_with=ProviderOutcome.PROVIDER_ERROR if status else None, status_code=status
+    )
+
+    await _pk_step(provider).run(_pk_upstream(), _context())
+
+    records = [r for r in caplog.records if getattr(r, "operation", None) == "job"]
+    assert len(records) == 1
+    assert hasattr(records[0], "status_code")
+    assert records[0].status_code == expected
+
+
+# --- Phase 7 audit gaps: log levels, contract_version label, span parentage,
+# prompt equality, deprecated-record duration. -------------------------------
+
+_SUMMARY_MESSAGES = {
+    "product_knowledge completed",
+    "product_knowledge degraded",
+    "product_knowledge not configured",
+}
+
+
+def _job_summary(caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
+    records = [r for r in caplog.records if r.getMessage() in _SUMMARY_MESSAGES]
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    return records[0]
+
+
+def _pk_points(reader: InMemoryMetricReader, name: str) -> list[tuple[dict[str, object], float]]:
+    """Every data point of one ``review.product_knowledge.*`` instrument as
+    ``(attributes, value-or-sum)``."""
+    data = reader.get_metrics_data()
+    assert data is not None
+    points: list[tuple[dict[str, object], float]] = []
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name != name:
+                    continue
+                for point in metric.data.data_points:
+                    value = point.value if isinstance(metric.data, Sum) else point.sum
+                    points.append((dict(point.attributes or {}), value))
+    return points
+
+
+_LEVEL_CASES: list[tuple[str, dict[str, object], int]] = [
+    # config-class outcomes: an operator must act, so warning.
+    (
+        "credential_unavailable",
+        {"fail_with": ProviderOutcome.CREDENTIAL_UNAVAILABLE},
+        logging.WARNING,
+    ),
+    ("blocked_egress", {"fail_with": ProviderOutcome.BLOCKED_EGRESS}, logging.WARNING),
+    ("auth_failed", {"fail_with": ProviderOutcome.AUTH_FAILED}, logging.WARNING),
+    ("unsupported_version", {"chosen_version": "9"}, logging.WARNING),
+    ("redaction_disabled", {"noop_redactor": True}, logging.WARNING),
+    # transient / expected outcomes: info.
+    ("timeout", {"fail_with": ProviderOutcome.TIMEOUT}, logging.INFO),
+    ("unreachable", {"fail_with": ProviderOutcome.UNREACHABLE}, logging.INFO),
+    ("provider_error", {"fail_with": ProviderOutcome.PROVIDER_ERROR}, logging.INFO),
+    ("malformed", {"fail_with": ProviderOutcome.MALFORMED}, logging.INFO),
+    ("oversized", {"fail_with": ProviderOutcome.OVERSIZED}, logging.INFO),
+    ("disabled", {"no_opener": True}, logging.INFO),
+    ("ok", {}, logging.INFO),
+    # M8: not_configured is the steady state for most repos; debug only
+    # (documented in docs/reference/operations.md).
+    ("not_configured", {"unconfigured": True}, logging.DEBUG),
+]
+
+
+@pytest.mark.parametrize(
+    ("expected", "options", "level"), _LEVEL_CASES, ids=[c[0] for c in _LEVEL_CASES]
+)
+async def test_job_log_level_per_outcome_class(
+    caplog: pytest.LogCaptureFixture, expected: str, options: dict[str, object], level: int
+) -> None:
+    logging.getLogger("review.context_builder").disabled = False
+    caplog.set_level(logging.DEBUG, logger="review.context_builder")
+    provider = _FakeProvider(
+        fail_with=options.get("fail_with"),  # type: ignore[arg-type]
+        chosen_version=str(options.get("chosen_version", "1")),
+    )
+    step = _pk_step(
+        provider,
+        configured=not options.get("unconfigured", False),
+        redactor=NoOpTextRedactor() if options.get("noop_redactor") else None,
+        wire_opener=not options.get("no_opener", False),
+    )
+
+    await step.run(_pk_upstream(), _context())
+
+    record = _job_summary(caplog)
+    assert record.outcome == expected  # type: ignore[attr-defined]
+    assert record.levelno == level
+
+
+async def test_bad_version_provider_is_labelled_unsupported_on_the_metrics(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    await _pk_step(_FakeProvider(chosen_version="9")).run(_pk_upstream(), _context())
+
+    points = _pk_points(in_memory_metric_reader, "review.product_knowledge.call_total")
+    # The contract call itself is recorded before a version is chosen ("none");
+    # the job-level point carries the negotiated verdict.
+    job = [a for a, _ in points if a["operation"] == "job"]
+    assert [(a["outcome"], a["contract_version"]) for a in job] == [
+        ("unsupported_version", "unsupported")
+    ]
+
+
+async def test_deprecated_record_carries_the_real_contract_call_duration(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    provider = _FakeProvider(deprecated=True, negotiate_delay=0.05)
+
+    await _pk_step(provider).run(_pk_upstream(), _context())
+
+    points = _pk_points(in_memory_metric_reader, "review.product_knowledge.call_duration_ms")
+    (deprecated_ms,) = [
+        v
+        for a, v in points
+        if a["operation"] == "contract" and a["outcome"] == "deprecated_version"
+    ]
+    assert deprecated_ms >= 40
+
+
+async def test_provider_span_is_a_child_of_the_context_builder_step_span(
+    in_memory_span_exporter: InMemorySpanExporter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import review.pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module.tracer, "_real_tracer", None, raising=False)
+    step = _pk_step(_FakeProvider())
+
+    class _Seed:
+        name = "static_analysis"
+        depends_on: tuple[str, ...] = ()
+
+        async def run(self, input: object, context: StepContext) -> _UpstreamOutput:
+            return _pk_upstream()
+
+    registry = StepRegistry(
+        [_Seed(), step],
+        enabled={"static_analysis": True, "context_builder": True},
+        timeouts={"static_analysis": 5, "context_builder": 30},
+        on_failure=FailurePolicy.FATAL,
+    )
+
+    await registry.run(seed_input="seed", context=_context())
+
+    spans = {s.name: s for s in in_memory_span_exporter.get_finished_spans()}
+    parent = spans["review.step.context_builder"]
+    child = spans["review.product_knowledge"]
+    assert child.parent is not None
+    assert child.parent.span_id == parent.context.span_id
+
+
+async def test_prompt_sections_are_identical_with_and_without_provider_config() -> None:
+    """US-PK4: an unconfigured or disabled provider changes nothing the LLM
+    sees; a configured one adds exactly the provider section."""
+    bare = ContextBuilderStep(
+        _FakeDiffFetcher({_APP_PATH: _APP_POST_MODIFIED}),
+        _FakeTreeFetcher({_APP_PATH: _APP_PRE}),
+        _NonEmptyGraphQuery(),
+        _NonEmptySimilarityQuery(),
+        _ZeroVectorEmbeddingClient(),
+        internal_timeout_seconds=25.0,
+        max_total_bytes=200_000,
+    )
+    baseline = (await bare.run(_pk_upstream(), _context())).context_bundle
+    unconfigured = (
+        await _pk_step(_FakeProvider(), configured=False).run(_pk_upstream(), _context())
+    ).context_bundle
+    configured = (await _pk_step(_FakeProvider()).run(_pk_upstream(), _context())).context_bundle
+
+    def rendered(bundle: object) -> str:
+        return render_context_bundle_section(bundle) + render_product_knowledge_section(bundle)  # type: ignore[arg-type]
+
+    assert rendered(unconfigured) == rendered(baseline)
+    assert render_product_knowledge_section(baseline) == ""
+    assert render_context_bundle_section(configured) == render_context_bundle_section(baseline)
+    assert rendered(configured) == rendered(baseline) + render_product_knowledge_section(configured)
+    assert render_product_knowledge_section(configured) != ""

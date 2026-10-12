@@ -281,9 +281,12 @@ context — see Level 2 and
 - **Context Builder can optionally call out to an external product-knowledge
   provider.** After querying review's own index, the Context Builder makes
   an additional MCP client call against review's own product-knowledge
-  contract (`product_knowledge_search`/`product_knowledge_fetch`/
-  `product_knowledge_related`) when a provider endpoint is configured for
-  the org/repo, pulling in non-code product knowledge (Confluence, Slack,
+  contract (`product_knowledge_contract` for version negotiation, then
+  `product_knowledge_search`/`product_knowledge_fetch`; the optional
+  `product_knowledge_related` is part of the contract but not called)
+  when a provider endpoint is configured for the org/repo — and only for
+  private-repo, non-fork pull requests unless the setting opts in via
+  `allow_public_repos` (Amendment A1's exposure gate), pulling in non-code product knowledge (Confluence, Slack,
   tickets, or whatever the configured provider connects). Review's own
   code-derived context and the provider's product-knowledge results are kept
   as distinct, labeled sources — labeled with the provider's configured
@@ -321,8 +324,13 @@ Two different kinds of configuration exist, deliberately handled differently:
   rule — never read ad hoc from domain or adapter code.
 - **Day-two platform config** — org/repo/team settings, per-stage model
   routing, rules, Memory, and — when the optional augmentation is enabled — a
-  per-org/repo product-knowledge provider endpoint, credential, and display
-  label ([ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md)).
+  per-org/repo product-knowledge provider endpoint, credential *reference*,
+  and display label ([ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md);
+  the credential itself stays bootstrap config, per
+  [ADR-0013](../adr/0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md);
+  the Worker uses the credential map to call the provider and the Admin API
+  reads the same map to validate bindings, list names and run
+  test-connection).
   This already lives in Postgres, managed through the platform's own admin
   API (see Level 2 above) — not a file, not an env var.
 
@@ -427,11 +435,3 @@ entirely outside the product's supported configuration contract.)
 - GitLab/Bitbucket adapters are explicitly deferred, not designed away — the
   git-host boundary in the domain layer must not leak GitHub-specific shapes
   (webhook payload fields, check-run semantics) into pipeline logic.
-- Exact context-fusion/citation UX for the optional product-knowledge
-  augmentation — how dual-sourced (code vs. product-knowledge) context is
-  presented to the review-generation LLM call, and how citations back to
-  provider-sourced content should render in a posted PR comment
-  ([ADR-0003](../adr/0003-knowhow-product-knowledge-augmentation.md)).
-- Review's own product-knowledge MCP contract versioning/deprecation policy
-  — needs confirming before the augmentation ships as a supported feature,
-  not just a prototype.
