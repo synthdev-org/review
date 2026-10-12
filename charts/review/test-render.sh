@@ -196,6 +196,53 @@ assert_not_contains "$ADMIN_API_DISABLED_OUT" 'app.kubernetes.io/component: admi
     "adminApi.enabled: false omits the Admin UI Deployment/Service entirely"
 
 echo
+echo "=== 4b. helm template: product knowledge credentials (plan-deliver-product-knowledge.md Phase 6, F12) ==="
+# Default values: no credential map => no env var and no secretKeyRef for it
+# in ANY Deployment, and no Secret key — an existing install must upgrade
+# with nothing to configure.
+assert_not_contains "$DEFAULT_OUT" 'PRODUCT_KNOWLEDGE_CREDENTIALS' \
+    "default render has no product-knowledge credentials env var (no unconditional secretKeyRef)"
+assert_not_contains "$DEFAULT_OUT" 'product-knowledge-credentials' \
+    "default render has no product-knowledge-credentials Secret key or reference"
+assert_contains "$DEFAULT_OUT" 'REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED: "true"' \
+    "default render carries the non-secret product-knowledge settings for the Worker"
+# A folded `>-` scalar does not interpret quotes, which would render the
+# literal `"5"` (quote characters included) and fail settings validation —
+# so the values must be plain inline quoted scalars.
+for k in REVIEW_WORKER_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS; do
+    assert_contains "$DEFAULT_OUT" "$k: \"5\"" "$k renders as an inline quoted scalar"
+done
+for k in REVIEW_WORKER_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS; do
+    assert_contains "$DEFAULT_OUT" "$k: \"true\"" "$k renders as an inline quoted scalar"
+done
+assert_not_contains "$DEFAULT_OUT" ': >-' \
+    "no ConfigMap value is a folded block scalar wrapping a quoted value"
+# A values file, not --set-string: the JSON's commas are Helm --set separators.
+PK_VALUES_FILE=$(mktemp)
+cat >"$PK_VALUES_FILE" <<'YAML'
+productKnowledge:
+  credentials:
+    value: '{"wiki":{"token":"t","allowed_hosts":["wiki.internal"]}}'
+YAML
+PK_VALUE_OUT=$(helm template "$RELEASE" "$CHART_DIR" -f "$PK_VALUES_FILE")
+rm -f "$PK_VALUES_FILE"
+assert_contains "$PK_VALUE_OUT" 'product-knowledge-credentials: ' \
+    "a literal credential map is written to this chart's own Secret"
+assert_contains "$PK_VALUE_OUT" $'name: REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS\n' \
+    "the Worker Deployment receives the credential map"
+assert_contains "$PK_VALUE_OUT" $'name: REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS\n' \
+    "the Admin API Deployment receives the credential map too"
+PK_EXISTING_OUT=$(helm template "$RELEASE" "$CHART_DIR" \
+    --set productKnowledge.credentials.existingSecret.name=review-pk \
+    --set productKnowledge.credentials.existingSecret.key=tokens)
+assert_not_contains "$PK_EXISTING_OUT" 'product-knowledge-credentials:' \
+    "no product-knowledge key is written to this chart's Secret when existingSecret is used"
+assert_contains "$PK_EXISTING_OUT" $'name: review-pk\n                  key: tokens' \
+    "product-knowledge env references the given existingSecret name/key"
+assert_contains "$PK_EXISTING_OUT" 'REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS' \
+    "existingSecret credential map reaches the Admin API Deployment"
+
+echo
 echo "=== 5. helm template: Ingress (Phase 9, US-A21) ==="
 assert_contains "$DEFAULT_OUT" 'kind: Ingress' \
     "default render includes an Ingress (ingress.enabled: true by default)"

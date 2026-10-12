@@ -30,6 +30,7 @@ import uuid
 from collections.abc import Iterator
 
 import httpx
+import httpx2
 import pytest
 import respx
 from cryptography.hazmat.primitives import serialization
@@ -262,13 +263,15 @@ def _post(
     event_type: str | None = "pull_request",
     delivery_id: str | None = None,
     secret: str = _SECRET,
-) -> httpx.Response:
+) -> httpx2.Response:
+    # starlette's TestClient prefers httpx2 whenever it is installed (it is,
+    # via the mcp 2.x dependency), so its responses are httpx2 objects.
     headers = {"X-Hub-Signature-256": _sign(body, secret)}
     if event_type is not None:
         headers[_EVENT_HEADER] = event_type
     if delivery_id is not None:
         headers[_DELIVERY_HEADER] = delivery_id
-    response: httpx.Response = client.post(_URL, content=body, headers=headers)
+    response: httpx2.Response = client.post(_URL, content=body, headers=headers)
     return response
 
 
@@ -732,6 +735,106 @@ async def test_missing_base_sha_still_enqueues_with_null_base_sha(
     assert len(jobs) == 2
     review_job = next(job for job in jobs if job.job_type == JobType.REVIEW)
     assert review_job.payload["base_sha"] is None
+
+
+def _pr_metadata_payload(
+    *,
+    head_repo: dict[str, object] | None,
+    include_head_repo: bool = True,
+    title: str = "  Fix   cache\n bug PROJ-9 ",
+    body: str = "Closes #41. See also HR-77. secret-body-marker",
+    head_ref: str = "bugfix/ABC-3-cache",
+) -> bytes:
+    head: dict[str, object] = {"sha": "a1", "ref": head_ref}
+    if include_head_repo:
+        head["repo"] = head_repo
+    return json.dumps(
+        {
+            "installation": {"id": 558},
+            "action": "opened",
+            "repository": {"full_name": "acme/widgets", "private": True},
+            "pull_request": {
+                "number": 1,
+                "title": title,
+                "body": body,
+                "head": head,
+                "base": {"sha": "b1", "repo": {"full_name": "acme/widgets"}},
+            },
+        }
+    ).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_pr_metadata_is_captured_into_review_payload_without_body(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """
+    docs/plans/plan-deliver-product-knowledge.md Phase 2 (US-PK2 capture).
+
+    Title, head ref, issue keys and the fork flag reach the queued REVIEW payload; the PR body never
+    does.
+    """
+    client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
+    body = _pr_metadata_payload(head_repo={"full_name": "acme/widgets", "fork": False})
+
+    response = _post(client, body, delivery_id="delivery-pr-meta")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    review_job = next(job for job in jobs if job.job_type == JobType.REVIEW)
+    payload = review_job.payload
+    assert payload["pr_title"] == "Fix cache bug PROJ-9"
+    assert payload["pr_head_ref"] == "bugfix/ABC-3-cache"
+    assert payload["pr_issue_keys"] == ["PROJ-9", "ABC-3", "#41", "HR-77"]
+    assert payload["pr_is_fork"] is False
+    assert "secret-body-marker" not in json.dumps(payload)
+    assert "pr_body" not in payload and "body" not in payload
+    for job in jobs:
+        assert "secret-body-marker" not in json.dumps(job.payload)
+        if job.job_type != JobType.REVIEW:
+            assert "pr_title" not in job.payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "head_repo",
+    [
+        {"full_name": "mallory/widgets", "fork": True},
+        {"full_name": "acme/widgets", "fork": True},
+        None,
+    ],
+)
+async def test_fork_or_missing_head_repo_sets_pr_is_fork_true(
+    migrated_engine: AsyncEngine, head_repo: dict[str, object] | None
+) -> None:
+    client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
+    body = _pr_metadata_payload(head_repo=head_repo)
+
+    response = _post(client, body, delivery_id="delivery-pr-fork")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    review_job = next(job for job in jobs if job.job_type == JobType.REVIEW)
+    assert review_job.payload["pr_is_fork"] is True
+
+
+@pytest.mark.asyncio
+async def test_delivery_without_pr_metadata_still_enqueues_with_defaults(
+    migrated_engine: AsyncEngine,
+) -> None:
+    client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
+    body = _payload(installation_id=559, pr_number=1, head_sha="a1")
+
+    response = _post(client, body, delivery_id="delivery-no-pr-meta")
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    review_job = next(job for job in jobs if job.job_type == JobType.REVIEW)
+    assert review_job.payload["pr_title"] is None
+    assert review_job.payload["pr_head_ref"] is None
+    assert review_job.payload["pr_issue_keys"] == []
+    # No head repo object => fail closed.
+    assert review_job.payload["pr_is_fork"] is True
 
 
 @pytest.mark.asyncio
@@ -2020,3 +2123,28 @@ async def test_non_reply_comments_do_not_consume_the_capture_ceiling(
     entries = await _fetch_memory_entries(migrated_engine)
     assert len(entries) == 1
     assert entries[0].posted_finding_comment_id == 4013
+
+
+@pytest.mark.asyncio
+async def test_missing_base_repo_falls_back_to_envelope_repository_for_fork_check(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """
+    ``base.repo`` omitted: the base repo falls back to the envelope's own ``repository``.
+
+    The envelope's ``repository`` (acme/widgets), so a same-repo head is not a fork.
+    """
+    client = _build_client(dsn=str(migrated_engine.url.render_as_string(hide_password=False)))
+    payload = json.loads(
+        _pr_metadata_payload(head_repo={"full_name": "acme/widgets", "fork": False})
+    )
+    del payload["pull_request"]["base"]["repo"]
+
+    response = _post(
+        client, json.dumps(payload).encode("utf-8"), delivery_id="delivery-no-base-repo"
+    )
+
+    assert response.status_code == 200
+    jobs = await _fetch_jobs(migrated_engine)
+    review_job = next(job for job in jobs if job.job_type == JobType.REVIEW)
+    assert review_job.payload["pr_is_fork"] is False

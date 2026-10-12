@@ -95,6 +95,10 @@ _findings_dropped_by_ceiling_total = meter.create_counter(
     "review.findings.dropped_by_ceiling_total",
     description="Findings dropped by the posted-findings ceiling after dedupe.",
 )
+_citation_findings_total = metrics.get_meter("review.citation").create_counter(
+    "review.citation.findings_total",
+    description="Findings carrying context_ref_ids, by whether any citation rendered.",
+)
 
 
 def _record_findings_metrics(merge_result: MergeResult) -> None:
@@ -404,6 +408,10 @@ class FindingsOutputStep:
             citation_text = render_citation(
                 list(finding.context_ref_ids), context_bundle, job_id=job_id
             )
+            with suppress_telemetry_errors(
+                logger, "citation findings telemetry recording failed (finding unaffected)"
+            ):
+                _citation_findings_total.add(1, {"cited": str(citation_text is not None).lower()})
             if citation_text is None:
                 result.append(finding)
                 continue

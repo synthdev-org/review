@@ -283,6 +283,11 @@ class PrefilterStep:
             pr_number=parsed.pr_number,
             head_sha=parsed.head_sha,
             base_sha=parsed.base_sha,
+            pr_title=parsed.pr_title,
+            pr_head_ref=parsed.pr_head_ref,
+            pr_issue_keys=parsed.pr_issue_keys,
+            pr_is_fork=parsed.pr_is_fork,
+            private=parsed.private,
         )
 
     def _apply_materialization_ceiling(self, files: list[DiffFile]) -> tuple[list[DiffFile], int]:

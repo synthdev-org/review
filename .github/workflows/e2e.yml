@@ -32,6 +32,20 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # Live product-knowledge conformance (plan Phase 5b, US-PK17): points
+      # the contract suite at a real provider (e.g. knowhow). Informational
+      # only, never a gate (testing.md): this file also triggers on push to
+      # main, so the event guard is what keeps it off merges; PK_LIVE_URL
+      # (a repository variable) opts a repo in; continue-on-error keeps a
+      # red result from failing the workflow. Deliberately absent from ci.yml.
+      - name: Live product-knowledge conformance (nightly/manual, non-gating)
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.PK_LIVE_URL != ''
+        continue-on-error: true
+        env:
+          PK_URL: ${{ vars.PK_LIVE_URL }}
+          PK_TOKEN: ${{ secrets.PK_LIVE_TOKEN }}
+        run: uv run python -m adapter.product_knowledge.conformance
+
       # GitHub-hosted ubuntu-latest runners ship Docker Engine + the Compose
       # v2 plugin out of the box — no extra setup step needed. This test
       # suite (tests/e2e/) drives the same docker-compose.yml a developer

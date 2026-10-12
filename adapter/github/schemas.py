@@ -51,8 +51,28 @@ class Repository(BaseModel):
     private: bool = False
 
 
+class PullRequestHeadRepo(BaseModel):
+    """
+    The ``pull_request.head.repo`` object, reduced to what the fork check needs.
+
+    Only what the product-knowledge exposure gate's fork check
+    (docs/plans/plan-deliver-product-knowledge.md Phase 2, A1) needs. GitHub
+    sends ``null`` here for a deleted fork.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    full_name: str | None = None
+    fork: bool | None = None
+
+
 class PullRequestHead(BaseModel):
-    """The ``pull_request.head`` object — only ``sha`` is needed here."""
+    """
+    The ``pull_request.head`` object.
+
+    ``sha`` plus the optional ``ref``/``repo`` the product-knowledge capture
+    (Phase 2) reads.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -61,6 +81,10 @@ class PullRequestHead(BaseModel):
     # rejected with a 4xx at the schema layer — see
     # apps/webhook_api/webhook_routes.py's point-of-use validation.
     sha: str | None = None
+    # Product-knowledge Phase 2 additions: same accepted-but-degraded
+    # discipline as ``sha`` (never a 4xx on absence).
+    ref: str | None = None
+    repo: PullRequestHeadRepo | None = None
 
 
 class PullRequestBase(BaseModel):
@@ -77,6 +101,8 @@ class PullRequestBase(BaseModel):
     # accepted-but-degraded (Phase 1's `base_sha is None` handling), never
     # rejected with a 4xx at the schema layer.
     sha: str | None = None
+    # Product-knowledge Phase 2 (A1 fork check): the base repo's full name.
+    repo: PullRequestHeadRepo | None = None
 
 
 class PullRequest(BaseModel):
@@ -89,6 +115,11 @@ class PullRequest(BaseModel):
     number: int | None = None
     head: PullRequestHead | None = None
     base: PullRequestBase | None = None
+    # Product-knowledge Phase 2 additions (F5). ``body`` is read only by
+    # ``ingestion.pr_metadata.extract_issue_keys`` at the webhook boundary and
+    # is never persisted or forwarded.
+    title: str | None = None
+    body: str | None = None
 
 
 class PushCommit(BaseModel):

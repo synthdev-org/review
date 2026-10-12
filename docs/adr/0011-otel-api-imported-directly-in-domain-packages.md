@@ -135,6 +135,20 @@ and the `_TELEMETRY_INITIALIZED_THIS_PROCESS` flag in
 call sites land, not re-litigated per case, the same way ADR-0006
 extends its own scope list.
 
+*Extension (Phase 7 of `docs/plans/plan-deliver-product-knowledge.md`):* the
+product-knowledge provider branch in `review/context_builder.py` (its
+`review.product_knowledge.*` instruments and span, alongside
+`review/product_knowledge.py`'s wire models/pure logic those instruments
+describe) and the module-level counter in
+`adapter/product_knowledge/provider_resolver.py`, both following the same
+no-op-until-a-composition-root-registers-a-provider rule.
+
+*Extension (citation-quality and config-write metrics):* the module-level
+`review.citation.ref_total` counter in `review/citation.py`, the
+`review.citation.findings_total` counter in `review/output.py`, and the
+`review.config.write_total` counter in `apps/admin_api/config_routes.py`,
+under the same no-op-until-registered rule.
+
 ## Consequences
 
 **Easier / positive:**

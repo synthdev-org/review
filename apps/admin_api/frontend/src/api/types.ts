@@ -74,12 +74,21 @@ export interface BulkOperationResponse {
 
 // --- Org/repo/team configuration (Unit E) ---
 
+// One key's resolved value at a node plus the scope descriptor it came from
+// (`tenancy.settings.EffectiveSetting`). Computed server-side so the UI never
+// re-implements precedence.
+export interface EffectiveSetting {
+  value: Record<string, unknown>;
+  source: string;
+}
+
 export interface ScopeSettings {
   id: string;
   name: string;
   scope: string;
   settings: Record<string, Record<string, unknown>>;
   using_platform_defaults: boolean;
+  effective?: Record<string, EffectiveSetting>;
 }
 
 export interface OrgConfig extends ScopeSettings {
@@ -89,6 +98,7 @@ export interface OrgConfig extends ScopeSettings {
 
 export interface ConfigTree {
   platform_settings: Record<string, Record<string, unknown>>;
+  platform_effective?: Record<string, EffectiveSetting>;
   orgs: OrgConfig[];
 }
 
@@ -100,11 +110,44 @@ export interface SettingRow {
   value: Record<string, unknown>;
 }
 
-// The closed setting-key registry (tenancy/settings.py's
-// SETTING_KEY_REGISTRY) — kept in sync by hand, same rationale as the
-// rest of this file.
+// The generic setting form's keys (tenancy/settings.py's
+// SETTING_KEY_REGISTRY, minus `product_knowledge_provider`) — kept in sync by
+// hand, same rationale as the rest of this file. `product_knowledge_provider`
+// is deliberately NOT here: its value has a multi-field shape the generic
+// form cannot build, so it is only ever written by ProductKnowledgePanel.
 export const SETTING_KEYS = ["memory_suppression_enabled", "findings_severity_threshold"] as const;
 export type SettingKey = (typeof SETTING_KEYS)[number];
+
+export const PRODUCT_KNOWLEDGE_PROVIDER_KEY = "product_knowledge_provider";
+
+// --- Product knowledge provider (Phase 6 routes; Unit H) ---
+
+// `allowed_hosts` is null for a Viewer (bound hosts are Admin-only).
+export interface ProductKnowledgeCredential {
+  ref: string;
+  allowed_hosts: string[] | null;
+}
+
+export type TestConnectionStatus =
+  | "ok"
+  | "blocked_by_policy"
+  | "disabled"
+  | "unreachable"
+  | "no_contract"
+  | "malformed"
+  | "auth_failed"
+  | "unsupported_version"
+  | "deprecated_version"
+  | "timeout";
+
+export interface TestConnectionResult {
+  status: TestConnectionStatus;
+  message: string;
+  negotiated_version?: string | null;
+  provider_supported_versions?: string[] | null;
+  tools_present?: string[] | null;
+  latency_ms?: number | null;
+}
 
 // --- Model routing (Unit F) ---
 

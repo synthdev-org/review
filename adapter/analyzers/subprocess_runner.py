@@ -88,7 +88,7 @@ import posixpath
 import shutil
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from adapter.analyzers.exceptions import (
@@ -328,6 +328,23 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
+_CREDENTIAL_ENV_SUFFIX = "_PRODUCT_KNOWLEDGE_CREDENTIALS"
+
+
+def analyzer_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """
+    Return the child environment: ``environ`` minus the product-knowledge credential map.
+
+    The credential map is ``REVIEW_<ENTRYPOINT>_PRODUCT_KNOWLEDGE_CREDENTIALS``.
+    Analyzers run over customer-controlled repo content (semgrep rules,
+    custom configs) and must never inherit provider bearer tokens. Every
+    other variable is kept so the tools keep finding PATH, HOME, etc.
+    ponytail: deny-list of one name; an allow-list env if more secrets land
+    in the worker environment.
+    """
+    return {k: v for k, v in environ.items() if not k.endswith(_CREDENTIAL_ENV_SUFFIX)}
+
+
 async def run_analyzer_subprocess(
     argv: Sequence[str],
     *,
@@ -354,6 +371,7 @@ async def run_analyzer_subprocess(
     process = await asyncio.create_subprocess_exec(
         *argv_list,
         cwd=cwd,
+        env=analyzer_env(os.environ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )

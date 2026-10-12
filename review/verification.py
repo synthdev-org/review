@@ -90,7 +90,11 @@ from llmgateway.routing import FallbackModelRoutingResolver
 from memory.fingerprint import build_finding_fingerprint
 from memory.store import DismissedFindingMatcher
 from review._telemetry import suppress_telemetry_errors
-from review.context_bundle import ContextBundle, render_context_bundle_section
+from review.context_bundle import (
+    ContextBundle,
+    render_context_bundle_section,
+    render_product_knowledge_section,
+)
 from review.diff_prompt import render_and_truncate_diff
 from review.llm_response import build_completion_request, parse_llm_json_envelope
 from review.llm_telemetry import record_llm_token_usage
@@ -266,6 +270,7 @@ def _build_user_message(
         f"{findings_json}\n\n"
         f"Diff:\n{diff_text}"
         f"{context_bundle_section}"
+        f"{render_product_knowledge_section(context_bundle)}"
     )
 
 

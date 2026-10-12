@@ -14,9 +14,11 @@ from tenancy.settings import (
     ScopeDescriptorError,
     SettingRow,
     SettingValidationError,
+    effective_settings,
     format_scope_descriptor,
     parse_scope_descriptor,
     resolve_setting,
+    validate_endpoint_url,
     validate_setting_value,
 )
 
@@ -176,3 +178,200 @@ class TestScopeDescriptor:
     def test_malformed_descriptor_is_rejected(self, descriptor: str) -> None:
         with pytest.raises(ScopeDescriptorError):
             parse_scope_descriptor(descriptor)
+
+
+# --- product_knowledge_provider (plan-deliver-product-knowledge.md Phase 6) --
+
+_PK_KEY = "product_knowledge_provider"
+
+
+def _pk_value(**overrides: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "enabled": True,
+        "display_name": "Company Wiki (prod)",
+        "endpoint_url": "https://wiki.internal/mcp",
+        "credential_ref": "wiki-prod",
+    }
+    value.update(overrides)
+    return value
+
+
+def _pk_row(
+    *, org_id: str | None, repo_id: str | None, team_id: str | None = None, **overrides: object
+) -> SettingRow:
+    return SettingRow(
+        org_id=org_id, repo_id=repo_id, team_id=team_id, key=_PK_KEY, value=_pk_value(**overrides)
+    )
+
+
+class TestProductKnowledgeProviderRegistryModel:
+    def test_valid_value_round_trips_with_defaults_filled_in(self) -> None:
+        stored = validate_setting_value(_PK_KEY, _pk_value())
+
+        assert stored == {
+            "enabled": True,
+            "display_name": "Company Wiki (prod)",
+            "endpoint_url": "https://wiki.internal/mcp",
+            "credential_ref": "wiki-prod",
+            "allow_public_repos": False,
+            "issue_key_prefixes": [],
+        }
+
+    def test_null_credential_ref_is_valid_for_an_unauthenticated_provider(self) -> None:
+        stored = validate_setting_value(_PK_KEY, _pk_value(credential_ref=None))
+
+        assert stored["credential_ref"] is None
+
+    def test_endpoint_url_is_stored_unchanged(self) -> None:
+        stored = validate_setting_value(_PK_KEY, _pk_value(endpoint_url="http://kb:8080"))
+
+        assert stored["endpoint_url"] == "http://kb:8080"
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"display_name": ""},
+            {"display_name": "x" * 41},
+            {"display_name": "<script>"},
+            {"display_name": "name\nnewline"},
+            {"endpoint_url": "ftp://wiki.internal/mcp"},
+            {"endpoint_url": "/relative/path"},
+            {"endpoint_url": "https://user:pw@wiki.internal/mcp"},
+            {"endpoint_url": "https://wiki.internal/mcp?token=abc"},
+            {"endpoint_url": "https://wiki.internal/mcp#frag"},
+            {"endpoint_url": "https://wiki.internal:notaport/mcp"},
+            {"endpoint_url": "https://" + "a" * 520 + ".example"},
+            {"endpoint_url": "https://wiki.internal/ mcp"},
+            {"credential_ref": "Has Caps"},
+            {"credential_ref": "x" * 65},
+            {"credential_ref": ""},
+            {"allow_public_repos": "yes please"},
+            {"issue_key_prefixes": ["lower"]},
+            {"issue_key_prefixes": ["A"]},
+            {"issue_key_prefixes": ["TOOLONGPREFIX"]},
+            {"issue_key_prefixes": ["OK"] * 21},
+            {"unknown_field": 1},
+        ],
+    )
+    def test_invalid_values_are_rejected_not_coerced(self, overrides: dict[str, object]) -> None:
+        with pytest.raises(SettingValidationError):
+            validate_setting_value(_PK_KEY, _pk_value(**overrides))
+
+    def test_endpoint_validation_error_never_echoes_userinfo(self) -> None:
+        with pytest.raises(SettingValidationError) as excinfo:
+            validate_setting_value(
+                _PK_KEY, _pk_value(endpoint_url="https://admin:hunter2pw@wiki.internal/mcp")
+            )
+
+        assert "userinfo" in excinfo.value.detail
+        assert "hunter2pw" not in excinfo.value.detail
+        assert "hunter2pw" not in str(excinfo.value)
+
+
+class TestEffectiveSettings:
+    def test_repo_row_wins_over_org_and_platform_whole_object(self) -> None:
+        rows = [
+            _pk_row(org_id=None, repo_id=None, display_name="Platform"),
+            _pk_row(org_id=_ORG, repo_id=None, display_name="Org", credential_ref=None),
+            _pk_row(org_id=_ORG, repo_id=_REPO, display_name="Repo", endpoint_url="http://r/mcp"),
+        ]
+
+        effective = effective_settings(rows, org_id=_ORG, repo_id=_REPO, team_id=None)
+
+        assert effective[_PK_KEY].source == f"repo:{_ORG}:{_REPO}"
+        # Whole object, no field merging: the repo row's own credential_ref.
+        assert effective[_PK_KEY].value["display_name"] == "Repo"
+        assert effective[_PK_KEY].value["credential_ref"] == "wiki-prod"
+
+    def test_org_row_is_inherited_by_a_repo_without_its_own(self) -> None:
+        rows = [_pk_row(org_id=_ORG, repo_id=None, display_name="Org")]
+
+        effective = effective_settings(rows, org_id=_ORG, repo_id=_REPO, team_id=None)
+
+        assert effective[_PK_KEY].source == f"org:{_ORG}"
+
+    def test_repo_enabled_false_is_the_effective_value_an_explicit_opt_out(self) -> None:
+        rows = [
+            _pk_row(org_id=None, repo_id=None),
+            _pk_row(org_id=_ORG, repo_id=_REPO, enabled=False),
+        ]
+
+        effective = effective_settings(rows, org_id=_ORG, repo_id=_REPO, team_id=None)
+
+        assert effective[_PK_KEY].value["enabled"] is False
+        assert effective[_PK_KEY].source == f"repo:{_ORG}:{_REPO}"
+
+    def test_platform_enabled_false_is_the_fleet_wide_no_restart_off(self) -> None:
+        rows = [_pk_row(org_id=None, repo_id=None, enabled=False)]
+
+        effective = effective_settings(rows, org_id=_ORG, repo_id=_REPO, team_id=None)
+
+        assert effective[_PK_KEY].value["enabled"] is False
+        assert effective[_PK_KEY].source == "platform"
+
+    def test_team_scoped_provider_row_is_ignored(self) -> None:
+        rows = [
+            _pk_row(org_id=_ORG, repo_id=None, display_name="Org"),
+            _pk_row(org_id=_ORG, repo_id=None, team_id=_TEAM, display_name="Team"),
+        ]
+
+        effective = effective_settings(rows, org_id=_ORG, repo_id=None, team_id=_TEAM)
+
+        assert effective[_PK_KEY].value["display_name"] == "Org"
+
+    def test_an_invalid_stored_row_is_unconfigured_not_effective_and_does_not_fall_through(
+        self,
+    ) -> None:
+        rows = [
+            _pk_row(org_id=None, repo_id=None, display_name="Platform"),
+            _pk_row(org_id=_ORG, repo_id=None, endpoint_url="ftp://x"),
+        ]
+
+        effective = effective_settings(rows, org_id=_ORG, repo_id=_REPO, team_id=None)
+
+        assert _PK_KEY not in effective
+
+    def test_orphaned_keys_outside_the_registry_are_not_resolved(self) -> None:
+        rows = [
+            SettingRow(org_id=None, repo_id=None, team_id=None, key="retired_key", value={"x": 1})
+        ]
+
+        assert effective_settings(rows, org_id=None, repo_id=None, team_id=None) == {}
+
+
+class TestValidateEndpointUrl:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "https://wiki.internal/mcp",
+            "http://kb:8080",
+            "https://[::1]:8443/mcp",
+            "https://wiki.internal/" + "a" * 480,
+        ],
+    )
+    def test_accepts_and_returns_unchanged(self, value: str) -> None:
+        assert validate_endpoint_url(value) == value
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            ("https://wiki.internal/" + "a" * 600, "printable ASCII"),
+            ("https://wiki.internal/\u00e9", "printable ASCII"),
+            ("https://wiki.internal/a b", "printable ASCII"),
+            ("https://wiki.internal/\x00", "printable ASCII"),
+            ("https://wiki.internal:99999/x", "not a valid URL"),
+            ("ftp://wiki.internal/x", "absolute http.s. URL with a host"),
+            ("/relative/path", "absolute http.s. URL with a host"),
+            ("https:///x", "absolute http.s. URL with a host"),
+            ("https://user:pw@wiki.internal/x", "userinfo"),
+            ("https://user@wiki.internal/x", "userinfo"),
+            ("https://wiki.internal/x?t=1", "query or fragment"),
+            ("https://wiki.internal/x#f", "query or fragment"),
+            ("https://wiki.internal/x?", "query or fragment"),
+            ("https://wiki.internal/x#", "query or fragment"),
+        ],
+    )
+    def test_rejects_with_fixed_message(self, value: str, message: str) -> None:
+        with pytest.raises(ValueError, match=message) as info:
+            validate_endpoint_url(value)
+        assert value not in str(info.value)

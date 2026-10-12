@@ -67,13 +67,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Sequence
-from typing import Any, Protocol
+from collections.abc import Awaitable, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Final, Protocol, TypeVar
+from urllib.parse import urlsplit
 
-from opentelemetry import metrics
+from opentelemetry import metrics, trace
 from pydantic import BaseModel, ConfigDict, Field
 
 from findings.models import Finding
+from findings.redact import NoOpTextRedactor, TextRedactor
 from indexing.chunk import Chunk
 from indexing.embedding import EmbeddingClient, EmbeddingError, EmbeddingVector
 from indexing.tree import (
@@ -83,6 +86,7 @@ from indexing.tree import (
     RepoTreeTruncatedError,
 )
 from ingestion.diff import Diff, DiffContentMalformedError, DiffContentUnavailableError, DiffFetcher
+from ingestion.pr_metadata import filter_issue_keys
 from review._telemetry import suppress_telemetry_errors
 from review.context_bundle import (
     MAX_CALLER_EDGES_PER_SYMBOL,
@@ -92,9 +96,28 @@ from review.context_bundle import (
 )
 from review.context_symbols import fetch_diff_content, resolve_changed_symbols
 from review.diff_prompt import render_diff
+from review.product_knowledge import (
+    FETCH_TOP_N,
+    SUPPORTED_MAJORS,
+    EffectiveProvider,
+    EffectiveProviderResolver,
+    ProductKnowledgeError,
+    ProductKnowledgeProvider,
+    ProductKnowledgeSection,
+    ProviderItem,
+    ProviderOpener,
+    ProviderOutcome,
+    assemble_product_knowledge,
+    formulate_query,
+    normalize_fetch,
+    normalize_results,
+    should_query,
+)
 from review.step import JobIdentity, Step, StepContext
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # US6 (docs/specs/spec-observability.md's METRIC & SPAN CATALOG) — the OTel
 # *API* import above, mirroring how `logging.getLogger(__name__)` is already
@@ -124,6 +147,76 @@ _bytes_histogram = meter.create_histogram(
     "review.context_builder.bytes",
     unit="By",
     description="Total serialized byte size of the assembled context bundle.",
+)
+
+# Product-knowledge provider branch (docs/plans/plan-deliver-product-knowledge.md
+# Phase 7, US-PK14). Literal instrument names so scripts/check-dashboard-metrics.py
+# finds them. Label allow-list (closed sets): `operation` ∈ {contract, search,
+# fetch, job}; `outcome` ∈ ProviderOutcome; `contract_version` ∈ {"1", "none",
+# "unsupported"}; `origin` ∈ {"worker"} (test-connection records "test_connection"
+# from the Admin API). Never a query, title, snippet, URL path, token or error body.
+_pk_tracer = trace.get_tracer("review.product_knowledge")
+_pk_meter = metrics.get_meter("review.product_knowledge")
+_pk_call_counter = _pk_meter.create_counter(
+    "review.product_knowledge.call_total",
+    description="Product-knowledge provider calls and job-level outcomes.",
+)
+_pk_duration_histogram = _pk_meter.create_histogram(
+    "review.product_knowledge.call_duration_ms",
+    unit="ms",
+    description="Product-knowledge provider call / branch wall-clock duration.",
+)
+_pk_item_count_histogram = _pk_meter.create_histogram(
+    "review.product_knowledge.item_count",
+    description="Number of provider items in the assembled section.",
+)
+_pk_bytes_histogram = _pk_meter.create_histogram(
+    "review.product_knowledge.bytes",
+    unit="By",
+    description="Serialized byte size of the assembled provider section.",
+)
+
+
+def record_product_knowledge_call(
+    operation: str,
+    outcome: ProviderOutcome,
+    contract_version: str,
+    duration_ms: int,
+    *,
+    origin: str,
+) -> None:
+    """
+    Record one provider call on the shared instruments.
+
+    ``origin`` is the closed set {"worker", "test_connection"}; the Admin API's test-connection
+    path uses this too so both appear on one dashboard row.
+    """
+    attributes = {
+        "operation": operation,
+        "outcome": outcome.value,
+        "contract_version": contract_version,
+        "origin": origin,
+    }
+    with suppress_telemetry_errors(
+        logger, "product_knowledge telemetry recording failed (review unaffected)"
+    ):
+        _pk_call_counter.add(1, attributes)
+        _pk_duration_histogram.record(duration_ms, attributes)
+
+
+# Headroom the fetch stage leaves before the branch deadline.
+_FETCH_DEADLINE_MARGIN_SECONDS: Final = 0.25
+
+# Outcomes an operator must act on: logged at warning with the credential ref
+# and endpoint host (log fields only), not just counted.
+_PK_CONFIG_CLASS: Final = frozenset(
+    {
+        ProviderOutcome.CREDENTIAL_UNAVAILABLE,
+        ProviderOutcome.BLOCKED_EGRESS,
+        ProviderOutcome.UNSUPPORTED_VERSION,
+        ProviderOutcome.AUTH_FAILED,
+        ProviderOutcome.REDACTION_DISABLED,
+    }
 )
 
 
@@ -273,10 +366,11 @@ class ContextBuilderOutput(JobIdentity):
     ``review_generation``, this step's own downstream dependency, to consume),
     plus the newly-assembled ``context_bundle``.
 
-    ``base_sha`` is explicitly forwarded at construction (Assumption 2's
-    fourth site) — it is *not* automatically carried forward just because
-    ``_ContextBuilderInput`` also has it (see ``review.step.JobIdentity``'s
-    own docstring for why an optional field is never auto-forwarded).
+    ``base_sha`` and the product-knowledge ``pr_*`` fields are explicitly
+    forwarded at construction (one of three hand-constructing sites, with
+    ``prefilter`` and ``static_analysis``) — they are *not* automatically
+    carried forward just because ``_ContextBuilderInput`` also has them (see
+    ``review.step.JobIdentity``'s own docstring for why an optional field is never auto-forwarded).
     """
 
     model_config = ConfigDict(frozen=True, from_attributes=True, arbitrary_types_allowed=True)
@@ -298,6 +392,35 @@ def _diff_byte_size(diff: Diff) -> int:
     ``render_diff``'s per-file header format.
     """
     return len(render_diff(diff).encode())
+
+
+@dataclass
+class _ProviderTrace:
+    """
+    Mutable record the provider branch fills in as it goes.
+
+    It lets the wrapper report accurately even when the deadline cancels the flow mid-way.
+    Holds only closed-set values and counts — never provider text.
+    """
+
+    outcome: ProviderOutcome = ProviderOutcome.PROVIDER_ERROR
+    contract_version: str = "none"
+    credential_ref: str | None = None
+    endpoint_host: str | None = None
+    display_name: str | None = None
+    searched: bool = False
+    duration_ms: int = 0
+    started_ns: int = 0
+    status_code: int | None = None
+    items: tuple[ProviderItem, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class _CodeRun:
+    bundle: ContextBundle
+    stats: dict[str, int]
+    outcome: str
+    error_extra: dict[str, Any]
 
 
 class ContextBuilderStep:
@@ -352,6 +475,10 @@ class ContextBuilderStep:
         internal_timeout_seconds: float,
         max_total_bytes: int,
         depends_on: str = "static_analysis",
+        provider_resolver: EffectiveProviderResolver | None = None,
+        provider_opener: ProviderOpener | None = None,
+        provider_redactor: TextRedactor | None = None,
+        provider_deadline_seconds: float = 10.0,
     ) -> None:
         """``depends_on`` names this step's single upstream dependency —
         ``"static_analysis"`` by default (the ordinary, both-steps-enabled
@@ -369,6 +496,18 @@ class ContextBuilderStep:
         budget and the single-oversized-item check in
         ``review.context_bundle.assemble_context_bundle`` are capped
         against.
+
+        **Optional product-knowledge provider branch** (plan Phase 7; every
+        parameter is keyword-only and defaults to the pre-feature behavior):
+        ``provider_resolver`` ``None`` ⇒ no provider code path at all,
+        byte-for-byte the prior step. ``provider_opener`` ``None`` with a
+        resolver set is the kill-switch-off state: a configured provider
+        yields ``outcome=disabled`` and no client is ever built.
+        ``provider_redactor`` is the same instance the Worker already builds;
+        a ``NoOpTextRedactor`` (or ``None``) means redaction is off, so the
+        branch is skipped (``redaction_disabled``, A5) rather than send an
+        unredacted title. ``provider_deadline_seconds`` is further capped to
+        ``internal_timeout_seconds`` so the branch never outlives the window.
         """
         self._diff_fetcher = diff_fetcher
         self._tree_fetcher = tree_fetcher
@@ -378,6 +517,10 @@ class ContextBuilderStep:
         self._internal_timeout_seconds = internal_timeout_seconds
         self._max_total_bytes = max_total_bytes
         self.depends_on: tuple[str, ...] = (depends_on,)
+        self._provider_resolver = provider_resolver
+        self._provider_opener = provider_opener
+        self._provider_redactor = provider_redactor
+        self._provider_deadline_seconds = min(provider_deadline_seconds, internal_timeout_seconds)
 
     async def _orchestrate(
         self, parsed: _ContextBuilderInput, job_id: str
@@ -504,17 +647,14 @@ class ContextBuilderStep:
         }
         return bundle, stats
 
-    async def run(self, input: Any, context: StepContext) -> ContextBuilderOutput:
-        # Any (not _ContextBuilderInput) because the registry passes the
-        # raw upstream step output here for validation — it may be
-        # StaticAnalysisOutput or, when static analysis can't produce
-        # findings, PrefilterOutput (see depends_on fallback above).
-        # `model_validate(..., from_attributes=True)` below enforces the
-        # actual shape at runtime.
-        parsed = _ContextBuilderInput.model_validate(input, from_attributes=True)
-        job_id = context.job_id
-        start = time.monotonic()
+    async def _run_code_branch(self, parsed: _ContextBuilderInput, job_id: str) -> _CodeRun:
+        """
+        Run the code-retrieval branch (Units A-D).
 
+        It has its own single ``wait_for`` and its own typed-failure degradation (US7). The
+        outcome/degraded labels and every pre-existing metric/log value are computed from this
+        branch only.
+        """
         bundle = ContextBundle()
         stats: dict[str, int] = {}
         outcome = "ok"
@@ -543,8 +683,43 @@ class ContextBuilderStep:
         else:
             if not bundle.items:
                 outcome = "degraded_empty"
+        return _CodeRun(bundle, stats, outcome, error_extra)
 
+    async def run(self, step_input: Any, context: StepContext) -> ContextBuilderOutput:
+        # Any (not _ContextBuilderInput) because the registry passes the
+        # raw upstream step output here for validation — it may be
+        # StaticAnalysisOutput or, when static analysis can't produce
+        # findings, PrefilterOutput (see depends_on fallback above).
+        # `model_validate(..., from_attributes=True)` below enforces the
+        # actual shape at runtime.
+        parsed = _ContextBuilderInput.model_validate(step_input, from_attributes=True)
+        job_id = context.job_id
+        start = time.monotonic()
+
+        # Two independent branches (F9): the provider branch never raises and
+        # has its own deadline, the code branch degrades on its own typed
+        # failures; neither can replace or fail the other's result.
+        provider_task: asyncio.Task[_ProviderTrace] | None = None
+        if self._provider_resolver is not None:
+            provider_task = asyncio.ensure_future(self._run_provider_branch(parsed, job_id))
+        try:
+            code = await self._run_code_branch(parsed, job_id)
+        except BaseException:
+            if provider_task is not None:
+                provider_task.cancel()
+            raise
+        # Measured before awaiting the provider so the existing duration
+        # histogram / log keep their code-branch-only meaning (plan Phase 7).
         duration_ms = int((time.monotonic() - start) * 1000)
+        bundle, stats, outcome, error_extra = (
+            code.bundle,
+            code.stats,
+            code.outcome,
+            code.error_extra,
+        )
+        if provider_task is not None:
+            bundle = await self._attach_provider_section(parsed, job_id, bundle, provider_task)
+
         item_count = len(bundle.items)
         # Sourced from `stats` (assemble_context_bundle's own already-computed
         # truncation total) rather than re-serializing every surviving item a
@@ -566,6 +741,40 @@ class ContextBuilderStep:
             **error_extra,
         }
 
+        self._record_and_log(job_id, outcome, duration_ms, bundle, log_extra)
+
+        return self._build_output(parsed, bundle)
+
+    async def _attach_provider_section(
+        self,
+        parsed: _ContextBuilderInput,
+        job_id: str,
+        bundle: ContextBundle,
+        provider_task: asyncio.Task[_ProviderTrace],
+    ) -> ContextBundle:
+        provider = await provider_task
+        # Assembled only now so ids continue after the final code id
+        # (``item()`` for a code id is unchanged).
+        section = assemble_product_knowledge(
+            provider.items,
+            label=provider.display_name or "Product knowledge",
+            first_id=bundle.next_item_id(),
+        )
+        if section is not None:
+            bundle = bundle.model_copy(update={"product_knowledge": section})
+        self._finish_provider(parsed, job_id, provider, section)
+        return bundle
+
+    @staticmethod
+    def _record_and_log(
+        job_id: str,
+        outcome: str,
+        duration_ms: int,
+        bundle: ContextBundle,
+        log_extra: dict[str, Any],
+    ) -> None:
+        item_count = len(bundle.items)
+        total_bytes = log_extra["context_bundle_total_bytes"]
         # US6 — recorded at the same point as the log line above, using the
         # real `outcome` literal ("ok" / "degraded_empty" / "degraded_error")
         # this method itself assigns, never a free-text value (Privacy NFR).
@@ -591,6 +800,8 @@ class ContextBuilderStep:
             ]
             logger.info("context_builder completed", extra=log_extra)
 
+    @staticmethod
+    def _build_output(parsed: _ContextBuilderInput, bundle: ContextBundle) -> ContextBuilderOutput:
         return ContextBuilderOutput(
             diff=parsed.diff,
             findings=parsed.findings,
@@ -602,7 +813,288 @@ class ContextBuilderStep:
             pr_number=parsed.pr_number,
             head_sha=parsed.head_sha,
             base_sha=parsed.base_sha,
+            pr_title=parsed.pr_title,
+            pr_head_ref=parsed.pr_head_ref,
+            pr_issue_keys=parsed.pr_issue_keys,
+            pr_is_fork=parsed.pr_is_fork,
+            private=parsed.private,
         )
+
+    # ------------------------------------------------------------------
+    # Product-knowledge provider branch (plan Phase 7)
+    # ------------------------------------------------------------------
+
+    async def _run_provider_branch(
+        self, parsed: _ContextBuilderInput, job_id: str
+    ) -> _ProviderTrace:
+        """
+        Run the provider branch; never raises.
+
+        Every failure maps to a ``ProviderOutcome``. Bounded by its own deadline (≤ the internal
+        window), so a hung provider or a hung settings read can neither delay nor fail the code
+        branch.
+        """
+        trace_ = _ProviderTrace(started_ns=time.time_ns())
+        start = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                self._provider_flow(
+                    parsed, job_id, trace_, deadline_at=start + self._provider_deadline_seconds
+                ),
+                timeout=self._provider_deadline_seconds,
+            )
+        except TimeoutError:
+            trace_.outcome = ProviderOutcome.TIMEOUT
+        except ProductKnowledgeError as exc:
+            trace_.outcome = exc.outcome
+            trace_.status_code = exc.status_code
+        except Exception as exc:
+            # Deliberately broad (plan Phase 7: "the branch itself never
+            # raises"; A5): an optional feature must not fail a review. Only
+            # the exception type is logged, never its text.
+            trace_.outcome = ProviderOutcome.PROVIDER_ERROR
+            logger.warning(
+                "product_knowledge branch failed unexpectedly",
+                extra={"job_id": job_id, "error_type": type(exc).__name__},
+            )
+        trace_.duration_ms = int((time.monotonic() - start) * 1000)
+        return trace_
+
+    async def _provider_flow(
+        self,
+        parsed: _ContextBuilderInput,
+        job_id: str,
+        trace_: _ProviderTrace,
+        *,
+        deadline_at: float,
+    ) -> None:
+        resolver = self._provider_resolver
+        assert resolver is not None  # only scheduled when a resolver is wired
+        # The settings read is bounded by min(its own 2 s cap, this branch's
+        # remaining deadline): the caller's ``wait_for`` on this whole flow is
+        # the deadline, so a hung read cannot outlive the branch.
+        setting = await resolver.resolve(parsed.org_id, parsed.repo_id)
+        if setting is None:
+            trace_.outcome = ProviderOutcome.NOT_CONFIGURED
+            return
+        trace_.credential_ref = setting.credential_ref
+        trace_.display_name = setting.display_name
+        trace_.endpoint_host = urlsplit(setting.endpoint_url).hostname
+        opener = self._provider_opener
+        if opener is None:
+            trace_.outcome = ProviderOutcome.DISABLED
+            return
+        skip = should_query(parsed.private, parsed.pr_is_fork, setting)
+        if skip is not None:
+            trace_.outcome = skip
+            return
+        keys = filter_issue_keys(parsed.pr_issue_keys, setting.issue_key_prefixes)
+        # Raises credential_unavailable on a missing/unbound credential,
+        # before any DNS or network.
+        provider = opener(setting.endpoint_url, setting.credential_ref)
+        redactor = self._provider_redactor
+        if redactor is None or isinstance(redactor, NoOpTextRedactor):
+            trace_.outcome = ProviderOutcome.REDACTION_DISABLED
+            return
+        # A1(c): a non-empty allow-list is a content restriction, so free-text
+        # title never reaches the provider; only allow-listed keys do.
+        title = None if setting.issue_key_prefixes else parsed.pr_title
+        if title:
+            try:
+                title = await redactor.redact(title)
+            except Exception as exc:
+                # Redaction raises on subprocess failure (findings.redact);
+                # inside this branch that is a typed outcome, never fatal.
+                logger.warning(
+                    "product_knowledge title redaction failed",
+                    extra={"job_id": job_id, "error_type": type(exc).__name__},
+                )
+                trace_.outcome = ProviderOutcome.PROVIDER_ERROR
+                return
+        query = formulate_query(title, keys)
+        if query is None:
+            trace_.outcome = ProviderOutcome.NO_QUERY
+            return
+        await self._provider_query(provider, query, setting, trace_, deadline_at=deadline_at)
+
+    async def _provider_query(
+        self,
+        provider: ProductKnowledgeProvider,
+        query: str,
+        setting: EffectiveProvider,
+        trace_: _ProviderTrace,
+        *,
+        deadline_at: float,
+    ) -> None:
+        contract_started = time.monotonic()
+        negotiated = await self._timed_call("contract", trace_, provider.negotiate())
+        contract_ms = int((time.monotonic() - contract_started) * 1000)
+        chosen = negotiated.chosen_version
+        trace_.contract_version = (
+            chosen if chosen is not None and chosen in SUPPORTED_MAJORS else "unsupported"
+        )
+        if chosen is None or chosen not in SUPPORTED_MAJORS:
+            raise ProductKnowledgeError(ProviderOutcome.UNSUPPORTED_VERSION)
+        if negotiated.deprecated:
+            self._record_call("contract", ProviderOutcome.DEPRECATED_VERSION, trace_, contract_ms)
+
+        trace_.searched = True
+        raw = await self._timed_call("search", trace_, provider.search(query))
+        normalized = normalize_results(raw)
+        if not normalized.items:
+            trace_.outcome = normalized.outcome  # empty | malformed
+            return
+        items = list(normalized.items)
+
+        top = items[:FETCH_TOP_N]
+        # Own, earlier bound: the fetch stage must expire (keeping the search
+        # snippets) before the branch's ``wait_for`` does, or a hung fetch
+        # would lose the whole branch to the same-instant outer timeout.
+        remaining = max(0.0, deadline_at - time.monotonic() - _FETCH_DEADLINE_MARGIN_SECONDS)
+        fetched = await self._fetch_top(provider, top, trace_, remaining)
+        items[: len(top)] = fetched
+        trace_.items = tuple(items)
+        trace_.outcome = normalized.outcome  # ok | partial
+
+    async def _fetch_top(
+        self,
+        provider: ProductKnowledgeProvider,
+        top: list[ProviderItem],
+        trace_: _ProviderTrace,
+        remaining_seconds: float,
+    ) -> list[ProviderItem]:
+        """
+        Fetch the top ``FETCH_TOP_N`` items in parallel.
+
+        A failed, slow or unusable fetch keeps that item's snippet (it never fails the job).
+        """
+
+        async def one(item: ProviderItem) -> ProviderItem:
+            try:
+                raw = await self._timed_call("fetch", trace_, provider.fetch(item.provider_item_id))
+            except ProductKnowledgeError:
+                return item
+            return normalize_fetch(raw, item)
+
+        try:
+            return list(
+                await asyncio.wait_for(
+                    asyncio.gather(*(one(item) for item in top)), timeout=remaining_seconds
+                )
+            )
+        except TimeoutError:
+            return top
+
+    async def _timed_call(
+        self, operation: str, trace_: _ProviderTrace, awaitable: Awaitable[_T]
+    ) -> _T:
+        """
+        Await one provider call and record its telemetry.
+
+        Records ``call_total``/``call_duration_ms`` for it (the closed ``operation`` label) with
+        the call's own outcome.
+        """
+        start = time.monotonic()
+        try:
+            result = await awaitable
+        except ProductKnowledgeError as exc:
+            trace_.status_code = exc.status_code
+            self._record_call(
+                operation, exc.outcome, trace_, int((time.monotonic() - start) * 1000)
+            )
+            raise
+        if operation == "contract":
+            # Label the negotiation's own call with the version it chose, not
+            # the "none" the trace still holds until `_provider_query` sets it.
+            chosen = getattr(result, "chosen_version", None)
+            if isinstance(chosen, str) and chosen in SUPPORTED_MAJORS:
+                trace_.contract_version = chosen
+        self._record_call(
+            operation, ProviderOutcome.OK, trace_, int((time.monotonic() - start) * 1000)
+        )
+        return result
+
+    def _record_call(
+        self, operation: str, outcome: ProviderOutcome, trace_: _ProviderTrace, duration_ms: int
+    ) -> None:
+        record_product_knowledge_call(
+            operation, outcome, trace_.contract_version, duration_ms, origin="worker"
+        )
+
+    def _finish_provider(
+        self,
+        parsed: _ContextBuilderInput,
+        job_id: str,
+        trace_: _ProviderTrace,
+        section: ProductKnowledgeSection | None,
+    ) -> None:
+        """
+        Emit job-level telemetry for the provider branch.
+
+        One ``operation=job`` counter/duration pair, one ``review.product_knowledge`` span (child
+        of the step span) and one log line. Closed-set labels and counts only — never content.
+        """
+        outcome = trace_.outcome
+        item_count = len(section.items) if section is not None else 0
+        total_bytes = (
+            sum(len(item.model_dump_json().encode()) for item in section.items)
+            if section is not None
+            else 0
+        )
+        self._record_job_telemetry(job_id, trace_, item_count, total_bytes)
+
+        log_extra: dict[str, Any] = {
+            "job_id": job_id,
+            "org_id": parsed.org_id,
+            "repo_id": parsed.repo_id,
+            "provider_ref": trace_.credential_ref,
+            "endpoint_host": trace_.endpoint_host,
+            "operation": "job",
+            "outcome": outcome.value,
+            "status_code": trace_.status_code,
+            "duration_ms": trace_.duration_ms,
+            "item_count": item_count,
+            "bytes": total_bytes,
+        }
+        if outcome in _PK_CONFIG_CLASS:
+            logger.warning("product_knowledge degraded", extra=log_extra)
+        elif outcome is ProviderOutcome.NOT_CONFIGURED:
+            logger.debug("product_knowledge not configured", extra=log_extra)
+        else:
+            logger.info("product_knowledge completed", extra=log_extra)
+
+    def _record_job_telemetry(
+        self, job_id: str, trace_: _ProviderTrace, item_count: int, total_bytes: int
+    ) -> None:
+        """The job-level metrics and span (errors suppressed: review unaffected)."""
+        outcome = trace_.outcome
+        attributes = {
+            "operation": "job",
+            "outcome": outcome.value,
+            "contract_version": trace_.contract_version,
+            "origin": "worker",
+        }
+        with suppress_telemetry_errors(
+            logger,
+            "product_knowledge telemetry recording failed (review unaffected)",
+            job_id=job_id,
+        ):
+            # The branch ran concurrently with code retrieval and is only
+            # reported here (item ids need the final code bundle), so the span
+            # is created with the branch's real start/end times rather than
+            # wrapping this call. It is a child of the step span (the current
+            # context here), per spec-observability's span-per-macro-step.
+            span = _pk_tracer.start_span("review.product_knowledge", start_time=trace_.started_ns)
+            span.set_attribute("outcome", outcome.value)
+            span.set_attribute("item_count", item_count)
+            span.set_attribute("contract_version", trace_.contract_version)
+            span.set_attribute("duration_ms", trace_.duration_ms)
+            span.end(end_time=trace_.started_ns + trace_.duration_ms * 1_000_000)
+            _pk_call_counter.add(1, attributes)
+            _pk_duration_histogram.record(trace_.duration_ms, attributes)
+            if trace_.searched:
+                _pk_item_count_histogram.record(item_count, {"outcome": outcome.value})
+                _pk_bytes_histogram.record(total_bytes, {"outcome": outcome.value})
 
 
 # Runtime confirmation (not just a docstring claim) that this class actually

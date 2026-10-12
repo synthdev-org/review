@@ -15,21 +15,41 @@ proven elsewhere).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 import uuid
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Iterator, Sequence
+from typing import Any, NamedTuple, TypedDict, Unpack
 
 import pytest
 import pytest_asyncio
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import Histogram, InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
+from adapter.product_knowledge.client import ClientTimeouts
+from adapter.product_knowledge.credentials import parse_credential_map
+from adapter.product_knowledge.factory import ProviderClientFactory
+from adapter.product_knowledge.provider_resolver import FailOpenProviderResolver
+from adapter.product_knowledge.testing.fake_provider import (
+    Era,
+    FakeProvider,
+    Fault,
+)
+from adapter.product_knowledge.testing.loopback import LoopbackTransport, fixed_resolver
+from adapter.product_knowledge.transport import EgressPolicy
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.engine import create_session_factory
 from adapter.storage.indexing_repository import IndexingRepository
 from adapter.storage.models import Org, Repo
+from adapter.storage.tenancy import PostgresSettingRepository
 from findings.models import Finding
+from findings.redact import NoOpTextRedactor, TextRedactor
 from indexing.chunk import Chunk
 from indexing.embedding import EmbeddingClient, EmbeddingError, EmbeddingVector
 from indexing.graph import GraphEdge, GraphNode
@@ -54,8 +74,15 @@ from review.context_builder import (
     GraphQuery,
     SimilarityQuery,
 )
-from review.context_bundle import MAX_CALLER_EDGES_PER_SYMBOL, ContextItemKind, serialized_item_size
+from review.context_bundle import (
+    MAX_CALLER_EDGES_PER_SYMBOL,
+    ContextItemKind,
+    render_context_bundle_section,
+    render_product_knowledge_section,
+    serialized_item_size,
+)
 from review.pipeline import FailurePolicy, StepRegistry
+from review.product_knowledge import EffectiveProvider, ProviderOpener
 from review.step import StepContext
 
 pytestmark = pytest.mark.integration
@@ -365,6 +392,7 @@ def upstream_output() -> Any:
             self.pr_number = 42
             self.head_sha = "head-sha"
             self.base_sha = base_sha
+            self.private = False
 
     return _FakeUpstreamOutput
 
@@ -1076,3 +1104,1035 @@ async def test_base_sha_none_with_nonzero_similarity_hits_is_ok_and_base_sha_mis
     assert len(completed) == 1
     assert completed[0].outcome == "ok"  # type: ignore[attr-defined]
     assert completed[0].base_sha_missing is True  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_product_knowledge_capture_fields_are_forwarded_to_output(
+    upstream_output: Any,
+) -> None:
+    """
+    Phase 2 of docs/plans/plan-deliver-product-knowledge.md: forward optional identity fields.
+
+    The optional ``JobIdentity`` fields must be explicitly forwarded by this step.
+    """
+    diff = _diff(DiffFile(path=_APP_PATH, status="modified", patch=_APP_PATCH))
+    step = _step(
+        diff_fetcher=_FakeDiffFetcher({_APP_PATH: _APP_POST_MODIFIED}),
+        tree_fetcher=_FakeTreeFetcher({_APP_PATH: _APP_PRE}),
+        graph_query=_EmptyGraphQuery(),
+        similarity_query=_EmptySimilarityQuery(),
+        embedding_client=_ZeroVectorEmbeddingClient(),
+    )
+    upstream = upstream_output(diff)
+    upstream.pr_title = "Fix PROJ-9"
+    upstream.pr_head_ref = "bugfix/PROJ-9"
+    upstream.pr_issue_keys = ("PROJ-9", "#41")
+    upstream.pr_is_fork = False
+    upstream.private = True
+
+    output = await step.run(upstream, _context())
+
+    assert output.pr_title == "Fix PROJ-9"
+    assert output.pr_head_ref == "bugfix/PROJ-9"
+    assert output.pr_issue_keys == ("PROJ-9", "#41")
+    assert output.pr_is_fork is False
+    assert output.private is True  # fail-closed field: a dropped forward kills the feature
+
+
+# =============================================================================
+# Product-knowledge provider branch (docs/plans/plan-deliver-product-knowledge.md
+# Phase 7: US-PK1/2/4/5/7/13/14/20). Real Postgres (the provider setting is
+# stored and read through `PostgresSettingRepository`) plus a real fake MCP
+# provider server (adapter/product_knowledge/testing/fake_provider.py) reached
+# through the production client/factory over a loopback transport.
+# =============================================================================
+
+_PK_HOST = "wiki.test"
+_PK_TOKEN = "tok-PK-SECRET-0123456789"
+_PK_SECRET = "ghp_PASTEDSECRET0123456789abcdef"
+_PK_TITLE = f"Fix PROJ-9 billing retry {_PK_SECRET}"
+_PK_FAST = ClientTimeouts(connect_seconds=1.0, call_seconds=1.5)
+_PK_DIFF = _diff(DiffFile(path=_APP_PATH, status="modified", patch=_APP_PATCH))
+
+
+class _MaskingRedactor:
+    """A fake ``TextRedactor`` masking the one known pasted secret."""
+
+    async def redact(self, text: str) -> str:
+        return text.replace(_PK_SECRET, "[REDACTED]")
+
+
+class _FailingRedactor:
+    async def redact(self, text: str) -> str:
+        raise RuntimeError("gitleaks subprocess exploded")
+
+
+class _HangingResolver:
+    """An ``EffectiveProviderResolver`` whose settings read never returns."""
+
+    async def resolve(self, org_id: str, repo_id: str) -> EffectiveProvider | None:
+        await asyncio.sleep(3600)
+        return None
+
+
+@pytest_asyncio.fixture
+async def pk_scope(session_factory: async_sessionmaker[Any]) -> dict[str, str]:
+    async with session_factory() as session, session.begin():
+        org = Org(name="acme", slug=f"acme-{uuid.uuid4().hex}")
+        session.add(org)
+        await session.flush()
+        repo = Repo(org_id=org.id, name="widgets", full_name=f"acme/widgets-{uuid.uuid4().hex}")
+        session.add(repo)
+        await session.flush()
+        return {"org_id": str(org.id), "repo_id": str(repo.id)}
+
+
+async def _write_setting(
+    session_factory: async_sessionmaker[Any],
+    scope: dict[str, str],
+    port: int,
+    **overrides: Any,
+) -> None:
+    value: dict[str, Any] = {
+        "enabled": True,
+        "display_name": "Company Wiki",
+        "endpoint_url": f"http://{_PK_HOST}:{port}/mcp",
+        "credential_ref": "wiki",
+        **overrides,
+    }
+    await PostgresSettingRepository(session_factory).upsert(
+        org_id=scope["org_id"],
+        repo_id=None,
+        team_id=None,
+        key="product_knowledge_provider",
+        value=value,
+    )
+
+
+def _pk_opener(provider: FakeProvider, timeouts: ClientTimeouts = _PK_FAST) -> ProviderOpener:
+    credentials = parse_credential_map(
+        SecretStr(json.dumps({"wiki": {"token": _PK_TOKEN, "allowed_hosts": [_PK_HOST]}}))
+    )
+    return ProviderClientFactory(
+        credentials=credentials,
+        policy=EgressPolicy(),
+        timeouts=timeouts,
+        resolver=fixed_resolver("10.9.8.7"),
+        inner_transport=LoopbackTransport(provider.port),
+    )
+
+
+class _PkStepOptions(TypedDict, total=False):
+    """Keyword overrides ``_pk_step`` accepts (all optional)."""
+
+    redactor: TextRedactor | None
+    opener: ProviderOpener | str | None
+    resolver: Any
+    graph_query: GraphQuery | None
+    similarity_query: SimilarityQuery | None
+    deadline: float
+    internal_timeout_seconds: float
+    timeouts: ClientTimeouts
+
+
+def _pk_step(
+    session_factory: async_sessionmaker[Any],
+    provider: FakeProvider,
+    **options: Unpack[_PkStepOptions],
+) -> ContextBuilderStep:
+    opener: Any = options.get("opener", "default")
+    resolver: Any = options.get("resolver", "default")
+    redactor = options.get("redactor")
+    return ContextBuilderStep(
+        _FakeDiffFetcher({_APP_PATH: _APP_POST_MODIFIED}),
+        _FakeTreeFetcher({_APP_PATH: _APP_PRE}),
+        options.get("graph_query") or _EmptyGraphQuery(),
+        options.get("similarity_query") or _DistinctPerFileSimilarityQuery(),
+        _ZeroVectorEmbeddingClient(),
+        internal_timeout_seconds=options.get("internal_timeout_seconds", 25.0),
+        max_total_bytes=200_000,
+        provider_resolver=(
+            FailOpenProviderResolver(PostgresSettingRepository(session_factory))
+            if resolver == "default"
+            else resolver
+        ),
+        provider_opener=(
+            _pk_opener(provider, options.get("timeouts", _PK_FAST))
+            if opener == "default"
+            else opener
+        ),
+        provider_redactor=redactor if redactor is not None else _MaskingRedactor(),
+        provider_deadline_seconds=options.get("deadline", 5.0),
+    )
+
+
+def _pk_upstream(
+    upstream_output: Any,
+    scope: dict[str, str],
+    *,
+    private: bool = True,
+    is_fork: bool | None = False,
+    title: str | None = _PK_TITLE,
+    keys: tuple[str, ...] = ("PROJ-9",),
+) -> Any:
+    upstream = upstream_output(_PK_DIFF, repo_id=scope["repo_id"])
+    upstream.org_id = scope["org_id"]
+    upstream.pr_title = title
+    upstream.pr_issue_keys = keys
+    upstream.pr_is_fork = is_fork
+    upstream.private = private
+    return upstream
+
+
+def _pk_queries(provider: FakeProvider) -> list[str]:
+    return [
+        str((r.arguments or {}).get("query"))
+        for r in provider.requests
+        if r.tool == "product_knowledge_search"
+    ]
+
+
+def _pk_outcome(caplog: pytest.LogCaptureFixture) -> str:
+    summary = {
+        "product_knowledge completed",
+        "product_knowledge degraded",
+        "product_knowledge not configured",
+    }
+    records = [r for r in caplog.records if r.message in summary]
+    assert len(records) == 1, [r.message for r in caplog.records]
+    return str(records[0].outcome)  # type: ignore[attr-defined]
+
+
+def _code_outcome(caplog: pytest.LogCaptureFixture) -> tuple[str, int]:
+    records = [r for r in caplog.records if r.message.startswith("context_builder ")]
+    assert len(records) == 1, [r.message for r in caplog.records]
+    return str(records[0].outcome), int(records[0].context_bundle_item_count)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("era", [Era.MODERN, Era.LEGACY])
+async def test_provider_section_joins_the_bundle_with_ids_after_code_ids(
+    era: Era,
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """US-PK1 (context-builder half) + US-PK7 + US-PK2 (query redaction)."""
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(era=era, token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        code_only = await _pk_step(session_factory, provider, resolver=None, opener=None).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+        caplog.clear()  # the single-summary-line assertions below are about `output` only
+        step = _pk_step(session_factory, provider)
+
+        output = await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+
+        queries = _pk_queries(provider)
+
+    bundle = output.context_bundle
+    assert len(bundle.items) >= 1  # code context is intact
+    # The provider section never joins ``items``: length is exactly the
+    # code-only length, and the first provider id is one past the last code id.
+    assert len(bundle.items) == len(code_only.context_bundle.items)
+    assert bundle.item(len(bundle.items)) is None
+    section = bundle.product_knowledge
+    assert section is not None
+    assert section.label == "Company Wiki"
+    assert [i.id for i in section.items] == [
+        len(bundle.items) + n for n in range(len(section.items))
+    ]
+    assert bundle.item(0) is bundle.items[0]
+    assert bundle.item(section.items[0].id) is None  # provider ids never index code items
+    assert bundle.product_knowledge_item(section.items[0].id) is section.items[0]
+    assert section.items[0].content.startswith("Full content of")  # top item was fetched
+    # US-PK2: the provider saw the redacted title and the key, nothing else.
+    # PROJ-9 is already in the title, so it is not repeated as a key.
+    assert queries == ["Fix PROJ-9 billing retry [REDACTED]"]
+    assert _PK_SECRET not in json.dumps([r.arguments for r in provider.requests])
+    assert _pk_outcome(caplog) == "ok"
+    code_outcome, code_count = _code_outcome(caplog)
+    assert code_outcome == "ok"
+    assert code_count == len(bundle.items)  # provider items never counted as code items
+
+
+class _GateCase(NamedTuple):
+    private: bool
+    is_fork: bool | None
+    allow_public: bool
+    expected: str
+    queried: bool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        _GateCase(True, False, False, "ok", True),
+        _GateCase(False, False, False, "skipped_public_repo", False),
+        _GateCase(True, True, False, "skipped_fork", False),
+        _GateCase(True, None, False, "skipped_fork", False),  # old payload: fail closed
+        _GateCase(False, True, True, "ok", True),  # explicit per-scope opt-in
+    ],
+)
+async def test_exposure_gate_matrix_sends_zero_requests_on_skip(
+    case: _GateCase,
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """US-PK20 (A1)."""
+    private, is_fork, allow_public, expected, queried = case
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(
+            session_factory, pk_scope, provider.port, allow_public_repos=allow_public
+        )
+        step = _pk_step(session_factory, provider)
+
+        output = await step.run(
+            _pk_upstream(upstream_output, pk_scope, private=private, is_fork=is_fork), _context()
+        )
+
+        assert bool(provider.requests) is queried
+    assert _pk_outcome(caplog) == expected
+    assert (output.context_bundle.product_knowledge is not None) is queried
+
+
+class _ChainDiffFetcher:
+    """
+    Serve both the prefilter's ``fetch`` and the later steps' ``fetch_content``.
+
+    Used by the chain-level ``private`` test.
+    """
+
+    async def fetch(self, **_: Any) -> Diff:
+        return _PK_DIFF
+
+    async def fetch_content(self, **_: Any) -> dict[str, bytes]:
+        return {_APP_PATH: _APP_POST_MODIFIED}
+
+
+class _NoFindingsAnalyzer:
+    async def run(self, diff: Diff, content: Any, *, timeout: float) -> list[Finding]:
+        return []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("private", "expected"), [(True, "ok"), (False, "skipped_public_repo")])
+async def test_private_flag_survives_prefilter_static_analysis_to_the_exposure_gate(
+    private: bool,
+    expected: str,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A1: the raw job payload's ``private`` key reaches the gate through every hand-off.
+
+    It must travel through the real prefilter -> static_analysis -> context_builder hand-offs;
+    a dropped forward would silently turn every private repo into ``skipped_public_repo``.
+    """
+    from review.prefilter import PrefilterStep
+    from review.static_analysis import StaticAnalysisStep
+
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    fetcher = _ChainDiffFetcher()
+    prefilter = PrefilterStep(fetcher)
+    static = StaticAnalysisStep(
+        fetcher,
+        gitleaks_analyzer=_NoFindingsAnalyzer(),
+        semgrep_analyzer=_NoFindingsAnalyzer(),
+        redactor=NoOpTextRedactor(),
+        enabled={"gitleaks": True, "semgrep": True},
+        timeouts={"gitleaks": 5.0, "semgrep": 5.0},
+    )
+    payload = {
+        "org_id": pk_scope["org_id"],
+        "repo_id": pk_scope["repo_id"],
+        "installation_id": 1,
+        "repo_full_name": "acme/widgets",
+        "pr_number": 42,
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
+        "pr_title": _PK_TITLE,
+        "pr_issue_keys": ["PROJ-9"],
+        "pr_is_fork": False,
+        "private": private,
+    }
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        step = _pk_step(session_factory, provider)
+
+        pre = await prefilter.run(payload, _context())
+        sa = await static.run(pre, _context())
+        await step.run(sa, _context())
+
+        assert bool(provider.requests) is private
+    assert _pk_outcome(caplog) == expected
+
+
+@pytest.mark.asyncio
+async def test_issue_key_prefix_allow_list_sends_only_matching_keys_never_title_text(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+) -> None:
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port, issue_key_prefixes=["PROJ"])
+        step = _pk_step(session_factory, provider)
+
+        await step.run(
+            _pk_upstream(
+                upstream_output, pk_scope, title="Fix salary bands", keys=("HR-77", "PROJ-9")
+            ),
+            _context(),
+        )
+
+        assert _pk_queries(provider) == ["PROJ-9"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Executive salary bands 2026",
+        "hr-77",
+        "HR_77",
+        "HR\u201177",
+        "HR-1234567",
+        "x_HR-77",
+        "HR 77",
+        "HR-77 #41",
+    ],
+)
+async def test_issue_key_prefix_allow_list_blocks_title_evasions_with_zero_requests(
+    title: str,
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from ingestion.pr_metadata import extract_issue_keys, filter_issue_keys
+
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    # Mirror the prefilter: keys are extracted from the title, then the
+    # step filters them by the allow-list.
+    keys = extract_issue_keys(title, None, None)
+    assert filter_issue_keys(keys, ["PROJ"]) == ()
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port, issue_key_prefixes=["PROJ"])
+        step = _pk_step(session_factory, provider)
+
+        await step.run(_pk_upstream(upstream_output, pk_scope, title=title, keys=keys), _context())
+
+        assert provider.requests == []
+    assert _pk_outcome(caplog) == "no_query"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "write_setting",
+    [False, True],
+    ids=["no_provider_setting", "repo_level_opt_out"],
+)
+async def test_no_provider_or_opt_out_sends_zero_requests_and_leaves_bundle_unchanged(
+    write_setting: bool,
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """US-PK4: output equals what a step with no provider wiring produces."""
+    caplog.set_level(logging.DEBUG, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        if write_setting:
+            await _write_setting(session_factory, pk_scope, provider.port, enabled=False)
+        with_provider = await _pk_step(session_factory, provider).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+        baseline = await _pk_step(session_factory, provider, resolver=None, opener=None).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+
+        assert provider.requests == []
+    assert with_provider.context_bundle == baseline.context_bundle
+    assert with_provider.context_bundle.product_knowledge is None
+    # The strings the LLM would see are equal with and without provider config.
+    for rendered in (render_context_bundle_section, render_product_knowledge_section):
+        assert rendered(with_provider.context_bundle) == rendered(baseline.context_bundle)
+    assert render_product_knowledge_section(with_provider.context_bundle) == ""
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_with_a_configured_provider_reports_disabled_and_calls_nothing(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        step = _pk_step(session_factory, provider, opener=None)
+
+        output = await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+
+        assert provider.requests == []
+    assert _pk_outcome(caplog) == "disabled"
+    assert output.context_bundle.product_knowledge is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("redactor", "expected"),
+    [(NoOpTextRedactor(), "redaction_disabled"), (_FailingRedactor(), "provider_error")],
+    ids=["noop_redactor", "redactor_failure"],
+)
+async def test_redaction_precondition_a5_blocks_the_call_and_the_job_completes(
+    redactor: TextRedactor,
+    expected: str,
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        step = _pk_step(session_factory, provider, redactor=redactor)
+
+        output = await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+
+        assert provider.requests == []
+    assert _pk_outcome(caplog) == expected
+    assert output.context_bundle.product_knowledge is None
+    assert len(output.context_bundle.items) >= 1
+    assert "exploded" not in " ".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_unbound_credential_fails_closed_before_any_request(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port, credential_ref="gone")
+        step = _pk_step(session_factory, provider)
+
+        await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+
+        assert provider.requests == []
+    assert _pk_outcome(caplog) == "credential_unavailable"
+    warned = [r for r in caplog.records if r.message == "product_knowledge degraded"]
+    assert len(warned) == 1
+    assert warned[0].levelno == logging.WARNING
+    assert warned[0].provider_ref == "gone"  # type: ignore[attr-defined]
+    assert warned[0].endpoint_host == _PK_HOST  # type: ignore[attr-defined]
+
+
+class _FlowCase(NamedTuple):
+    private: bool
+    credential_ref: str
+    redactor: TextRedactor | None
+    opener: Any
+    expected: str
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        # A1 gate precedes the credential lookup.
+        _FlowCase(False, "gone", None, "default", "skipped_public_repo"),
+        # credential lookup precedes the A5 redaction precondition.
+        _FlowCase(True, "gone", NoOpTextRedactor(), "default", "credential_unavailable"),
+        # kill switch (no opener) precedes the A1 gate.
+        _FlowCase(False, "wiki", None, None, "disabled"),
+    ],
+    ids=["a1_before_credential", "credential_before_a5", "disabled_before_a1"],
+)
+async def test_provider_flow_order_with_overlapping_skip_conditions(
+    case: _FlowCase,
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Plan Phase 7 branch flow: disabled -> A1 -> credential -> A5."""
+    private, credential_ref, redactor, opener, expected = case
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(
+            session_factory, pk_scope, provider.port, credential_ref=credential_ref
+        )
+        step = _pk_step(session_factory, provider, redactor=redactor, opener=opener)
+
+        await step.run(_pk_upstream(upstream_output, pk_scope, private=private), _context())
+
+        assert provider.requests == []
+    assert _pk_outcome(caplog) == expected
+
+
+@pytest.mark.asyncio
+async def test_code_duration_metric_and_log_exclude_provider_wait(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """
+    The existing duration histogram/log stay code-branch-only.
+
+    A provider that hangs until its 1.5 s deadline must not show up in them.
+    """
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(
+        token=_PK_TOKEN, fault=Fault("hang", "product_knowledge_search")
+    ) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        step = _pk_step(
+            session_factory,
+            provider,
+            deadline=1.5,
+            timeouts=ClientTimeouts(connect_seconds=1.0, call_seconds=10.0),
+        )
+        start = time.monotonic()
+        await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+        total_ms = (time.monotonic() - start) * 1000
+
+    assert _pk_outcome(caplog) == "timeout"
+    assert total_ms >= 1400  # the provider wait really happened
+    (record,) = [r for r in caplog.records if r.message == "context_builder completed"]
+    assert int(record.duration_ms) < 1000  # type: ignore[attr-defined]
+    points = _histogram_points(in_memory_metric_reader, "review.context_builder.duration_ms")
+    assert len(points) == 1 and points[0].max < 1000
+
+
+@pytest.mark.asyncio
+async def test_no_title_and_no_keys_is_no_query(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        step = _pk_step(session_factory, provider)
+
+        await step.run(_pk_upstream(upstream_output, pk_scope, title=None, keys=()), _context())
+
+        assert provider.requests == []
+    assert _pk_outcome(caplog) == "no_query"
+
+
+_PK_FAILURES: list[tuple[str, Fault, str]] = [
+    ("auth", Fault("status401", "product_knowledge_search"), "auth_failed"),
+    ("server_error", Fault("status500", "product_knowledge_search"), "provider_error"),
+    ("error_result", Fault("error_result", "product_knowledge_search"), "provider_error"),
+    ("malformed", Fault("bad_structure", "product_knowledge_search"), "malformed"),
+    ("oversized", Fault("huge"), "oversized"),
+    ("bad_version", Fault("badversion"), "unsupported_version"),
+    ("slow", Fault("hang", "product_knowledge_search"), "timeout"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "expected"), [(f, e) for _, f, e in _PK_FAILURES], ids=[n for n, _, _ in _PK_FAILURES]
+)
+async def test_every_provider_failure_class_leaves_code_context_and_completes(
+    fault: Fault,
+    expected: str,
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """US-PK5 at job level: right outcome, empty section, code unchanged."""
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN, fault=fault) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        step = _pk_step(session_factory, provider, deadline=5.0)
+
+        baseline = await _pk_step(session_factory, provider, resolver=None, opener=None).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+        caplog.clear()
+        output = await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+
+    assert _pk_outcome(caplog) == expected
+    assert output.context_bundle.product_knowledge is None
+    assert output.context_bundle.items == baseline.context_bundle.items
+    assert _code_outcome(caplog)[0] == "ok"
+    log_text = " ".join(f"{r.getMessage()} {r.__dict__}" for r in caplog.records)
+    assert _PK_TOKEN not in log_text
+
+
+@pytest.mark.asyncio
+async def test_partial_results_keep_the_valid_items(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(
+        token=_PK_TOKEN, fault=Fault("partial", "product_knowledge_search")
+    ) as p:
+        await _write_setting(session_factory, pk_scope, p.port)
+        output = await _pk_step(session_factory, p).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+
+    section = output.context_bundle.product_knowledge
+    assert section is not None
+    assert [i.title for i in section.items] == ["Product doc 1", "Product doc 2", "Product doc 3"]
+    assert _pk_outcome(caplog) == "partial"
+
+
+@pytest.mark.asyncio
+async def test_failed_fetch_keeps_the_search_snippet(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+) -> None:
+    async with FakeProvider(
+        token=_PK_TOKEN, fault=Fault("status500", "product_knowledge_fetch")
+    ) as p:
+        await _write_setting(session_factory, pk_scope, p.port)
+        output = await _pk_step(session_factory, p).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+
+    section = output.context_bundle.product_knowledge
+    assert section is not None
+    assert section.items[0].content.startswith("Snippet for document 1")
+
+
+@pytest.mark.asyncio
+async def test_code_failure_keeps_the_provider_section(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two-way isolation, direction 1 (F9)."""
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        step = _pk_step(
+            session_factory,
+            provider,
+            graph_query=_RaisingGraphQuery(
+                ContextQueryError(operation="find_callers_edges", detail="x")
+            ),
+        )
+
+        output = await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+
+    assert output.context_bundle.items == ()
+    section = output.context_bundle.product_knowledge
+    assert section is not None
+    assert section.items[0].id == 0  # ids continue after zero code items
+    assert _code_outcome(caplog)[0] == "degraded_error"
+    assert _pk_outcome(caplog) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_hanging_provider_cannot_exceed_the_internal_window_or_hurt_code_context(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Two-way isolation, direction 2, with a provider deadline larger than the window.
+
+    The deadline is *larger* than the internal window: the branch is capped to the window.
+    """
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(
+        token=_PK_TOKEN, fault=Fault("hang", "product_knowledge_search")
+    ) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        # The adapter call timeout (10s) and the branch deadline (60s) are both
+        # far above the 1.0s window, so only the min() cap in the step can end
+        # the hung search in time; deleting the cap pushes elapsed to ~10s.
+        step = _pk_step(
+            session_factory,
+            provider,
+            deadline=60.0,
+            internal_timeout_seconds=1.0,
+            timeouts=ClientTimeouts(connect_seconds=1.0, call_seconds=10.0),
+        )
+
+        start = time.monotonic()
+        output = await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+        elapsed = time.monotonic() - start
+
+    assert elapsed < 2.5
+    assert _pk_outcome(caplog) == "timeout"
+    assert len(output.context_bundle.items) >= 1
+
+
+@pytest.mark.asyncio
+async def test_hung_settings_read_is_bounded_by_the_branch_deadline(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        step = _pk_step(session_factory, provider, resolver=_HangingResolver(), deadline=0.5)
+
+        start = time.monotonic()
+        output = await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+
+    assert time.monotonic() - start < 3.0
+    assert _pk_outcome(caplog) == "timeout"
+    assert len(output.context_bundle.items) >= 1
+
+
+@pytest.mark.asyncio
+async def test_existing_outcome_metrics_and_log_are_emitted_once_when_the_provider_fails(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN, fault=Fault("status500")) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        await _pk_step(session_factory, provider).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+
+    code_logs = [r for r in caplog.records if r.message.startswith("context_builder ")]
+    assert len(code_logs) == 1
+    data = in_memory_metric_reader.get_metrics_data()
+    assert data is not None
+    outcome_points = [
+        p
+        for rm in data.resource_metrics
+        for sm in rm.scope_metrics
+        for m in sm.metrics
+        if m.name == "review.context_builder.outcome_total"
+        for p in m.data.data_points
+    ]
+    assert len(outcome_points) == 1
+    assert dict(outcome_points[0].attributes or {}) == {"outcome": "ok"}
+    assert outcome_points[0].value == 1
+
+
+@pytest.fixture
+def in_memory_metric_reader(
+    reset_otel_global_providers: None,
+) -> Iterator[InMemoryMetricReader]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-test"}), metric_readers=[reader]
+    )
+    metrics.set_meter_provider(provider)
+    yield reader
+    provider.shutdown()
+
+
+_PK_ALLOWED_ATTRIBUTES = {
+    "review.product_knowledge.call_total": {"operation", "outcome", "contract_version", "origin"},
+    "review.product_knowledge.call_duration_ms": {
+        "operation",
+        "outcome",
+        "contract_version",
+        "origin",
+    },
+    "review.product_knowledge.item_count": {"outcome"},
+    "review.product_knowledge.bytes": {"outcome"},
+}
+
+
+def _pk_metric_attributes(reader: InMemoryMetricReader) -> dict[str, list[dict[str, Any]]]:
+    """Every ``review.product_knowledge.*`` data point's attributes, by metric."""
+    data = reader.get_metrics_data()
+    assert data is not None
+    seen: dict[str, list[dict[str, Any]]] = {}
+    for rm in data.resource_metrics:
+        for sm in rm.scope_metrics:
+            for metric in sm.metrics:
+                if not metric.name.startswith("review.product_knowledge."):
+                    continue
+                assert isinstance(metric.data, Sum | Histogram)
+                seen.setdefault(metric.name, []).extend(
+                    dict(p.attributes or {}) for p in metric.data.data_points
+                )
+    return seen
+
+
+def _assert_closed_attribute_sets(seen: dict[str, list[dict[str, Any]]]) -> None:
+    for name, attribute_sets in seen.items():
+        if name not in _PK_ALLOWED_ATTRIBUTES:
+            continue  # config_resolution_total has its own closed {source} set
+        for attributes in attribute_sets:
+            assert set(attributes) <= _PK_ALLOWED_ATTRIBUTES[name], (name, attributes)
+
+
+@pytest.mark.asyncio
+async def test_telemetry_uses_only_closed_label_sets_and_no_sensitive_text(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    """
+    US-PK14: metric attributes are the closed allow-list.
+
+    The pasted secret, query, titles, URLs and token appear nowhere in them.
+    """
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        await _pk_step(session_factory, provider).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+
+    seen = _pk_metric_attributes(in_memory_metric_reader)
+    assert set(_PK_ALLOWED_ATTRIBUTES) <= set(seen)
+    _assert_closed_attribute_sets(seen)
+    calls = seen["review.product_knowledge.call_total"]
+    assert {a["operation"] for a in calls} == {"contract", "search", "fetch", "job"}
+    assert {a["origin"] for a in calls} == {"worker"}
+    assert {a["contract_version"] for a in calls} <= {"1", "none"}
+    blob = json.dumps(seen)
+    for forbidden in (_PK_SECRET, _PK_TOKEN, "PROJ-9", "Product doc", "wiki.example.com", _PK_HOST):
+        assert forbidden not in blob
+
+
+class _HangingGraphQuery:
+    async def find_callers(
+        self, *, repo_id: str, symbol_names: Sequence[str], limit_per_symbol: int
+    ) -> dict[str, tuple[CallerHit, ...]]:
+        await asyncio.sleep(3600)
+        return {}
+
+
+def _histogram_points(reader: InMemoryMetricReader, name: str) -> list[Any]:
+    data = reader.get_metrics_data()
+    assert data is not None
+    return [
+        p
+        for rm in data.resource_metrics
+        for sm in rm.scope_metrics
+        for m in sm.metrics
+        if m.name == name
+        for p in m.data.data_points
+    ]
+
+
+@pytest.mark.asyncio
+async def test_only_the_code_branch_timing_out_keeps_the_provider_section(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Two-way isolation, direction 1, via the code branch's own ``wait_for``.
+
+    The failure is a TimeoutError from a hung graph query, not a typed query error.
+    """
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        step = _pk_step(
+            session_factory,
+            provider,
+            graph_query=_HangingGraphQuery(),
+            internal_timeout_seconds=2.0,
+        )
+
+        output = await step.run(_pk_upstream(upstream_output, pk_scope), _context())
+
+    assert output.context_bundle.items == ()
+    section = output.context_bundle.product_knowledge
+    assert section is not None and section.items
+    degraded = [r for r in caplog.records if r.message == "context_builder degraded"]
+    assert len(degraded) == 1
+    assert degraded[0].error_type == "TimeoutError"  # type: ignore[attr-defined]
+    assert _pk_outcome(caplog) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_code_histograms_exclude_provider_items_on_a_successful_provider_run(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        code_only = await _pk_step(session_factory, provider, resolver=None, opener=None).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+        with_provider = await _pk_step(session_factory, provider).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+
+    section = with_provider.context_bundle.product_knowledge
+    assert section is not None and section.items  # the provider really contributed
+    code_count = len(code_only.context_bundle.items)
+    assert len(with_provider.context_bundle.items) == code_count
+    logged_bytes = [
+        int(r.context_bundle_total_bytes)  # type: ignore[attr-defined]
+        for r in caplog.records
+        if r.message == "context_builder completed"
+    ]
+    assert len(logged_bytes) == 2 and logged_bytes[0] == logged_bytes[1] > 0
+    counts = _histogram_points(in_memory_metric_reader, "review.context_builder.item_count")
+    sizes = _histogram_points(in_memory_metric_reader, "review.context_builder.bytes")
+    assert [(p.count, p.min, p.max) for p in counts] == [(2, code_count, code_count)]
+    assert [(p.count, p.min, p.max) for p in sizes] == [(2, logged_bytes[0], logged_bytes[0])]
+
+
+_STD_LOG_ATTRS = frozenset(logging.makeLogRecord({}).__dict__) | {"message", "asctime", "taskName"}
+
+
+@pytest.mark.asyncio
+async def test_job_log_line_has_exactly_the_documented_field_set(
+    upstream_output: Any,
+    session_factory: async_sessionmaker[Any],
+    pk_scope: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="review.context_builder")
+    async with FakeProvider(token=_PK_TOKEN) as provider:
+        await _write_setting(session_factory, pk_scope, provider.port)
+        await _pk_step(session_factory, provider).run(
+            _pk_upstream(upstream_output, pk_scope), _context()
+        )
+
+    (record,) = [r for r in caplog.records if r.message == "product_knowledge completed"]
+    assert set(record.__dict__) - _STD_LOG_ATTRS == {
+        "job_id",
+        "org_id",
+        "repo_id",
+        "provider_ref",
+        "endpoint_host",
+        "operation",
+        "outcome",
+        "status_code",
+        "duration_ms",
+        "item_count",
+        "bytes",
+    }
+    assert record.operation == "job"  # type: ignore[attr-defined]

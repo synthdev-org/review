@@ -62,9 +62,9 @@ from adapter.github.tree import GitHubTreeFetcher
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
-from adapter.storage.tenancy import PostgresUsageCounterRepository
+from adapter.storage.tenancy import PostgresSettingRepository, PostgresUsageCounterRepository
 from adapter.telemetry.sdk import init_telemetry
-from apps.worker.main import main
+from apps.worker.main import ProductKnowledgeWiring, main
 from apps.worker.settings import WorkerSettings
 from findings.redact import NoOpTextRedactor, TextRedactor
 from indexing.chunk import Chunk
@@ -405,6 +405,7 @@ def _capture_redactor(
         settings: WorkerSettings,
         memory_matcher: PostgresMemoryRepository,
         model_resolver: FallbackModelRoutingResolver | None,
+        product_knowledge: ProductKnowledgeWiring | None = None,
     ) -> StepRegistry:
         captured.append(redactor)
         return original(
@@ -421,6 +422,7 @@ def _capture_redactor(
             settings,
             memory_matcher,
             model_resolver,
+            product_knowledge,
         )
 
     monkeypatch.setattr(worker_main, "_build_review_registry", _capturing)
@@ -1052,6 +1054,168 @@ def test_model_routing_default_enabled_logs_no_disabled_warning(
     captured = capsys.readouterr()
     payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
     assert not [p for p in payloads if "model routing is disabled" in p["message"]]
+
+
+# --- plan-deliver-product-knowledge.md Phase 6: product_knowledge_enabled -----
+#
+# The kill switch (US-PK13): one startup warning, no provider client factory
+# or settings reader constructed, even with a credential map present.
+
+_PK_MAP = '{"wiki-prod": {"token": "tok-1", "allowed_hosts": ["wiki.internal"]}}'
+_PK_DISABLED_MESSAGE = (
+    "product knowledge is disabled: no external provider will be queried "
+    "even if provider settings exist"
+)
+
+
+def test_product_knowledge_kill_switch_builds_no_client_and_warns_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    constructed: list[object] = []
+
+    class _ExplodingFactory:
+        def __init__(self, **kwargs: object) -> None:
+            constructed.append(kwargs)
+
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS", _PK_MAP)
+    monkeypatch.setattr(worker_main, "ProviderClientFactory", _ExplodingFactory)
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    payloads = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines() if line]
+    matching = [p for p in payloads if p["message"] == _PK_DISABLED_MESSAGE]
+    assert len(matching) == 1
+    assert matching[0]["level"] == "WARNING"
+    assert constructed == []
+    assert not [p for p in payloads if p["message"] == "product knowledge wired"]
+
+
+def test_product_knowledge_default_wires_a_factory_without_warning_or_token_in_logs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS", _PK_MAP)
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    out = capsys.readouterr().out
+    payloads = [json.loads(line) for line in out.strip().splitlines() if line]
+    wired = [p for p in payloads if p["message"] == "product knowledge wired"]
+    assert len(wired) == 1
+    assert wired[0]["credential_count"] == 1
+    if [p for p in payloads if p["message"] == _PK_DISABLED_MESSAGE]:
+        pytest.fail("no disabled-provider message expected")
+    assert "tok-1" not in out
+
+
+_PK_CB_DISABLED_MESSAGE = (
+    "product knowledge credentials are configured but the context_builder step "
+    "is disabled (or cannot produce a value): no provider will be queried"
+)
+
+
+def test_product_knowledge_credentials_with_context_builder_disabled_warns_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_CONTEXT_BUILDER_ENABLED", "false")
+    monkeypatch.setenv("REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS", _PK_MAP)
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    payloads = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines() if line]
+    matching = [p for p in payloads if p["message"] == _PK_CB_DISABLED_MESSAGE]
+    assert len(matching) == 1
+    assert matching[0]["level"] == "WARNING"
+
+
+def test_product_knowledge_context_builder_warning_absent_by_default_or_without_credentials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_CONTEXT_BUILDER_ENABLED", "false")  # no credential map
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    main()
+
+    payloads = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines() if line]
+    assert not [p for p in payloads if p["message"] == _PK_CB_DISABLED_MESSAGE]
+
+
+def test_product_knowledge_wiring_has_no_opener_when_the_kill_switch_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Kill switch: the resolver stays but no client factory exists.
+
+    A configured provider reports `outcome=disabled`, and there is nothing to
+    call anything with.
+    """
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    repository = cast(PostgresSettingRepository, object())
+    logger = logging.getLogger("test")
+
+    monkeypatch.setenv("REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED", "false")
+    off = worker_main._build_product_knowledge_wiring(
+        WorkerSettings(_env_file=None), repository, logger
+    )
+    monkeypatch.setenv("REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED", "true")
+    on = worker_main._build_product_knowledge_wiring(
+        WorkerSettings(_env_file=None), repository, logger
+    )
+
+    assert off.opener is None
+    assert off.resolver is not None
+    assert on.opener is not None
+
+    # And the registry hands exactly that wiring to the Context Builder step.
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    registry = worker_main._build_review_registry(
+        StepEnablement(),
+        StepTimeouts(),
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        WorkerSettings(_env_file=None),
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
+        on,
+    )
+    step = registry._by_name["context_builder"]
+    assert step._provider_opener is on.opener  # type: ignore[attr-defined]
+    assert step._provider_resolver is on.resolver  # type: ignore[attr-defined]
+
+
+def test_product_knowledge_malformed_credential_map_fails_worker_startup_without_the_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv(
+        "REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS",
+        '{"wiki": {"token": "SECRET-TOK-XYZ", "allowed_hosts": []}}',
+    )
+    monkeypatch.setattr(worker_main, "_build_llm_client", lambda settings: _FakeLLMClient())
+
+    with pytest.raises(Exception) as excinfo:
+        main()
+
+    assert "no allowed_hosts" in str(excinfo.value)
+    assert "SECRET-TOK-XYZ" not in str(excinfo.value)
 
 
 # --- Phase 5 (verification pipeline plan): resolved depends_on in startup log

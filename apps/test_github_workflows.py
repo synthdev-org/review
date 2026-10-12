@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 WORKFLOWS_DIR = Path(__file__).resolve().parents[1] / ".github" / "workflows"
@@ -98,3 +99,27 @@ def test_e2e_workflow_runs_the_compose_e2e_suite() -> None:
     runs = _job_step_runs(job)
 
     assert any("pytest tests/e2e" in run for run in runs)
+
+
+def test_live_product_knowledge_conformance_step_is_nightly_only_and_non_gating() -> None:
+    steps = [
+        step
+        for step in _load("e2e.yml")["jobs"]["e2e"]["steps"]
+        if "adapter.product_knowledge.conformance" in step.get("run", "")
+    ]
+
+    assert len(steps) == 1, "e2e.yml must carry exactly one live conformance step"
+    step = steps[0]
+    condition = step.get("if", "")
+    # e2e.yml also triggers on push to main: the event guard keeps the live
+    # run off merges, PK_LIVE_URL opts a repo in, and a red run never gates.
+    if "github.event_name == 'schedule'" not in condition:
+        pytest.fail("live step must run on schedule")
+    if "github.event_name == 'workflow_dispatch'" not in condition:
+        pytest.fail("live step must run on workflow_dispatch")
+    assert "PK_LIVE_URL" in condition
+    if step.get("continue-on-error") is not True:
+        pytest.fail("live step must be non-gating (continue-on-error)")
+    assert "PK_LIVE_URL" not in (WORKFLOWS_DIR / "ci.yml").read_text()
+    if "adapter.product_knowledge.conformance" in (WORKFLOWS_DIR / "ci.yml").read_text():
+        pytest.fail("ci.yml must not run the live conformance suite")

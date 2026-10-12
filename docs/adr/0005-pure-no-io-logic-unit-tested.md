@@ -155,6 +155,68 @@ rule applies unchanged.
   against hand-built request parameters/already-received LLM response text
   (assembling a request payload and parsing/validating an already-received
   JSON envelope perform no I/O of their own).
+- Phase 1 of `docs/plans/plan-deliver-product-knowledge.md` (this ADR's scope
+  extended by that phase's own PR, not a second ADR): `review/product_knowledge.py`'s
+  wire models and limits constants (US-PK16) —
+  `adapter/product_knowledge/test_contract_schemas.py`, a static check that
+  the committed JSON Schemas under `docs/reference/product-knowledge-contract/v1/`
+  equal those generated from the models and that every committed example
+  validates or fails as named (pydantic model definitions and file
+  comparison perform no network or database I/O; later phases add pure
+  functions to this module and extend this entry). Mutation testing covers
+  this module through those unit tests only.
+- Phase 2 of `docs/plans/plan-deliver-product-knowledge.md` (same
+  mechanism): `ingestion/pr_metadata.py`'s title/head-ref normalization
+  (`normalize_title`, `normalize_head_ref`), issue-key extraction/prefix
+  filtering (`extract_issue_keys`, `filter_issue_keys`) and fail-closed `is_fork_pr`
+  derivation (US-PK2 capture, US-PK20) — `ingestion/test_pr_metadata.py`;
+  pure string/boolean logic over already-parsed webhook fields.
+- Phase 3 of `docs/plans/plan-deliver-product-knowledge.md` (same
+  mechanism): `review/product_knowledge.py`'s `should_query` (A1 exposure
+  gate), `formulate_query`, `normalize_results`/`normalize_fetch`, the single
+  `sanitize_url`/`url_display` sanitizer, `assemble_product_knowledge`,
+  `product_knowledge_prompt_payload`, plus
+  `review/context_bundle.py`'s `render_product_knowledge_section` /
+  `product_knowledge_item` and `review/citation.py`'s product-knowledge
+  block (US-PK2/PK3/PK6/PK7/PK20) — `review/test_product_knowledge.py`,
+  `review/test_context_bundle.py`, `review/test_citation.py`; string,
+  URL-parsing and bounded-arithmetic logic over already-received provider
+  payloads, with the prompt/post wiring proven by the integration tests in
+  `review/test_review_generation_step.py`, `test_verification_step.py` and
+  `test_findings_output_step.py`.
+- Phase 4 of `docs/plans/plan-deliver-product-knowledge.md` (same
+  mechanism): `adapter/product_knowledge/egress.py`'s `canonicalize_host`,
+  `split_host_port`, `classify_address`, `host_matches_allowlist`,
+  `parse_allow_entry` and `endpoint_origin` (US-PK12,
+  Amendment A3) — `adapter/product_knowledge/test_egress_pure.py`; stdlib
+  `ipaddress`/`socket.inet_aton` string-and-address arithmetic with no
+  network, DNS or socket I/O (`inet_aton` only parses text). The enforcing
+  transport (`transport.py`) is deliberately a separate module so this one
+  stays purely unit-testable and mutation-testable; its behavior is proven by
+  `test_egress.py`/`test_client.py` against real sockets. The fake provider
+  under `adapter/product_knowledge/testing/` is test tooling and is excluded
+  from mutation testing (`[tool.mutmut] do_not_mutate`).
+- Phase 6 of `docs/plans/plan-deliver-product-knowledge.md` (same
+  mechanism): `adapter/product_knowledge/credentials.py`'s
+  `parse_credential_map`, `parse_endpoint_allowlist` and
+  `CredentialMap.binding_problem` (US-PK9/PK13, Amendment A2) —
+  `adapter/product_knowledge/test_credentials.py`; JSON parsing, pydantic
+  validation and the shared host canonicaliser only, no I/O, and the
+  error-message-never-contains-a-token property is unit-asserted there. Plus
+  `tenancy/settings.py`'s `ProductKnowledgeProviderSetting`,
+  `validate_endpoint_url` and `effective_settings` (`tenancy/test_settings.py`).
+  The keyed Postgres read and the fail-open resolver wrapper are adapter code
+  proven by `adapter/storage/test_tenancy.py` against real Postgres.
+- Phase 7 of `docs/plans/plan-deliver-product-knowledge.md` (same
+  mechanism): no new pure function — the provider branch in
+  `review/context_builder.py` is orchestration (async, I/O through injected
+  Protocols) and is proven by the integration tests in
+  `review/test_context_builder_step.py`; the pure functions it composes
+  (`should_query`, `formulate_query`, `filter_issue_keys`,
+  `normalize_results`/`normalize_fetch`, `assemble_product_knowledge`) are
+  the ones already listed above and stay under mutation testing via their
+  own unit tests. `review/product_knowledge.py` is therefore registered here
+  as the pure module those unit tests cover, not the branch itself.
 - Later phases extend this same list as their own pure, no-I/O cases land —
   each phase's own plan section names the specific addition; this ADR's own
   text is updated to list it, rather than a new ADR being created per case.

@@ -31,13 +31,15 @@ export function EmptyState({
 export function ErrorState({
   message,
   onRetry,
+  title = "Couldn\u2019t load this screen",
 }: {
   message: string;
   onRetry?: () => void;
+  title?: string;
 }): JSX.Element {
   return (
     <div className="state-view state-view--error" role="alert">
-      <p className="state-view__title">Couldn&rsquo;t load this screen</p>
+      <p className="state-view__title">{title}</p>
       <p className="state-view__description">{message}</p>
       {onRetry && (
         <button type="button" onClick={onRetry}>

@@ -150,7 +150,8 @@ optional, review is fully functional with none of this configured, and not
 locked to any single provider.
 
 - Define and version review's own product-knowledge MCP contract
-  (`product_knowledge_search`/`product_knowledge_fetch`/
+  (`product_knowledge_contract` for version negotiation,
+  `product_knowledge_search`/`product_knowledge_fetch`, and the optional
   `product_knowledge_related`).
 - Context Builder's additional MCP client call against a configured
   provider's endpoint.
@@ -163,10 +164,20 @@ locked to any single provider.
   any future provider would use, with no knowhow-specific code in the
   Context Builder.
 
-*Open: exact context-fusion/citation UX, review's own contract
-versioning/deprecation policy, and whether a conformance test harness is
-worth shipping for third-party implementers — all flagged in ADR-0003 and
-`c4-architecture.md`.*
+Specified in [`specs/spec-product-knowledge.md`](specs/spec-product-knowledge.md)
+(with [ADR-0013](adr/0013-product-knowledge-mcp-client-sdk-credentials-and-egress.md)).
+
+**Status (2026-10-11):** implemented in this repo across the plan's Phases 1-9
+([`plans/plan-deliver-product-knowledge.md`](plans/plan-deliver-product-knowledge.md)):
+contract + schemas, PR metadata capture, domain logic, MCP client + egress
+guard, conformance suite, configuration/Admin API, Context Builder wiring and
+telemetry, Admin UI panel, runbook and E2E. Remaining before it is
+"done": ADR-0013 sign-off (still `PROPOSED`), knowhow registering the contract
+tools (cross-repo Workstream K; the nightly live-conformance run is its
+acceptance signal), the two-week pilot behind the kill switch, and the
+`platform/docs/vision.md` follow-up (that file, in another project root, still
+names `knowhow_search/fetch/related` as review's consumed surface and should
+reference review's `product_knowledge_*` contract).
 
 ---
 

@@ -28,12 +28,16 @@ dependencies = [
     # different, symmetric primitive). Pulls in `cryptography` as its RS256
     # backend.
     "pyjwt[crypto]>=2.9,<3",
-    # Phase 5: Semgrep (adapter/analyzers/semgrep.py) ships a proper PyPI
-    # wheel — added like any other library, per the plan's Assumptions
-    # section ("Analyzer binary packaging"). Gitleaks does not (a Go binary
-    # with no first-party Python packaging) — it's vendored into the
-    # Dockerfile's runtime/dev stages instead, per that same section.
-    "semgrep>=1.85,<2",
+    # Semgrep is NOT a dependency of this project: it hard-pins mcp 1.x and
+    # imports mcp.server.fastmcp, which conflicts with `mcp` below. It is
+    # run as a subprocess from its own locked environment
+    # (tools/semgrep/pyproject.toml + uv.lock; see the Dockerfile's
+    # `semgrep-tool` stage and ci.yml). Gitleaks (a Go binary) is vendored
+    # into the Dockerfile's runtime/dev stages.
+    # Product-knowledge MCP client (adapter/product_knowledge/ only), per
+    # ADR-0013. mcp 2.x brings httpx2 (not httpx) as its HTTP stack.
+    # ADR-0013 is PROPOSED: do not merge this line before it is ACCEPTED.
+    "mcp>=2.3,<3",
     # Phase 3 (indexing plan): the AST-aware chunker (indexing/chunk.py)
     # parses TypeScript/PHP/Go source into real syntax trees and splits at
     # structural boundaries (per rag-techniques.md's cAST rationale) —
@@ -111,6 +115,12 @@ dev = [
     "pyyaml>=6.0,<7",
     "types-pyyaml>=6.0,<7",
     "mutmut>=3.7,<4",
+    # Validates committed product-knowledge contract examples against the
+    # committed JSON Schemas (adapter/product_knowledge/test_contract_schemas.py);
+    # already in the lockfile transitively, listed explicitly so the test does
+    # not depend on that.
+    "jsonschema>=4.20,<5",
+    "types-jsonschema>=4.20,<5",
 ]
 
 [tool.uv]
@@ -289,5 +299,26 @@ source_paths = [
 # are outside every source_paths package dir above, so mutmut's sandbox copy
 # needs them added explicitly or those two test files fail with a
 # FileNotFoundError against every single mutant, not just the ones that
-# actually broke something.
-also_copy = [".env.example", ".github"]
+# actually broke something. Same for
+# adapter/product_knowledge/test_contract_schemas.py, whose drift test reads
+# the committed schemas/examples under docs/reference/product-knowledge-contract/
+# (parents[2] of the test file == the repo root, or mutants/ in the sandbox).
+# Likewise the Dockerfile and docker-compose.yml (packaging/env-sync guards),
+# charts/ (configmap + test-render.sh), docs/reference/operations.md and the
+# admin frontend's src/ (runbook-vs-disclosure-literal tests), and docs/adr
+# (test_adr_scope_sync.py checks ADR-0005 names every public pure function).
+# apps/test_product_knowledge_runbook.py asserts every repo-root path a unit
+# test reads is listed here, so a new one fails loudly instead of per-mutant.
+also_copy = [
+    ".env.example",
+    ".github",
+    "Dockerfile",
+    "docker-compose.yml",
+    "charts",
+    "docs/adr",
+    "docs/reference/operations.md",
+    "docs/reference/product-knowledge-contract",
+    "apps/admin_api/frontend/src",
+]
+# The fake MCP provider is test tooling, not product code: never mutate it.
+do_not_mutate = ["adapter/product_knowledge/testing/*"]

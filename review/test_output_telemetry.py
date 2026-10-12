@@ -22,6 +22,7 @@ from adapter.telemetry.conftest import (
     reset_otel_global_providers as _reset_otel_global_providers,  # noqa: F401
 )
 from findings.models import Finding, Severity, Source
+from review.context_bundle import ContextBundle, ContextBundleItem, ContextItemKind
 from review.output import FindingsOutputResult, FindingsOutputStep
 from review.step import StepContext
 
@@ -224,3 +225,36 @@ async def test_no_findings_records_no_count_total_but_still_records_dropped(
         in_memory_metric_reader, "review.findings.dropped_by_ceiling_total"
     )
     assert dropped_points == [(0, {})]
+
+
+async def test_citation_findings_total_counts_cited_and_uncited_findings(
+    in_memory_metric_reader: InMemoryMetricReader,
+) -> None:
+    bundle = ContextBundle(
+        items=(
+            ContextBundleItem(
+                id=0,
+                kind=ContextItemKind.CALLER,
+                file_path="src/x.ts",
+                symbol_name=None,
+                content="x",
+                line_range=(1, 2),
+            ),
+        )
+    )
+
+    def _llm(ids: tuple[int, ...]) -> Finding:
+        return Finding(
+            file="a.py",
+            line=1,
+            severity="medium",
+            message="m",
+            source="llm",
+            context_ref_ids=ids,
+        )
+
+    FindingsOutputStep._apply_citations([_llm((0,)), _llm((99,)), _llm(())], bundle, job_id="job-1")
+
+    points = _metric_data_points(in_memory_metric_reader, "review.citation.findings_total")
+    # the no-ref finding is excluded so the ratio stays meaningful
+    assert sorted((a["cited"], v) for v, a in points) == [("false", 1), ("true", 1)]

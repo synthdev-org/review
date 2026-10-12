@@ -1,0 +1,11 @@
+{
+  "results": [
+    {
+      "id": "a",
+      "title": "T",
+      "snippet": "s",
+      "source_type": "jira",
+      "score": 1.5
+    }
+  ]
+}

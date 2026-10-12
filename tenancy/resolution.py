@@ -80,6 +80,15 @@ class WebhookEvent(BaseModel):
     head_sha: str | None
     base_sha: str | None = None
     repo_private: bool = False
+    # docs/plans/plan-deliver-product-knowledge.md Phase 2 (US-PK2 capture,
+    # A1). ``pr_issue_keys`` are extracted at the webhook boundary
+    # (``ingestion.pr_metadata``); the PR body is never carried.
+    # ``pr_is_fork`` is ``None`` when the delivery is not a PR event; the
+    # fail-closed derivation lives in ``ingestion.pr_metadata.is_fork_pr``.
+    pr_title: str | None = None
+    pr_head_ref: str | None = None
+    pr_issue_keys: tuple[str, ...] = ()
+    pr_is_fork: bool | None = None
 
 
 class OrgRepoIds(BaseModel):

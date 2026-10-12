@@ -470,3 +470,206 @@ def test_context_builder_internal_timeout_with_valid_margin_is_accepted(
 
     assert settings.context_builder_step_timeout_seconds == 20
     assert settings.context_builder_internal_timeout_seconds == 10
+
+
+# --- Product knowledge (plan-deliver-product-knowledge.md Phase 6; US-PK13) --
+
+_PK_CANARY = "CANARY-PK-TOKEN-8f14e45f"
+
+
+def _pk_map(**overrides: object) -> str:
+    import json
+
+    entry: dict[str, object] = {"token": _PK_CANARY, "allowed_hosts": ["wiki.internal"]}
+    entry.update(overrides)
+    return json.dumps({"wiki-prod": entry})
+
+
+def _worker_settings(monkeypatch: pytest.MonkeyPatch, **env: str) -> WorkerSettings:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    for key, value in env.items():
+        monkeypatch.setenv(f"REVIEW_WORKER_{key}", value)
+    return WorkerSettings(_env_file=None)
+
+
+def test_product_knowledge_defaults_start_clean_with_no_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _worker_settings(monkeypatch)
+
+    assert settings.product_knowledge_enabled is True
+    assert settings.product_knowledge_call_timeout_seconds == 5
+    assert settings.product_knowledge_deadline_seconds == 10
+    assert settings.product_knowledge_allow_private_networks is True
+    assert not settings.credential_map()
+    assert settings.endpoint_allowlist() == ()
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_empty_or_whitespace_credentials_are_the_same_as_unset(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    settings = _worker_settings(monkeypatch, PRODUCT_KNOWLEDGE_CREDENTIALS=blank)
+
+    assert settings.product_knowledge_credentials is None
+    assert not settings.credential_map()
+
+
+def test_valid_map_is_parsed_and_token_stays_out_of_repr(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _worker_settings(monkeypatch, PRODUCT_KNOWLEDGE_CREDENTIALS=_pk_map())
+
+    assert settings.credential_map().refs == ("wiki-prod",)
+    assert _PK_CANARY not in repr(settings)
+    assert _PK_CANARY not in str(settings.model_dump())
+
+
+def test_internal_timeout_of_8_with_no_map_starts_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    An operator who tuned the Context Builder window <= 10 s still upgrades cleanly.
+
+    The ordering rule applies only when the feature is in use.
+    """
+    settings = _worker_settings(
+        monkeypatch,
+        CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS="8",
+        CONTEXT_BUILDER_STEP_TIMEOUT_SECONDS="12",
+    )
+
+    assert settings.context_builder_internal_timeout_seconds == 8
+
+
+def test_internal_timeout_of_8_with_a_map_fails_naming_the_ordering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        _worker_settings(
+            monkeypatch,
+            PRODUCT_KNOWLEDGE_CREDENTIALS=_pk_map(),
+            CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS="8",
+            CONTEXT_BUILDER_STEP_TIMEOUT_SECONDS="12",
+        )
+
+    assert "product_knowledge_deadline_seconds" in str(excinfo.value)
+    assert _PK_CANARY not in str(excinfo.value)
+
+
+def test_internal_timeout_of_8_with_only_an_allowlist_fails_naming_the_ordering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unauthenticated-only provider (no credential map) counts as in use.
+
+    It is reachable only via the allow-list, so a non-empty allow-list also
+    means in use.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        _worker_settings(
+            monkeypatch,
+            PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST="wiki.internal",
+            CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS="8",
+            CONTEXT_BUILDER_STEP_TIMEOUT_SECONDS="12",
+        )
+
+    assert "product_knowledge_deadline_seconds" in str(excinfo.value)
+
+
+def test_internal_timeout_of_8_with_an_allowlist_but_kill_switch_off_starts_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _worker_settings(
+        monkeypatch,
+        PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST="wiki.internal",
+        PRODUCT_KNOWLEDGE_ENABLED="false",
+        CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS="8",
+        CONTEXT_BUILDER_STEP_TIMEOUT_SECONDS="12",
+    )
+
+    assert settings.context_builder_internal_timeout_seconds == 8
+
+
+def test_internal_timeout_of_8_with_a_map_but_kill_switch_off_starts_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _worker_settings(
+        monkeypatch,
+        PRODUCT_KNOWLEDGE_CREDENTIALS=_pk_map(),
+        PRODUCT_KNOWLEDGE_ENABLED="false",
+        CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS="8",
+        CONTEXT_BUILDER_STEP_TIMEOUT_SECONDS="12",
+    )
+
+    assert settings.product_knowledge_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("call", "deadline"),
+    [("10", "10"), ("11", "10"), ("5", "25"), ("5", "30")],
+)
+def test_call_deadline_internal_ordering_is_strict_when_in_use(
+    monkeypatch: pytest.MonkeyPatch, call: str, deadline: str
+) -> None:
+    with pytest.raises(ValidationError):
+        _worker_settings(
+            monkeypatch,
+            PRODUCT_KNOWLEDGE_CREDENTIALS=_pk_map(),
+            PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS=call,
+            PRODUCT_KNOWLEDGE_DEADLINE_SECONDS=deadline,
+        )
+
+
+@pytest.mark.parametrize(
+    ("raw", "problem"),
+    [
+        ("not json", "not valid JSON"),
+        ('["a"]', "non-empty JSON object"),
+        ('{"ref": {"token": "", "allowed_hosts": ["h"]}}', "empty token"),
+        ('{"ref": {"token": "x", "allowed_hosts": []}}', "no allowed_hosts"),
+        ('{"ref": {"token": "x", "allowed_hosts": ["*"]}}', "invalid allowed_hosts"),
+        ('{"ref": {"token": "x", "allowed_hosts": ["https://h"]}}', "invalid allowed_hosts"),
+        ('{"Bad Ref": {"token": "x", "allowed_hosts": ["h"]}}', "invalid ref"),
+        ('{"r": {"token": "x", "allowed_hosts": ["h"]}, "r": {"token": "y"}}', "duplicate"),
+    ],
+)
+def test_malformed_credential_map_fails_fast_naming_the_problem_not_the_value(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, raw: str, problem: str
+) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        _worker_settings(monkeypatch, PRODUCT_KNOWLEDGE_CREDENTIALS=raw)
+
+    assert problem in str(excinfo.value)
+    assert "REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Canary token inside every malformed shape: pydantic's `input_value`
+        # echo must be suppressed everywhere.
+        '{"ref": {"token": "' + _PK_CANARY + '", "allowed_hosts": []}}',
+        '{"ref": {"token": "' + _PK_CANARY + '", "allowed_hosts": ["*"]}}',
+        '{"ref": {"token": "' + _PK_CANARY + '"',
+        '{"Bad Ref": {"token": "' + _PK_CANARY + '", "allowed_hosts": ["h"]}}',
+    ],
+)
+def test_token_canary_is_never_echoed_by_a_validation_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, raw: str
+) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        _worker_settings(monkeypatch, PRODUCT_KNOWLEDGE_CREDENTIALS=raw)
+
+    assert _PK_CANARY not in str(excinfo.value)
+    assert _PK_CANARY not in repr(excinfo.value)
+    assert _PK_CANARY not in caplog.text
+    # `ValidationError.errors()` (programmatic, never rendered by the
+    # entrypoint) still carries pydantic's raw `input`; the loggable text
+    # channels above are the contract.
+
+
+def test_endpoint_allowlist_is_parsed_and_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _worker_settings(
+        monkeypatch, PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST="wiki.internal, *.corp.example"
+    )
+    assert settings.endpoint_allowlist() == ("wiki.internal", "*.corp.example")
+
+    with pytest.raises(ValidationError):
+        _worker_settings(monkeypatch, PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST="*")

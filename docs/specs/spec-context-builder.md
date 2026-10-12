@@ -183,7 +183,8 @@ this spec's non-functional requirements bound that added load.
   the roadmap, this is Phase 7, entirely separate from Phase 2's own
   code-derived context — this spec's Context Builder produces only
   code-derived context; the provider call-out is a distinct, later
-  addition to the same step.
+  addition to the same step. **Now specified in
+  [`spec-product-knowledge.md`](spec-product-knowledge.md).**
 - **Memory / dismissed-finding suppression / learned rules.** Phase 4. This
   spec's context bundle contains only code retrieved from the index, never
   anything from the (not-yet-built) Memory store.
@@ -427,6 +428,12 @@ searched under the new (or now-absent) name.
   ceilings imply.
 
 ### Privacy / Compliance
+
+*(True of the code-derived retrieval specified here. Phase 7
+([`spec-product-knowledge.md`](spec-product-knowledge.md)) adds an optional,
+operator-configured provider call that does send the PR title and linked
+issue keys to the configured endpoint — see that spec's Privacy / Compliance
+section.)*
 
 No new data leaves the deployment on the retrieval side — blast-radius and
 similarity queries run entirely against the customer's own Postgres, and the

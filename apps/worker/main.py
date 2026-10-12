@@ -127,6 +127,7 @@ import logging
 import os
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TypedDict
 
 import dotenv
@@ -143,13 +144,17 @@ from adapter.github.posting import GitHubFindingsPublisher
 from adapter.github.reactions import GitHubReactionFetcher
 from adapter.github.tree import GitHubTreeFetcher
 from adapter.llm.litellm_client import LiteLLMClient
+from adapter.product_knowledge.client import ClientTimeouts
+from adapter.product_knowledge.factory import ProviderClientFactory
+from adapter.product_knowledge.provider_resolver import FailOpenProviderResolver
+from adapter.product_knowledge.transport import EgressPolicy
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.indexing_repository import IndexingRepository
 from adapter.storage.llm_routing import PostgresModelRoutingRepository
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
-from adapter.storage.tenancy import PostgresUsageCounterRepository
+from adapter.storage.tenancy import PostgresSettingRepository, PostgresUsageCounterRepository
 from adapter.telemetry.heartbeat import heartbeat_task_scope
 from adapter.telemetry.sdk import (
     init_telemetry,
@@ -537,6 +542,102 @@ def _log_model_routing_disabled_warning(settings: WorkerSettings, logger: loggin
         )
 
 
+def _log_product_knowledge_disabled_warning(
+    settings: WorkerSettings, logger: logging.Logger
+) -> None:
+    """
+    A one-time `warning`-level startup log when `product_knowledge_enabled` is `False`.
+
+    (plan-deliver-product-knowledge.md Phase 6, US-PK13) — mirrors
+    `_log_memory_suppression_disabled_warning`: the kill switch is a deliberate deviation from the
+    shipped default and must be visible. No provider client is constructed and no outbound call is
+    made, even if provider settings exist.
+    """
+    if not settings.product_knowledge_enabled:
+        logger.warning(
+            "product knowledge is disabled: no external provider will be queried "
+            "even if provider settings exist",
+            extra={"product_knowledge_enabled": False},
+        )
+
+
+def _log_product_knowledge_context_builder_disabled_warning(
+    settings: WorkerSettings, enablement: StepEnablement, logger: logging.Logger
+) -> None:
+    """
+    A one-time `warning`-level startup log when configured credentials cannot be used.
+
+    This fires when provider credentials are configured but the Context Builder cannot run (the
+    provider is queried only from inside that step), so the operator is not left wondering why a
+    configured provider is never called (plan Phase 7).
+    """
+    if (
+        settings.product_knowledge_enabled
+        and settings.credential_map().refs
+        and not context_builder_can_produce_value(enablement)
+    ):
+        logger.warning(
+            "product knowledge credentials are configured but the context_builder step "
+            "is disabled (or cannot produce a value): no provider will be queried",
+            extra={"context_builder_enabled": enablement.context_builder_enabled},
+        )
+
+
+@dataclass(frozen=True)
+class ProductKnowledgeWiring:
+    """
+    What the Context Builder's provider branch is handed.
+
+    The fail-open effective-setting resolver and the per-endpoint client factory (a
+    `review.product_knowledge.ProviderOpener`). `opener` is `None` when the kill switch is off: the
+    resolver is still wired so a *configured* provider is reported as `outcome=disabled` (a visible
+    rollback signal, not silence), but no client can ever be built.
+    """
+
+    opener: ProviderClientFactory | None
+    resolver: FailOpenProviderResolver
+
+
+def _build_product_knowledge_wiring(
+    settings: WorkerSettings,
+    setting_repository: PostgresSettingRepository,
+    logger: logging.Logger,
+) -> ProductKnowledgeWiring:
+    """
+    With `product_knowledge_enabled=False` no client factory is built.
+
+    So no outbound call is possible even when settings exist; the resolver is still wired for the
+    `disabled` outcome. The credential map was already validated by `WorkerSettings` (fail-fast), so
+    parsing here cannot raise.
+    """
+    resolver = FailOpenProviderResolver(setting_repository)
+    if not settings.product_knowledge_enabled:
+        return ProductKnowledgeWiring(opener=None, resolver=resolver)
+    credentials = settings.credential_map()
+    policy = EgressPolicy(
+        allow_private_networks=settings.product_knowledge_allow_private_networks,
+        endpoint_allowlist=settings.endpoint_allowlist(),
+    )
+    logger.info(
+        "product knowledge wired",
+        extra={
+            "credential_count": len(credentials.refs),
+            "allow_private_networks": policy.allow_private_networks,
+            "endpoint_allowlist_size": len(policy.endpoint_allowlist),
+        },
+    )
+    return ProductKnowledgeWiring(
+        opener=ProviderClientFactory(
+            credentials=credentials,
+            policy=policy,
+            timeouts=ClientTimeouts(
+                call_seconds=float(settings.product_knowledge_call_timeout_seconds)
+            ),
+        ),
+        resolver=resolver,
+    )
+
+
 _DEPRECATED_SETTINGS_ENV_VARS: tuple[tuple[str, str], ...] = (
     ("REVIEW_WORKER_LLM_REVIEW_ENABLED", "REVIEW_WORKER_REVIEW_GENERATION_ENABLED"),
     (
@@ -716,6 +817,7 @@ def _build_review_registry(
     settings: WorkerSettings,
     memory_matcher: PostgresMemoryRepository,
     model_resolver: FallbackModelRoutingResolver | None,
+    product_knowledge: ProductKnowledgeWiring | None = None,
 ) -> StepRegistry:
     """Construct the macro-step registry `REVIEW` jobs dispatch to.
 
@@ -873,6 +975,14 @@ def _build_review_registry(
                 # StepRegistry.__init__'s dependency validation doesn't
                 # reject it as pointing at an absent step.
                 depends_on=resolved["context_builder"],
+                # Plan Phase 7: `None` wiring => no provider code path at all
+                # (byte-for-byte the prior step). The redactor is the same
+                # instance the other steps use; a NoOp one disables the
+                # branch (A5).
+                provider_resolver=product_knowledge.resolver if product_knowledge else None,
+                provider_opener=product_knowledge.opener if product_knowledge else None,
+                provider_redactor=redactor,
+                provider_deadline_seconds=float(settings.product_knowledge_deadline_seconds),
             ),
             IntentSummaryStep(
                 llm_client,
@@ -1028,6 +1138,13 @@ async def _run(
     _log_verification_disabled_warning(settings, logger)
     _log_memory_suppression_disabled_warning(settings, logger)
     _log_model_routing_disabled_warning(settings, logger)
+    _log_product_knowledge_disabled_warning(settings, logger)
+    _log_product_knowledge_context_builder_disabled_warning(settings, enablement, logger)
+    # plan-deliver-product-knowledge.md Phases 6-7: consumed by the Context
+    # Builder's provider branch (passed to `_build_review_registry` below).
+    product_knowledge = _build_product_knowledge_wiring(
+        settings, PostgresSettingRepository(session_factory), logger
+    )
     # docs/plans/plan-deliver-admin-gui.md's Phase 5 section (Unit F,
     # Assumption 3) — `None` when `model_routing_config_enabled` is
     # `False`, restoring exactly the pre-Phase-5 construction (every
@@ -1070,6 +1187,7 @@ async def _run(
         settings,
         memory_repository,
         model_routing_resolver,
+        product_knowledge,
     )
     index_repository = IndexingRepository(session_factory)
     indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)
