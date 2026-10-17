@@ -286,22 +286,20 @@ async def test_double_dash_separator_reaches_the_child_process_as_a_literal_argu
 # ---------------------------------------------------------------------------
 
 
-def test_analyzer_env_drops_only_the_credential_map() -> None:
+def test_analyzer_env_drops_every_worker_setting() -> None:
     env = analyzer_env(
         {
             "PATH": "/usr/bin",
             "HOME": "/root",
             "REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS": '{"w": {"token": "t"}}',
             "REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS": "x",
-            "REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST": "wiki",
+            "REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY": "pem",
+            "REVIEW_WORKER_DATABASE_URL": "postgresql://u:p@h/db",
+            "OTEL_EXPORTER_OTLP_HEADERS": "authorization=secret",
         }
     )
 
-    expected = {
-        "PATH": "/usr/bin",
-        "HOME": "/root",
-        "REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST": "wiki",
-    }
+    expected = {"PATH": "/usr/bin", "HOME": "/root"}
     if env != expected:
         pytest.fail(f"env {env!r} != {expected!r}")
 
@@ -329,3 +327,21 @@ async def test_child_process_does_not_inherit_the_credential_map_but_keeps_path(
     assert b"cred=None" in output
     assert b"CANARY" not in output
     assert b"path=True" in output
+
+
+@pytest.mark.integration
+def test_fetched_config_files_are_materialized_as_inert_non_executable_files(
+    tmp_path: Path,
+) -> None:
+    """Phase 9 / Phase 2: a fake engine writes the fetched repo config
+    alongside the scan content; it lands as plain data (no exec bits) and is
+    never run by the materializer."""
+    marker = tmp_path / "marker"
+    config = {"ruff.toml": f"x = 1\n# touch {marker}\n".encode()}
+
+    written = materialize_files({"a.py": b"print(1)\n", **config}, tmp_path / "scan")
+
+    assert not marker.exists()
+    for target in written:
+        assert target.stat().st_mode & 0o111 == 0
+    assert (tmp_path / "scan" / "ruff.toml").read_bytes() == config["ruff.toml"]

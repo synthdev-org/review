@@ -43,7 +43,7 @@ async def test_semgrep_analyzer_run_against_real_binary_returns_findings() -> No
     analyzer = SemgrepAnalyzer()
     content = {"app.py": b"def run(x):\n    return eval(x)\n"}
 
-    findings = await analyzer.run(Diff(files=()), content, timeout=60)
+    findings = await analyzer.run(Diff(files=()), content, timeout=60, config_files={})
 
     assert findings
     assert all(f.source == "semgrep" for f in findings)
@@ -60,7 +60,7 @@ async def test_semgrep_analyzer_finding_message_quotes_the_matched_source_line()
     analyzer = SemgrepAnalyzer()
     content = {"app.py": b"def run(x):\n    return eval(x)\n"}
 
-    findings = await analyzer.run(Diff(files=()), content, timeout=60)
+    findings = await analyzer.run(Diff(files=()), content, timeout=60, config_files={})
 
     assert any("eval(x)" in f.message for f in findings)
 
@@ -73,7 +73,7 @@ async def test_semgrep_analyzer_run_returns_nothing_for_empty_content() -> None:
     scanning its own materialization directory instead of doing nothing."""
     analyzer = SemgrepAnalyzer()
 
-    findings = await analyzer.run(Diff(files=()), {}, timeout=60)
+    findings = await analyzer.run(Diff(files=()), {}, timeout=60, config_files={})
 
     assert findings == []
 
@@ -83,7 +83,9 @@ async def test_semgrep_analyzer_run_returns_nothing_for_empty_content() -> None:
 async def test_semgrep_analyzer_run_finds_nothing_in_clean_content() -> None:
     analyzer = SemgrepAnalyzer()
 
-    findings = await analyzer.run(Diff(files=()), {"clean.py": b"x = 1\n"}, timeout=60)
+    findings = await analyzer.run(
+        Diff(files=()), {"clean.py": b"x = 1\n"}, timeout=60, config_files={}
+    )
 
     assert findings == []
 
@@ -98,7 +100,7 @@ async def test_semgrep_analyzer_treats_a_dash_prefixed_filename_as_a_positional_
     analyzer = SemgrepAnalyzer()
     content = {"-weird-name.py": b"def run(x):\n    return eval(x)\n"}
 
-    findings = await analyzer.run(Diff(files=()), content, timeout=60)
+    findings = await analyzer.run(Diff(files=()), content, timeout=60, config_files={})
 
     assert any(f.file == "-weird-name.py" for f in findings)
 
@@ -124,7 +126,7 @@ async def test_semgrep_analyzer_routes_through_the_shared_retry_helper(
 
     monkeypatch.setattr(semgrep_module, "run_analyzer_subprocess", _recording)
     analyzer = SemgrepAnalyzer()
-    await analyzer.run(Diff(files=()), {"clean.py": b"x = 1\n"}, timeout=60)
+    await analyzer.run(Diff(files=()), {"clean.py": b"x = 1\n"}, timeout=60, config_files={})
 
     assert len(calls) == 1
     assert calls[0][0] == "semgrep"

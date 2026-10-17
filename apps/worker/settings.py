@@ -97,11 +97,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import SettingsConfigDict
 
 from adapter.product_knowledge.settings import ProductKnowledgeSettingsMixin
 from adapter.telemetry.sdk import OtelSettingsMixin
+from review.config import check_static_analysis_budget
 
 
 class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
@@ -182,6 +183,11 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     # own field set exactly.
     static_analysis_gitleaks_enabled: bool = True
     static_analysis_semgrep_enabled: bool = True
+    static_analysis_ruff_enabled: bool = True
+    static_analysis_eslint_enabled: bool = True
+    static_analysis_trivy_enabled: bool = True
+    static_analysis_phpstan_enabled: bool = True
+    static_analysis_golangci_lint_enabled: bool = True
 
     # One timeout-in-seconds field per macro step, plus one shared field covering both of
     # the static-analysis step's own analyzer sub-steps — see `review.config.StepTimeouts`'s
@@ -190,6 +196,15 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     prefilter_step_timeout_seconds: int = 30
     static_analysis_step_timeout_seconds: int = 240
     static_analysis_analyzer_timeout_seconds: int = 60
+    # Optional per-analyzer override; None inherits the analyzer default above (US-A7).
+    static_analysis_ruff_timeout_seconds: int | None = Field(default=None, gt=0)
+    static_analysis_eslint_timeout_seconds: int | None = Field(default=None, gt=0)
+    static_analysis_trivy_timeout_seconds: int | None = Field(default=None, gt=0)
+    static_analysis_phpstan_timeout_seconds: int | None = Field(default=None, gt=0)
+    static_analysis_golangci_lint_timeout_seconds: int | None = Field(default=None, gt=0)
+    # Worker-process-wide cap on simultaneously running analyzer subprocesses
+    # (US-A8); the registry in apps/worker/main.py builds one semaphore of this size.
+    static_analysis_max_concurrent_analyzers: int = Field(default=3, ge=1)
     # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section —
     # a short summarization call, lighter than
     # `review_generation_step_timeout_seconds` below (see that plan's US-V9
@@ -412,6 +427,48 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
                 "strictly sequentially, so a threshold below their worst-case sum would flag "
                 "a still-healthy job as stuck before it could possibly finish"
             )
+        return self
+
+    @field_validator(
+        "static_analysis_ruff_timeout_seconds",
+        "static_analysis_eslint_timeout_seconds",
+        "static_analysis_trivy_timeout_seconds",
+        "static_analysis_phpstan_timeout_seconds",
+        "static_analysis_golangci_lint_timeout_seconds",
+        mode="before",
+    )
+    @classmethod
+    def _blank_engine_timeout_inherits_default(cls, value: object) -> object:
+        # Compose passes an unset override as an empty string.
+        return None if value == "" else value
+
+    @model_validator(mode="after")
+    def _static_analysis_analyzers_fit_step_timeout(self) -> WorkerSettings:
+        """US-A7: fail fast when the enabled analyzers' timeouts cannot fit
+        the step timeout at the configured concurrency (pure, no I/O)."""
+        if not self.static_analysis_enabled:
+            return self
+        enabled_count = sum(
+            value
+            for name, value in vars(self).items()
+            if name.startswith("static_analysis_")
+            and name.endswith("_enabled")
+            and name != "static_analysis_enabled"
+            and isinstance(value, bool)
+        )
+        check_static_analysis_budget(
+            enabled_analyzer_count=enabled_count,
+            max_concurrent=self.static_analysis_max_concurrent_analyzers,
+            max_analyzer_timeout_seconds=max(
+                self.static_analysis_analyzer_timeout_seconds,
+                self.static_analysis_ruff_timeout_seconds or 0,
+                self.static_analysis_eslint_timeout_seconds or 0,
+                self.static_analysis_trivy_timeout_seconds or 0,
+                self.static_analysis_phpstan_timeout_seconds or 0,
+                self.static_analysis_golangci_lint_timeout_seconds or 0,
+            ),
+            step_timeout_seconds=self.static_analysis_step_timeout_seconds,
+        )
         return self
 
     @model_validator(mode="after")

@@ -50,6 +50,29 @@ data:
   REVIEW_WORKER_GITHUB_API_BASE_URL: {{ .Values.worker.github.apiBaseUrl | quote }}
   REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: {{ .Values.worker.github.apiTimeoutSeconds | quote }}
   REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: {{ .Values.worker.github.retryMaxAttempts | quote }}
+  # Static-analysis engines (docs/plans/plan-phase-9.md). Timeout override is
+  # rendered only when set; blank inherits the analyzer default.
+  REVIEW_WORKER_STATIC_ANALYSIS_MAX_CONCURRENT_ANALYZERS: {{ .Values.worker.staticAnalysis.maxConcurrentAnalyzers | quote }}
+  REVIEW_WORKER_STATIC_ANALYSIS_RUFF_ENABLED: {{ .Values.worker.staticAnalysis.ruff.enabled | quote }}
+  {{- with .Values.worker.staticAnalysis.ruff.timeoutSeconds }}
+  REVIEW_WORKER_STATIC_ANALYSIS_RUFF_TIMEOUT_SECONDS: {{ . | quote }}
+  {{- end }}
+  REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_ENABLED: {{ .Values.worker.staticAnalysis.eslint.enabled | quote }}
+  {{- with .Values.worker.staticAnalysis.eslint.timeoutSeconds }}
+  REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_TIMEOUT_SECONDS: {{ . | quote }}
+  {{- end }}
+  REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_ENABLED: {{ .Values.worker.staticAnalysis.trivy.enabled | quote }}
+  {{- with .Values.worker.staticAnalysis.trivy.timeoutSeconds }}
+  REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_TIMEOUT_SECONDS: {{ . | quote }}
+  {{- end }}
+  REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_ENABLED: {{ .Values.worker.staticAnalysis.phpstan.enabled | quote }}
+  {{- with .Values.worker.staticAnalysis.phpstan.timeoutSeconds }}
+  REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_TIMEOUT_SECONDS: {{ . | quote }}
+  {{- end }}
+  REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_ENABLED: {{ .Values.worker.staticAnalysis.golangciLint.enabled | quote }}
+  {{- with .Values.worker.staticAnalysis.golangciLint.timeoutSeconds }}
+  REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_TIMEOUT_SECONDS: {{ . | quote }}
+  {{- end }}
 
   # --- Product knowledge (non-secret; the token map is in secret.yaml) ---
   REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED: {{ .Values.productKnowledge.enabled | quote }}

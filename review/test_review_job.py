@@ -46,7 +46,7 @@ import asyncio
 import contextlib
 import json
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -88,7 +88,7 @@ from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
 from review.review_generation import ReviewGenerationStep
-from review.static_analysis import StaticAnalysisStep
+from review.static_analysis import StaticAnalysisStep, gitleaks_semgrep_registrations
 from review.step import JobIdentity, Step, StepContext
 from review.verification import VerificationStep
 
@@ -152,7 +152,14 @@ class _RaisingStaticAnalyzer:
 
     name = "semgrep"
 
-    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[Finding]:
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[Finding]:
         raise RuntimeError("simulated: semgrep crashed")
 
 
@@ -305,8 +312,7 @@ def _registry(
         PrefilterStep(diff_fetcher),
         StaticAnalysisStep(
             diff_fetcher,
-            gitleaks_analyzer=GitleaksAnalyzer(),
-            semgrep_analyzer=semgrep,
+            registrations=gitleaks_semgrep_registrations(GitleaksAnalyzer(), semgrep),
             redactor=redactor,
             enabled=enabled,
             timeouts=timeouts,

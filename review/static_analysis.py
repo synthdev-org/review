@@ -49,19 +49,70 @@ implementations are wired in only at the composition root
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Mapping
+import time
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Protocol
 
+from opentelemetry import metrics
 from pydantic import BaseModel, ConfigDict
 
-from findings.models import Finding
+from findings.models import SEVERITY_RANK, Finding
 from findings.redact import TextRedactor, apply_redaction_ceiling, redact_findings
 from ingestion.diff import Diff, DiffFetcher
+from review._telemetry import suppress_telemetry_errors
+from review.changed_lines import filter_to_changed_lines
+from review.file_matchers import FileMatcher, match_all
 from review.pipeline import FailurePolicy, StepRegistry
 from review.step import JobIdentity, Step, StepContext
 
 logger = logging.getLogger(__name__)
+
+# OTel API only, per docs/adr/0011 — no SDK/exporter construction here.
+_meter = metrics.get_meter(__name__)
+_runs_counter = _meter.create_counter(
+    "review.static_analysis.analyzer.runs_total",
+    description="Analyzer sub-step runs, by analyzer_name and outcome.",
+)
+_duration_histogram = _meter.create_histogram(
+    "review.static_analysis.analyzer.duration_ms",
+    unit="ms",
+    description="Time an analyzer spent running (excludes time queued for a slot).",
+)
+_slot_wait_histogram = _meter.create_histogram(
+    "review.static_analysis.analyzer.slot_wait_ms",
+    unit="ms",
+    description="Time an analyzer waited for a concurrency slot.",
+)
+_config_fallback_counter = _meter.create_counter(
+    "review.static_analysis.config_fallback_total",
+    description="Jobs whose repo-config fetch failed and fell back to default profiles.",
+)
+_skipped_counter = _meter.create_counter(
+    "review.static_analysis.analyzer.skipped_total",
+    description="Analyzer runs skipped because no changed file matched its routing.",
+)
+_findings_counter = _meter.create_counter(
+    "review.static_analysis.findings_total",
+    description="Findings returned by successful analyzer runs, by analyzer_name.",
+)
+_findings_dropped_counter = _meter.create_counter(
+    "review.static_analysis.findings_dropped_total",
+    description="Findings discarded before redaction, by reason (and analyzer_name for "
+    "not_changed_line).",
+)
+_config_skipped_counter = _meter.create_counter(
+    "review.static_analysis.config_skipped_total",
+    description="Engine runs that ignored the repo's config and used the default profile, "
+    "by analyzer_name and config_skip_reason.",
+)
+_in_flight = _meter.create_up_down_counter(
+    "review.static_analysis.analyzers.in_flight",
+    description="Analyzers currently holding a concurrency slot.",
+)
 
 # Combined across both analyzers — the same unbounded-subprocess-spawn risk
 # Phase 6 caps (at a smaller ceiling) for LLM-sourced findings: each
@@ -74,6 +125,68 @@ logger = logging.getLogger(__name__)
 REDACTION_FINDING_CEILING = 50
 
 
+# Repo-config discovery bounds (spec Unit B): small, data-only files at the
+# repository root, so a hostile PR cannot make the Worker fetch large blobs.
+MAX_CONFIG_FILE_BYTES = 256 * 1024
+MAX_CONFIG_FILES = 16
+
+
+class RepoConfigFetchError(Exception):
+    """The repo's analyzer config could not be fetched (truncated tree,
+    unreachable GitHub, ...). Never fatal: the step degrades to default
+    profiles. ``reason`` is the ``config_skip_reason`` log value.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class RepoConfigFetcher(Protocol):
+    """Fetches allow-listed analyzer config files from the repo root at one
+    commit. Implemented by ``adapter/github/repo_config.py``. Only names in
+    ``names`` are ever fetched (never a path a config or the PR names);
+    oversize files and files beyond ``max_files`` are omitted. Raises
+    ``RepoConfigFetchError`` on any fetch failure.
+    """
+
+    async def fetch_config_files(
+        self,
+        *,
+        installation_id: int,
+        repo_full_name: str,
+        commit_sha: str,
+        names: Collection[str],
+        max_file_bytes: int,
+        max_files: int,
+    ) -> dict[str, bytes]: ...
+
+
+@dataclass(frozen=True)
+class ConfigOutcome:
+    """Honored-vs-skipped bookkeeping shared by every engine: the
+    ``config_source`` / ``config_skip_reason`` log fields.
+    """
+
+    source: str  # "repo" | "default"
+    skip_reason: str | None = None
+
+    def log_fields(self) -> dict[str, str]:
+        fields = {"config_source": self.source}
+        if self.skip_reason is not None:
+            fields["config_skip_reason"] = self.skip_reason
+        return fields
+
+    def record(self, analyzer_name: str) -> None:
+        """Counts a skipped repo config (no-op when the repo config was honored)."""
+        if self.skip_reason is None:
+            return
+        with suppress_telemetry_errors(logger, "config skip counter failed"):
+            _config_skipped_counter.add(
+                1, {"analyzer_name": analyzer_name, "reason": self.skip_reason}
+            )
+
+
 class StaticAnalyzer(Protocol):
     """A single analyzer's own scan capability, per US4 — narrower than
     ``review.step.Step`` (see the module docstring for why). Implemented by
@@ -82,8 +195,39 @@ class StaticAnalyzer(Protocol):
     """
 
     async def run(
-        self, diff: Diff, content: dict[str, bytes], *, timeout: float
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
     ) -> list[Finding]: ...
+
+
+@dataclass(frozen=True)
+class AnalyzerRegistration:
+    """One analyzer as the step sees it: ``matches`` routes files to it (it is
+    skipped when none match), ``changed_lines_only`` limits its findings to
+    added/modified lines, and ``security_class`` ranks its findings ahead of
+    lint-class ones at equal severity under the combined ceiling (US-A10).
+    Gitleaks and Semgrep register with the defaults below, so behave as before.
+    """
+
+    name: str
+    analyzer: StaticAnalyzer
+    matches: FileMatcher = match_all
+    changed_lines_only: bool = False
+    security_class: bool = False
+    config_filenames: tuple[str, ...] = ()
+
+
+def gitleaks_semgrep_registrations(
+    gitleaks: StaticAnalyzer, semgrep: StaticAnalyzer
+) -> list[AnalyzerRegistration]:
+    return [
+        AnalyzerRegistration("gitleaks", gitleaks, security_class=True),
+        AnalyzerRegistration("semgrep", semgrep, security_class=True),
+    ]
 
 
 class _StaticAnalysisInput(JobIdentity):
@@ -136,38 +280,91 @@ class _AnalyzerSubStepInput(BaseModel):
 
     diff: Diff
     content: dict[str, bytes]
+    config_files: dict[str, bytes] = {}
 
 
 class _AnalyzerSubStep:
-    """Adapts one ``StaticAnalyzer`` into a ``review.step.Step`` for
-    registration into this macro step's own inner registry. ``timeouts`` is
-    the same full ``Mapping[str, float]`` the outer macro-step registry
-    already reads its own timeouts from (``review.config.StepTimeouts.as_mapping()``
-    — it already carries ``"gitleaks"``/``"semgrep"`` keys, both mapped to
-    the shared ``static_analysis_analyzer_timeout_seconds`` value, per that
-    model's own docstring) — this sub-step looks up its own entry by name
-    rather than needing a second, narrower mapping threaded through
-    separately.
+    """Adapts one ``AnalyzerRegistration`` into a ``review.step.Step`` for
+    registration into this macro step's own inner registry: routes files to
+    the analyzer (skipping it when none match), runs it, then applies the
+    changed-line filter when the registration asks for one. ``timeouts`` is
+    looked up by analyzer name (resolved by ``StaticAnalysisStep``, which fills
+    in the inherited default for analyzers without their own entry).
     """
 
     depends_on: tuple[str, ...] = ()
 
     def __init__(
-        self, name: str, analyzer: StaticAnalyzer, *, timeouts: Mapping[str, float]
+        self, registration: AnalyzerRegistration, *, timeouts: Mapping[str, float]
     ) -> None:
-        self.name = name
-        self._analyzer = analyzer
+        self.name = registration.name
+        self._registration = registration
         self._timeouts = timeouts
 
     async def run(self, input: _AnalyzerSubStepInput, context: StepContext) -> list[Finding]:
-        return await self._analyzer.run(
-            input.diff, input.content, timeout=self._timeouts[self.name]
-        )
+        registration = self._registration
+        content = {
+            path: data for path, data in input.content.items() if registration.matches(path, data)
+        }
+        # Unrouted analyzers (Gitleaks/Semgrep) run even on empty content, as before.
+        if not content and registration.matches is not match_all:
+            logger.info(
+                "analyzer skipped: no matching files",
+                extra={"job_id": context.job_id, "analyzer_name": self.name},
+            )
+            with suppress_telemetry_errors(logger, "analyzer skipped counter failed"):
+                _skipped_counter.add(1, {"analyzer_name": self.name})
+            return []
+        diff = input.diff
+        if len(content) != len(input.content):
+            diff = Diff(files=tuple(f for f in diff.files if f.path in content))
+
+        start = time.monotonic()
+        try:
+            findings = await registration.analyzer.run(
+                diff,
+                content,
+                timeout=self._timeouts[self.name],
+                # Only this engine's own allow-listed names, never the rest.
+                config_files={
+                    name: input.config_files[name]
+                    for name in registration.config_filenames
+                    if name in input.config_files
+                },
+            )
+        finally:
+            with suppress_telemetry_errors(logger, "analyzer duration recording failed"):
+                _duration_histogram.record(
+                    int((time.monotonic() - start) * 1000), {"analyzer_name": self.name}
+                )
+
+        if registration.changed_lines_only:
+            findings, filtered = filter_to_changed_lines(
+                findings, {f.path: f.patch for f in input.diff.files}
+            )
+            with suppress_telemetry_errors(logger, "findings dropped counter failed"):
+                _findings_dropped_counter.add(
+                    filtered, {"reason": "not_changed_line", "analyzer_name": self.name}
+                )
+            logger.info(
+                "analyzer findings filtered to changed lines",
+                extra={
+                    "job_id": context.job_id,
+                    "analyzer_name": self.name,
+                    "filtered_count": filtered,
+                },
+            )
+        return findings
 
 
 class StaticAnalysisStep:
     """``review.step.Step`` implementation for US4/US9 — see this module's
     own docstring for the full design.
+
+    ``analyzer_slots`` is the Worker-process-wide semaphore bounding
+    simultaneously running analyzers (US-A8), created by the composition
+    root. A slot is taken *before* an analyzer's timed region (via the inner
+    registry's ``admission`` hook), so queue time never consumes its timeout.
     """
 
     name = "static_analysis"
@@ -177,29 +374,38 @@ class StaticAnalysisStep:
         self,
         diff_fetcher: DiffFetcher,
         *,
-        gitleaks_analyzer: StaticAnalyzer,
-        semgrep_analyzer: StaticAnalyzer,
+        registrations: Sequence[AnalyzerRegistration],
         redactor: TextRedactor,
         enabled: Mapping[str, bool],
         timeouts: Mapping[str, float],
+        analyzer_slots: asyncio.Semaphore | None = None,
+        config_fetcher: RepoConfigFetcher | None = None,
     ) -> None:
         self._diff_fetcher = diff_fetcher
-        self._analyzers: list[tuple[str, StaticAnalyzer]] = [
-            ("gitleaks", gitleaks_analyzer),
-            ("semgrep", semgrep_analyzer),
-        ]
+        self._config_fetcher = config_fetcher
+        self._registrations = list(registrations)
+        self._security_sources = frozenset(r.name for r in self._registrations if r.security_class)
         self._redactor = redactor
         self._enabled = dict(enabled)
         self._timeouts = dict(timeouts)
+        self._analyzer_slots = analyzer_slots
+
+        default_timeout = self._timeouts.get("static_analysis_analyzer")
+        analyzer_timeouts: dict[str, float] = {}
+        for registration in self._registrations:
+            timeout = self._timeouts.get(registration.name, default_timeout)
+            if timeout is None:
+                raise ValueError(f"no timeout configured for analyzer {registration.name!r}")
+            analyzer_timeouts[registration.name] = timeout
 
         sub_steps: list[Step[Any, Any]] = [
-            _AnalyzerSubStep(name, analyzer, timeouts=self._timeouts)
-            for name, analyzer in self._analyzers
+            _AnalyzerSubStep(registration, timeouts=analyzer_timeouts)
+            for registration in self._registrations
         ]
         self._inner_registry = StepRegistry(
             sub_steps,
             enabled=self._enabled,
-            timeouts=self._timeouts,
+            timeouts=analyzer_timeouts,
             on_failure=FailurePolicy.ISOLATE,
             # Distinct from the outer per-job root span's default
             # "review.job.run" name — this inner registry's seed_input is
@@ -207,7 +413,25 @@ class StaticAnalysisStep:
             # span must not collide with (and be mistaken for) the real
             # one-per-job root span the catalog expects.
             root_span_name="review.step.static_analysis.run",
+            admission=self._admit if analyzer_slots is not None else None,
         )
+
+    @asynccontextmanager
+    async def _admit(self, step: Step[Any, Any]) -> AsyncIterator[None]:
+        assert self._analyzer_slots is not None
+        attributes = {"analyzer_name": step.name}
+        waited_from = time.monotonic()
+        async with self._analyzer_slots:
+            with suppress_telemetry_errors(logger, "analyzer slot telemetry failed"):
+                _slot_wait_histogram.record(
+                    int((time.monotonic() - waited_from) * 1000), attributes
+                )
+                _in_flight.add(1, attributes)
+            try:
+                yield
+            finally:
+                with suppress_telemetry_errors(logger, "analyzer slot telemetry failed"):
+                    _in_flight.add(-1, attributes)
 
     async def run(self, input: Any, context: StepContext) -> StaticAnalysisOutput:
         # Any (not _StaticAnalysisInput) because the registry passes the
@@ -225,16 +449,28 @@ class StaticAnalysisStep:
             paths=pre_filtered_paths,
         )
 
-        outcomes = await self._run_analyzer_sub_steps(parsed.diff, content, context)
+        config_files = await self._fetch_config_files(parsed, content, context)
+        outcomes = await self._run_analyzer_sub_steps(parsed.diff, content, config_files, context)
 
         findings: list[Finding] = []
-        for name, _analyzer in self._analyzers:
-            outcome = outcomes.get(name)
+        for registration in self._registrations:
+            outcome = outcomes.get(registration.name)
             if outcome is not None and outcome.status == "success":
                 findings.extend(outcome.output)
 
+        # US-A10: the ceiling drops from the tail, so order severity first,
+        # then security-class sources ahead of lint-class (stable sort).
+        findings.sort(
+            key=lambda f: (
+                SEVERITY_RANK[f.severity],
+                0 if f.source in self._security_sources else 1,
+            )
+        )
+
         surviving, dropped = apply_redaction_ceiling(findings, REDACTION_FINDING_CEILING)
         if dropped:
+            with suppress_telemetry_errors(logger, "findings dropped counter failed"):
+                _findings_dropped_counter.add(dropped, {"reason": "redaction_ceiling"})
             logger.warning(
                 "static-analysis redaction ceiling exceeded; dropping excess findings",
                 extra={
@@ -263,10 +499,59 @@ class StaticAnalysisStep:
             private=parsed.private,
         )
 
+    async def _fetch_config_files(
+        self, parsed: _StaticAnalysisInput, content: dict[str, bytes], context: StepContext
+    ) -> dict[str, bytes]:
+        """One fetch per job, and only when an enabled engine with config
+        names has files routed to it. Any failure degrades to no config.
+        """
+        names = {
+            name
+            for registration in self._registrations
+            if registration.config_filenames
+            and self._enabled.get(registration.name, True)
+            and any(registration.matches(path, data) for path, data in content.items())
+            for name in registration.config_filenames
+        }
+        if self._config_fetcher is None or not names:
+            return {}
+        try:
+            files = await self._config_fetcher.fetch_config_files(
+                installation_id=parsed.installation_id,
+                repo_full_name=parsed.repo_full_name,
+                commit_sha=parsed.head_sha,
+                names=names,
+                max_file_bytes=MAX_CONFIG_FILE_BYTES,
+                max_files=MAX_CONFIG_FILES,
+            )
+        except Exception as exc:
+            # Degrade-by-design: an unexpected fetcher error (timeout, transport
+            # failure the adapter did not wrap) must not fail the whole step.
+            reason = exc.reason if isinstance(exc, RepoConfigFetchError) else "config_fetch_failed"
+            outcome = ConfigOutcome("default", reason)
+            with suppress_telemetry_errors(logger, "config fallback counter failed"):
+                _config_fallback_counter.add(1, {"reason": reason})
+            logger.warning(
+                "analyzer repo config fetch failed; using default profiles",
+                extra={"job_id": context.job_id, **outcome.log_fields()},
+            )
+            return {}
+        logger.info(
+            "analyzer repo config fetched",
+            extra={"job_id": context.job_id, "config_files_fetched": len(files)},
+        )
+        return files
+
     async def _run_analyzer_sub_steps(
-        self, diff: Diff, content: dict[str, bytes], context: StepContext
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        config_files: dict[str, bytes],
+        context: StepContext,
     ) -> Mapping[str, Any]:
-        sub_step_input = _AnalyzerSubStepInput(diff=diff, content=content)
+        sub_step_input = _AnalyzerSubStepInput(
+            diff=diff, content=content, config_files=config_files
+        )
         outcomes = await self._inner_registry.run(sub_step_input, context)
         self._log_analyzer_outcomes(outcomes, context)
         return outcomes
@@ -292,7 +577,11 @@ class StaticAnalysisStep:
         regardless of which concrete sub-step it was.
         """
         for name, outcome in outcomes.items():
+            with suppress_telemetry_errors(logger, "analyzer run counter failed"):
+                _runs_counter.add(1, {"analyzer_name": name, "outcome": outcome.status})
             if outcome.status == "success":
+                with suppress_telemetry_errors(logger, "analyzer findings counter failed"):
+                    _findings_counter.add(len(outcome.output), {"analyzer_name": name})
                 logger.info(
                     "analyzer sub-step findings",
                     extra={

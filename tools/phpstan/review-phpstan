@@ -1,0 +1,16 @@
+#!/bin/sh
+# Runs the pinned PHPStan phar on the pinned minimal PHP CLI. `-n` ignores every
+# php.ini; the network stream wrappers are off (the engine must never fetch
+# anything), and PHP's own diagnostics are kept off the stream the adapter
+# parses as JSON. There is no composer and no autoloader: only the phar runs.
+dir=$(dirname "$(readlink -f "$0")")
+out=$(php -n -d allow_url_fopen=0 -d allow_url_include=0 -d display_errors=0 \
+    -d log_errors=0 -d memory_limit=1G "$dir/phpstan.phar" "$@" 2>&1)
+status=$?
+printf '%s\n' "$out"
+# PHPStan exits 1 when it merely reported errors; that is success here. Exit 1
+# without a JSON report (a rejected config, a crash) stays a failure.
+if [ "$status" -eq 1 ]; then
+    case "$out" in '{'*) exit 0 ;; esac
+fi
+exit "$status"

@@ -19,7 +19,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, TypedDict, Unpack
 
 import pytest
@@ -1417,7 +1417,9 @@ class _ChainDiffFetcher:
 
 
 class _NoFindingsAnalyzer:
-    async def run(self, diff: Diff, content: Any, *, timeout: float) -> list[Finding]:
+    async def run(
+        self, diff: Diff, content: Any, *, timeout: float, config_files: Mapping[str, bytes]
+    ) -> list[Finding]:
         return []
 
 
@@ -1437,15 +1439,14 @@ async def test_private_flag_survives_prefilter_static_analysis_to_the_exposure_g
     a dropped forward would silently turn every private repo into ``skipped_public_repo``.
     """
     from review.prefilter import PrefilterStep
-    from review.static_analysis import StaticAnalysisStep
+    from review.static_analysis import StaticAnalysisStep, gitleaks_semgrep_registrations
 
     caplog.set_level(logging.INFO, logger="review.context_builder")
     fetcher = _ChainDiffFetcher()
     prefilter = PrefilterStep(fetcher)
     static = StaticAnalysisStep(
         fetcher,
-        gitleaks_analyzer=_NoFindingsAnalyzer(),
-        semgrep_analyzer=_NoFindingsAnalyzer(),
+        registrations=gitleaks_semgrep_registrations(_NoFindingsAnalyzer(), _NoFindingsAnalyzer()),
         redactor=NoOpTextRedactor(),
         enabled={"gitleaks": True, "semgrep": True},
         timeouts={"gitleaks": 5.0, "semgrep": 5.0},

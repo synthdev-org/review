@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -212,7 +213,14 @@ class GitleaksAnalyzer:
 
     name = "gitleaks"
 
-    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[Finding]:
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[Finding]:
         # Gitleaks reports the materialized (validate_relative_path-
         # normalized) path it scanned, which only differs from `content`'s
         # own key when a path contains a backslash.

@@ -1,0 +1,11 @@
+# Pinned default PHPStan profile (docs/specs/spec-static-analysis-expansion.md,
+# US-A5): correctness-only, used when a repo has no usable PHPStan config.
+# Level 1 covers unknown functions/methods/properties on known types, undefined
+# variables and syntax errors, and nothing stricter (no type-strictness, dead
+# code or doc-comment rules). No autoload, bootstrap or extension is configured;
+# findings that merely reflect missing dependencies are dropped by the adapter.
+#
+# Pinned by content: this file's sha256 is in `phpstan_default.neon.sha256`,
+# verified by `test_phpstan.py`; an edit without re-pinning fails that test.
+parameters:
+    level: 1

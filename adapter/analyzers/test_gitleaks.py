@@ -65,7 +65,7 @@ async def test_gitleaks_analyzer_run_against_real_binary_returns_findings() -> N
     analyzer = GitleaksAnalyzer()
 
     findings = await analyzer.run(
-        Diff(files=()), {"secret.py": _PLANTED_SECRET.encode()}, timeout=30
+        Diff(files=()), {"secret.py": _PLANTED_SECRET.encode()}, timeout=30, config_files={}
     )
 
     assert findings
@@ -85,7 +85,7 @@ async def test_gitleaks_analyzer_reports_the_original_path_for_a_backslash_filen
     analyzer = GitleaksAnalyzer()
 
     findings = await analyzer.run(
-        Diff(files=()), {"weird\\secret.py": _PLANTED_SECRET.encode()}, timeout=30
+        Diff(files=()), {"weird\\secret.py": _PLANTED_SECRET.encode()}, timeout=30, config_files={}
     )
 
     assert findings
@@ -97,7 +97,9 @@ async def test_gitleaks_analyzer_reports_the_original_path_for_a_backslash_filen
 async def test_gitleaks_analyzer_run_finds_nothing_in_clean_content() -> None:
     analyzer = GitleaksAnalyzer()
 
-    findings = await analyzer.run(Diff(files=()), {"clean.py": b"x = 1\n"}, timeout=30)
+    findings = await analyzer.run(
+        Diff(files=()), {"clean.py": b"x = 1\n"}, timeout=30, config_files={}
+    )
 
     assert findings == []
 
@@ -125,7 +127,7 @@ async def test_gitleaks_analyzer_routes_through_the_shared_retry_helper(
 
     monkeypatch.setattr(gitleaks_module, "run_analyzer_subprocess", _recording)
     analyzer = GitleaksAnalyzer()
-    await analyzer.run(Diff(files=()), {"clean.py": b"x = 1\n"}, timeout=30)
+    await analyzer.run(Diff(files=()), {"clean.py": b"x = 1\n"}, timeout=30, config_files={})
 
     assert len(calls) == 1
     assert calls[0][0] == "gitleaks"

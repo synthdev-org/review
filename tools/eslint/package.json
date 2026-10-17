@@ -1,0 +1,12 @@
+{
+  "name": "review-eslint-toolset",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned ESLint + fixed plugin set for adapter/analyzers/eslint.py (plan-phase-9 Phase 4). Installed from package-lock.json (sha512 integrity) at image build only; never at scan time.",
+  "dependencies": {
+    "@typescript-eslint/eslint-plugin": "8.71.2",
+    "@typescript-eslint/parser": "8.71.2",
+    "eslint": "9.39.5",
+    "typescript": "6.0.3"
+  }
+}

@@ -74,7 +74,10 @@ webhookApi:
 worker:
   replicaCount: 1
   image:
-    repository: ghcr.io/mystery-digital/review
+    # The worker-only image target (`worker-runtime` in the Dockerfile: `runtime`
+    # plus Node + ESLint, PHP + PHPStan and Go + golangci-lint); the other Deployments keep the
+    # interpreter-free `review` image.
+    repository: ghcr.io/mystery-digital/review-worker
     tag: ""
     pullPolicy: IfNotPresent
   # Mirrors apps/worker/settings.py's WorkerSettings fields one-for-one
@@ -96,6 +99,26 @@ worker:
     apiBaseUrl: https://api.github.com
     apiTimeoutSeconds: 10
     retryMaxAttempts: 3
+  # Static-analysis engines (docs/plans/plan-phase-9.md). New engines default on;
+  # set enabled: false before upgrading for a quiet rollout. timeoutSeconds: null
+  # inherits the analyzer default.
+  staticAnalysis:
+    maxConcurrentAnalyzers: 3
+    ruff:
+      enabled: true
+      timeoutSeconds: null
+    trivy:
+      enabled: true
+      timeoutSeconds: null
+    eslint:
+      enabled: true
+      timeoutSeconds: null
+    phpstan:
+      enabled: true
+      timeoutSeconds: null
+    golangciLint:
+      enabled: true
+      timeoutSeconds: null
   # Phase 5: non-empty defaults, closing the gap between the pipeline's own
   # per-step timeout (Phase 2) and actual container enforcement — a
   # pathological diff or a misbehaving analyzer subprocess (Gitleaks,
@@ -103,10 +126,16 @@ worker:
   # docker-compose.yml's own worker service `mem_limit`/`cpus` figures;
   # tunable per-deployment via a values override, not hardcoded by the
   # chart itself.
+  #
+  # Phase 9 sizing (docs/reference/operations.md, "Worker memory arithmetic"):
+  # Worker baseline ~415 MiB (embedding model loaded) + the N=3 largest
+  # measured engine peaks (golangci-lint 303 + ESLint 234 + Trivy 233 MiB RSS
+  # = 770 MiB) ~= 1.2 GiB worst case, so 2Gi leaves ~0.8 GiB of headroom;
+  # the request is the observed 5-engine scan peak (735 MiB cgroup) rounded up.
   resources:
     requests:
       cpu: 500m
-      memory: 512Mi
+      memory: 1Gi
     limits:
       cpu: "2"
       memory: 2Gi

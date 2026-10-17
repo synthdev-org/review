@@ -133,8 +133,13 @@ from typing import TypedDict
 import dotenv
 import httpx
 
+from adapter.analyzers.eslint import ESLINT_CONFIG_FILENAMES, EslintAnalyzer
 from adapter.analyzers.gitleaks import GitleaksAnalyzer, GitleaksTextRedactor
+from adapter.analyzers.golangci_lint import GOLANGCI_CONFIG_FILENAMES, GolangciLintAnalyzer
+from adapter.analyzers.phpstan import PHPSTAN_CONFIG_FILENAMES, PhpstanAnalyzer
+from adapter.analyzers.ruff import RUFF_CONFIG_FILENAMES, RuffAnalyzer
 from adapter.analyzers.semgrep import SemgrepAnalyzer
+from adapter.analyzers.trivy import TRIVY_CONFIG_FILENAMES, TrivyAnalyzer
 from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
 from adapter.embedding.startup_check import check_embedding_model_loaded
 from adapter.github.auth import GitHubInstallationTokenProvider, validate_private_key
@@ -142,6 +147,7 @@ from adapter.github.diff import GitHubDiffFetcher
 from adapter.github.exceptions import GitHubPrivateKeyInvalidError
 from adapter.github.posting import GitHubFindingsPublisher
 from adapter.github.reactions import GitHubReactionFetcher
+from adapter.github.repo_config import GitHubRepoConfigFetcher
 from adapter.github.tree import GitHubTreeFetcher
 from adapter.llm.litellm_client import LiteLLMClient
 from adapter.product_knowledge.client import ClientTimeouts
@@ -182,12 +188,17 @@ from review.config import (
     resolve_review_pipeline_depends_on,
 )
 from review.context_builder import ContextBuilderStep
+from review.file_matchers import match_go, match_iac, match_javascript, match_php, match_python
 from review.intent_summary import IntentSummaryStep
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
 from review.review_generation import ReviewGenerationStep
-from review.static_analysis import StaticAnalysisStep
+from review.static_analysis import (
+    AnalyzerRegistration,
+    StaticAnalysisStep,
+    gitleaks_semgrep_registrations,
+)
 from review.verification import MemorySuppressionConfig, VerificationStep
 
 
@@ -735,6 +746,11 @@ def _build_step_enablement(settings: WorkerSettings) -> StepEnablement:
         output_enabled=settings.output_enabled,
         static_analysis_gitleaks_enabled=settings.static_analysis_gitleaks_enabled,
         static_analysis_semgrep_enabled=settings.static_analysis_semgrep_enabled,
+        static_analysis_ruff_enabled=settings.static_analysis_ruff_enabled,
+        static_analysis_eslint_enabled=settings.static_analysis_eslint_enabled,
+        static_analysis_trivy_enabled=settings.static_analysis_trivy_enabled,
+        static_analysis_phpstan_enabled=settings.static_analysis_phpstan_enabled,
+        static_analysis_golangci_lint_enabled=settings.static_analysis_golangci_lint_enabled,
     )
 
 
@@ -744,6 +760,13 @@ def _build_step_timeouts(settings: WorkerSettings) -> StepTimeouts:
         prefilter_step_timeout_seconds=settings.prefilter_step_timeout_seconds,
         static_analysis_step_timeout_seconds=settings.static_analysis_step_timeout_seconds,
         static_analysis_analyzer_timeout_seconds=settings.static_analysis_analyzer_timeout_seconds,
+        static_analysis_ruff_timeout_seconds=settings.static_analysis_ruff_timeout_seconds,
+        static_analysis_eslint_timeout_seconds=settings.static_analysis_eslint_timeout_seconds,
+        static_analysis_trivy_timeout_seconds=settings.static_analysis_trivy_timeout_seconds,
+        static_analysis_phpstan_timeout_seconds=settings.static_analysis_phpstan_timeout_seconds,
+        static_analysis_golangci_lint_timeout_seconds=(
+            settings.static_analysis_golangci_lint_timeout_seconds
+        ),
         context_builder_step_timeout_seconds=settings.context_builder_step_timeout_seconds,
         intent_summary_step_timeout_seconds=settings.intent_summary_step_timeout_seconds,
         review_generation_step_timeout_seconds=settings.review_generation_step_timeout_seconds,
@@ -955,11 +978,53 @@ def _build_review_registry(
             PrefilterStep(diff_fetcher),
             StaticAnalysisStep(
                 diff_fetcher,
-                gitleaks_analyzer=GitleaksAnalyzer(),
-                semgrep_analyzer=SemgrepAnalyzer(),
+                registrations=[
+                    *gitleaks_semgrep_registrations(GitleaksAnalyzer(), SemgrepAnalyzer()),
+                    AnalyzerRegistration(
+                        "ruff",
+                        RuffAnalyzer(),
+                        matches=match_python,
+                        changed_lines_only=True,
+                        config_filenames=RUFF_CONFIG_FILENAMES,
+                    ),
+                    AnalyzerRegistration(
+                        "eslint",
+                        EslintAnalyzer(),
+                        matches=match_javascript,
+                        changed_lines_only=True,
+                        config_filenames=ESLINT_CONFIG_FILENAMES,
+                    ),
+                    AnalyzerRegistration(
+                        "phpstan",
+                        PhpstanAnalyzer(),
+                        matches=match_php,
+                        changed_lines_only=True,
+                        config_filenames=PHPSTAN_CONFIG_FILENAMES,
+                    ),
+                    AnalyzerRegistration(
+                        "golangci_lint",
+                        GolangciLintAnalyzer(),
+                        matches=match_go,
+                        changed_lines_only=True,
+                        config_filenames=GOLANGCI_CONFIG_FILENAMES,
+                    ),
+                    # Not changed_lines_only: Trivy maps a resource's line range
+                    # to added lines itself (adapter/analyzers/trivy.py, US-A3).
+                    AnalyzerRegistration(
+                        "trivy",
+                        TrivyAnalyzer(),
+                        matches=match_iac,
+                        security_class=True,
+                        config_filenames=TRIVY_CONFIG_FILENAMES,
+                    ),
+                ],
                 redactor=redactor,
                 enabled=enabled_mapping,
                 timeouts=timeouts_mapping,
+                # One semaphore per Worker process (US-A8), shared by every job
+                # because the registry is built once at startup.
+                analyzer_slots=asyncio.Semaphore(settings.static_analysis_max_concurrent_analyzers),
+                config_fetcher=GitHubRepoConfigFetcher(tree_fetcher),
             ),
             ContextBuilderStep(
                 diff_fetcher,

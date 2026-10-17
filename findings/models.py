@@ -46,7 +46,9 @@ truncating ceiling" reasoning applies to) shares one definition rather than
 each inventing its own.
 """
 
-Source = Literal["gitleaks", "semgrep", "llm"]
+Source = Literal[
+    "gitleaks", "semgrep", "ruff", "eslint", "golangci_lint", "phpstan", "trivy", "llm"
+]
 """Which producer generated a given ``Finding`` — lets a downstream consumer
 (redaction, dedupe, an operator reading logs) distinguish "the free,
 deterministic static-analysis pass found this" from "the LLM's own,
