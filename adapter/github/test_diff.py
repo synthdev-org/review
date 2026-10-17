@@ -489,3 +489,42 @@ async def test_fetch_content_bounded_concurrency_is_enforced(test_rsa_private_ke
 
     assert max_observed <= concurrency_cap
     assert max_observed > 1  # sanity: fetches genuinely overlapped, not accidentally serial
+
+
+@respx.mock
+async def test_fetch_populates_previous_path_for_a_renamed_file(
+    test_rsa_private_key_pem: str,
+) -> None:
+    _mock_token_exchange()
+    _mock_pr(changed_files=2)
+    respx.get(f"{_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/files?per_page=100").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "filename": "src/new.ts",
+                    "status": "renamed",
+                    "previous_filename": "src/old.ts",
+                },
+                {"filename": "src/other.ts", "status": "modified"},
+            ],
+        )
+    )
+    respx.get(f"{_BASE}/repos/{_OWNER_REPO}/git/trees/{_HEAD_SHA}?recursive=1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "tree": [
+                    {"path": "src/new.ts", "mode": "100644", "sha": "b" * 40, "size": 10},
+                    {"path": "src/other.ts", "mode": "100644", "sha": "c" * 40, "size": 10},
+                ],
+                "truncated": False,
+            },
+        )
+    )
+
+    diff = await _fetch(_fetcher(test_rsa_private_key_pem))
+
+    by_path = {file.path: file for file in diff.files}
+    assert by_path["src/new.ts"].previous_path == "src/old.ts"
+    assert by_path["src/other.ts"].previous_path is None

@@ -825,3 +825,84 @@ def test_phpstan_timeout_override_larger_than_the_step_budget_fails_fast(
 
     with pytest.raises(ValidationError, match="exceeds static_analysis_step_timeout_seconds"):
         WorkerSettings(_env_file=None)
+
+
+# --- clone_detection (docs/plans/plan-phase-10.md, Phase 4) -----------------
+
+
+def _clone_env(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    for key, value in env.items():
+        monkeypatch.setenv(f"REVIEW_WORKER_{key}", value)
+
+
+def test_clone_detection_defaults_per_the_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clone_env(monkeypatch)
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.clone_detection_enabled is True
+    assert settings.clone_detection_step_timeout_seconds == 30
+    assert settings.clone_detection_min_tokens == 100
+    assert settings.clone_detection_min_lines == 10
+    assert settings.clone_detection_max_findings == 5
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CLONE_DETECTION_STEP_TIMEOUT_SECONDS",
+        "CLONE_DETECTION_MIN_TOKENS",
+        "CLONE_DETECTION_MIN_LINES",
+        "CLONE_DETECTION_MAX_FINDINGS",
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_clone_detection_non_positive_values_fail_startup(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    _clone_env(monkeypatch, **{name: value})
+
+    with pytest.raises(ValidationError):
+        WorkerSettings(_env_file=None)
+
+
+def test_clone_detection_min_tokens_below_the_winnowing_guarantee_fails_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clone_env(monkeypatch, CLONE_DETECTION_MIN_TOKENS="99")
+
+    with pytest.raises(ValidationError, match="must be at least 100"):
+        WorkerSettings(_env_file=None)
+
+
+def test_clone_detection_min_tokens_can_be_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clone_env(monkeypatch, CLONE_DETECTION_MIN_TOKENS="250")
+
+    assert WorkerSettings(_env_file=None).clone_detection_min_tokens == 250
+
+
+@pytest.mark.parametrize("value", ["5", "3"])
+def test_clone_detection_step_timeout_must_exceed_the_internal_margin(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    _clone_env(monkeypatch, CLONE_DETECTION_STEP_TIMEOUT_SECONDS=value)
+
+    with pytest.raises(ValidationError, match="greater than 5"):
+        WorkerSettings(_env_file=None)
+
+
+def test_stuck_job_threshold_must_cover_the_clone_detection_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 545 s is the new worst-case chain (515 + 30); 530 covered the old sum only.
+    _clone_env(monkeypatch, STUCK_JOB_WARNING_THRESHOLD_SECONDS="530")
+
+    with pytest.raises(ValidationError, match="545"):
+        WorkerSettings(_env_file=None)
+
+
+def test_stuck_job_threshold_accepts_the_new_chain_sum(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clone_env(monkeypatch, STUCK_JOB_WARNING_THRESHOLD_SECONDS="545")
+
+    assert WorkerSettings(_env_file=None).stuck_job_warning_threshold_seconds == 545.0

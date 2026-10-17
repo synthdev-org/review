@@ -51,6 +51,7 @@ import pytest
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.trace import TracerProvider
+from pydantic import ValidationError
 
 import adapter.telemetry.heartbeat as heartbeat_module
 import apps.worker.main as worker_main
@@ -59,7 +60,9 @@ from adapter.embedding.local_onnx import LocalONNXEmbeddingClient
 from adapter.github.diff import GitHubDiffFetcher
 from adapter.github.posting import GitHubFindingsPublisher
 from adapter.github.tree import GitHubTreeFetcher
+from adapter.storage.clone_query import PostgresCloneIndexQuery
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
+from adapter.storage.indexing_repository import IndexingRepository
 from adapter.storage.memory_repository import PostgresMemoryRepository
 from adapter.storage.queue import JobQueueRepository
 from adapter.storage.tenancy import PostgresSettingRepository, PostgresUsageCounterRepository
@@ -76,10 +79,12 @@ from llmgateway.client import LLMClient
 from llmgateway.models import CompletionRequest, CompletionResponse
 from llmgateway.routing import FallbackModelRoutingResolver
 from memory.reaction_poll import MemoryReactionPollJobDependencies
+from review.clone_detection import CloneDetectionStep
 from review.config import StepEnablement, StepTimeouts
 from review.context_builder import CallerHit
 from review.pipeline import StepRegistry
 from review.step import StepContext
+from review.verification import VerificationStep
 
 
 @pytest.fixture(autouse=True)
@@ -398,6 +403,7 @@ def _capture_redactor(
         tree_fetcher: GitHubTreeFetcher,
         graph_query: PostgresGraphQuery,
         similarity_query: PostgresSimilarityQuery,
+        clone_query: PostgresCloneIndexQuery,
         embedding_client: LocalONNXEmbeddingClient,
         redactor: TextRedactor,
         llm_client: LLMClient,
@@ -415,6 +421,7 @@ def _capture_redactor(
             tree_fetcher,
             graph_query,
             similarity_query,
+            clone_query,
             embedding_client,
             redactor,
             llm_client,
@@ -553,6 +560,14 @@ class _UnusedGraphQuery:
         raise AssertionError("find_callers should never be called for an empty diff")
 
 
+class _UnusedCloneQuery:
+    async def find_candidates(self, **kwargs: object) -> object:
+        raise AssertionError("find_candidates should never be called in this test")
+
+    async def load_files(self, **kwargs: object) -> object:
+        raise AssertionError("load_files should never be called in this test")
+
+
 class _UnusedSimilarityQuery:
     async def find_similar(
         self, *, repo_id: str, embedding: EmbeddingVector, exclude_file_path: str, limit: int
@@ -659,10 +674,10 @@ async def _run_review_registry(registry: StepRegistry) -> dict[str, object]:
 @pytest.mark.parametrize(
     ("context_builder_enabled", "sa_can_produce_findings", "expected_context_builder_depends_on"),
     [
-        (True, True, "static_analysis"),
-        (True, False, "prefilter"),
-        (False, True, "static_analysis"),
-        (False, False, "prefilter"),
+        (True, True, "clone_detection"),
+        (True, False, "clone_detection"),
+        (False, True, "clone_detection"),
+        (False, False, "clone_detection"),
     ],
 )
 @pytest.mark.asyncio
@@ -695,6 +710,7 @@ async def test_all_four_context_builder_enablement_combinations_complete_success
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _EmptyFindingsLLMClient(),
@@ -709,6 +725,10 @@ async def test_all_four_context_builder_enablement_combinations_complete_success
     review_generation_step = registry._by_name["review_generation"]
     verification_step = registry._by_name["verification"]
     assert context_builder_step.depends_on == (expected_context_builder_depends_on,)
+    clone_detection_step = registry._by_name["clone_detection"]
+    assert clone_detection_step.depends_on == (
+        "static_analysis" if sa_can_produce_findings else "prefilter",
+    )
     # `intent_summary_enabled`/`review_generation_enabled` are both at their
     # default (`True`) in this parametrization, so `intent_summary` is
     # always effectively enabled — it inherits exactly the same
@@ -731,6 +751,7 @@ async def test_all_four_context_builder_enablement_combinations_complete_success
     assert statuses["review_generation"] == "success"
     assert statuses["verification"] == "success"
     assert statuses["context_builder"] == ("success" if context_builder_enabled else "disabled")
+    assert statuses["clone_detection"] == "success"
 
 
 @pytest.mark.asyncio
@@ -769,6 +790,7 @@ async def test_context_builder_enabled_but_review_generation_disabled_skips_cont
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _EmptyFindingsLLMClient(),
@@ -820,6 +842,7 @@ async def test_context_builder_disabled_produces_byte_for_byte_phase_1_review_ge
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _RecordingLLMClient(),
@@ -831,7 +854,7 @@ async def test_context_builder_disabled_produces_byte_for_byte_phase_1_review_ge
 
     intent_summary_step = registry._by_name["intent_summary"]
     review_generation_step = registry._by_name["review_generation"]
-    assert intent_summary_step.depends_on == ("static_analysis",)
+    assert intent_summary_step.depends_on == ("clone_detection",)
     assert review_generation_step.depends_on == ("intent_summary",)
 
     statuses = await _run_review_registry(registry)
@@ -1206,6 +1229,7 @@ def test_product_knowledge_wiring_has_no_opener_when_the_kill_switch_is_off(
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _EmptyFindingsLLMClient(),
@@ -1254,7 +1278,8 @@ def test_step_configuration_valid_log_includes_resolved_depends_on(
     matching = [p for p in payloads if p["message"] == "step configuration valid"]
     assert len(matching) == 1
     assert matching[0]["review_pipeline_depends_on"] == {
-        "context_builder": "static_analysis",
+        "clone_detection": "static_analysis",
+        "context_builder": "clone_detection",
         "intent_summary": "context_builder",
         "review_generation": "intent_summary",
         "verification": "review_generation",
@@ -1435,6 +1460,7 @@ def test_ruff_is_wired_as_a_python_scoped_changed_lines_only_analyzer(
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _EmptyFindingsLLMClient(),
@@ -1466,6 +1492,7 @@ def test_eslint_is_wired_as_a_javascript_scoped_changed_lines_only_analyzer(
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _EmptyFindingsLLMClient(),
@@ -1497,6 +1524,7 @@ def test_trivy_is_wired_as_an_iac_scoped_security_class_analyzer(
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _EmptyFindingsLLMClient(),
@@ -1530,6 +1558,7 @@ def test_phpstan_is_wired_as_a_php_scoped_changed_lines_only_analyzer(
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _EmptyFindingsLLMClient(),
@@ -1560,6 +1589,7 @@ def test_golangci_lint_is_wired_as_a_go_scoped_changed_lines_only_analyzer(
         cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
         cast("PostgresGraphQuery", _UnusedGraphQuery()),
         cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
         cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
         NoOpTextRedactor(),
         _EmptyFindingsLLMClient(),
@@ -1574,3 +1604,110 @@ def test_golangci_lint_is_wired_as_a_go_scoped_changed_lines_only_analyzer(
     assert golangci.changed_lines_only is True
     assert golangci.matches("cmd/main.go", b"") and not golangci.matches("a.py", b"")
     assert ".golangci.yml" in golangci.config_filenames
+
+
+def test_build_indexing_deps_wires_the_same_repository_as_clone_backfill_tracker() -> None:
+    """Production wiring must pass the clone-fingerprint backfill tracker, or the
+    backfill (plan-phase-10 Phase 2) silently never runs."""
+    tree_fetcher = cast(GitHubTreeFetcher, object())
+    embedding_client = cast(LocalONNXEmbeddingClient, object())
+    index_repository = cast(IndexingRepository, object())
+
+    deps = worker_main._build_indexing_deps(tree_fetcher, embedding_client, index_repository)
+
+    assert deps.clone_backfill is index_repository
+    assert deps.index_repository is index_repository
+    assert deps.commit_tracker is index_repository
+
+
+# --- clone_detection wiring (docs/plans/plan-phase-10.md, Phase 4) ---------
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("REVIEW_WORKER_CLONE_DETECTION_MIN_TOKENS", "99"),
+        ("REVIEW_WORKER_CLONE_DETECTION_STEP_TIMEOUT_SECONDS", "5"),
+    ],
+)
+def test_worker_boot_aborts_on_invalid_clone_detection_settings(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(worker_main, "_run_dispatch_loop_forever", _noop_dispatch_loop_forever)
+
+    with pytest.raises(ValidationError):
+        main()
+
+
+def _registry_with_settings(settings: WorkerSettings, enablement: StepEnablement) -> StepRegistry:
+    return worker_main._build_review_registry(
+        enablement,
+        StepTimeouts(),
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("PostgresCloneIndexQuery", _UnusedCloneQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
+    )
+
+
+def test_clone_detection_step_is_built_with_derived_timeout_and_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_CLONE_DETECTION_STEP_TIMEOUT_SECONDS", "42")
+    monkeypatch.setenv("REVIEW_WORKER_CLONE_DETECTION_MIN_TOKENS", "150")
+    monkeypatch.setenv("REVIEW_WORKER_CLONE_DETECTION_MIN_LINES", "12")
+    monkeypatch.setenv("REVIEW_WORKER_CLONE_DETECTION_MAX_FINDINGS", "3")
+    settings = _wiring_test_settings(monkeypatch)
+
+    registry = _registry_with_settings(settings, StepEnablement())
+
+    step = cast("CloneDetectionStep", registry._by_name["clone_detection"])
+    assert step._internal_timeout_seconds == 37.0  # step timeout - 5
+    assert (step._min_tokens, step._min_lines, step._max_findings) == (150, 12, 3)
+    assert step.depends_on == ("static_analysis",)
+    assert registry._by_name["context_builder"].depends_on == ("clone_detection",)
+
+
+@pytest.mark.asyncio
+async def test_clone_detection_disabled_is_registered_but_never_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _wiring_test_settings(monkeypatch)
+
+    registry = _registry_with_settings(settings, StepEnablement(clone_detection_enabled=False))
+
+    assert "clone_detection" in registry._by_name  # unconditionally constructed
+    assert registry._by_name["context_builder"].depends_on == ("static_analysis",)
+    statuses = await _run_review_registry(registry)
+    assert statuses["clone_detection"] == "disabled"
+    assert statuses["output"] == "success"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_memory_suppression_config_is_shared_by_clone_and_verification_steps(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_MEMORY_SUPPRESSION_ENABLED", str(enabled).lower())
+    settings = _wiring_test_settings(monkeypatch)
+
+    registry = _registry_with_settings(settings, StepEnablement())
+
+    clone = cast("CloneDetectionStep", registry._by_name["clone_detection"])
+    verification = cast("VerificationStep", registry._by_name["verification"])
+    if enabled:
+        assert clone._memory_suppression is not None
+        assert clone._memory_suppression is verification._memory_suppression
+        assert clone._memory_suppression.enabled is True
+    else:
+        assert clone._memory_suppression is None
+        assert verification._memory_suppression is None

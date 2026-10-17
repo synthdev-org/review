@@ -765,6 +765,12 @@ _PANELS_WITHOUT_E2E_TRAFFIC = frozenset(
         "Citation refs unresolved (ratio)",
         "Product knowledge config resolution failures",
         "Admin config write rejections",
+        # Phase 10 failure-path clone counters: they only record on a candidate-cap hit,
+        # a skipped file or a memory-suppression error, which the stub PRs never trigger.
+        # The other clone panels get data from the indexing push and the review PRs, and
+        # tests/e2e/test_clone_detection.py exercises the failure modes themselves.
+        "Clone findings suppressed / capped",
+        "Clone review-time skips and Memory failures",
         # Phase 9 failure-path counters: a config the tool rejects, a findings
         # cap/changed-line drop, or an engine with no matching files needs
         # traffic the stub PRs do not generate.

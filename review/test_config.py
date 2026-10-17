@@ -28,6 +28,7 @@ from review.config import (
     NoViableStepConfigurationError,
     StepEnablement,
     check_step_configuration_viable,
+    clone_detection_can_produce_value,
     intent_summary_can_produce_value,
     resolve_review_pipeline_depends_on,
 )
@@ -39,7 +40,8 @@ def test_all_steps_enabled_resolves_the_ordinary_six_step_chain() -> None:
     resolved = resolve_review_pipeline_depends_on(StepEnablement())
 
     assert resolved == {
-        "context_builder": "static_analysis",
+        "clone_detection": "static_analysis",
+        "context_builder": "clone_detection",
         "intent_summary": "context_builder",
         "review_generation": "intent_summary",
         "verification": "review_generation",
@@ -50,7 +52,7 @@ def test_all_steps_enabled_resolves_the_ordinary_six_step_chain() -> None:
 def test_context_builder_disabled_falls_back_to_static_analysis() -> None:
     resolved = resolve_review_pipeline_depends_on(StepEnablement(context_builder_enabled=False))
 
-    assert resolved["intent_summary"] == "static_analysis"
+    assert resolved["intent_summary"] == "clone_detection"
     assert resolved["review_generation"] == "intent_summary"
     assert resolved["verification"] == "review_generation"
     assert resolved["output"] == "verification"
@@ -59,7 +61,7 @@ def test_context_builder_disabled_falls_back_to_static_analysis() -> None:
 def test_intent_summary_disabled_falls_back_to_context_builder() -> None:
     resolved = resolve_review_pipeline_depends_on(StepEnablement(intent_summary_enabled=False))
 
-    assert resolved["context_builder"] == "static_analysis"
+    assert resolved["context_builder"] == "clone_detection"
     assert resolved["review_generation"] == "context_builder"
     assert resolved["verification"] == "review_generation"
     assert resolved["output"] == "verification"
@@ -75,10 +77,10 @@ def test_review_generation_disabled_falls_back_all_the_way_to_static_analysis() 
     """
     resolved = resolve_review_pipeline_depends_on(StepEnablement(review_generation_enabled=False))
 
-    assert resolved["context_builder"] == "static_analysis"
-    assert resolved["intent_summary"] == "static_analysis"
-    assert resolved["review_generation"] == "static_analysis"
-    assert resolved["verification"] == "static_analysis"
+    assert resolved["context_builder"] == "clone_detection"
+    assert resolved["intent_summary"] == "clone_detection"
+    assert resolved["review_generation"] == "clone_detection"
+    assert resolved["verification"] == "clone_detection"
     assert resolved["output"] == "verification"
 
 
@@ -111,7 +113,8 @@ def test_static_analysis_cannot_produce_findings_falls_back_to_prefilter() -> No
         )
     )
 
-    assert resolved["context_builder"] == "prefilter"
+    assert resolved["clone_detection"] == "prefilter"
+    assert resolved["context_builder"] == "clone_detection"
     assert resolved["intent_summary"] == "context_builder"
     assert resolved["review_generation"] == "intent_summary"
 
@@ -124,8 +127,8 @@ def test_context_builder_and_intent_summary_disabled_together_still_resolves_cor
         StepEnablement(context_builder_enabled=False, intent_summary_enabled=False)
     )
 
-    assert resolved["intent_summary"] == "static_analysis"
-    assert resolved["review_generation"] == "static_analysis"
+    assert resolved["intent_summary"] == "clone_detection"
+    assert resolved["review_generation"] == "clone_detection"
 
 
 # --- intent_summary_can_produce_value's own two-input truth table -----------
@@ -349,3 +352,70 @@ def test_trivy_timeout_inherits_the_analyzer_default_unless_overridden() -> None
         ).as_mapping()["trivy"]
         == 20
     )
+
+
+# --- clone_detection (plan-phase-10 Phase 4) --------------------------------
+
+
+def test_clone_detection_disabled_restores_the_pre_phase_10_chain() -> None:
+    resolved = resolve_review_pipeline_depends_on(StepEnablement(clone_detection_enabled=False))
+
+    assert resolved["context_builder"] == "static_analysis"
+    assert resolved["intent_summary"] == "context_builder"
+    assert "clone_detection" in resolved  # still wired (registered, gated by enablement)
+
+
+def test_clone_detection_can_produce_value_follows_its_own_flag() -> None:
+    assert clone_detection_can_produce_value(StepEnablement()) is True
+    assert clone_detection_can_produce_value(StepEnablement(clone_detection_enabled=False)) is False
+
+
+@pytest.mark.parametrize("clone_detection", [True, False])
+@pytest.mark.parametrize("context_builder", [True, False])
+@pytest.mark.parametrize("analyzers", [True, False])
+def test_every_enabled_step_depends_on_the_nearest_enabled_predecessor(
+    clone_detection: bool, context_builder: bool, analyzers: bool
+) -> None:
+    enablement = StepEnablement(
+        clone_detection_enabled=clone_detection,
+        context_builder_enabled=context_builder,
+        static_analysis_gitleaks_enabled=analyzers,
+        static_analysis_semgrep_enabled=analyzers,
+        static_analysis_ruff_enabled=analyzers,
+        static_analysis_eslint_enabled=analyzers,
+        static_analysis_trivy_enabled=analyzers,
+        static_analysis_phpstan_enabled=analyzers,
+        static_analysis_golangci_lint_enabled=analyzers,
+    )
+    chain = [
+        ("prefilter", True),
+        ("static_analysis", analyzers),
+        ("clone_detection", clone_detection),
+        ("context_builder", context_builder),
+        ("intent_summary", True),
+        ("review_generation", True),
+        ("verification", True),
+        ("output", True),
+    ]
+    resolved = resolve_review_pipeline_depends_on(enablement)
+
+    previous = "prefilter"
+    for name, enabled in chain[1:]:
+        if not enabled:
+            continue
+        if name in resolved:
+            assert resolved[name] == previous, name
+        previous = name
+    check_step_configuration_viable(enablement)  # every combination is viable
+
+
+def test_clone_detection_enabled_with_prefilter_disabled_is_rejected() -> None:
+    enablement = StepEnablement(
+        prefilter_enabled=False,
+        static_analysis_enabled=False,
+        clone_detection_enabled=True,
+        review_generation_enabled=True,
+    )
+
+    with pytest.raises(NoViableStepConfigurationError, match="clone_detection"):
+        check_step_configuration_viable(enablement)

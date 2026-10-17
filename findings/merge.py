@@ -38,7 +38,7 @@ from difflib import SequenceMatcher
 
 from pydantic import BaseModel, ConfigDict
 
-from findings.models import SEVERITY_RANK, Finding
+from findings.models import SEVERITY_RANK, Finding, source_rank
 
 # After dedupe, findings beyond this ceiling are dropped entirely — never
 # posted. See this module's own docstring for the full reasoning.
@@ -129,8 +129,8 @@ def merge_findings(findings: Sequence[Finding]) -> MergeResult:
         return MergeResult(findings=deduped, dropped_by_ceiling_count=0)
 
     # US-V8: once the ceiling actually truncates, order survivors by
-    # severity first, then source-trust (non-"llm" — i.e. static-analysis —
-    # ahead of "llm" at equal severity; by the time a finding reaches here,
+    # severity first, then source-trust via `source_rank` (static-analysis,
+    # then "llm", then "clone_detection"); by the time a finding reaches here,
     # any "llm"-sourced one has already survived verification, or
     # verification was disabled entirely, so `source` alone is a
     # well-defined trust signal either way). `sorted()` is stable, so
@@ -139,7 +139,7 @@ def merge_findings(findings: Sequence[Finding]) -> MergeResult:
         deduped,
         key=lambda finding: (
             SEVERITY_RANK[finding.severity],
-            0 if finding.source != "llm" else 1,
+            source_rank(finding.source),
         ),
     )
     kept = ordered[:POSTED_FINDINGS_CEILING]

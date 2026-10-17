@@ -119,6 +119,16 @@ worker:
     golangciLint:
       enabled: true
       timeoutSeconds: null
+  # Clone detection (docs/plans/plan-phase-10.md). Default on: set enabled: false
+  # before upgrading for a quiet rollout (reverting this file alone does nothing
+  # once the Worker image ships; the code default is also on). minTokens must be
+  # >= 100 (the winnowing guarantee); stepTimeoutSeconds must exceed 5.
+  cloneDetection:
+    enabled: true
+    stepTimeoutSeconds: 30
+    minTokens: 100
+    minLines: 10
+    maxFindings: 5
   # Phase 5: non-empty defaults, closing the gap between the pipeline's own
   # per-step timeout (Phase 2) and actual container enforcement — a
   # pathological diff or a misbehaving analyzer subprocess (Gitleaks,

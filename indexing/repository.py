@@ -62,6 +62,7 @@ from collections.abc import Sequence
 from typing import Protocol
 
 from indexing.chunk import Chunk
+from indexing.clone import CloneFileIndex
 from indexing.embedding import EmbeddingVector
 from indexing.graph import GraphEdge, GraphNode
 
@@ -97,6 +98,7 @@ class IndexRepository(Protocol):
         embeddings: Sequence[EmbeddingVector],
         nodes: Sequence[GraphNode],
         edges: Sequence[GraphEdge],
+        clone_index: CloneFileIndex | None = None,
     ) -> None:
         """Upsert one file's own chunks *and* graph definitions in a single
         atomic write, scoped by ``repo_id``/``pr_number`` — one method, not
@@ -134,19 +136,33 @@ class IndexRepository(Protocol):
         step, not just an upsert, since a symbol's outgoing edges can shrink
         between pushes (per the plan's Phase 6 section).
 
+        Clone data (``docs/plans/plan-phase-10.md`` Phase 2): ``clone_index``
+        is the file's ``indexing.clone.CloneFileIndex`` (per-token hashes,
+        line map, sampled fingerprints), replaced delete-then-insert in the
+        **same transaction** as the chunks and graph. ``None`` means "no clone
+        data for this file" — the file's existing clone rows are deleted
+        rather than left stale (a tokenization failure for one file must not
+        cost it its chunks, but must also never leave fingerprints for code
+        that has since changed). Defaults to ``None`` so a caller that
+        predates clone detection keeps working. Every clone row is keyed on
+        ``(repo_id, pr_number, file_path)``, so a PR-scoped call can never
+        touch the canonical ``pr_number = 0`` rows.
+
         Raises ``IndexingRepositoryError`` on a Postgres-level failure —
-        either both the chunk and graph writes land, or neither does.
+        either all of the chunk, graph and clone writes land, or none does.
         """
         ...
 
-    async def delete_file(self, *, repo_id: uuid.UUID, pr_number: int, file_path: str) -> None:
-        """Delete every chunk and graph node keyed to ``(repo_id,
+    async def delete_file(self, *, repo_id: uuid.UUID, pr_number: int, file_path: str) -> int:
+        """Delete every chunk, graph node and clone row keyed to ``(repo_id,
         pr_number, file_path)``, per US7. Every graph edge whose *source*
         node was just deleted is removed too (via the schema's own
         ``ondelete=CASCADE`` on ``index_graph_edge.source_node_id`` — not a
         second explicit delete this method issues itself); an edge whose
         *target* was one of this file's now-deleted symbols is left in
-        place as a dangling reference, per US7's own text. Raises
+        place as a dangling reference, per US7's own text. Returns the
+        number of clone fingerprint rows removed (for the
+        ``clone_fingerprints_deleted_total`` metric). Raises
         ``IndexingRepositoryError`` on a Postgres-level failure.
         """
         ...
@@ -172,6 +188,43 @@ class IndexCommitTracker(Protocol):
 
     async def set_last_indexed_commit(self, *, repo_id: uuid.UUID, commit_sha: str) -> None:
         """Advance ``repo_id``'s stored cursor to ``commit_sha``. Raises
+        ``IndexingRepositoryError`` on a Postgres-level failure.
+        """
+        ...
+
+
+class CloneBackfillTracker(Protocol):
+    """The per-repo clone-fingerprint backfill state
+    (``docs/plans/plan-phase-10.md`` Phase 2, Assumption 5) — a separate
+    Protocol from ``IndexCommitTracker`` so each stays within
+    ``architecture.md``'s 1-3 method cap. Implemented by
+    ``adapter/storage/indexing_repository.py``'s ``IndexingRepository``.
+    """
+
+    async def get_clone_fingerprint_version(self, *, repo_id: uuid.UUID) -> int:
+        """The clone-fingerprint schema version ``repo_id``'s index was last
+        fully backfilled at (``0`` until a backfill completes). Raises
+        ``IndexingRepositoryError`` on a Postgres-level failure, or if the
+        repo does not exist.
+        """
+        ...
+
+    async def advance_cursor_with_clone_version(
+        self,
+        *,
+        repo_id: uuid.UUID,
+        commit_sha: str,
+        expected_previous_commit: str | None,
+        clone_version: int,
+    ) -> bool:
+        """Optimistic-concurrency write used only by a backfill job: set the
+        last-indexed-commit cursor to ``commit_sha`` **and** the clone
+        version to ``clone_version`` in one conditional ``UPDATE``, applied
+        only if the cursor still equals ``expected_previous_commit`` (the
+        value this job started from; ``None`` matches an unset cursor).
+        Returns ``False`` — changing nothing — when another job advanced the
+        cursor first, so a job that lost the race neither moves the cursor
+        backwards nor stamps a version over rows another job wrote. Raises
         ``IndexingRepositoryError`` on a Postgres-level failure.
         """
         ...

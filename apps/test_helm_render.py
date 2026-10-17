@@ -73,3 +73,29 @@ def test_worker_runtime_stage_extends_runtime_and_is_the_only_one_with_node() ->
     assert "golangci-tool" not in runtime_stage
     assert "--from=go-toolchain" in worker_stage
     assert "--from=golangci-tool" in worker_stage
+
+
+# --- plan-phase-10 Phase 6: clone_detection settings mirrored one-for-one ------------
+# Static, so it runs without helm or docker (US-C15).
+
+
+def test_every_clone_detection_worker_setting_is_mirrored_in_chart_and_compose() -> None:
+    from apps.worker.settings import WorkerSettings
+
+    settings = WorkerSettings.model_fields
+    fields = {n for n in settings if n.startswith("clone_detection_")}
+    assert len(fields) == 5
+    values = yaml.safe_load((ROOT / "charts" / "review" / "values.yaml").read_text())
+    chart_defaults = values["worker"]["cloneDetection"]
+    configmap = (ROOT / "charts" / "review" / "templates" / "configmap.yaml").read_text()
+    compose = (ROOT / "docker-compose.yml").read_text()
+
+    for name in fields:
+        env_var = f"REVIEW_WORKER_{name.upper()}"
+        camel = re.sub(
+            r"_(\w)", lambda m: m.group(1).upper(), name.removeprefix("clone_detection_")
+        )
+        assert camel in chart_defaults, name
+        assert chart_defaults[camel] == settings[name].default, name
+        assert f"{env_var}: {{{{ .Values.worker.cloneDetection.{camel} | quote }}}}" in configmap
+        assert f"{env_var}:" in compose, name

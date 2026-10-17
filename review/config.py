@@ -42,6 +42,8 @@ class StepEnablement(BaseModel):
 
     prefilter_enabled: bool = True
     static_analysis_enabled: bool = True
+    # Phase 10 (docs/plans/plan-phase-10.md): the clone_detection step's kill switch.
+    clone_detection_enabled: bool = True
     # Added by docs/plans/plan-deliver-context-builder.md's Phase 5 section —
     # the context_builder step's own kill switch (spec-context-builder.md's
     # Rollout & Release Safety "decided" flag), default `True`, mirroring
@@ -94,6 +96,7 @@ class StepEnablement(BaseModel):
         return {
             "prefilter": self.prefilter_enabled,
             "static_analysis": self.static_analysis_enabled,
+            "clone_detection": self.clone_detection_enabled,
             "context_builder": self.context_builder_enabled,
             "intent_summary": self.intent_summary_enabled,
             "review_generation": self.review_generation_enabled,
@@ -118,6 +121,8 @@ class StepTimeouts(BaseModel):
     prefilter_step_timeout_seconds: int = 30
     static_analysis_step_timeout_seconds: int = 240
     static_analysis_analyzer_timeout_seconds: int = 60
+    # Phase 10: the outer timeout; the step's own internal wait_for is this minus 5 s.
+    clone_detection_step_timeout_seconds: int = 30
     # Optional per-analyzer override; None inherits the analyzer default above (US-A7).
     static_analysis_ruff_timeout_seconds: int | None = None
     static_analysis_eslint_timeout_seconds: int | None = None
@@ -156,6 +161,7 @@ class StepTimeouts(BaseModel):
         return {
             "prefilter": self.prefilter_step_timeout_seconds,
             "static_analysis": self.static_analysis_step_timeout_seconds,
+            "clone_detection": self.clone_detection_step_timeout_seconds,
             "context_builder": self.context_builder_step_timeout_seconds,
             "intent_summary": self.intent_summary_step_timeout_seconds,
             "review_generation": self.review_generation_step_timeout_seconds,
@@ -252,6 +258,15 @@ def context_builder_can_produce_value(enablement: StepEnablement) -> bool:
     return enablement.context_builder_enabled and enablement.review_generation_enabled
 
 
+def clone_detection_can_produce_value(enablement: StepEnablement) -> bool:
+    """Whether running ``CloneDetectionStep`` can produce value: its findings are
+    consumed by the always-required ``output`` step, so only its own flag matters.
+    Kept as a named predicate (like its siblings) so the registry wiring and
+    ``check_step_configuration_viable`` share one definition.
+    """
+    return enablement.clone_detection_enabled
+
+
 def intent_summary_can_produce_value(enablement: StepEnablement) -> bool:
     """Whether running ``IntentSummaryStep`` can actually produce any value
     under ``enablement`` — true only when the step itself is enabled *and*
@@ -267,8 +282,8 @@ def intent_summary_can_produce_value(enablement: StepEnablement) -> bool:
 
 
 def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, str]:
-    """Resolves ``depends_on`` for the five dynamically-wired steps in the
-    one review pipeline this codebase has (``context_builder ->
+    """Resolves ``depends_on`` for the six dynamically-wired steps in the
+    one review pipeline this codebase has (``clone_detection -> context_builder ->
     intent_summary -> review_generation -> verification -> output``) —
     **one small, concrete, hard-coded-to-this-one-chain function, not a
     general-purpose, arbitrary-chain-length utility** (Assumption 6 of
@@ -289,7 +304,12 @@ def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, 
     docs/adr/0005-pure-no-io-logic-unit-tested.md's own scope list.
     """
     sa_can_produce_findings = static_analysis_can_produce_findings(enablement)
-    upstream_of_context_builder = "static_analysis" if sa_can_produce_findings else "prefilter"
+    upstream_of_clone_detection = "static_analysis" if sa_can_produce_findings else "prefilter"
+    upstream_of_context_builder = (
+        "clone_detection"
+        if clone_detection_can_produce_value(enablement)
+        else upstream_of_clone_detection
+    )
 
     context_builder_effectively_enabled = context_builder_can_produce_value(enablement)
 
@@ -313,6 +333,7 @@ def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, 
     )
 
     return {
+        "clone_detection": upstream_of_clone_detection,
         "context_builder": upstream_of_context_builder,
         "intent_summary": intent_summary_depends_on,
         "review_generation": upstream_of_review_generation,
@@ -409,6 +430,7 @@ def check_step_configuration_viable(enablement: StepEnablement) -> None:
     effectively_enabled: dict[str, bool] = {
         "prefilter": enablement.prefilter_enabled,
         "static_analysis": sa_can_produce_findings,
+        "clone_detection": clone_detection_can_produce_value(enablement),
         "context_builder": context_builder_can_produce_value(enablement),
         "intent_summary": intent_summary_can_produce_value(enablement),
         "review_generation": enablement.review_generation_enabled,

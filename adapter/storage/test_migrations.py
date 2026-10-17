@@ -28,6 +28,9 @@ _EXPECTED_TABLES = {
     "index_chunk",
     "index_graph_node",
     "index_graph_edge",
+    # Phase 10 (clone detection, Unit B):
+    "index_clone_file",
+    "index_clone_fingerprint",
     # Phase 1 (Memory delivery plan, Unit A):
     "posted_finding_comment",
     "memory_entry",
@@ -47,6 +50,7 @@ _EXPECTED_COLUMNS = {
         "full_name",
         "installation_id",
         "last_indexed_commit_sha",
+        "clone_fingerprint_version",
         "created_at",
         "updated_at",
     },
@@ -143,6 +147,16 @@ _EXPECTED_COLUMNS = {
         "updated_at",
     },
     "captured_reaction": {"posted_finding_comment_id", "reaction_id"},
+    "index_clone_file": {
+        "repo_id",
+        "pr_number",
+        "file_path",
+        "language",
+        "token_hashes",
+        "line_first_token",
+        "updated_at",
+    },
+    "index_clone_fingerprint": {"repo_id", "pr_number", "file_path", "token_offset", "hash"},
 }
 
 
@@ -214,3 +228,66 @@ async def test_downgrade_base_reverses_the_baseline_migration(pgvector_container
     tables = await _table_names(dsn)
     assert not (_EXPECTED_TABLES - {"alembic_version"}) & tables
     assert not await _pgvector_extension_present(dsn)
+
+
+async def _execute(dsn: str, statement: str, params: dict[str, object] | None = None) -> None:
+    engine = create_storage_engine(dsn)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(statement), params or {})
+    finally:
+        await engine.dispose()
+
+
+async def _scalar(dsn: str, statement: str) -> object:
+    engine = create_storage_engine(dsn)
+    try:
+        async with engine.connect() as connection:
+            return (await connection.execute(text(statement))).scalar_one()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_0011_up_down_on_a_populated_schema(pgvector_container) -> None:  # type: ignore[no-untyped-def]
+    """Plan Phase 10/2: existing repo rows default to version 0 on upgrade, and
+    a downgrade succeeds with clone rows present (dropping them)."""
+    dsn = pgvector_container.get_connection_url()
+    config = alembic_config_for(dsn)
+
+    await asyncio.to_thread(command.upgrade, config, "0010")
+    try:
+        await _execute(
+            dsn,
+            "INSERT INTO org (id, name, slug) VALUES "
+            "('00000000-0000-0000-0000-000000000001', 'o', 'o')",
+        )
+        await _execute(
+            dsn,
+            "INSERT INTO repo (id, org_id, name, full_name) VALUES "
+            "('00000000-0000-0000-0000-000000000002', "
+            "'00000000-0000-0000-0000-000000000001', 'r', 'o/r')",
+        )
+
+        await asyncio.to_thread(command.upgrade, config, "0011")
+        assert await _scalar(dsn, "SELECT clone_fingerprint_version FROM repo") == 0
+
+        await _execute(
+            dsn,
+            "INSERT INTO index_clone_file (repo_id, file_path, language, token_hashes, "
+            "line_first_token) VALUES ('00000000-0000-0000-0000-000000000002', 'a.ts', "
+            "'typescript', ARRAY[1,2], ARRAY[0])",
+        )
+        await _execute(
+            dsn,
+            "INSERT INTO index_clone_fingerprint (repo_id, file_path, token_offset, hash) "
+            "VALUES ('00000000-0000-0000-0000-000000000002', 'a.ts', 0, 42)",
+        )
+
+        await asyncio.to_thread(command.downgrade, config, "0010")
+        tables = await _table_names(dsn)
+        assert not {"index_clone_file", "index_clone_fingerprint"} & tables
+        assert "clone_fingerprint_version" not in await _column_names(dsn, "repo")
+        assert await _scalar(dsn, "SELECT count(*) FROM repo") == 1
+    finally:
+        await asyncio.to_thread(command.downgrade, config, "base")

@@ -301,10 +301,13 @@ class GitHubDiffFetcher:
             except (KeyError, TypeError) as exc:
                 raise GitHubDiffFetchMalformedResponseError(detail=str(exc)) from exc
             patch = raw_file.get("patch")
+            previous_path = raw_file.get("previous_filename")
 
             if status == _REMOVED_STATUS:
                 # No longer exists at head_sha's tree — nothing to resolve.
-                diff_files.append(DiffFile(path=path, status=status, patch=patch))
+                diff_files.append(
+                    DiffFile(path=path, status=status, patch=patch, previous_path=previous_path)
+                )
                 continue
 
             entry = tree_by_path.get(path)
@@ -325,6 +328,7 @@ class GitHubDiffFetcher:
                     mode=entry.get("mode"),
                     blob_sha=entry.get("sha"),
                     blob_size_bytes=entry.get("size"),
+                    previous_path=previous_path,
                 )
             )
 

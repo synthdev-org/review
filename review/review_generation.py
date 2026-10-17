@@ -78,7 +78,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from findings.models import SEVERITY_RANK, Finding, Severity
+from findings.models import SEVERITY_RANK, Finding, Severity, source_rank
 from findings.redact import TextRedactor, apply_redaction_ceiling, redact_findings
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
@@ -474,7 +474,8 @@ class ReviewGenerationStep:
         # findings.merge.merge_findings's own severity-aware ordering
         # (US-V8) before that later stage ever sees the finding.
         severity_ordered_llm_findings = sorted(
-            llm_findings, key=lambda finding: SEVERITY_RANK[finding.severity]
+            llm_findings,
+            key=lambda finding: (SEVERITY_RANK[finding.severity], source_rank(finding.source)),
         )
         surviving, dropped = apply_redaction_ceiling(
             severity_ordered_llm_findings, REDACTION_FINDING_CEILING

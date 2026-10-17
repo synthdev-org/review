@@ -60,7 +60,7 @@ from typing import Any, Protocol
 from opentelemetry import metrics
 from pydantic import BaseModel, ConfigDict
 
-from findings.models import SEVERITY_RANK, Finding
+from findings.models import SEVERITY_RANK, Finding, source_rank
 from findings.redact import TextRedactor, apply_redaction_ceiling, redact_findings
 from ingestion.diff import Diff, DiffFetcher
 from review._telemetry import suppress_telemetry_errors
@@ -463,6 +463,7 @@ class StaticAnalysisStep:
         findings.sort(
             key=lambda f: (
                 SEVERITY_RANK[f.severity],
+                source_rank(f.source),
                 0 if f.source in self._security_sources else 1,
             )
         )

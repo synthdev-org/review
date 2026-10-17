@@ -72,23 +72,17 @@ design.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 
 from opentelemetry import metrics
 from pydantic import BaseModel, ConfigDict, Field
 
 from findings.models import Finding
-from indexing.embedding import EmbeddingClient
 from ingestion.diff import Diff
 from llmgateway.client import LLMClient
 from llmgateway.routing import FallbackModelRoutingResolver
-from memory.fingerprint import build_finding_fingerprint
-from memory.store import DismissedFindingMatcher
 from review._telemetry import suppress_telemetry_errors
 from review.context_bundle import (
     ContextBundle,
@@ -98,6 +92,10 @@ from review.context_bundle import (
 from review.diff_prompt import render_and_truncate_diff
 from review.llm_response import build_completion_request, parse_llm_json_envelope
 from review.llm_telemetry import record_llm_token_usage
+from review.memory_suppression import (
+    MemorySuppressionConfig as MemorySuppressionConfig,  # re-export
+)
+from review.memory_suppression import suppress_via_memory
 from review.step import JobIdentity, Step, StepContext, job_identity_fields
 
 logger = logging.getLogger(__name__)
@@ -338,28 +336,6 @@ def _passes_rubric(verdict: _VerificationVerdictItem) -> bool:
     return all(getattr(verdict, criterion) for criterion in _RUBRIC_CRITERIA)
 
 
-@dataclass(frozen=True)
-class MemorySuppressionConfig:
-    """The four mutually-dependent fields US-M6/US-M7/US-M9/US-M12's
-    similarity-suppression pre-check needs, grouped into one parameter
-    rather than four independent ones on ``VerificationStep.__init__`` —
-    per ``docs/plans/plan-deliver-memory.md``'s Phase 6 section: ``threshold``/
-    ``decay_half_life_days`` are meaningless without ``memory_matcher``/
-    ``embedding_client`` present together, so bundling them removes the
-    invalid states four independent optional constructor parameters would
-    otherwise allow (e.g. a threshold set with no matcher). There is no
-    construction-time state where one field is present while another is
-    missing — the invalid combination a plan-review pass flagged is
-    structurally unrepresentable here, not merely validated after the fact.
-    """
-
-    memory_matcher: DismissedFindingMatcher
-    embedding_client: EmbeddingClient
-    similarity_threshold: float
-    decay_half_life_days: float
-    enabled: bool
-
-
 class VerificationStep:
     """``review.step.Step`` implementation for US-V3 through US-V6 — see
     this module's own docstring for the full design."""
@@ -417,49 +393,6 @@ class VerificationStep:
         self._model_resolver = model_resolver
         self.depends_on: tuple[str, ...] = (depends_on,)
 
-    @staticmethod
-    async def _suppress_via_memory(
-        llm_findings: list[Finding], *, config: MemorySuppressionConfig, repo_id: str
-    ) -> tuple[list[Finding], int]:
-        """US-M6/US-M7/US-M9's own pre-check — see the module docstring's
-        "Similarity-based suppression" section for the full design. Returns
-        ``(kept_findings, suppressed_count)``. Takes ``config`` explicitly
-        (rather than reading ``self._memory_suppression`` and narrowing away
-        the ``None`` case internally) — the caller (``run()``) only calls
-        this once it has already checked ``self._memory_suppression is not
-        None and .enabled`` (US-M12's own kill switch), so there is nothing
-        left for this method itself to guard against.
-        """
-        fingerprints = [
-            build_finding_fingerprint(
-                file=finding.file, rule_id=finding.rule_id, message=finding.message
-            )
-            for finding in llm_findings
-        ]
-        # `embed` is a plain, synchronous, CPU-bound call (per
-        # `indexing.embedding.EmbeddingClient`'s own docstring) —
-        # `asyncio.to_thread`-wrapped so it never blocks this step's event
-        # loop, the same pattern `review.context_builder.ContextBuilderStep`
-        # already establishes for its own `embed` call.
-        vectors = await asyncio.to_thread(config.embedding_client.embed, fingerprints)
-
-        now = datetime.now(UTC)
-        kept: list[Finding] = []
-        suppressed_count = 0
-        for finding, vector in zip(llm_findings, vectors, strict=True):
-            similarity = await config.memory_matcher.best_effective_similarity(
-                repo_id=repo_id,
-                embedding=vector.values,
-                half_life_days=config.decay_half_life_days,
-                now=now,
-            )
-            if similarity is not None and similarity > config.similarity_threshold:
-                suppressed_count += 1
-                continue
-            kept.append(finding)
-
-        return kept, suppressed_count
-
     async def run(self, input: Any, context: StepContext) -> VerificationOutput:
         # Any (not _VerificationInput) because the registry passes the raw
         # upstream step output here for validation — see the module
@@ -481,7 +414,7 @@ class VerificationStep:
 
         memory_suppressed_count = 0
         if self._memory_suppression is not None and self._memory_suppression.enabled:
-            llm_findings, memory_suppressed_count = await self._suppress_via_memory(
+            llm_findings, memory_suppressed_count = await suppress_via_memory(
                 llm_findings, config=self._memory_suppression, repo_id=parsed.repo_id
             )
 

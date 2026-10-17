@@ -415,9 +415,10 @@ it can't start before Phase 2 lands.
   correctness/security findings in the findings schema.
 - Tunable minimum-clone-size threshold (likely per-language) to avoid
   flagging trivial boilerplate.
-- Reuses Memory (Phase 4) unmodified: a dismissed duplication finding
-  suppresses similarly-patterned future flags the same way any other
-  dismissed finding does, with no special-casing needed.
+- Reuses Memory (Phase 4): the dismissal *capture* path is unmodified; the
+  *consumption* path (similarity suppression) is extended to cover
+  `clone_detection` findings (ADR-0009 decision 3 amendment), so a dismissed
+  duplication finding stops recurring without special-casing.
 
 *Open (for a future PRD): build vs. adopt an existing OSS clone-detection
 engine (e.g. jscpd, PMD CPD) vs. a custom AST-hash approach reusing Phase 2's
@@ -426,6 +427,18 @@ surfaced as a PR-time finding at all, or only in a separate scheduled
 "codebase health" report — this decides whether it's a pipeline step or a
 standalone job; and the performance budget for the underlying full-repo
 comparison.*
+
+Specified in [`specs/spec-clone-detection.md`](specs/spec-clone-detection.md)
+(draft): custom winnowing fingerprints off Phase 2's parse, a PR-time step
+scoped to duplication the PR introduces.
+
+*Manual real-repository false-positive check (plan-phase-10 Phase 7):
+**unexercised** (2026-10-17). It has not been run against a real TypeScript,
+PHP or Go repository, so the Go error-handling-idiom false-positive risk
+(spec A1/A2) is unmeasured; the per-language clean-code fixtures and the
+Compose E2E (`tests/e2e/test_clone_detection.py`, 5 passed) are the only
+evidence. Record the result here once run; a measured problem changes the
+default by a recorded owner decision.*
 
 **Status (2026-10-16): Not started.** No clone-detection step, `duplication`
 finding category or related code exists (a search for clone/duplication logic

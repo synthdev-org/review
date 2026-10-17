@@ -70,7 +70,7 @@ class _NullIndexRepository:
     async def upsert_file(self, **kwargs: object) -> None:
         raise AssertionError("_NullIndexRepository.upsert_file should never be called")
 
-    async def delete_file(self, **kwargs: object) -> None:
+    async def delete_file(self, **kwargs: object) -> int:
         raise AssertionError("_NullIndexRepository.delete_file should never be called")
 
     async def get_last_indexed_commit(self, **kwargs: object) -> str | None:
