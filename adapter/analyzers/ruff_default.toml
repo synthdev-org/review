@@ -1,0 +1,14 @@
+# Pinned default Ruff profile (docs/specs/spec-static-analysis-expansion.md,
+# US-A5): correctness-only, used when a repo has no usable Ruff config. It
+# enables undefined names (F821), unused imports (F401) and syntax/IO errors
+# (E9) and nothing else, so no style, naming, docstring or formatting rule can
+# ever fire. Syntax errors are reported by Ruff regardless of `select`.
+# The newest target version is set so modern syntax (match, PEP 695, ...) is
+# never reported as an error just because no `requires-python` was fetched.
+#
+# Pinned by content: this file's sha256 is in `ruff_default.toml.sha256`,
+# verified by `test_ruff.py`; an edit without re-pinning fails that test.
+target-version = "py314"
+
+[lint]
+select = ["F401", "F821", "E9"]

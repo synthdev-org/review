@@ -1,0 +1,14 @@
+#!/bin/sh
+# Runs the pinned ESLint from this directory's node_modules, in legacy
+# (eslintrc, data-only) mode. NODE_PATH makes the pinned parser/plugins
+# resolvable from a config living in the scan directory, and nothing else;
+# --no-warnings keeps Node's eslintrc deprecation notice off the JSON stream.
+dir=$(dirname "$(readlink -f "$0")")
+ESLINT_USE_FLAT_CONFIG=false NODE_PATH="$dir/node_modules" \
+    node --no-warnings "$dir/node_modules/eslint/bin/eslint.js" \
+    --resolve-plugins-relative-to "$dir" --format "$dir/formatter.cjs" "$@"
+status=$?
+# ESLint exits 1 when it merely reported lint errors; that is success here.
+# Exit 2 (bad config, crash) and anything else stay failures.
+[ "$status" -eq 1 ] && exit 0
+exit "$status"

@@ -68,7 +68,7 @@ assert_contains "$DEFAULT_OUT" '# Source: review/charts/postgresql/templates/sta
     "postgresql.enabled: true (default) bundles the pgvector subchart"
 assert_contains "$DEFAULT_OUT" 'kind: Deployment' \
     "default render includes Deployment manifests"
-assert_contains "$DEFAULT_OUT" $'resources:\n            limits:\n              cpu: "2"\n              memory: 2Gi\n            requests:\n              cpu: 500m\n              memory: 512Mi' \
+assert_contains "$DEFAULT_OUT" $'resources:\n            limits:\n              cpu: "2"\n              memory: 2Gi\n            requests:\n              cpu: 500m\n              memory: 1Gi' \
     "default render includes the Worker Deployment's non-empty resources.requests/limits (Phase 5)"
 
 echo
@@ -185,6 +185,51 @@ WORKER_BLOCK=$(awk '/# Source: review\/templates\/deployment-worker.yaml/,/^---$
 WEBHOOK_API_BLOCK=$(awk '/# Source: review\/templates\/deployment-webhook-api.yaml/,/^---$/' <<<"$DEFAULT_OUT")
 assert_not_contains "$WORKER_BLOCK" 'livenessProbe' \
     "the Worker Deployment is not retroactively given a probe by this phase"
+# plan-phase-9 Phase 4: only the Worker runs the interpreter-bearing
+# `worker-runtime` image; the internet-facing Deployments keep the plain one.
+ADMIN_API_BLOCK=$(awk '/# Source: review\/templates\/deployment-admin-api.yaml/,/^---$/' <<<"$DEFAULT_OUT")
+assert_contains "$WORKER_BLOCK" 'image: "ghcr.io/mystery-digital/review-worker:' \
+    "the Worker Deployment runs the worker-only review-worker image"
+assert_contains "$WEBHOOK_API_BLOCK" 'image: "ghcr.io/mystery-digital/review:' \
+    "the Webhook API Deployment keeps the interpreter-free review image"
+assert_contains "$ADMIN_API_BLOCK" 'image: "ghcr.io/mystery-digital/review:' \
+    "the Admin API Deployment keeps the interpreter-free review image"
+assert_contains "$DEFAULT_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_ENABLED: "true"' \
+    "default render carries the ESLint enable flag (on by default)"
+ESLINT_OFF_OUT=$(helm template "$RELEASE" "$CHART_DIR" \
+    --set worker.staticAnalysis.eslint.enabled=false \
+    --set worker.staticAnalysis.eslint.timeoutSeconds=45)
+assert_contains "$ESLINT_OFF_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_ENABLED: "false"' \
+    "worker.staticAnalysis.eslint.enabled=false renders the kill switch"
+assert_contains "$ESLINT_OFF_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_TIMEOUT_SECONDS: "45"' \
+    "worker.staticAnalysis.eslint.timeoutSeconds renders the per-analyzer override"
+assert_contains "$DEFAULT_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_ENABLED: "true"' \
+    "default render carries the Trivy enable flag (on by default)"
+TRIVY_OFF_OUT=$(helm template "$RELEASE" "$CHART_DIR" \
+    --set worker.staticAnalysis.trivy.enabled=false \
+    --set worker.staticAnalysis.trivy.timeoutSeconds=45)
+assert_contains "$TRIVY_OFF_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_ENABLED: "false"' \
+    "worker.staticAnalysis.trivy.enabled=false renders the kill switch"
+assert_contains "$TRIVY_OFF_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_TIMEOUT_SECONDS: "45"' \
+    "worker.staticAnalysis.trivy.timeoutSeconds renders the per-analyzer override"
+assert_contains "$DEFAULT_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_ENABLED: "true"' \
+    "default render carries the PHPStan enable flag (on by default)"
+PHPSTAN_OFF_OUT=$(helm template "$RELEASE" "$CHART_DIR" \
+    --set worker.staticAnalysis.phpstan.enabled=false \
+    --set worker.staticAnalysis.phpstan.timeoutSeconds=45)
+assert_contains "$PHPSTAN_OFF_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_ENABLED: "false"' \
+    "worker.staticAnalysis.phpstan.enabled=false renders the kill switch"
+assert_contains "$PHPSTAN_OFF_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_TIMEOUT_SECONDS: "45"' \
+    "worker.staticAnalysis.phpstan.timeoutSeconds renders the per-analyzer override"
+assert_contains "$DEFAULT_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_ENABLED: "true"' \
+    "default render carries the golangci-lint enable flag (on by default)"
+GOLANGCI_OFF_OUT=$(helm template "$RELEASE" "$CHART_DIR" \
+    --set worker.staticAnalysis.golangciLint.enabled=false \
+    --set worker.staticAnalysis.golangciLint.timeoutSeconds=45)
+assert_contains "$GOLANGCI_OFF_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_ENABLED: "false"' \
+    "worker.staticAnalysis.golangciLint.enabled=false renders the kill switch"
+assert_contains "$GOLANGCI_OFF_OUT" 'REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_TIMEOUT_SECONDS: "45"' \
+    "worker.staticAnalysis.golangciLint.timeoutSeconds renders the per-analyzer override"
 assert_not_contains "$WEBHOOK_API_BLOCK" 'livenessProbe' \
     "the Webhook API Deployment is not retroactively given a probe by this phase"
 ADMIN_API_DISABLED_OUT=$(helm template "$RELEASE" "$CHART_DIR" --set adminApi.enabled=false)
@@ -290,6 +335,14 @@ assert_contains "$COMPOSE_OUT" 'target: 8001' \
     "admin_api service exposes its own port, distinct from webhook_api's 8000"
 assert_contains "$COMPOSE_OUT" "/healthz" \
     "admin_api service's healthcheck targets the real /healthz surface"
+# plan-phase-9 Phase 4: the worker alone builds the worker-only image target.
+COMPOSE_WORKER=$(awk '/^  worker:/,0' <<<"$COMPOSE_OUT")
+assert_contains "$COMPOSE_WORKER" 'target: worker-runtime' \
+    "worker service builds the worker-only worker-runtime target"
+assert_contains "$COMPOSE_WORKER" 'image: review-worker:compose-local' \
+    "worker service has its own image tag, distinct from the shared review-app one"
+assert_not_contains "$(awk '/^  admin_api:/,/^  worker:/' <<<"$COMPOSE_OUT" | sed '$d')" 'worker-runtime' \
+    "webhook_api and admin_api keep the interpreter-free runtime target"
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then

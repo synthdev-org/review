@@ -28,20 +28,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
+from opentelemetry import metrics as otel_metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader, Sum
+from opentelemetry.sdk.resources import Resource
 
 from adapter.analyzers.exceptions import AnalyzerOutputParseError
 from adapter.analyzers.gitleaks import GitleaksAnalyzer
 from adapter.analyzers.semgrep import SemgrepAnalyzer
+from adapter.telemetry.conftest import (
+    reset_otel_global_providers as _reset_otel_global_providers,  # noqa: F401
+)
 from findings.models import Finding, Source
 from findings.redact import TextRedactor
 from ingestion.diff import Diff, DiffFetcher, DiffFile
 from review.pipeline import FailurePolicy, PipelineFailedError, StepRegistry
-from review.static_analysis import REDACTION_FINDING_CEILING, StaticAnalysisStep
+from review.static_analysis import (
+    REDACTION_FINDING_CEILING,
+    ConfigOutcome,
+    StaticAnalysisStep,
+    gitleaks_semgrep_registrations,
+)
 from review.step import StepContext
 
 
@@ -307,7 +320,14 @@ class _RaisingStaticAnalyzer:
         self.name = name
         self._error = error
 
-    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[Finding]:
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[Finding]:
         raise self._error
 
 
@@ -323,7 +343,14 @@ class _SleepingStaticAnalyzer:
         self.name = name
         self._delay_seconds = delay_seconds
 
-    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[Finding]:
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[Finding]:
         await asyncio.sleep(self._delay_seconds)
         return []
 
@@ -360,8 +387,7 @@ def _static_analysis_step(
 ) -> StaticAnalysisStep:
     return StaticAnalysisStep(
         diff_fetcher,
-        gitleaks_analyzer=gitleaks,
-        semgrep_analyzer=semgrep,
+        registrations=gitleaks_semgrep_registrations(gitleaks, semgrep),
         redactor=redactor,
         enabled=enabled or {"gitleaks": True, "semgrep": True},
         timeouts=timeouts or {"gitleaks": 30.0, "semgrep": 30.0},
@@ -560,7 +586,14 @@ class _ReturningStaticAnalyzer:
         self.name = name
         self._findings = findings
 
-    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[Finding]:
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[Finding]:
         return list(self._findings)
 
 
@@ -648,3 +681,352 @@ async def test_product_knowledge_capture_fields_are_forwarded_to_output() -> Non
     assert output.pr_issue_keys == ("PROJ-9", "#41")
     assert output.pr_is_fork is False
     assert output.private is True  # fail-closed field: a dropped forward kills the feature
+
+
+# ============================================================================
+# Phase 9 / Phase 1: registry-driven analyzers, language routing, changed-line
+# filtering, ordering, timeout inheritance. Unit tier: fake analyzers at the
+# StaticAnalyzer Protocol boundary, no real binaries.
+# ============================================================================
+
+from review.changed_lines import changed_lines  # noqa: E402
+from review.file_matchers import match_python  # noqa: E402
+from review.static_analysis import (  # noqa: E402
+    AnalyzerRegistration,
+    RepoConfigFetcher,
+    RepoConfigFetchError,
+)
+
+
+class _RecordingAnalyzer:
+    def __init__(self, findings: list[Finding] | None = None) -> None:
+        self.findings = findings or []
+        self.calls: list[tuple[list[str], float]] = []
+        self.config_seen: list[dict[str, bytes]] = []
+
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[Finding]:
+        self.calls.append((sorted(content), timeout))
+        self.config_seen.append(dict(config_files))
+        return list(self.findings)
+
+
+def _finding(
+    source: Source, line: int | None, severity: str = "low", file: str = "a.py"
+) -> Finding:
+    return Finding(
+        file=file,
+        line=line,
+        severity=severity,
+        message=f"{source}@{line}",
+        source=source,
+    )
+
+
+_PY_PATCH = "@@ -1,2 +1,3 @@\n keep = 1\n+added = 2\n keep2 = 3\n"
+
+
+def _fake_step(
+    registrations: list[AnalyzerRegistration],
+    content: dict[str, bytes],
+    *,
+    patches: dict[str, str | None] | None = None,
+    enabled: dict[str, bool] | None = None,
+    timeouts: dict[str, float] | None = None,
+    analyzer_slots: asyncio.Semaphore | None = None,
+    config_fetcher: RepoConfigFetcher | None = None,
+) -> tuple[StaticAnalysisStep, Diff]:
+    patches = patches or {}
+    diff = Diff(
+        files=tuple(
+            DiffFile(path=p, status="modified", patch=patches.get(p), mode="100644")
+            for p in content
+        )
+    )
+    step = StaticAnalysisStep(
+        _FakeDiffFetcher(content),
+        registrations=registrations,
+        redactor=_RecordingTextRedactor(),
+        enabled=enabled or {},
+        timeouts=timeouts or {"static_analysis_analyzer": 9.0},
+        analyzer_slots=analyzer_slots,
+        config_fetcher=config_fetcher,
+    )
+    return step, diff
+
+
+@pytest.mark.asyncio
+async def test_us_a1_each_analyzer_receives_only_its_languages_and_is_skipped_otherwise() -> None:
+    py = _RecordingAnalyzer()
+    other = AnalyzerRegistration("ruff", py, matches=match_python)
+    go = _RecordingAnalyzer()
+    never = AnalyzerRegistration("golangci_lint", go, matches=lambda p, c: p.endswith(".go"))
+    everything = _RecordingAnalyzer()
+    step, diff = _fake_step(
+        [other, never, AnalyzerRegistration("gitleaks", everything)],
+        {"a.py": b"x", "notes.md": b"y"},
+    )
+
+    await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    assert [c[0] for c in py.calls] == [["a.py"]]
+    assert go.calls == []  # no matching file: never invoked
+    assert [c[0] for c in everything.calls] == [["a.py", "notes.md"]]  # unchanged behavior
+
+
+@pytest.mark.asyncio
+async def test_us_a3_changed_line_filter_drops_untouched_lines_and_patchless_files() -> None:
+    lint = _RecordingAnalyzer(
+        [
+            _finding("ruff", 2),
+            _finding("ruff", 1),
+            _finding("ruff", 1, file="big.py"),
+        ]
+    )
+    secret = _RecordingAnalyzer([_finding("gitleaks", 1)])
+    step, diff = _fake_step(
+        [
+            AnalyzerRegistration("ruff", lint, changed_lines_only=True),
+            AnalyzerRegistration("gitleaks", secret),
+        ],
+        {"a.py": b"x", "big.py": b"y"},
+        patches={"a.py": _PY_PATCH, "big.py": None},
+    )
+    assert changed_lines(_PY_PATCH) == {2}
+
+    output = await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    assert sorted((f.source, f.line) for f in output.findings) == [("gitleaks", 1), ("ruff", 2)]
+
+
+@pytest.mark.asyncio
+async def test_us_a7_disabled_analyzer_is_never_invoked_and_timeout_is_inherited() -> None:
+    on = _RecordingAnalyzer()
+    off = _RecordingAnalyzer()
+    own = _RecordingAnalyzer()
+    step, diff = _fake_step(
+        [
+            AnalyzerRegistration("ruff", on),
+            AnalyzerRegistration("eslint", off),
+            AnalyzerRegistration("gitleaks", own),
+        ],
+        {"a.py": b"x"},
+        enabled={"eslint": False},
+        timeouts={"static_analysis_analyzer": 9.0, "gitleaks": 4.0},
+    )
+
+    await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    assert off.calls == []
+    assert on.calls[0][1] == 9.0  # inherited default
+    assert own.calls[0][1] == 4.0  # its own entry wins
+
+
+def test_analyzer_without_any_timeout_is_rejected_at_construction() -> None:
+    with pytest.raises(ValueError, match="no timeout configured"):
+        StaticAnalysisStep(
+            _FakeDiffFetcher({}),
+            registrations=[AnalyzerRegistration("ruff", _RecordingAnalyzer())],
+            redactor=_RecordingTextRedactor(),
+            enabled={},
+            timeouts={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_us_a10_ceiling_keeps_highest_severity_then_security_class_first() -> None:
+    lint = _RecordingAnalyzer(
+        [_finding("ruff", i, "low") for i in range(1, REDACTION_FINDING_CEILING + 1)]
+        + [_finding("ruff", 1000, "critical")]
+    )
+    sec = _RecordingAnalyzer([_finding("semgrep", 7, "low")])
+    step, diff = _fake_step(
+        [
+            AnalyzerRegistration("ruff", lint),  # registered first on purpose
+            AnalyzerRegistration("semgrep", sec, security_class=True),
+        ],
+        {"a.py": b"x"},
+    )
+
+    output = await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    assert len(output.findings) == REDACTION_FINDING_CEILING
+    assert output.findings[0].severity == "critical"
+    # The security-class low finding survives; one lint-class low is dropped instead.
+    assert any(f.source == "semgrep" for f in output.findings)
+    assert sum(f.source == "ruff" for f in output.findings) == REDACTION_FINDING_CEILING - 1
+
+
+# --- Phase 9 / Phase 2: repo-config discovery -------------------------------
+
+
+class _FakeConfigFetcher:
+    def __init__(
+        self, files: dict[str, bytes] | None = None, error: RepoConfigFetchError | None = None
+    ) -> None:
+        self.files = files or {}
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    async def fetch_config_files(self, **kwargs: Any) -> dict[str, bytes]:
+        self.calls.append(kwargs)
+        if self.error:
+            raise self.error
+        return dict(self.files)
+
+
+def _config_registrations() -> tuple[_RecordingAnalyzer, _RecordingAnalyzer, list[Any]]:
+    ruff, other = _RecordingAnalyzer(), _RecordingAnalyzer()
+    return (
+        ruff,
+        other,
+        [
+            AnalyzerRegistration(
+                "ruff", ruff, matches=match_python, config_filenames=("ruff.toml",)
+            ),
+            AnalyzerRegistration("gitleaks", other, config_filenames=("other.cfg",)),
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_engine_receives_only_its_own_allow_listed_config_files() -> None:
+    ruff, other, regs = _config_registrations()
+    fetcher = _FakeConfigFetcher({"ruff.toml": b"[x]", "other.cfg": b"o", "evil.sh": b"!"})
+    step, diff = _fake_step(regs, {"a.py": b"x"}, config_fetcher=fetcher)
+
+    await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    assert ruff.config_seen == [{"ruff.toml": b"[x]"}]
+    assert other.config_seen == [{"other.cfg": b"o"}]
+    assert len(fetcher.calls) == 1  # once per job
+    assert set(fetcher.calls[0]["names"]) == {"ruff.toml", "other.cfg"}
+    assert fetcher.calls[0]["commit_sha"] == _FakePrefilterOutput(diff=diff).head_sha
+
+
+@pytest.mark.asyncio
+async def test_no_config_fetch_when_no_engine_with_config_names_is_due() -> None:
+    ruff = _RecordingAnalyzer()
+    fetcher = _FakeConfigFetcher({"ruff.toml": b"x"})
+    regs = [
+        AnalyzerRegistration("ruff", ruff, matches=match_python, config_filenames=("ruff.toml",))
+    ]
+    step, diff = _fake_step(regs, {"notes.md": b"x"}, config_fetcher=fetcher)
+    await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    disabled_step, diff2 = _fake_step(
+        regs, {"a.py": b"x"}, enabled={"ruff": False}, config_fetcher=fetcher
+    )
+    await disabled_step.run(_FakePrefilterOutput(diff=diff2), _context())
+
+    assert fetcher.calls == []
+
+
+@pytest.mark.asyncio
+async def test_config_fetch_failure_degrades_to_no_config_and_job_succeeds(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ruff, _, regs = _config_registrations()
+    fetcher = _FakeConfigFetcher(error=RepoConfigFetchError("tree_truncated"))
+    step, diff = _fake_step(regs, {"a.py": b"x"}, config_fetcher=fetcher)
+
+    with caplog.at_level("WARNING", logger="review.static_analysis"):
+        await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    assert ruff.config_seen == [{}]
+    fallback = [r for r in caplog.records if hasattr(r, "config_skip_reason")]
+    assert [(r.config_source, r.config_skip_reason) for r in fallback] == [  # type: ignore[attr-defined]
+        ("default", "tree_truncated")
+    ]
+
+
+@pytest.fixture
+def metric_reader(reset_otel_global_providers: None) -> Any:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(
+        resource=Resource.create({"service.name": "review-test"}), metric_readers=[reader]
+    )
+    otel_metrics.set_meter_provider(provider)
+    yield reader
+    provider.shutdown()
+
+
+def _counter_points(
+    reader: InMemoryMetricReader, name: str
+) -> dict[tuple[tuple[str, Any], ...], int]:
+    data = reader.get_metrics_data()
+    assert data is not None
+    points: dict[tuple[tuple[str, Any], ...], int] = {}
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == name:
+                    assert isinstance(metric.data, Sum)
+                    for point in metric.data.data_points:
+                        points[tuple(sorted((point.attributes or {}).items()))] = point.value
+    return points
+
+
+@pytest.mark.asyncio
+async def test_skipped_findings_and_changed_line_drops_are_counted(
+    metric_reader: InMemoryMetricReader,
+) -> None:
+    lint = _RecordingAnalyzer([_finding("ruff", 2), _finding("ruff", 1)])
+    go = _RecordingAnalyzer()
+    step, diff = _fake_step(
+        [
+            AnalyzerRegistration("ruff", lint, matches=match_python, changed_lines_only=True),
+            AnalyzerRegistration("golangci_lint", go, matches=lambda p, c: p.endswith(".go")),
+        ],
+        {"a.py": b"x"},
+        patches={"a.py": _PY_PATCH},
+    )
+
+    await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    assert _counter_points(metric_reader, "review.static_analysis.analyzer.skipped_total") == {
+        (("analyzer_name", "golangci_lint"),): 1
+    }
+    assert _counter_points(metric_reader, "review.static_analysis.findings_total") == {
+        (("analyzer_name", "golangci_lint"),): 0,
+        (("analyzer_name", "ruff"),): 1,
+    }
+    assert _counter_points(metric_reader, "review.static_analysis.findings_dropped_total") == {
+        (("analyzer_name", "ruff"), ("reason", "not_changed_line")): 1
+    }
+
+
+@pytest.mark.asyncio
+async def test_redaction_ceiling_drops_are_counted(metric_reader: InMemoryMetricReader) -> None:
+    step = _static_analysis_step(
+        diff_fetcher=_FakeDiffFetcher({}),
+        gitleaks=_ReturningStaticAnalyzer(
+            "gitleaks", _synthetic_findings(REDACTION_FINDING_CEILING + 3)
+        ),
+        semgrep=_ReturningStaticAnalyzer("semgrep", []),
+        redactor=_RecordingTextRedactor(),
+    )
+
+    await step.run(_FakePrefilterOutput(diff=Diff(files=())), _context())
+
+    assert _counter_points(metric_reader, "review.static_analysis.findings_dropped_total") == {
+        (("reason", "redaction_ceiling"),): 3
+    }
+
+
+def test_config_skip_is_counted_only_when_the_repo_config_was_not_honored(
+    metric_reader: InMemoryMetricReader,
+) -> None:
+    ConfigOutcome("repo").record("ruff")
+    ConfigOutcome("default").record("ruff")
+    ConfigOutcome("default", "rejected_by_tool").record("ruff")
+
+    assert _counter_points(metric_reader, "review.static_analysis.config_skipped_total") == {
+        (("analyzer_name", "ruff"), ("reason", "rejected_by_tool")): 1
+    }

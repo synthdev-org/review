@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -305,6 +306,42 @@ async def test_macro_step_exceeding_its_timeout_is_fatal_and_short_circuits_down
 
     assert excinfo.value.step_name == "static_analysis"
     assert downstream.calls == []
+
+
+@pytest.mark.asyncio
+async def test_admission_gate_serialises_steps_and_queue_time_is_outside_the_timeout() -> None:
+    """The ``admission`` hook is held for a step's whole run, and time spent
+    waiting to enter it does not count against that step's timeout."""
+    lock = asyncio.Lock()
+    in_gate = 0
+    peak = 0
+
+    @asynccontextmanager
+    async def admit(_step: Any) -> AsyncIterator[None]:
+        nonlocal in_gate, peak
+        async with lock:
+            in_gate += 1
+            peak = max(peak, in_gate)
+            try:
+                yield
+            finally:
+                in_gate -= 1
+
+    first = _FakeStep(name="a", delay_seconds=0.2)
+    second = _FakeStep(name="b", delay_seconds=0.05)  # queued ~0.2s, timeout 0.15s
+    registry = StepRegistry(
+        [first, second],
+        enabled=_all_enabled("a", "b"),
+        timeouts={"a": 5, "b": 0.15},
+        on_failure=FailurePolicy.FATAL,
+        admission=admit,
+    )
+
+    outcomes = await registry.run(seed_input="diff", context=_context())
+
+    assert peak == 1
+    assert outcomes["a"].status == "success"
+    assert outcomes["b"].status == "success"
 
 
 @pytest.mark.asyncio

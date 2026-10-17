@@ -319,6 +319,7 @@ also_copy = [
     "docs/reference/operations.md",
     "docs/reference/product-knowledge-contract",
     "apps/admin_api/frontend/src",
+    "tools/phpstan",
 ]
 # The fake MCP provider is test tooling, not product code: never mutate it.
 do_not_mutate = ["adapter/product_knowledge/testing/*"]

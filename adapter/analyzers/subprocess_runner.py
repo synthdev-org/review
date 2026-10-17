@@ -328,21 +328,21 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
     await process.wait()
 
 
-_CREDENTIAL_ENV_SUFFIX = "_PRODUCT_KNOWLEDGE_CREDENTIALS"
+# Every Worker setting (GitHub App key, DB DSN, LLM and product-knowledge
+# credentials) is REVIEW_*; OTEL_* can carry exporter auth headers.
+_SECRET_ENV_PREFIXES = ("REVIEW_", "OTEL_")
 
 
 def analyzer_env(environ: Mapping[str, str]) -> dict[str, str]:
     """
-    Return the child environment: ``environ`` minus the product-knowledge credential map.
+    Return the child environment: ``environ`` minus every Worker setting.
 
-    The credential map is ``REVIEW_<ENTRYPOINT>_PRODUCT_KNOWLEDGE_CREDENTIALS``.
     Analyzers run over customer-controlled repo content (semgrep rules,
-    custom configs) and must never inherit provider bearer tokens. Every
-    other variable is kept so the tools keep finding PATH, HOME, etc.
-    ponytail: deny-list of one name; an allow-list env if more secrets land
-    in the worker environment.
+    custom configs, project toolchains) and must never inherit the Worker's
+    credentials. Everything not prefixed ``REVIEW_``/``OTEL_`` is kept so
+    the tools keep finding PATH, HOME, etc.
     """
-    return {k: v for k, v in environ.items() if not k.endswith(_CREDENTIAL_ENV_SUFFIX)}
+    return {k: v for k, v in environ.items() if not k.startswith(_SECRET_ENV_PREFIXES)}
 
 
 async def run_analyzer_subprocess(
@@ -351,6 +351,7 @@ async def run_analyzer_subprocess(
     cwd: Path,
     timeout: float,
     max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+    env_overrides: Mapping[str, str] | None = None,
 ) -> bytes:
     """Runs ``argv`` (an analyzer tool invocation, or a
     ``findings.redact.TextRedactor`` redaction call) via
@@ -371,7 +372,9 @@ async def run_analyzer_subprocess(
     process = await asyncio.create_subprocess_exec(
         *argv_list,
         cwd=cwd,
-        env=analyzer_env(os.environ),
+        # ``env_overrides`` lets an engine pin offline-hardening variables (Trivy's
+        # dead-proxy) on top of the credential-stripped environment.
+        env={**analyzer_env(os.environ), **(env_overrides or {})},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )

@@ -28,3 +28,7 @@ mutants/
 # dist/ output is copied into `runtime`.
 apps/admin_api/frontend/node_modules/
 apps/admin_api/frontend/dist/
+
+# Local `npm ci` output of the pinned ESLint toolset (tools/eslint); the image
+# build installs its own from the lockfile.
+tools/eslint/node_modules/

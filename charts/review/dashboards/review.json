@@ -957,6 +957,280 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 31,
+      "type": "row",
+      "title": "Static analysis engines",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "panels": []
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Analyzer runs by engine and outcome",
+      "description": "review.static_analysis.analyzer.runs_total by analyzer_name and outcome (success / failed / timeout). A sustained failed or timeout series for one engine means its invocation is broken; set static_analysis_<engine>_enabled=false to isolate it (docs/reference/operations.md).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 70
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_static_analysis_analyzer_runs_total[5m])) by (analyzer_name, outcome)",
+          "legendFormat": "{{analyzer_name}} / {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Analyzer duration (p95)",
+      "description": "Time an analyzer spent running, excluding time queued for a concurrency slot. Compare against static_analysis_<engine>_timeout_seconds.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 70
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_static_analysis_analyzer_duration_ms_milliseconds_bucket[5m])) by (le, analyzer_name))",
+          "legendFormat": "{{analyzer_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Analyzer slot wait (p95)",
+      "description": "Time an analyzer waited for a concurrency slot. Persistently high values mean static_analysis_max_concurrent_analyzers is the bottleneck (docs/reference/operations.md, concurrency arithmetic).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 70
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_static_analysis_analyzer_slot_wait_ms_milliseconds_bucket[5m])) by (le, analyzer_name))",
+          "legendFormat": "{{analyzer_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Analyzers in flight",
+      "description": "Analyzers currently holding a concurrency slot, summed across Worker processes. Never exceeds worker replicas x the per-process bound.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 78
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(review_static_analysis_analyzers_in_flight)",
+          "legendFormat": "in flight"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Repo-config fallbacks (default profile used)",
+      "description": "review.static_analysis.config_fallback_total by reason: the repo-config fetch failed and every engine ran its default profile. A storm means the GitHub tree API is failing or repos exceed the tree size limit (docs/reference/operations.md).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 78
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_static_analysis_config_fallback_total[5m])) by (reason)",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Config skipped (repo config ignored)",
+      "description": "review.static_analysis.config_skipped_total by analyzer_name and reason: the engine ran its default profile instead of the repo's config. A jump in rejected_by_tool for one engine after an image bump means the pinned tool version rejects configs it used to accept (docs/reference/operations.md).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 78
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_static_analysis_config_skipped_total[15m])) by (analyzer_name, reason)",
+          "legendFormat": "{{analyzer_name}} / {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Findings returned by engine",
+      "description": "review.static_analysis.findings_total by analyzer_name. An engine that drops to zero while its runs stay 'success' is silently broken (routing, parse or profile); a sudden jump is a rule-set regression flooding PRs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 86
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_static_analysis_findings_total[15m])) by (analyzer_name)",
+          "legendFormat": "{{analyzer_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Findings dropped (ceiling / unchanged lines)",
+      "description": "review.static_analysis.findings_dropped_total: redaction_ceiling is the hard cap (REDACTION_FINDING_CEILING) discarding findings; not_changed_line is the changed-lines filter hiding an engine's output.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 86
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_static_analysis_findings_dropped_total[1h])) by (reason, analyzer_name)",
+          "legendFormat": "{{reason}} {{analyzer_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Analyzer runs skipped (no matching files)",
+      "description": "review.static_analysis.analyzer.skipped_total by analyzer_name. Distinguishes 'ran and found nothing' from 'never ran': compare against runs_total to see how often each engine is actually exercised.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 86
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_static_analysis_analyzer_skipped_total[1h])) by (analyzer_name)",
+          "legendFormat": "{{analyzer_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
     }
   ]
 }

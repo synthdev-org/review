@@ -40,7 +40,7 @@ import json
 import logging
 import socket
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -580,12 +580,26 @@ class _UnusedMemoryMatcher:
 
 
 class _NoOpGitleaksAnalyzer:
-    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[object]:
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[object]:
         return []
 
 
 class _NoOpSemgrepAnalyzer:
-    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[object]:
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[object]:
         return []
 
 
@@ -666,6 +680,11 @@ async def test_all_four_context_builder_enablement_combinations_complete_success
         context_builder_enabled=context_builder_enabled,
         static_analysis_gitleaks_enabled=sa_can_produce_findings,
         static_analysis_semgrep_enabled=sa_can_produce_findings,
+        static_analysis_ruff_enabled=sa_can_produce_findings,
+        static_analysis_eslint_enabled=sa_can_produce_findings,
+        static_analysis_trivy_enabled=sa_can_produce_findings,
+        static_analysis_phpstan_enabled=sa_can_produce_findings,
+        static_analysis_golangci_lint_enabled=sa_can_produce_findings,
     )
     timeouts = StepTimeouts()
 
@@ -1400,3 +1419,158 @@ async def test_amain_propagates_dispatch_loop_exception_unwrapped_and_cancels_he
         meter_provider.shutdown()
 
     assert heartbeat_cancelled.is_set()
+
+
+def test_ruff_is_wired_as_a_python_scoped_changed_lines_only_analyzer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    settings = _wiring_test_settings(monkeypatch)
+
+    registry = worker_main._build_review_registry(
+        StepEnablement(),
+        StepTimeouts(),
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
+    )
+
+    registrations = {r.name: r for r in registry._by_name["static_analysis"]._registrations}  # type: ignore[attr-defined]
+    ruff = registrations["ruff"]
+    assert ruff.changed_lines_only is True
+    assert ruff.matches("a.py", b"") and not ruff.matches("a.go", b"")
+    assert ".ruff.toml" in ruff.config_filenames
+    assert registrations["gitleaks"].changed_lines_only is False
+
+
+def test_eslint_is_wired_as_a_javascript_scoped_changed_lines_only_analyzer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    settings = _wiring_test_settings(monkeypatch)
+
+    registry = worker_main._build_review_registry(
+        StepEnablement(),
+        StepTimeouts(),
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
+    )
+
+    registrations = {r.name: r for r in registry._by_name["static_analysis"]._registrations}  # type: ignore[attr-defined]
+    eslint = registrations["eslint"]
+    assert eslint.changed_lines_only is True
+    assert eslint.matches("a.ts", b"") and eslint.matches("a.jsx", b"")
+    assert not eslint.matches("a.py", b"")
+    assert ".eslintrc.json" in eslint.config_filenames
+
+
+def test_trivy_is_wired_as_an_iac_scoped_security_class_analyzer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    settings = _wiring_test_settings(monkeypatch)
+
+    registry = worker_main._build_review_registry(
+        StepEnablement(),
+        StepTimeouts(),
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
+    )
+
+    registrations = {r.name: r for r in registry._by_name["static_analysis"]._registrations}  # type: ignore[attr-defined]
+    trivy = registrations["trivy"]
+    # Its own resource-range rule, not the generic changed-lines filter.
+    assert trivy.changed_lines_only is False
+    assert trivy.security_class is True
+    assert trivy.matches("main.tf", b"") and trivy.matches("Dockerfile", b"")
+    assert not trivy.matches("a.py", b"")
+    assert "trivy.yaml" in trivy.config_filenames
+
+
+def test_phpstan_is_wired_as_a_php_scoped_changed_lines_only_analyzer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    settings = _wiring_test_settings(monkeypatch)
+
+    registry = worker_main._build_review_registry(
+        StepEnablement(),
+        StepTimeouts(),
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
+    )
+
+    registrations = {r.name: r for r in registry._by_name["static_analysis"]._registrations}  # type: ignore[attr-defined]
+    phpstan = registrations["phpstan"]
+    assert phpstan.changed_lines_only is True
+    assert phpstan.matches("a.php", b"") and not phpstan.matches("a.py", b"")
+    assert "phpstan.neon" in phpstan.config_filenames
+
+
+def test_golangci_lint_is_wired_as_a_go_scoped_changed_lines_only_analyzer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_main, "GitleaksAnalyzer", _NoOpGitleaksAnalyzer)
+    monkeypatch.setattr(worker_main, "SemgrepAnalyzer", _NoOpSemgrepAnalyzer)
+    settings = _wiring_test_settings(monkeypatch)
+
+    registry = worker_main._build_review_registry(
+        StepEnablement(),
+        StepTimeouts(),
+        cast("GitHubDiffFetcher", _EmptyDiffFetcher()),
+        cast("GitHubTreeFetcher", _EmptyTreeFetcher()),
+        cast("PostgresGraphQuery", _UnusedGraphQuery()),
+        cast("PostgresSimilarityQuery", _UnusedSimilarityQuery()),
+        cast("LocalONNXEmbeddingClient", _UnusedEmbeddingClient()),
+        NoOpTextRedactor(),
+        _EmptyFindingsLLMClient(),
+        cast("GitHubFindingsPublisher", _NoOpPublisher()),
+        settings,
+        cast("PostgresMemoryRepository", _UnusedMemoryMatcher()),
+        None,
+    )
+
+    registrations = {r.name: r for r in registry._by_name["static_analysis"]._registrations}  # type: ignore[attr-defined]
+    golangci = registrations["golangci_lint"]
+    assert golangci.changed_lines_only is True
+    assert golangci.matches("cmd/main.go", b"") and not golangci.matches("a.py", b"")
+    assert ".golangci.yml" in golangci.config_filenames

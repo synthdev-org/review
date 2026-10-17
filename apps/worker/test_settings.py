@@ -673,3 +673,155 @@ def test_endpoint_allowlist_is_parsed_and_validated(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(ValidationError):
         _worker_settings(monkeypatch, PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST="*")
+
+
+def test_max_concurrent_analyzers_defaults_to_three_and_rejects_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    assert WorkerSettings(_env_file=None).static_analysis_max_concurrent_analyzers == 3
+
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_MAX_CONCURRENT_ANALYZERS", "0")
+    with pytest.raises(ValidationError):
+        WorkerSettings(_env_file=None)
+
+
+def test_analyzer_timeouts_that_cannot_fit_the_step_budget_fail_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_MAX_CONCURRENT_ANALYZERS", "1")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ANALYZER_TIMEOUT_SECONDS", "200")
+
+    with pytest.raises(ValidationError, match="exceeds static_analysis_step_timeout_seconds"):
+        WorkerSettings(_env_file=None)
+
+
+def test_ruff_flag_defaults_on_and_timeout_override_inherits_when_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    settings = WorkerSettings(_env_file=None)
+    assert settings.static_analysis_ruff_enabled is True
+    assert settings.static_analysis_ruff_timeout_seconds is None
+
+    # Compose passes an unset override as an empty string.
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_RUFF_TIMEOUT_SECONDS", "")
+    assert WorkerSettings(_env_file=None).static_analysis_ruff_timeout_seconds is None
+
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_RUFF_TIMEOUT_SECONDS", "20")
+    assert WorkerSettings(_env_file=None).static_analysis_ruff_timeout_seconds == 20
+
+
+def test_ruff_timeout_override_larger_than_the_step_budget_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_RUFF_TIMEOUT_SECONDS", "300")
+
+    with pytest.raises(ValidationError, match="exceeds static_analysis_step_timeout_seconds"):
+        WorkerSettings(_env_file=None)
+
+
+def test_eslint_flag_defaults_on_and_timeout_override_inherits_when_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    settings = WorkerSettings(_env_file=None)
+    assert settings.static_analysis_eslint_enabled is True
+    assert settings.static_analysis_eslint_timeout_seconds is None
+
+    # Compose passes an unset override as an empty string.
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_TIMEOUT_SECONDS", "")
+    assert WorkerSettings(_env_file=None).static_analysis_eslint_timeout_seconds is None
+
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_TIMEOUT_SECONDS", "45")
+    assert WorkerSettings(_env_file=None).static_analysis_eslint_timeout_seconds == 45
+
+
+def test_eslint_timeout_override_larger_than_the_step_budget_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_TIMEOUT_SECONDS", "300")
+
+    with pytest.raises(ValidationError, match="exceeds static_analysis_step_timeout_seconds"):
+        WorkerSettings(_env_file=None)
+
+
+def test_trivy_flag_defaults_on_and_timeout_override_inherits_when_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    settings = WorkerSettings(_env_file=None)
+    assert settings.static_analysis_trivy_enabled is True
+    assert settings.static_analysis_trivy_timeout_seconds is None
+
+    # Compose passes an unset override as an empty string.
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_TIMEOUT_SECONDS", "")
+    assert WorkerSettings(_env_file=None).static_analysis_trivy_timeout_seconds is None
+
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_TIMEOUT_SECONDS", "45")
+    assert WorkerSettings(_env_file=None).static_analysis_trivy_timeout_seconds == 45
+
+
+def test_trivy_timeout_override_larger_than_the_step_budget_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_TIMEOUT_SECONDS", "300")
+
+    with pytest.raises(ValidationError, match="exceeds static_analysis_step_timeout_seconds"):
+        WorkerSettings(_env_file=None)
+
+
+def test_phpstan_flag_defaults_on_and_timeout_override_inherits_when_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    settings = WorkerSettings(_env_file=None)
+    assert settings.static_analysis_phpstan_enabled is True
+    assert settings.static_analysis_phpstan_timeout_seconds is None
+
+    # Compose passes an unset override as an empty string.
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_TIMEOUT_SECONDS", "")
+    assert WorkerSettings(_env_file=None).static_analysis_phpstan_timeout_seconds is None
+
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_TIMEOUT_SECONDS", "45")
+    assert WorkerSettings(_env_file=None).static_analysis_phpstan_timeout_seconds == 45
+
+
+def test_golangci_lint_flag_defaults_on_and_timeout_override_inherits_when_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    settings = WorkerSettings(_env_file=None)
+    assert settings.static_analysis_golangci_lint_enabled is True
+    assert settings.static_analysis_golangci_lint_timeout_seconds is None
+
+    # Compose passes an unset override as an empty string.
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_TIMEOUT_SECONDS", "")
+    assert WorkerSettings(_env_file=None).static_analysis_golangci_lint_timeout_seconds is None
+
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_TIMEOUT_SECONDS", "45")
+    assert WorkerSettings(_env_file=None).static_analysis_golangci_lint_timeout_seconds == 45
+
+
+def test_golangci_lint_timeout_override_larger_than_the_step_budget_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_TIMEOUT_SECONDS", "300")
+
+    with pytest.raises(ValidationError, match="exceeds static_analysis_step_timeout_seconds"):
+        WorkerSettings(_env_file=None)
+
+
+def test_phpstan_timeout_override_larger_than_the_step_budget_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "production")
+    monkeypatch.setenv("REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_TIMEOUT_SECONDS", "300")
+
+    with pytest.raises(ValidationError, match="exceeds static_analysis_step_timeout_seconds"):
+        WorkerSettings(_env_file=None)

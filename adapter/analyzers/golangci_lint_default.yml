@@ -1,0 +1,29 @@
+# Pinned default golangci-lint profile (docs/specs/spec-static-analysis-expansion.md,
+# US-A5): correctness-only, used when a repo has no usable golangci-lint config.
+# Linters: govet (the default analyzers: printf, copylocks, lostcancel, ...),
+# errcheck (an ignored error return), staticcheck limited to its SA* bug checks
+# (no style ST*, no simplifications S1*, no quick fixes QF*, and no SA1019
+# deprecation notices) and ineffassign (a dead assignment). Nothing here needs
+# resolved third-party types beyond what the changed files import; findings caused
+# by an unresolved import are dropped by the adapter. `unused` is deliberately
+# absent: only the changed files are materialized, so a symbol used from an
+# unchanged sibling file would be reported as unused. The two presets drop the
+# conventional `defer f.Close()` / `fmt.Print*` unchecked-error noise.
+#
+# Pinned by content: this file's sha256 is in `golangci_lint_default.yml.sha256`,
+# verified by `test_golangci_lint.py`; an edit without re-pinning fails that test.
+version: "2"
+linters:
+  default: none
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - ineffassign
+  settings:
+    staticcheck:
+      checks: ["SA*", "-SA1019"]
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives

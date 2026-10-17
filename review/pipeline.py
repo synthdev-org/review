@@ -54,7 +54,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
@@ -239,7 +239,13 @@ class StepRegistry:
         on_failure: FailurePolicy,
         terminal_step: str | None = None,
         root_span_name: str = "review.job.run",
+        admission: Callable[[Step[Any, Any]], AbstractAsyncContextManager[None]] | None = None,
     ) -> None:
+        # ``admission`` gates a step *before* its timed region starts: the
+        # returned context is held for the whole step run, but time spent
+        # waiting to enter it counts against neither the step's timeout nor
+        # its reported duration (used by the static-analysis concurrency bound).
+        self._admission = admission
         self._steps = list(steps)
         self._by_name: dict[str, Step[Any, Any]] = {}
         for step in self._steps:
@@ -492,6 +498,17 @@ class StepRegistry:
             _step_duration_histogram.record(duration_ms, {"step_name": step_name, "status": status})
 
     async def _run_one(
+        self,
+        step: Step[Any, Any],
+        context: StepContext,
+        *,
+        resolve_input: Callable[[], Any],
+    ) -> StepOutcome:
+        gate = self._admission(step) if self._admission is not None else nullcontext()
+        async with gate:
+            return await self._run_timed(step, context, resolve_input=resolve_input)
+
+    async def _run_timed(
         self,
         step: Step[Any, Any],
         context: StepContext,

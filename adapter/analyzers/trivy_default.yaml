@@ -1,0 +1,11 @@
+# Pinned default Trivy profile (docs/specs/spec-static-analysis-expansion.md,
+# US-A5): used when a repo has no usable trivy.yaml. Misconfiguration findings
+# of HIGH and CRITICAL severity only; everything else (scanners, offline flags,
+# cache and output locations) is fixed on the command line by
+# adapter/analyzers/trivy.py.
+#
+# Pinned by content: this file's sha256 is in `trivy_default.yaml.sha256`,
+# verified by `test_trivy.py`; an edit without re-pinning fails that test.
+severity:
+  - HIGH
+  - CRITICAL

@@ -5,6 +5,8 @@ tests too" rule. No real I/O.
 
 from __future__ import annotations
 
+import pytest
+
 from findings.merge import POSTED_FINDINGS_CEILING, merge_findings
 from findings.models import Finding, Severity, Source
 
@@ -261,3 +263,18 @@ def test_under_ceiling_mixed_severity_list_is_completely_unaffected_by_the_sort(
     result = merge_findings(findings)
 
     assert result.findings == findings
+
+
+@pytest.mark.parametrize("source", ["ruff", "eslint", "golangci_lint", "phpstan", "trivy"])
+def test_new_static_sources_need_no_special_casing_in_merge(source: str) -> None:
+    """US-A2: dedupe and ceiling ordering treat every non-llm source alike."""
+    static = _finding(line=1, message=f"{source} finding", source=source)
+    llm = _finding(line=2, message="entirely different llm finding", source="llm")
+    assert merge_findings([static, llm]).findings == [static, llm]
+
+    llm_findings = [
+        _finding(line=i, message=f"llm issue {i}", severity="medium", source="llm")
+        for i in range(POSTED_FINDINGS_CEILING)
+    ]
+    late = _finding(line=999, message=f"{source} late", severity="medium", source=source)
+    assert merge_findings([*llm_findings, late]).findings[0] == late

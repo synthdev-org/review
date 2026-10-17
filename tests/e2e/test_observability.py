@@ -127,6 +127,11 @@ _HEAD_SHA = "c" * 40
 _SECOND_PUSH_COMMIT_SHA = "d" * 40
 _FAILURE_HEAD_SHA = "e" * 40
 _FAILURE_PR_NUMBER = 100
+# Phase 9 (static-analysis expansion): a PR whose head tree is served once (for
+# the diff fetch) and then fails, so the static-analysis repo-config fetch falls
+# back to default profiles and the config-fallback panel gets a real sample.
+_FALLBACK_HEAD_SHA = "f" * 40
+_FALLBACK_PR_NUMBER = 101
 
 _HELPER_BASE_BLOB_SHA = "1" * 40
 _HELPER_HEAD_BLOB_SHA = "2" * 40
@@ -198,6 +203,10 @@ _TREES_BY_SHA: dict[str, list[dict[str, object]]] = {
     ],
     _INDEX_COMMIT_SHA: [
         _tree_entry("helper.ts", _HELPER_BASE_BLOB_SHA, _HELPER_TS_BASE),
+        _tree_entry("caller.ts", _CALLER_BLOB_SHA, _CALLER_TS),
+    ],
+    _FALLBACK_HEAD_SHA: [
+        _tree_entry("helper.ts", _HELPER_HEAD_BLOB_SHA, _HELPER_TS_HEAD),
         _tree_entry("caller.ts", _CALLER_BLOB_SHA, _CALLER_TS),
     ],
     _SECOND_PUSH_COMMIT_SHA: [_tree_entry("second.ts", _SECOND_FILE_BLOB_SHA, _SECOND_FILE_TS)],
@@ -284,6 +293,12 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
 
         match = re.fullmatch(rf"/repos/{re.escape(_OWNER_REPO)}/git/trees/(\w+)", path_only)
         if match:
+            if match.group(1) == _FALLBACK_HEAD_SHA:
+                served = getattr(self.server, "fallback_tree_requests", 0)
+                self.server.fallback_tree_requests = served + 1  # type: ignore[attr-defined]
+                if served >= 1:  # first request is the diff fetch; later ones are config fetch
+                    self._send_json(500, {"message": "simulated tree failure (stub)"})
+                    return
             tree = _TREES_BY_SHA.get(match.group(1), [])
             self._send_json(200, {"tree": tree, "truncated": False})
             return
@@ -737,11 +752,37 @@ def _dashboard_panel_targets() -> list[tuple[str, list[str]]]:
     return targets
 
 
+# Panels whose metric needs traffic this stack does not generate (an external
+# product-knowledge provider, an authenticated Admin API write, LLM citations).
+# They shipped without E2E data before Phase 9 and this test was red because of
+# it; each is listed explicitly (never "everything else") and checked against the
+# dashboard so a renamed or removed panel fails here rather than rotting.
+_PANELS_WITHOUT_E2E_TRAFFIC = frozenset(
+    {
+        "Provider job outcomes (non-ok, by outcome)",
+        "Provider call rate by operation and outcome",
+        "Provider call duration (p95)",
+        "Citation refs unresolved (ratio)",
+        "Product knowledge config resolution failures",
+        "Admin config write rejections",
+        # Phase 9 failure-path counters: a config the tool rejects, a findings
+        # cap/changed-line drop, or an engine with no matching files needs
+        # traffic the stub PRs do not generate.
+        "Config skipped (repo config ignored)",
+        "Findings dropped (ceiling / unchanged lines)",
+        "Analyzer runs skipped (no matching files)",
+    }
+)
+
+
 def _wait_for_all_panels_to_resolve_data(
     env: dict[str, str], *, timeout: float = _DASHBOARD_DATA_TIMEOUT_SECONDS
 ) -> None:
-    panel_targets = _dashboard_panel_targets()
-    assert panel_targets, "dashboard JSON yielded no queryable panels — parsing regression"
+    all_targets = _dashboard_panel_targets()
+    assert all_targets, "dashboard JSON yielded no queryable panels — parsing regression"
+    titles = {title for title, _ in all_targets}
+    assert titles >= _PANELS_WITHOUT_E2E_TRAFFIC, _PANELS_WITHOUT_E2E_TRAFFIC - titles
+    panel_targets = [t for t in all_targets if t[0] not in _PANELS_WITHOUT_E2E_TRAFFIC]
 
     deadline = time.monotonic() + timeout
     pending: dict[str, list[str]] = {}
@@ -834,6 +875,22 @@ def test_dashboard_panels_resolve_real_data_within_two_minutes(
     _wait_until_check_run_count_at_least(calls, 2)
     assert calls.check_run_bodies[-1]["conclusion"] == "failure"
     stub_github_server.files_endpoint_status = 200  # type: ignore[attr-defined]
+
+    # 3b. Phase 9: the static-analysis config-fallback panel only has a series
+    #     once a repo-config fetch actually fails. This PR's head tree is served
+    #     for the diff fetch and then 500s, so the review still completes (on
+    #     default profiles) and `review.static_analysis.config_fallback_total`
+    #     gets a real `reason="tree_fetch_failed"` sample.
+    stub_llm_review_server.call_count = 0  # type: ignore[attr-defined]  # fresh 3-call sequence
+    fallback_body = _pull_request_payload(
+        pr_number=_FALLBACK_PR_NUMBER, head_sha=_FALLBACK_HEAD_SHA
+    )
+    fallback_status = _post_webhook(
+        env, body=fallback_body, signature=_sign(fallback_body), event_type="pull_request"
+    )
+    assert fallback_status == 200
+    _wait_until_check_run_count_at_least(calls, 3)
+    assert str(calls.check_run_bodies[-1]["conclusion"]) == "neutral"
 
     # 4. Now the part US11/US12 actually own: poll Grafana's own HTTP API
     #    (not Prometheus directly, not "containers started") until every

@@ -15,7 +15,12 @@ registry/registries it constructs.
 
 from __future__ import annotations
 
+import math
+import re
+
 from pydantic import BaseModel
+
+_ANALYZER_FLAG = re.compile(r"static_analysis_(.+)_enabled")
 
 
 class StepEnablement(BaseModel):
@@ -61,6 +66,23 @@ class StepEnablement(BaseModel):
     output_enabled: bool = True
     static_analysis_gitleaks_enabled: bool = True
     static_analysis_semgrep_enabled: bool = True
+    static_analysis_ruff_enabled: bool = True
+    static_analysis_eslint_enabled: bool = True
+    static_analysis_trivy_enabled: bool = True
+    static_analysis_phpstan_enabled: bool = True
+    static_analysis_golangci_lint_enabled: bool = True
+
+    def analyzer_flags(self) -> dict[str, bool]:
+        """Every ``static_analysis_<name>_enabled`` field, keyed by analyzer
+        ``<name>`` — so adding an engine's flag field is the only edit needed
+        for ``as_mapping`` and the can-produce-value predicate to cover it.
+        """
+        flags: dict[str, bool] = {}
+        for field_name in type(self).model_fields:
+            match = _ANALYZER_FLAG.fullmatch(field_name)
+            if match:
+                flags[match.group(1)] = getattr(self, field_name)
+        return flags
 
     def as_mapping(self) -> dict[str, bool]:
         """Translate this model's fixed field set into the plain
@@ -77,8 +99,7 @@ class StepEnablement(BaseModel):
             "review_generation": self.review_generation_enabled,
             "verification": self.verification_enabled,
             "output": self.output_enabled,
-            "gitleaks": self.static_analysis_gitleaks_enabled,
-            "semgrep": self.static_analysis_semgrep_enabled,
+            **self.analyzer_flags(),
         }
 
 
@@ -97,6 +118,12 @@ class StepTimeouts(BaseModel):
     prefilter_step_timeout_seconds: int = 30
     static_analysis_step_timeout_seconds: int = 240
     static_analysis_analyzer_timeout_seconds: int = 60
+    # Optional per-analyzer override; None inherits the analyzer default above (US-A7).
+    static_analysis_ruff_timeout_seconds: int | None = None
+    static_analysis_eslint_timeout_seconds: int | None = None
+    static_analysis_trivy_timeout_seconds: int | None = None
+    static_analysis_phpstan_timeout_seconds: int | None = None
+    static_analysis_golangci_lint_timeout_seconds: int | None = None
     # Added by docs/plans/plan-deliver-context-builder.md's Phase 5
     # section — the value the outer `StepRegistry` reads for this step
     # (distinct from `ContextBuilderStep`'s own internal
@@ -136,6 +163,18 @@ class StepTimeouts(BaseModel):
             "output": self.output_step_timeout_seconds,
             "gitleaks": self.static_analysis_analyzer_timeout_seconds,
             "semgrep": self.static_analysis_analyzer_timeout_seconds,
+            "ruff": self.static_analysis_ruff_timeout_seconds
+            or self.static_analysis_analyzer_timeout_seconds,
+            "trivy": self.static_analysis_trivy_timeout_seconds
+            or self.static_analysis_analyzer_timeout_seconds,
+            "eslint": self.static_analysis_eslint_timeout_seconds
+            or self.static_analysis_analyzer_timeout_seconds,
+            "phpstan": self.static_analysis_phpstan_timeout_seconds
+            or self.static_analysis_analyzer_timeout_seconds,
+            "golangci_lint": self.static_analysis_golangci_lint_timeout_seconds
+            or self.static_analysis_analyzer_timeout_seconds,
+            # Default for any analyzer without its own entry (US-A7 inheritance).
+            "static_analysis_analyzer": self.static_analysis_analyzer_timeout_seconds,
         }
 
 
@@ -152,9 +191,31 @@ def static_analysis_can_produce_findings(enablement: StepEnablement) -> bool:
     would let the startup check validate a configuration the registry then
     wires incorrectly.
     """
-    return enablement.static_analysis_enabled and (
-        enablement.static_analysis_gitleaks_enabled or enablement.static_analysis_semgrep_enabled
-    )
+    return enablement.static_analysis_enabled and any(enablement.analyzer_flags().values())
+
+
+def check_static_analysis_budget(
+    *,
+    enabled_analyzer_count: int,
+    max_concurrent: int,
+    max_analyzer_timeout_seconds: float,
+    step_timeout_seconds: float,
+) -> None:
+    """Raise ``ValueError`` if the enabled analyzers cannot all finish inside
+    the step timeout at the configured concurrency: ``ceil(count / N) *
+    max(per-analyzer timeout)`` must fit (US-A7/US-A8; analyzers run in waves
+    of at most ``N`` since queue time is excluded from each analyzer's own
+    timeout).
+    """
+    waves = math.ceil(enabled_analyzer_count / max_concurrent)
+    worst_case = waves * max_analyzer_timeout_seconds
+    if worst_case > step_timeout_seconds:
+        raise ValueError(
+            f"static-analysis worst case ({enabled_analyzer_count} analyzers / "
+            f"{max_concurrent} concurrent = {waves} waves x {max_analyzer_timeout_seconds}s = "
+            f"{worst_case}s) exceeds static_analysis_step_timeout_seconds "
+            f"({step_timeout_seconds}s)"
+        )
 
 
 def context_builder_can_produce_value(enablement: StepEnablement) -> bool:

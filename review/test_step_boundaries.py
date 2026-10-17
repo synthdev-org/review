@@ -95,6 +95,10 @@ _FRAMEWORK_MODULES = frozenset(
         "llm_response",
         "llm_telemetry",
         "_telemetry",
+        # Pure helpers of the static_analysis step (language routing and
+        # changed-line hunk parsing); no `Step` of their own.
+        "file_matchers",
+        "changed_lines",
     }
 )
 

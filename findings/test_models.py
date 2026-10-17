@@ -50,3 +50,15 @@ def test_verification_status_accepts_explicit_none() -> None:
 def test_verification_status_rejects_an_invalid_value() -> None:
     with pytest.raises(ValidationError):
         _finding(verification_status="maybe")
+
+
+@pytest.mark.parametrize(
+    "source", ["gitleaks", "semgrep", "ruff", "eslint", "golangci_lint", "phpstan", "trivy", "llm"]
+)
+def test_every_producer_is_a_valid_source(source: str) -> None:
+    assert _finding(source=source).source == source
+
+
+def test_unknown_source_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        _finding(source="pylint")

@@ -101,7 +101,13 @@ def test_output_disabled_does_not_change_any_resolved_dependency() -> None:
 def test_static_analysis_cannot_produce_findings_falls_back_to_prefilter() -> None:
     resolved = resolve_review_pipeline_depends_on(
         StepEnablement(
-            static_analysis_gitleaks_enabled=False, static_analysis_semgrep_enabled=False
+            static_analysis_gitleaks_enabled=False,
+            static_analysis_semgrep_enabled=False,
+            static_analysis_ruff_enabled=False,
+            static_analysis_eslint_enabled=False,
+            static_analysis_trivy_enabled=False,
+            static_analysis_phpstan_enabled=False,
+            static_analysis_golangci_lint_enabled=False,
         )
     )
 
@@ -230,3 +236,116 @@ def test_additive_check_does_not_reject_the_real_resolvers_own_output() -> None:
         StepEnablement(context_builder_enabled=False, intent_summary_enabled=False),
     ):
         check_step_configuration_viable(enablement)  # must not raise
+
+
+# --- Phase 9 / Phase 1: generalized analyzer flags and the budget check ---
+
+
+def test_analyzer_flags_cover_every_static_analysis_flag_field() -> None:
+    from review.config import StepEnablement
+
+    enablement = StepEnablement(static_analysis_semgrep_enabled=False)
+    assert enablement.analyzer_flags() == {
+        "gitleaks": True,
+        "semgrep": False,
+        "ruff": True,
+        "eslint": True,
+        "trivy": True,
+        "phpstan": True,
+        "golangci_lint": True,
+    }
+    assert enablement.as_mapping()["semgrep"] is False
+
+
+def test_timeouts_mapping_carries_the_inherited_analyzer_default() -> None:
+    from review.config import StepTimeouts
+
+    assert (
+        StepTimeouts(static_analysis_analyzer_timeout_seconds=7).as_mapping()[
+            "static_analysis_analyzer"
+        ]
+        == 7
+    )
+
+
+def test_budget_check_accepts_a_fit_and_rejects_an_overrun() -> None:
+    import pytest
+
+    from review.config import check_static_analysis_budget
+
+    check_static_analysis_budget(
+        enabled_analyzer_count=9,
+        max_concurrent=3,
+        max_analyzer_timeout_seconds=60,
+        step_timeout_seconds=240,
+    )
+    with pytest.raises(ValueError, match="exceeds static_analysis_step_timeout_seconds"):
+        check_static_analysis_budget(
+            enabled_analyzer_count=13,
+            max_concurrent=3,
+            max_analyzer_timeout_seconds=60,
+            step_timeout_seconds=240,
+        )
+
+
+def test_ruff_timeout_inherits_the_analyzer_default_unless_overridden() -> None:
+    from review.config import StepTimeouts
+
+    assert StepTimeouts(static_analysis_analyzer_timeout_seconds=7).as_mapping()["ruff"] == 7
+    assert (
+        StepTimeouts(
+            static_analysis_analyzer_timeout_seconds=7, static_analysis_ruff_timeout_seconds=20
+        ).as_mapping()["ruff"]
+        == 20
+    )
+
+
+def test_eslint_timeout_inherits_the_analyzer_default_unless_overridden() -> None:
+    from review.config import StepTimeouts
+
+    assert StepTimeouts(static_analysis_analyzer_timeout_seconds=7).as_mapping()["eslint"] == 7
+    assert (
+        StepTimeouts(
+            static_analysis_analyzer_timeout_seconds=7, static_analysis_eslint_timeout_seconds=40
+        ).as_mapping()["eslint"]
+        == 40
+    )
+
+
+def test_phpstan_timeout_inherits_the_analyzer_default_unless_overridden() -> None:
+    from review.config import StepTimeouts
+
+    assert StepTimeouts(static_analysis_analyzer_timeout_seconds=7).as_mapping()["phpstan"] == 7
+    assert (
+        StepTimeouts(
+            static_analysis_analyzer_timeout_seconds=7, static_analysis_phpstan_timeout_seconds=20
+        ).as_mapping()["phpstan"]
+        == 20
+    )
+
+
+def test_golangci_lint_timeout_inherits_the_analyzer_default_unless_overridden() -> None:
+    from review.config import StepTimeouts
+
+    assert (
+        StepTimeouts(static_analysis_analyzer_timeout_seconds=7).as_mapping()["golangci_lint"] == 7
+    )
+    assert (
+        StepTimeouts(
+            static_analysis_analyzer_timeout_seconds=7,
+            static_analysis_golangci_lint_timeout_seconds=20,
+        ).as_mapping()["golangci_lint"]
+        == 20
+    )
+
+
+def test_trivy_timeout_inherits_the_analyzer_default_unless_overridden() -> None:
+    from review.config import StepTimeouts
+
+    assert StepTimeouts(static_analysis_analyzer_timeout_seconds=7).as_mapping()["trivy"] == 7
+    assert (
+        StepTimeouts(
+            static_analysis_analyzer_timeout_seconds=7, static_analysis_trivy_timeout_seconds=20
+        ).as_mapping()["trivy"]
+        == 20
+    )

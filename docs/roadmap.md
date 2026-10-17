@@ -14,6 +14,55 @@ to be "complete."
 
 ---
 
+## Delivery snapshot (verified 2026-10-16, `main` @ `76e2187`)
+
+Each phase below carries a dated **Status** line. These come from running the
+repo's own CI gates and reading the code, not from the plans' self-reported
+status — see "Verification basis" for exactly what was run.
+
+| Phase | State |
+|---|---|
+| 0 Scaffolding | **Done** |
+| 1 Core review loop | **Done** (exit criterion's "real PR, real repo" not exercised — E2E stubs GitHub) |
+| 2 Indexing / RAG | **Done** |
+| 3 Verification / multi-pass | **Done** |
+| 4 Memory | **Done** |
+| 5 Admin UI (MVP) | **Done** |
+| 6 Multi-org tenancy | **Partial** — org scoping and multi-installation done; org-bound RBAC / cross-org grants not built |
+| 7 Product-knowledge augmentation | **Implemented, not closed** — 2 E2E tests fail on `main`; external sign-offs outstanding |
+| 8 Production hardening | **Partial** |
+| 9 Static-analysis expansion | **Implemented, not closed** — analyzers, repo-config fetch and concurrency bound built; integration/E2E sign-off outstanding |
+| 10 Clone detection | Not started |
+| 11 Auto-fix | Not started |
+| 12 Walkthrough artifact | Not started |
+
+**MVP line (Phases 0–5): reached.** Phases 0–5 pass every gate except the two
+Phase 7 E2E failures noted below, which sit outside the MVP.
+
+**Verification basis** (dev image built from `Dockerfile --target dev`, run in
+Docker):
+
+- `ruff check` clean; `ruff format --check` clean (332 files);
+  `mypy --strict` clean (313 files).
+- Unit: 1293 passed, 1 skipped (`apps/test_helm_render.py` — needs the host
+  `helm` binary; run separately, below).
+- Integration (`pytest -m integration`, testcontainers Postgres/pgvector,
+  real Gitleaks/Semgrep binaries): 764 passed, 1 skipped.
+- Frontend: `npm run build` + `vitest` 85 passed.
+- `charts/review/test-render.sh` (helm lint/template + compose config): all
+  checks passed.
+- E2E (`tests/e2e`, full Compose stack): 20 passed, **2 failed**. The suite
+  also can't run as one pytest process: with `-x`, `test_indexing_pipeline`
+  errored on `Address already in use` for the stub LLM port (1234) after
+  earlier modules had run. The error did not recur when each module ran in
+  its own process, which points at stub-server cleanup between modules (not
+  confirmed), not a product failure.
+
+Not run: the nightly live-provider conformance run, any real GitHub
+repo/org, any real LLM endpoint, any real Kubernetes cluster.
+
+---
+
 ## Phase 0 — Scaffolding
 
 The non-feature foundation every later phase builds on. Nothing here is
@@ -41,6 +90,13 @@ customer-visible.
 **Exit criteria:** `docker compose up` runs a Webhook API + Worker + Postgres
 that boots cleanly with no review capability yet.
 
+**Status (2026-10-16): Done.** All listed items exist — the three entrypoints
+(`apps/webhook_api`, `apps/worker`, plus `apps/admin_api` from Phase 5), the
+domain/adapter packages, Alembic migrations 0001–0010, LiteLLM gateway,
+GitHub App signature/installation/manifest code, the Helm chart skeleton and
+Compose stack. CI gates (ruff, format, `mypy --strict`, unit) pass.
+`tests/e2e/test_compose_stack.py` passes (stack boots and serves).
+
 ---
 
 ## Phase 1 — Walking skeleton: the core review loop
@@ -57,6 +113,14 @@ each stage before adding sophistication to any one of them.
 
 **Exit criteria:** a real PR against a real repo gets a real (if
 unsophisticated) review posted by the platform.
+
+**Status (2026-10-16): Done, with one unexercised clause.**
+`tests/e2e/test_review_pipeline.py` passes (7 tests: posted-comment shape,
+check-run status, and the failure modes testing.md names). The static-analysis
+runner has Gitleaks and Semgrep adapters; their integration tests pass
+against the real binaries. The exit criterion's "real PR against a real repo"
+has **not** been exercised — every E2E run stubs the GitHub endpoint and the
+LLM.
 
 ---
 
@@ -75,6 +139,11 @@ builds (research §2.1).
 - Review job upgraded to consume built context instead of the bare diff from
   Phase 1.
 
+**Status (2026-10-16): Done.** `indexing/` (AST chunking, call/import graph,
+local ONNX bi-encoder embeddings — no LLM call in the indexing path, per
+ADR-0007) and `review/context_builder.py` are in place;
+`tests/e2e/test_indexing_pipeline.py` and `test_context_builder.py` pass.
+
 ---
 
 ## Phase 3 — Verification / multi-pass pipeline
@@ -87,6 +156,11 @@ identifies as the difference between "thorough" and "diff-into-an-LLM."
   self-critique.
 - Findings merger: dedupes, applies confidence/severity, drops low-value
   findings before a human sees them.
+
+**Status (2026-10-16): Done.** `review/intent_summary.py`,
+`review/verification.py` (a distinct call against a fixed rubric) and
+`findings/merge.py` exist with passing unit tests; verification and
+findings-output run inside the passing `test_review_pipeline.py` E2E.
 
 ---
 
@@ -106,6 +180,12 @@ identifies as the difference between "thorough" and "diff-into-an-LLM."
 how a dismissal becomes the similarity-check signal design goal 6 commits
 to — see `c4-architecture.md`'s "Open questions."*
 
+**Status (2026-10-16): Done.** All four bullets are built: Memory schema and
+repository (migration 0009 adds `approved_by_user_id`), webhook/reaction
+capture, similarity-based suppression, and the admin API.
+`tests/e2e/test_memory_pipeline.py` passes. `accepted_fix` exists only as a
+reserved `entry_type` — nothing populates it until Phase 11.
+
 ---
 
 ## Phase 5 — Admin UI (MVP)
@@ -119,6 +199,17 @@ Confirmed in scope for the MVP release, not a fast-follow.
 
 *Open: whether SSO/OIDC ships in this same MVP or immediately after — see
 `c4-architecture.md`'s "Open questions."*
+
+**Status (2026-10-16): Done.** All ten plan phases of
+`plan-deliver-admin-gui.md` are marked Done (2026-09-30; frontend UI and E2E
+closed 2026-10-01): `apps/admin_api` with local auth, user management,
+org/repo/team config, model routing, admin stats, usage counter, the React
+frontend and Helm/Compose wiring, plus bulk Memory approve/reject. Verified
+here: frontend build + 85 vitest tests, admin-API integration tests, and
+`test_admin_ui.py` E2E all pass. Login is local username/password with
+`admin`/`viewer` roles only; SSO/OIDC is **not** built (ADR-0010, still
+`PROPOSED`, classifies it as a future Tier-1 plugin). The plan's header still
+reads "Status: Proposed" — stale.
 
 **— MVP line —** Phases 0–5 are what a pilot customer needs: a working
 review loop, real context, verification, basic learning, and a UI to
@@ -140,6 +231,20 @@ multi-tenant-SaaS isolation between separate companies.
 
 *Open: exact RBAC design for org-scoping — flagged in ADR-0004's
 consequences and `c4-architecture.md`'s "Open questions."*
+
+**Status (2026-10-16): Partial.**
+- Done — org-scoping layer: `org_id` keys the repo, team, job queue,
+  model-routing, settings and Memory tables; `tenancy/resolution.py` resolves
+  any new GitHub installation to an org and repo, so multiple installations
+  under one deployment work.
+- Not built — RBAC: `iam` has only the global `admin`/`viewer` roles. Admin
+  users carry no org binding and there is no cross-org grant mechanism;
+  today every admin sees every org (the "platform admin sees all orgs" MVP
+  default in the Admin UI plan). ADR-0010 (`PROPOSED`) places org-bound and
+  cross-org RBAC in a future `review-enterprise` plugin, so this item is
+  deliberately open, not forgotten.
+- Not verified: admin-API org filters were only spot-checked (Memory list
+  takes an `org_id` filter), not audited route by route.
 
 ---
 
@@ -179,6 +284,23 @@ acceptance signal), the two-week pilot behind the kill switch, and the
 names `knowhow_search/fetch/related` as review's consumed surface and should
 reference review's `product_knowledge_*` contract).
 
+**Verified 2026-10-16:** the code claim holds — `adapter/product_knowledge/`
+(client, egress guard, credentials, conformance suite), `review/product_knowledge.py`
+and the admin config/panel exist, and the unit/integration tests pass. But the
+Phase 7 end-to-end checks do **not** pass on `main`:
+- `tests/e2e/test_product_knowledge.py` fails (reproduced twice). Its stub
+  GitHub returns an empty Git tree, and `adapter/github/diff.py` raises
+  `GitHubTreeEntryMissingError` for any changed file with no tree entry
+  (`helper.ts`), so the review job dies at `prefilter` before reaching the
+  provider. The production check is the intended one; the test stub is stale.
+- `tests/e2e/test_observability.py` fails on its "every dashboard panel
+  resolves data" check: six panels this phase added (provider job outcomes,
+  provider call rate, provider call duration p95, citation refs unresolved,
+  config resolution failures, admin config write rejections) get no data
+  because the test's traffic never exercises them.
+
+So "runbook and E2E" in the status above is not yet true.
+
 ---
 
 ## Phase 8 — Production hardening
@@ -195,6 +317,22 @@ in their own cluster rather than a demo Docker Compose stack.
 - Strong local reproducibility (Docker Compose mirrors production images) to
   compensate for the trade-off ADR-0001 accepted: no shared fleet visibility
   across customers.
+
+**Status (2026-10-16): Partial, early.**
+- Done — Compose mirrors the production images (the E2E suite drives that
+  exact stack); `test-render.sh` passes; per-stage model routing is
+  configurable (`ModelRoutingConfig`, Admin UI screen); OpenTelemetry
+  instrumentation and a Grafana dashboard ConfigMap exist; a
+  `values-production.yaml` overlay exists.
+- Not done — health probes: only the `admin_api` Deployment defines
+  liveness/readiness probes. The `webhook_api` and `worker` Deployments have
+  none (`webhook_api` serves `/healthz`, the chart just doesn't use it).
+  Resource defaults: `values.yaml` leaves `webhookApi.resources` and
+  `adminApi.resources` empty (`worker` sets requests/limits). Upgrade path:
+  no migration Job or Helm hook; `docs/reference/operations.md` still tells
+  operators to run `alembic upgrade head` by hand before `helm upgrade`.
+- Not assessed — whether the routing defaults are actually tuned for
+  cost/quality.
 
 ---
 
@@ -223,11 +361,33 @@ waiting on Phases 2–8.
 - Analyzer selection scoped to languages actually detected in the repo —
   don't invoke irrelevant tools on every push.
 
-*Open (for a future PRD): which languages/tools to prioritize first, ranked
-by customer language mix, not built alphabetically; whether tool
-versions/configs are deployment-pinned or customer-configurable; and how many
-analyzer subprocesses the Worker can run concurrently before this needs its
-own resource-isolation story.*
+Specified in [`specs/spec-static-analysis-expansion.md`](specs/spec-static-analysis-expansion.md):
+Ruff, ESLint, golangci-lint, PHPStan and Trivy (IaC) first; tools
+deployment-pinned; Worker analyzer concurrency bounded per process.
+
+**Status (2026-10-17): Implemented, not closed.** Built: Ruff, ESLint,
+golangci-lint, PHPStan and Trivy adapters (each with a committed, checksummed
+default profile), language/file-type routing (`review/file_matchers.py`),
+changed-line scoping (`review/changed_lines.py`), allow-listed repo-config
+fetch (`adapter/github/repo_config.py`), per-analyzer enable/timeout
+settings, the Worker-wide analyzer concurrency bound, pinned tool packaging in
+the `Dockerfile`, and `tests/e2e/test_static_analysis_expansion.py`.
+
+Test pyramid checked against `testing.md` on 2026-10-17: the default
+(non-integration) unit run over the changed modules passed, with 100% line
+coverage on `review/changed_lines.py`, `file_matchers.py`, `config.py` and
+`adapter/github/repo_config.py`, 94% on `review/static_analysis.py` (the
+uncovered slot-admission telemetry is exercised by the integration
+concurrency test) and 99% on `apps/worker/settings.py`. Unit gaps found and
+closed: `repo_config` selection logic, hunk-parsing edge cases, and `Source`
+handling in `findings` merge/models. The spec's traceability table was
+corrected to the test files that actually exist.
+
+Not yet verified: the per-engine integration tests (they need the pinned
+binaries), the Phase 9 E2E, the Docker checksum-verification build stage and
+`charts/review/test-render.sh` were not run for this update, so the
+"Verification basis" counts above predate Phase 9 and are unchanged. The spec
+is still `Draft`.
 
 ---
 
@@ -267,6 +427,10 @@ surfaced as a PR-time finding at all, or only in a separate scheduled
 standalone job; and the performance budget for the underlying full-repo
 comparison.*
 
+**Status (2026-10-16): Not started.** No clone-detection step, `duplication`
+finding category or related code exists (a search for clone/duplication logic
+finds only unrelated mentions).
+
 ---
 
 ## Phase 11 — Auto-fix / committable suggested-fix generation
@@ -303,6 +467,10 @@ single-hunk only; and the added per-stage model-routing/cost implication of a
 second generation call per eligible finding, which ties into Phase 8's model
 routing tuning.*
 
+**Status (2026-10-16): Not started.** No fix-generation step or GitHub
+"suggested change" posting exists. `accepted_fix` appears only as the
+reserved Memory entry type.
+
 ---
 
 ## Phase 12 — PR-level walkthrough/summary artifact
@@ -327,6 +495,10 @@ land any time after Phase 3, independent of Phases 4–11.
 findings-comment format; the diagram-generation LLM-cost tradeoff on large
 PRs; and whether walkthrough content should also cite Phase 7's
 product-knowledge context (linked specs/tickets) once that phase exists.*
+
+**Status (2026-10-16): Not started.** The intent summary is computed
+(`review/intent_summary.py`) but is only fed into review generation; nothing
+posts it, and there is no Mermaid/diagram code.
 
 ---
 
@@ -369,9 +541,12 @@ roadmap because nothing above depends on them landing first.
 ## How to update this roadmap
 
 - Reorder or re-scope a phase when a real dependency changes, not to reflect
-  optimism or slippage — this document sequences work, it doesn't track
-  progress. Use issue tracking (Jira, GitHub Projects, whatever the team
-  uses) for status; don't turn this into a Kanban board.
+  optimism or slippage — this document sequences work. The dated **Status**
+  lines and the delivery snapshot are verification snapshots, not a live
+  tracker: refresh them only by re-running the gates listed under
+  "Verification basis" (and updating the date), never from a plan's
+  self-reported status. Use issue tracking for day-to-day status; don't turn
+  this into a Kanban board.
 - When a phase's "Open" note gets resolved (an ADR lands, an open question in
   `c4-architecture.md` gets answered), remove the note — don't leave stale
   open-question callouts here once the source document has resolved them.

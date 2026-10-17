@@ -408,3 +408,136 @@ stays up. An empty value means "not configured". With the feature in use,
 `REVIEW_WORKER_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS` <
 `..._DEADLINE_SECONDS` < `REVIEW_WORKER_CONTEXT_BUILDER_INTERNAL_TIMEOUT_SECONDS`
 must hold.
+
+## Static-analysis engines: switches, concurrency arithmetic, config skips, fallback storms
+
+Context: [`docs/specs/spec-static-analysis-expansion.md`](../specs/spec-static-analysis-expansion.md)
+and [`docs/plans/plan-phase-9.md`](../plans/plan-phase-9.md). Besides Gitleaks and
+Semgrep the Worker runs five correctness-only engines on the files a PR changes:
+Ruff (Python), ESLint (JS/TS), golangci-lint (Go), Trivy config (Terraform,
+Dockerfile, Kubernetes YAML) and PHPStan (PHP). All scans are offline, run as the
+non-root `worker` user, and honor a repo's own config only as inert data (an
+executable config such as `eslint.config.js` is skipped, never run).
+
+### Upgrading: the new engines are on by default
+
+An upgrade changes review output (more inline comments on the languages above). For a
+quiet rollout set the flags to `false` first, then enable engines one at a time:
+
+| Engine | Env var (Compose `.env` / Helm `worker.staticAnalysis.*`) | Timeout override |
+| --- | --- | --- |
+| Ruff | `REVIEW_WORKER_STATIC_ANALYSIS_RUFF_ENABLED` / `ruff.enabled` | `..._RUFF_TIMEOUT_SECONDS` / `ruff.timeoutSeconds` |
+| ESLint | `..._ESLINT_ENABLED` / `eslint.enabled` | `..._ESLINT_TIMEOUT_SECONDS` |
+| golangci-lint | `..._GOLANGCI_LINT_ENABLED` / `golangciLint.enabled` | `..._GOLANGCI_LINT_TIMEOUT_SECONDS` |
+| Trivy | `..._TRIVY_ENABLED` / `trivy.enabled` | `..._TRIVY_TIMEOUT_SECONDS` |
+| PHPStan | `..._PHPSTAN_ENABLED` / `phpstan.enabled` | `..._PHPSTAN_TIMEOUT_SECONDS` |
+
+(All env vars carry the `REVIEW_WORKER_STATIC_ANALYSIS_` prefix.) A disabled engine is
+not started, costs nothing, and cannot affect a job. An engine that crashes or times
+out is isolated: the job still completes with every other engine's findings, the
+failure is logged at `error` by `review.static_analysis`, and it shows as a
+`failed`/`timeout` series on the dashboard's "Analyzer runs by engine and outcome"
+panel. Turn that one engine off with its switch; no rebuild is needed.
+
+The interpreters (Node, PHP, Go) exist only in the `worker-runtime` image target
+(`review-worker`); the Webhook and Admin API images contain none of them. Run the
+Worker from the `review-worker` image, not `review`.
+
+### Concurrency arithmetic (US-A8) and Worker memory
+
+At most `REVIEW_WORKER_STATIC_ANALYSIS_MAX_CONCURRENT_ANALYZERS` (default `3`) analyzer
+subprocesses run at once **per Worker process**, across all of that process's jobs; the
+rest wait for a slot. Waiting does not consume an analyzer's own timeout, but the step
+timeout still bounds the whole step. Startup fails fast unless
+
+    ceil(enabled_analyzers / N) x max(per-analyzer timeout) <= static_analysis_step_timeout_seconds
+
+(defaults: 7 analyzers, N = 3, 60 s each, 240 s step: `ceil(7/3) x 60 = 180 <= 240`).
+Raising N, enabling more analyzers or raising a timeout can break that inequality; the
+Worker then refuses to start and names the offending setting.
+
+Total in-flight analyzers across a deployment is `worker replicas x N`
+(dashboard: "Analyzers in flight"). Memory limit rule: the Worker limit must exceed the
+Worker baseline plus the sum of the N largest per-engine peak RSS values. Measured
+(linux/amd64, `worker` user, `--network none`, real fixtures):
+
+| Item | Peak RSS |
+| --- | --- |
+| Worker process, embedding model loaded (idle / between jobs) | ~390-415 MiB |
+| golangci-lint (largest single process; container cgroup peak 369-537 MiB) | 277-303 MiB |
+| ESLint (node) | 182-234 MiB |
+| Trivy config | 171-233 MiB |
+| PHPStan | ~106 MiB |
+| Semgrep | ~108 MiB |
+| Ruff / Gitleaks | 17-29 MiB / ~16 MiB |
+| Whole container, one PR with all five engines + Gitleaks/Semgrep (E2E, N = 3) | 734 MiB peak (`memory.peak`) |
+
+For N = 3: 415 + (303 + 234 + 233) = ~1.2 GiB worst case, so the chart ships
+`worker.resources` of request `1Gi` (the observed scan peak, rounded up) and limit `2Gi`
+(Compose: `mem_limit: 2g`). If you raise N, recompute: add the next-largest engine peak
+for each extra slot and keep the limit above the total with headroom; larger real
+repositories use more memory than these small fixtures. An OOM-killed Worker shows up
+as restarts plus jobs re-claimed after the stuck-job threshold.
+
+### Config-skip log reasons
+
+Each engine logs `config_source` (`repo` or `default`) when it picks a profile. When a
+repo's config was not honored, the same log line carries `config_skip_reason`, and the
+default correctness-only profile ran instead. The engine's config is only ever read from
+the **repository root** at the PR head commit (nested configs are logged as
+`nested analyzer config ignored (repo root only)` and ignored).
+
+| `config_skip_reason` | Meaning |
+| --- | --- |
+| `executable_config` | The config is code (JS/TS ESLint config, PHP bootstrap, ...); never executed. |
+| `config_invalid` | Unparseable, wrong shape, or an unsupported version. |
+| `unsupported_syntax`, `unsupported_option`, `unsupported_config_version` | Valid, but uses something the data-only classifier does not allow. |
+| `path_option_not_allowed`, `cache_dir_not_allowed`, `output_path_not_allowed` | The config names a path outside the scan directory (cache, output, include). |
+| `extend_unresolved`, `extends_unresolved`, `plugin_unresolved`, `parser_unresolved` | References a file, preset, plugin or parser that was not fetched / is not in the pinned set. |
+| `env_reference` | Reads an environment variable. |
+| `custom_checks_not_allowed`, `remote_checks_not_allowed`, `type_aware_not_supported` | Custom rules, remote rule bundles or type-aware linting. |
+| `ignorefile_invalid` | Trivy ignore file unusable. |
+| `rejected_by_tool` | The engine itself rejected the config at run time; it was re-run once with the default profile. |
+| `not_a_regular_file`, `file_too_large`, `too_many_files` | Config-fetch caps (symlink/submodule, > 256 KiB, > 16 files). |
+
+A handful of these per day is normal (customers use plugins we do not ship). It is not an
+incident; the review still ran, on defaults.
+
+### Counting config skips, silent engines and dropped findings
+
+These counters make the failure modes above visible without log searching (dashboard row
+"Static analysis engines"):
+
+- `review.static_analysis.config_skipped_total{analyzer_name, reason}` is the metric form of
+  the `config_skip_reason` log above (every reason in the table, including `rejected_by_tool`).
+  A rise in `rejected_by_tool` for one engine right after an image bump means the pinned tool
+  version rejects configs it used to accept; check the engine's release notes and its pinned
+  default profile.
+- `review.static_analysis.findings_total{analyzer_name}`: an engine at zero while its
+  `runs_total{outcome="success"}` keeps climbing is silently broken (routing, output parsing
+  or default profile). A sudden jump is a rule-set regression flooding PRs.
+- `review.static_analysis.analyzer.skipped_total{analyzer_name}`: runs skipped because no
+  changed file matched the engine. A `success` run with no skip is a real execution, so
+  "100% success" is only meaningful against this.
+- `review.static_analysis.findings_dropped_total`: `reason="redaction_ceiling"` means the
+  hard cap discarded findings (consider whether it is too low now that lint engines run);
+  `reason="not_changed_line"` (with `analyzer_name`) counts findings hidden by the
+  changed-lines filter.
+
+### Fallback storm: `review.static_analysis.config_fallback_total` climbing
+
+The dashboard panel "Repo-config fallbacks (default profile used)" counts jobs whose whole
+repo-config fetch failed, by `reason`: `tree_fetch_failed` (GitHub tree API error or
+timeout after retries), `content_fetch_failed` (blob fetch failed) or `tree_truncated`
+(repository tree too large for one API response; permanent for that repo). Reviews keep
+working; every engine just runs its default profile, so repo-specific rules silently stop
+applying.
+
+1. A sudden rise across many repos with `tree_fetch_failed` / `content_fetch_failed` is
+   a GitHub-side or network problem: check `adapter.github.http` retry/budget-exhausted
+   warnings in the Worker logs, GitHub status, and the App's rate limit. It clears when
+   GitHub recovers; no action on the platform.
+2. `tree_truncated` for one or two very large repos is expected and permanent (a
+   per-path contents lookup is the known follow-up); do not chase it.
+3. Nothing needs disabling: a fallback never fails a job. Only disable an engine if its
+   own `failed`/`timeout` series is the problem.

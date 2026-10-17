@@ -148,8 +148,114 @@ jobs:
           chmod +x /usr/local/bin/gitleaks
           gitleaks version
 
+      # Pinned Ruff binary for adapter/analyzers/ruff.py, same version and
+      # sha256 as the Dockerfile's `ruff` stage (keep them in step). Installed
+      # outside the venv: the lint job's dev-dependency ruff must never be
+      # what the integration tests exercise.
+      - name: Install Ruff (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          RUFF_VERSION=0.16.5
+          ARCHIVE="ruff-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$ARCHIVE" \
+            "https://github.com/astral-sh/ruff/releases/download/${RUFF_VERSION}/${ARCHIVE}"
+          echo "65b8bae7e43f12a91b71036a52176012b3aefb725d5ae263e2771474110a0983  ${ARCHIVE}" | sha256sum -c -
+          mkdir -p "$HOME/.local/ruff-bin"
+          tar xzf "$ARCHIVE" --strip-components=1 -C "$HOME/.local/ruff-bin" ruff-x86_64-unknown-linux-gnu/ruff
+          echo "$HOME/.local/ruff-bin" >> "$GITHUB_PATH"
+          "$HOME/.local/ruff-bin/ruff" --version
+
+      # Pinned Trivy for adapter/analyzers/trivy.py, same version and sha256 as
+      # the Dockerfile's `trivy` stage (keep them in step). Misconfiguration
+      # checks are embedded in the binary, so nothing is downloaded at scan time.
+      - name: Install Trivy (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          TRIVY_VERSION=0.76.0
+          ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL -o "$ARCHIVE" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${ARCHIVE}"
+          echo "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7  ${ARCHIVE}" | sha256sum -c -
+          mkdir -p "$HOME/.local/trivy-bin"
+          tar xzf "$ARCHIVE" -C "$HOME/.local/trivy-bin" trivy
+          echo "$HOME/.local/trivy-bin" >> "$GITHUB_PATH"
+          "$HOME/.local/trivy-bin/trivy" --version
+
+      # Pinned Node + ESLint toolset for adapter/analyzers/eslint.py, same Node
+      # version and sha256 as the Dockerfile's `node-runtime` stage (keep them in
+      # step), with the plugin set installed from tools/eslint/package-lock.json
+      # (sha512 integrity; `npm ci` fails on any mismatch) and no install scripts.
+      - name: Install Node + ESLint (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          NODE_VERSION=22.23.3
+          ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.gz"
+          curl -fsSL -o "$ARCHIVE" "https://nodejs.org/dist/v${NODE_VERSION}/${ARCHIVE}"
+          echo "1084aa36196bba4c3a5e69a1ee388a6e4ff729dad09445fbcd434b28fe3c24af  ${ARCHIVE}" | sha256sum -c -
+          mkdir -p "$HOME/.local/node" "$HOME/.local/eslint-bin"
+          tar xzf "$ARCHIVE" --strip-components=1 -C "$HOME/.local/node"
+          PATH="$HOME/.local/node/bin:$PATH" npm ci --prefix tools/eslint --omit=dev --ignore-scripts --no-audit --no-fund
+          ln -sf "$PWD/tools/eslint/review-eslint" "$HOME/.local/eslint-bin/review-eslint"
+          echo "$HOME/.local/node/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/eslint-bin" >> "$GITHUB_PATH"
+          PATH="$HOME/.local/node/bin:$HOME/.local/eslint-bin:$PATH" review-eslint --version
+
+      # Pinned minimal PHP CLI (built from the official source tarball) + PHPStan
+      # phar for adapter/analyzers/phpstan.py, same versions and sha256 as the
+      # Dockerfile's `php-runtime` / `phpstan-tool` stages (keep them in step).
+      - name: Install PHP + PHPStan (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          PHP_VERSION=8.4.26
+          PHPSTAN_VERSION=2.3.1
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libonig-dev xz-utils
+          ARCHIVE="php-${PHP_VERSION}.tar.xz"
+          curl -fsSL -o "$ARCHIVE" "https://www.php.net/distributions/${ARCHIVE}"
+          echo "32a2de53862ad44ed4a5005244ce4f1b50c271e74dced215449a4443b40569f1  ${ARCHIVE}" | sha256sum -c -
+          mkdir php-src
+          tar xJf "$ARCHIVE" --strip-components=1 -C php-src
+          (cd php-src && ./configure --prefix="$HOME/.local/php" --disable-all --disable-cgi \
+            --disable-phpdbg --without-pear --enable-cli --enable-phar --enable-tokenizer \
+            --enable-mbstring --enable-ctype --enable-filter && make -j"$(nproc)" && make install-cli)
+          mkdir -p "$HOME/.local/phpstan"
+          curl -fsSL -o "$HOME/.local/phpstan/phpstan.phar" \
+            "https://github.com/phpstan/phpstan/releases/download/${PHPSTAN_VERSION}/phpstan.phar"
+          echo "85157dba3d95d77ca603d2b7303aa78a538f9e3b56ccad07dd794c53aa96d1ae  $HOME/.local/phpstan/phpstan.phar" | sha256sum -c -
+          install -m 0755 tools/phpstan/review-phpstan "$HOME/.local/phpstan/review-phpstan"
+          echo "$HOME/.local/php/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/phpstan" >> "$GITHUB_PATH"
+          PATH="$HOME/.local/php/bin:$HOME/.local/phpstan:$PATH" review-phpstan --version
+
+      # Pinned Go toolchain + golangci-lint for adapter/analyzers/golangci_lint.py,
+      # same versions and sha256 as the Dockerfile's `go-toolchain` /
+      # `golangci-tool` stages (keep them in step). The Dockerfile prunes the Go
+      # tree; the full toolchain is a superset, so the tests behave the same.
+      - name: Install Go + golangci-lint (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          GO_VERSION=1.27.2
+          GOLANGCI_LINT_VERSION=2.15.0
+          GO_ARCHIVE="go${GO_VERSION}.linux-amd64.tar.gz"
+          curl -fsSL -o "$GO_ARCHIVE" "https://go.dev/dl/${GO_ARCHIVE}"
+          echo "ecbadb99091a3f46e31f5f934b068b1864eafa7995211b39eaddf76996045fe5  ${GO_ARCHIVE}" | sha256sum -c -
+          mkdir -p "$HOME/.local/go"
+          tar xzf "$GO_ARCHIVE" --strip-components=1 -C "$HOME/.local/go"
+          LINT_ARCHIVE="golangci-lint-${GOLANGCI_LINT_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL -o "$LINT_ARCHIVE" \
+            "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/${LINT_ARCHIVE}"
+          echo "9b7fe6a6bf6334b98decf8d86b11415ea7889afdabdd1959fdce23af2a9ebcea  ${LINT_ARCHIVE}" | sha256sum -c -
+          mkdir -p "$HOME/.local/golangci-bin"
+          tar xzf "$LINT_ARCHIVE" --strip-components=1 -C "$HOME/.local/golangci-bin" \
+            "golangci-lint-${GOLANGCI_LINT_VERSION}-linux-amd64/golangci-lint"
+          echo "$HOME/.local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/golangci-bin" >> "$GITHUB_PATH"
+          PATH="$HOME/.local/go/bin:$HOME/.local/golangci-bin:$PATH" golangci-lint --version
+
+      # `.venv/bin/python -m pytest`, not `uv run`: `uv run` puts the venv's
+      # dev-dependency ruff ahead of the pinned binary on PATH.
       - name: pytest -m integration
-        run: uv run pytest -m integration
+        run: .venv/bin/python -m pytest -m integration
 
   frontend:
     name: Frontend (typecheck, build, vitest)

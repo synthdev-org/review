@@ -259,10 +259,13 @@ services:
       start_period: 5s
 
   worker:
+    # The worker-only image target: `runtime` plus the interpreters the
+    # static-analysis engines need (Node + ESLint, PHP + PHPStan, Go + golangci-lint; plan-phase-9
+    # Decisions 1, 2, 4). The other services stay on `runtime` and gain none.
     build:
       context: .
-      target: runtime
-    image: review-app:compose-local
+      target: worker-runtime
+    image: review-worker:compose-local
     command: ["python", "-m", "apps.worker.main"]
     environment:
       REVIEW_WORKER_ENVIRONMENT: ${REVIEW_WORKER_ENVIRONMENT:-development}
@@ -294,6 +297,28 @@ services:
         ${REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY:?set REVIEW_WORKER_GITHUB_APP_PRIVATE_KEY in .env, see .env.example}
       REVIEW_WORKER_GITHUB_API_BASE_URL: ${REVIEW_WORKER_GITHUB_API_BASE_URL:-https://api.github.com}
       REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: ${REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS:-10}
+      REVIEW_WORKER_STATIC_ANALYSIS_MAX_CONCURRENT_ANALYZERS: ${REVIEW_WORKER_STATIC_ANALYSIS_MAX_CONCURRENT_ANALYZERS:-3}
+      # Ruff static-analysis engine (docs/plans/plan-phase-9.md Phase 3). Set the
+      # flag false for a quiet rollout; a blank timeout inherits the analyzer default.
+      REVIEW_WORKER_STATIC_ANALYSIS_RUFF_ENABLED: ${REVIEW_WORKER_STATIC_ANALYSIS_RUFF_ENABLED:-true}
+      REVIEW_WORKER_STATIC_ANALYSIS_RUFF_TIMEOUT_SECONDS: >-
+        ${REVIEW_WORKER_STATIC_ANALYSIS_RUFF_TIMEOUT_SECONDS:-}
+      # ESLint (plan-phase-9 Phase 4), same semantics as Ruff above.
+      REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_ENABLED: ${REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_ENABLED:-true}
+      REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_TIMEOUT_SECONDS: >-
+        ${REVIEW_WORKER_STATIC_ANALYSIS_ESLINT_TIMEOUT_SECONDS:-}
+      # Trivy config scanning (plan-phase-9 Phase 6), same semantics as Ruff above.
+      REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_ENABLED: ${REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_ENABLED:-true}
+      REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_TIMEOUT_SECONDS: >-
+        ${REVIEW_WORKER_STATIC_ANALYSIS_TRIVY_TIMEOUT_SECONDS:-}
+      # PHPStan (plan-phase-9 Phase 7), same semantics as Ruff above.
+      REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_ENABLED: ${REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_ENABLED:-true}
+      REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_TIMEOUT_SECONDS: >-
+        ${REVIEW_WORKER_STATIC_ANALYSIS_PHPSTAN_TIMEOUT_SECONDS:-}
+      # golangci-lint (plan-phase-9 Phase 5), same semantics as Ruff above.
+      REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_ENABLED: ${REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_ENABLED:-true}
+      REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_TIMEOUT_SECONDS: >-
+        ${REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_TIMEOUT_SECONDS:-}
       REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: ${REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS:-3}
       # Product knowledge (plan-deliver-product-knowledge.md Phase 6) —
       # optional external provider; empty/unset credentials means none. See

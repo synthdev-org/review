@@ -41,6 +41,7 @@ import json
 import logging
 import shutil
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -198,7 +199,14 @@ class SemgrepAnalyzer:
 
     name = "semgrep"
 
-    async def run(self, diff: Diff, content: dict[str, bytes], *, timeout: float) -> list[Finding]:
+    async def run(
+        self,
+        diff: Diff,
+        content: dict[str, bytes],
+        *,
+        timeout: float,
+        config_files: Mapping[str, bytes],
+    ) -> list[Finding]:
         if not content:
             # No positional paths would follow `_argv`'s own trailing `--`
             # end-of-options separator, and Semgrep's CLI falls back to its
