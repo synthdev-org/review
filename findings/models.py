@@ -47,7 +47,15 @@ each inventing its own.
 """
 
 Source = Literal[
-    "gitleaks", "semgrep", "ruff", "eslint", "golangci_lint", "phpstan", "trivy", "llm"
+    "gitleaks",
+    "semgrep",
+    "ruff",
+    "eslint",
+    "golangci_lint",
+    "phpstan",
+    "trivy",
+    "llm",
+    "clone_detection",
 ]
 """Which producer generated a given ``Finding`` — lets a downstream consumer
 (redaction, dedupe, an operator reading logs) distinguish "the free,
@@ -56,6 +64,20 @@ unverified single inference pass found this," per the PRD's US4 design
 rationale (design goal 4's "deterministic first pass as the free trust
 anchor").
 """
+
+_SOURCE_TRUST_RANK: dict[str, int] = {"llm": 1, "clone_detection": 2}
+
+
+def source_rank(source: Source) -> int:
+    """Ordinal source-trust ranking for truncating ceilings (lower survives):
+    deterministic static-analysis sources first, ``"llm"`` next,
+    ``"clone_detection"`` last (US-C13: a duplication finding is the lowest-
+    priority kind at equal severity). The one place every ceiling sort
+    (``findings.merge``, ``review.review_generation``,
+    ``review.static_analysis``) gets its source tiebreak from, so a new source
+    is ranked here once rather than by a per-caller branch.
+    """
+    return _SOURCE_TRUST_RANK.get(source, 0)
 
 
 class Finding(BaseModel):

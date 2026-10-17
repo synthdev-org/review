@@ -1231,6 +1231,339 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 41,
+      "type": "row",
+      "title": "Clone detection",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 94
+      },
+      "panels": []
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Clone detection step outcomes",
+      "description": "review.clone_detection.outcome_total by outcome. failed_open_* means the step was skipped for that review (the review still posted); a sustained failed_open_query or failed_open_timeout means the clone index is unreachable or too slow (docs/reference/operations.md).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 95
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_clone_detection_outcome_total[1h])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "Clone detection duration (p95)",
+      "description": "Wall-clock time of the clone_detection step by outcome. Compare against clone_detection_step_timeout_seconds.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 95
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_clone_detection_duration_ms_milliseconds_bucket[1h])) by (le, outcome))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Clone candidates / filtered / findings",
+      "description": "review.clone_detection candidates_total (verified duplicated regions), filtered_total (not new code or import-only) and findings_total (emitted). A high filtered share is normal; findings far below candidates means most duplication predates the PR.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 95
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_clone_detection_candidates_total[1h]))",
+          "legendFormat": "candidates"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_clone_detection_filtered_total[1h]))",
+          "legendFormat": "filtered"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(review_clone_detection_findings_total[1h]))",
+          "legendFormat": "findings"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Clone findings suppressed / capped",
+      "description": "memory_suppressed_total (dropped by an approved dismissal), cap_dropped_total (over clone_detection_max_findings) and candidate_cap_dropped_total by reason (files = MAX_FILES_CONSIDERED, per_hash = PER_HASH_CANDIDATE_LIMIT, candidate_files = CANDIDATE_FILE_CAP: the constant to tune). Nonzero cap counts mean boilerplate matched widely or a PR is very large.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 103
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_clone_detection_memory_suppressed_total[1h]))",
+          "legendFormat": "memory suppressed"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_clone_detection_cap_dropped_total[1h]))",
+          "legendFormat": "finding cap dropped"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(review_clone_detection_candidate_cap_dropped_total[1h])) by (reason)",
+          "legendFormat": "candidate cap dropped: {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 46,
+      "type": "timeseries",
+      "title": "Clone fingerprints written / deleted",
+      "description": "review.indexing.clone_fingerprints_written_total and clone_fingerprints_deleted_total (rows removed because their file was deleted). Written stuck at zero while files are indexed means the clone index is not being kept fresh.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 103
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_indexing_clone_fingerprints_written_total[1h]))",
+          "legendFormat": "written"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_indexing_clone_fingerprints_deleted_total[1h]))",
+          "legendFormat": "deleted"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 47,
+      "type": "timeseries",
+      "title": "Clone backfill outcomes",
+      "description": "review.indexing.clone_backfill_total by outcome (complete, complete_with_drops, incomplete, superseded). incomplete means a transient failure left the version unstamped so the next push retries (docs/reference/operations.md).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 103
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_indexing_clone_backfill_total[1h])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 48,
+      "type": "timeseries",
+      "title": "Clone backfill files dropped at ceilings",
+      "description": "review.indexing.clone_backfill_dropped_total: in-scope files a backfill dropped at the full-run ceilings. Nonzero means the repo is larger than the ceilings and part of it has no clone data.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 111
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_indexing_clone_backfill_dropped_total[1h]))",
+          "legendFormat": "dropped"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 49,
+      "type": "timeseries",
+      "title": "Clone index-time stage failures",
+      "description": "review.indexing.clone_stage_failed_total: files whose clone tokenization failed while indexing (they keep their chunks and graph but have no clone data). A rising rate points at a tokenizer bug.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 111
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_indexing_clone_stage_failed_total[1h]))",
+          "legendFormat": "failed files"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 50,
+      "type": "timeseries",
+      "title": "Clone detection phase duration (p95)",
+      "description": "review.clone_detection.phase_duration_ms by phase. Recorded even for a phase that raised or timed out, so a failed_open_timeout can be traced to its slow phase: fetch_content (GitHub), prepare (parsing), find_candidates/load_files (Postgres), match (CPU) or memory_suppression.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 111
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_clone_detection_phase_duration_ms_milliseconds_bucket[1h])) by (le, phase))",
+          "legendFormat": "{{phase}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Clone review-time skips and Memory failures",
+      "description": "files_skipped_total by reason (unparseable = parser/tokenizer failure on a PR file, no_content = file missing from the fetched content) and memory_suppression_failed_total (the Memory dismissal check failed, so dismissed clone findings were re-posted). Any sustained rate is a bug or an outage, not normal traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 119
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_clone_detection_files_skipped_total[1h])) by (reason)",
+          "legendFormat": "skipped: {{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_clone_detection_memory_suppression_failed_total[1h]))",
+          "legendFormat": "memory suppression failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
     }
   ]
 }

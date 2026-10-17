@@ -27,18 +27,28 @@ import logging
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 import indexing.pipeline as pipeline_module
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.indexing_repository import IndexingRepository
-from adapter.storage.models import IndexChunkRow, IndexGraphEdgeRow, IndexGraphNodeRow, Org, Repo
+from adapter.storage.models import (
+    IndexChunkRow,
+    IndexCloneFileRow,
+    IndexCloneFingerprintRow,
+    IndexGraphEdgeRow,
+    IndexGraphNodeRow,
+    Org,
+    Repo,
+)
 from indexing.chunk import Chunk, chunk_file
+from indexing.clone import CLONE_FINGERPRINT_VERSION, CloneIndexError
 from indexing.conftest import FakeEmbeddingClient
 from indexing.graph import GraphExtractionError, GraphResult
 from indexing.pipeline import IndexingJobDependencies, IndexingJobFailedError, run_indexing_job
@@ -748,8 +758,8 @@ class _UpsertFailingOnPath:
             raise IndexingRepositoryError(operation="upsert_file", detail="forced failure")
         await self.real.upsert_file(chunks=chunks, **kwargs)
 
-    async def delete_file(self, **kwargs: Any) -> None:
-        await self.real.delete_file(**kwargs)
+    async def delete_file(self, **kwargs: Any) -> int:
+        return await self.real.delete_file(**kwargs)
 
     async def get_last_indexed_commit(self, **kwargs: Any) -> str | None:
         return await self.real.get_last_indexed_commit(**kwargs)
@@ -795,10 +805,10 @@ class _DeleteFailingOnPath:
     async def upsert_file(self, **kwargs: Any) -> None:
         await self.real.upsert_file(**kwargs)
 
-    async def delete_file(self, *, file_path: str, **kwargs: Any) -> None:
+    async def delete_file(self, *, file_path: str, **kwargs: Any) -> int:
         if file_path == self.fail_path:
             raise IndexingRepositoryError(operation="delete_file", detail="forced failure")
-        await self.real.delete_file(file_path=file_path, **kwargs)
+        return await self.real.delete_file(file_path=file_path, **kwargs)
 
     async def get_last_indexed_commit(self, **kwargs: Any) -> str | None:
         return await self.real.get_last_indexed_commit(**kwargs)
@@ -1160,3 +1170,268 @@ async def test_whole_job_postgres_failure_leaves_cursor_untouched_and_retry_repr
     assert result.files_processed == 1
     assert await repository.get_last_indexed_commit(repo_id=repo_id) == _COMMIT_1
     assert len(await _chunk_rows(session_factory, repo_id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Clone detection (docs/plans/plan-phase-10.md Phase 2): US-C1 end to end and
+# US-C3 backfill against a real IndexingRepository.
+# ---------------------------------------------------------------------------
+
+_FIXTURE_DIR = Path(__file__).parent / "testdata" / "clone"
+
+
+async def _clone_file_paths(
+    session_factory: async_sessionmaker[Any], repo_id: uuid.UUID, *, pr_number: int = 0
+) -> set[str]:
+    async with session_factory() as session:
+        rows = await session.execute(
+            select(IndexCloneFileRow.file_path).where(
+                IndexCloneFileRow.repo_id == repo_id, IndexCloneFileRow.pr_number == pr_number
+            )
+        )
+        return set(rows.scalars())
+
+
+async def _fingerprint_count(session_factory: async_sessionmaker[Any], repo_id: uuid.UUID) -> int:
+    async with session_factory() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(IndexCloneFingerprintRow)
+            .where(IndexCloneFingerprintRow.repo_id == repo_id)
+        )
+        return int(count or 0)
+
+
+def _clone_deps(repository: IndexingRepository, fetcher: Any) -> IndexingJobDependencies:
+    return IndexingJobDependencies(
+        tree_fetcher=fetcher,
+        embedding_client=FakeEmbeddingClient(),
+        index_repository=repository,
+        commit_tracker=repository,
+        clone_backfill=repository,
+    )
+
+
+@pytest.mark.asyncio
+async def test_push_job_stores_clone_rows_and_none_for_a_parse_failing_file(
+    repository: IndexingRepository, repo_id: uuid.UUID, session_factory: async_sessionmaker[Any]
+) -> None:
+    original = (_FIXTURE_DIR / "original.ts").read_bytes()
+    bad = b"\xff\xfe\x00\x01not valid utf-8"
+    fetcher = _MultiCommitTreeFetcher(
+        trees={_COMMIT_1: (_entry("original.ts", original), _entry("bad.ts", bad))},
+        content={"original.ts": original, "bad.ts": bad},
+    )
+
+    result = await run_indexing_job(
+        _payload(repo_id=repo_id, added=["original.ts", "bad.ts"]),
+        _clone_deps(repository, fetcher),
+        job_id="job-1",
+    )
+
+    assert result.files_failed == 1
+    assert await _clone_file_paths(session_factory, repo_id) == {"original.ts"}
+    assert result.fingerprints_written > 0
+    assert await _fingerprint_count(session_factory, repo_id) == result.fingerprints_written
+
+
+@pytest.mark.asyncio
+async def test_clone_index_error_file_keeps_its_chunks_and_loses_stale_clone_rows(
+    repository: IndexingRepository,
+    repo_id: uuid.UUID,
+    session_factory: async_sessionmaker[Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = (_FIXTURE_DIR / "original.ts").read_bytes()
+    fetcher = _MultiCommitTreeFetcher(
+        trees={_COMMIT_1: (_entry("a.ts", original),), _COMMIT_2: (_entry("a.ts", _HELPER_TS),)},
+        content={"a.ts": original},
+    )
+    await run_indexing_job(
+        _payload(repo_id=repo_id, added=["a.ts"]), _clone_deps(repository, fetcher), job_id="j1"
+    )
+    assert await _clone_file_paths(session_factory, repo_id) == {"a.ts"}
+
+    def _boom(language: Any, path: str, tree: Any) -> Any:
+        raise CloneIndexError(file_path=path, language=str(language), detail="forced")
+
+    monkeypatch.setattr(pipeline_module, "build_clone_index", _boom)
+    fetcher.content["a.ts"] = _HELPER_TS
+    result = await run_indexing_job(
+        _payload(repo_id=repo_id, commit_sha=_COMMIT_2, modified=["a.ts"]),
+        _clone_deps(repository, fetcher),
+        job_id="j2",
+    )
+
+    assert (result.files_processed, result.files_failed, result.clone_stage_failures) == (1, 0, 1)
+    assert {row.file_path for row in await _chunk_rows(session_factory, repo_id)} == {"a.ts"}
+    assert await _clone_file_paths(session_factory, repo_id) == set()
+    assert await _fingerprint_count(session_factory, repo_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_version_backfill_reprocesses_all_prunes_removed_and_stamps_version(
+    repository: IndexingRepository, repo_id: uuid.UUID, session_factory: async_sessionmaker[Any]
+) -> None:
+    # An index built before clone detection: chunks exist, no clone rows, version 0.
+    old = _MultiCommitTreeFetcher(
+        trees={_COMMIT_1: (_entry("caller.ts", _CALLER_TS), _entry("gone.ts", _HELPER_TS))},
+        content={"caller.ts": _CALLER_TS, "gone.ts": _HELPER_TS},
+    )
+    legacy = IndexingJobDependencies(
+        tree_fetcher=old,
+        embedding_client=FakeEmbeddingClient(),
+        index_repository=repository,
+        commit_tracker=repository,
+    )
+    await run_indexing_job(
+        _payload(repo_id=repo_id, added=["caller.ts", "gone.ts"]), legacy, job_id="j0"
+    )
+    async with session_factory() as session, session.begin():
+        await session.execute(delete(IndexCloneFingerprintRow))
+        await session.execute(delete(IndexCloneFileRow))
+    assert await _clone_file_paths(session_factory, repo_id) == set()
+    assert await repository.get_clone_fingerprint_version(repo_id=repo_id) == 0
+
+    fetcher = _MultiCommitTreeFetcher(
+        trees={
+            _COMMIT_1: (_entry("caller.ts", _CALLER_TS), _entry("gone.ts", _HELPER_TS)),
+            _COMMIT_2: (_entry("caller.ts", _CALLER_TS), _entry("new.ts", _HELPER_TS)),
+        },
+        content={"caller.ts": _CALLER_TS, "new.ts": _HELPER_TS},
+    )
+    result = await run_indexing_job(
+        _payload(repo_id=repo_id, commit_sha=_COMMIT_2, added=["new.ts"]),
+        _clone_deps(repository, fetcher),
+        job_id="j1",
+    )
+
+    assert result.clone_backfill_outcome == "complete"
+    assert result.used_full_tree_fallback is True
+    assert await _clone_file_paths(session_factory, repo_id) == {"caller.ts", "new.ts"}
+    assert {row.file_path for row in await _chunk_rows(session_factory, repo_id)} == {
+        "caller.ts",
+        "new.ts",
+    }
+    assert (
+        await repository.get_clone_fingerprint_version(repo_id=repo_id) == CLONE_FINGERPRINT_VERSION
+    )
+    assert await repository.get_last_indexed_commit(repo_id=repo_id) == _COMMIT_2
+
+    # Version is current now: the next push is an ordinary incremental job.
+    again = await run_indexing_job(
+        _payload(repo_id=repo_id, commit_sha=_COMMIT_2, modified=["new.ts"]),
+        _clone_deps(repository, fetcher),
+        job_id="j2",
+    )
+    assert again.clone_backfill_outcome is None
+    assert again.used_full_tree_fallback is False
+    assert again.files_processed == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_on_never_indexed_repo_succeeds_and_stamps(
+    repository: IndexingRepository, repo_id: uuid.UUID, session_factory: async_sessionmaker[Any]
+) -> None:
+    fetcher = _MultiCommitTreeFetcher(
+        trees={_COMMIT_1: (_entry("helper.ts", _HELPER_TS),)}, content={"helper.ts": _HELPER_TS}
+    )
+
+    result = await run_indexing_job(
+        _payload(repo_id=repo_id), _clone_deps(repository, fetcher), job_id="j1"
+    )
+
+    assert result.clone_backfill_outcome == "complete"
+    assert await _clone_file_paths(session_factory, repo_id) == {"helper.ts"}
+    assert (
+        await repository.get_clone_fingerprint_version(repo_id=repo_id) == CLONE_FINGERPRINT_VERSION
+    )
+
+
+@dataclass
+class _CursorHijackingRepo:
+    """Delegates to a real repository but advances the cursor from "another
+    job" right before the backfill's conditional write."""
+
+    real: IndexingRepository
+
+    async def upsert_file(self, **kwargs: Any) -> None:
+        await self.real.upsert_file(**kwargs)
+
+    async def delete_file(self, **kwargs: Any) -> int:
+        return await self.real.delete_file(**kwargs)
+
+    async def get_last_indexed_commit(self, **kwargs: Any) -> str | None:
+        return await self.real.get_last_indexed_commit(**kwargs)
+
+    async def set_last_indexed_commit(self, **kwargs: Any) -> None:
+        await self.real.set_last_indexed_commit(**kwargs)
+
+    async def get_clone_fingerprint_version(self, **kwargs: Any) -> int:
+        return await self.real.get_clone_fingerprint_version(**kwargs)
+
+    async def advance_cursor_with_clone_version(self, *, repo_id: uuid.UUID, **kwargs: Any) -> bool:
+        await self.real.set_last_indexed_commit(repo_id=repo_id, commit_sha="f" * 40)
+        return await self.real.advance_cursor_with_clone_version(repo_id=repo_id, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_backfill_superseded_by_another_job_does_not_stamp_or_move_cursor(
+    repository: IndexingRepository, repo_id: uuid.UUID
+) -> None:
+    await repository.set_last_indexed_commit(repo_id=repo_id, commit_sha=_COMMIT_1)
+    fetcher = _MultiCommitTreeFetcher(
+        trees={_COMMIT_1: (), _COMMIT_2: (_entry("helper.ts", _HELPER_TS),)},
+        content={"helper.ts": _HELPER_TS},
+    )
+    racing = _CursorHijackingRepo(real=repository)
+
+    result = await run_indexing_job(
+        _payload(repo_id=repo_id, commit_sha=_COMMIT_2),
+        _clone_deps(racing, fetcher),  # type: ignore[arg-type]
+        job_id="j1",
+    )
+
+    assert result.clone_backfill_outcome == "superseded"
+    assert await repository.get_clone_fingerprint_version(repo_id=repo_id) == 0
+    assert await repository.get_last_indexed_commit(repo_id=repo_id) == "f" * 40
+
+
+@pytest.mark.asyncio
+async def test_backfill_previous_tree_fetch_failure_is_job_fatal_and_unstamped(
+    repository: IndexingRepository, repo_id: uuid.UUID
+) -> None:
+    await repository.set_last_indexed_commit(repo_id=repo_id, commit_sha=_COMMIT_1)
+    fetcher = _MultiCommitTreeFetcher(
+        trees={_COMMIT_2: (_entry("helper.ts", _HELPER_TS),)},
+        content={"helper.ts": _HELPER_TS},
+        unreachable_for=frozenset({_COMMIT_1}),
+    )
+
+    with pytest.raises(IndexingJobFailedError):
+        await run_indexing_job(
+            _payload(repo_id=repo_id, commit_sha=_COMMIT_2),
+            _clone_deps(repository, fetcher),
+            job_id="j1",
+        )
+
+    assert await repository.get_clone_fingerprint_version(repo_id=repo_id) == 0
+    assert await repository.get_last_indexed_commit(repo_id=repo_id) == _COMMIT_1
+
+
+@pytest.mark.asyncio
+async def test_backfill_transient_batch_fetch_failure_leaves_version_unstamped(
+    repository: IndexingRepository, repo_id: uuid.UUID
+) -> None:
+    fetcher = _MultiCommitTreeFetcher(
+        trees={_COMMIT_1: (_entry("helper.ts", _HELPER_TS),)},
+        content={"helper.ts": _HELPER_TS},
+        fail_content_fetch=True,
+    )
+
+    result = await run_indexing_job(
+        _payload(repo_id=repo_id), _clone_deps(repository, fetcher), job_id="j1"
+    )
+
+    assert result.clone_backfill_outcome == "incomplete"
+    assert await repository.get_clone_fingerprint_version(repo_id=repo_id) == 0

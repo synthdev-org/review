@@ -53,7 +53,18 @@ def test_verification_status_rejects_an_invalid_value() -> None:
 
 
 @pytest.mark.parametrize(
-    "source", ["gitleaks", "semgrep", "ruff", "eslint", "golangci_lint", "phpstan", "trivy", "llm"]
+    "source",
+    [
+        "gitleaks",
+        "semgrep",
+        "ruff",
+        "eslint",
+        "golangci_lint",
+        "phpstan",
+        "trivy",
+        "llm",
+        "clone_detection",
+    ],
 )
 def test_every_producer_is_a_valid_source(source: str) -> None:
     assert _finding(source=source).source == source

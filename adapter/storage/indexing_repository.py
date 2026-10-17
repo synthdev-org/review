@@ -53,12 +53,25 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from adapter.storage.models import IndexChunkRow, IndexGraphEdgeRow, IndexGraphNodeRow, Repo
+from adapter.storage.models import (
+    IndexChunkRow,
+    IndexCloneFileRow,
+    IndexCloneFingerprintRow,
+    IndexGraphEdgeRow,
+    IndexGraphNodeRow,
+    Repo,
+)
 from adapter.storage.unit_of_work import run_in_session
 from indexing.chunk import Chunk
+from indexing.clone import CloneFileIndex
 from indexing.embedding import EmbeddingVector
 from indexing.graph import GraphEdge, GraphNode
-from indexing.repository import IndexCommitTracker, IndexingRepositoryError, IndexRepository
+from indexing.repository import (
+    CloneBackfillTracker,
+    IndexCommitTracker,
+    IndexingRepositoryError,
+    IndexRepository,
+)
 
 
 class IndexingRepository:
@@ -96,6 +109,7 @@ class IndexingRepository:
         embeddings: Sequence[EmbeddingVector],
         nodes: Sequence[GraphNode],
         edges: Sequence[GraphEdge],
+        clone_index: CloneFileIndex | None = None,
     ) -> None:
         chunks_tuple = tuple(chunks)
         embeddings_tuple = tuple(embeddings)
@@ -249,10 +263,13 @@ class IndexingRepository:
                 )
                 await session.execute(edge_statement)
 
+            await _replace_clone_rows(session, repo_id, pr_number, file_path, clone_index)
+
         await self._run(operation="upsert_file", fn=_write)
 
-    async def delete_file(self, *, repo_id: uuid.UUID, pr_number: int, file_path: str) -> None:
-        async def _write(session: AsyncSession) -> None:
+    async def delete_file(self, *, repo_id: uuid.UUID, pr_number: int, file_path: str) -> int:
+        async def _write(session: AsyncSession) -> int:
+            deleted_fingerprints = await _delete_clone_rows(session, repo_id, pr_number, file_path)
             await session.execute(
                 delete(IndexChunkRow).where(
                     IndexChunkRow.repo_id == repo_id,
@@ -273,8 +290,9 @@ class IndexingRepository:
                     IndexGraphNodeRow.file_path == file_path,
                 )
             )
+            return deleted_fingerprints
 
-        await self._run(operation="delete_file", fn=_write)
+        return await self._run(operation="delete_file", fn=_write)
 
     # -- IndexCommitTracker --------------------------------------------------
 
@@ -312,9 +330,127 @@ class IndexingRepository:
                 operation="set_last_indexed_commit", detail=f"repo {repo_id} not found"
             )
 
+    # -- CloneBackfillTracker -------------------------------------------------
+
+    async def get_clone_fingerprint_version(self, *, repo_id: uuid.UUID) -> int:
+        async def _read(session: AsyncSession) -> Row[tuple[int]] | None:
+            result = await session.execute(
+                select(Repo.clone_fingerprint_version).where(Repo.id == repo_id)
+            )
+            return result.first()
+
+        row = await self._run(operation="get_clone_fingerprint_version", fn=_read)
+        if row is None:
+            raise IndexingRepositoryError(
+                operation="get_clone_fingerprint_version", detail=f"repo {repo_id} not found"
+            )
+        return int(row[0])
+
+    async def advance_cursor_with_clone_version(
+        self,
+        *,
+        repo_id: uuid.UUID,
+        commit_sha: str,
+        expected_previous_commit: str | None,
+        clone_version: int,
+    ) -> bool:
+        async def _write(session: AsyncSession) -> int:
+            result = cast(
+                "CursorResult[Any]",
+                await session.execute(
+                    update(Repo)
+                    .where(
+                        Repo.id == repo_id,
+                        Repo.last_indexed_commit_sha.is_not_distinct_from(expected_previous_commit),
+                    )
+                    .values(
+                        last_indexed_commit_sha=commit_sha, clone_fingerprint_version=clone_version
+                    )
+                ),
+            )
+            return result.rowcount
+
+        return await self._run(operation="advance_cursor_with_clone_version", fn=_write) > 0
+
+
+# Fingerprint rows are inserted in batches: asyncpg caps a statement at 32,767
+# bind parameters, and a very large generated file can carry thousands of rows.
+_FINGERPRINT_INSERT_BATCH = 5000
+
+
+async def _delete_clone_rows(
+    session: AsyncSession, repo_id: uuid.UUID, pr_number: int, file_path: str
+) -> int:
+    """Delete one file's clone-file and fingerprint rows (always scoped by
+    ``pr_number``, so a PR-scoped call can never touch the canonical
+    ``pr_number = 0`` rows). Returns the number of fingerprint rows removed."""
+    fingerprints = cast(
+        "CursorResult[Any]",
+        await session.execute(
+            delete(IndexCloneFingerprintRow).where(
+                IndexCloneFingerprintRow.repo_id == repo_id,
+                IndexCloneFingerprintRow.pr_number == pr_number,
+                IndexCloneFingerprintRow.file_path == file_path,
+            )
+        ),
+    )
+    await session.execute(
+        delete(IndexCloneFileRow).where(
+            IndexCloneFileRow.repo_id == repo_id,
+            IndexCloneFileRow.pr_number == pr_number,
+            IndexCloneFileRow.file_path == file_path,
+        )
+    )
+    return int(fingerprints.rowcount)
+
+
+async def _replace_clone_rows(
+    session: AsyncSession,
+    repo_id: uuid.UUID,
+    pr_number: int,
+    file_path: str,
+    clone_index: CloneFileIndex | None,
+) -> None:
+    """Delete-then-insert one file's clone rows in the caller's transaction;
+    ``clone_index=None`` leaves the file with no clone rows at all."""
+    await _delete_clone_rows(session, repo_id, pr_number, file_path)
+    if clone_index is None:
+        return
+    if clone_index.file_path != file_path:
+        raise ValueError(
+            f"clone_index must belong to file_path={file_path!r}, got {clone_index.file_path!r}"
+        )
+    await session.execute(
+        pg_insert(IndexCloneFileRow).values(
+            repo_id=repo_id,
+            pr_number=pr_number,
+            file_path=file_path,
+            language=clone_index.language,
+            token_hashes=list(clone_index.token_hashes),
+            line_first_token=list(clone_index.line_first_token),
+        )
+    )
+    fingerprint_rows = [
+        {
+            "repo_id": repo_id,
+            "pr_number": pr_number,
+            "file_path": file_path,
+            "token_offset": fingerprint.token_offset,
+            "hash": fingerprint.hash,
+        }
+        for fingerprint in clone_index.fingerprints
+    ]
+    for start in range(0, len(fingerprint_rows), _FINGERPRINT_INSERT_BATCH):
+        await session.execute(
+            pg_insert(IndexCloneFingerprintRow).values(
+                fingerprint_rows[start : start + _FINGERPRINT_INSERT_BATCH]
+            )
+        )
+
 
 # Runtime confirmation (not just a docstring claim) that this concrete
-# implementation actually satisfies both Protocols it stands in for,
+# implementation actually satisfies the Protocols it stands in for,
 # mirroring adapter/github/tree.py's own runtime check.
 _: type[IndexRepository] = IndexingRepository
 __: type[IndexCommitTracker] = IndexingRepository
+___: type[CloneBackfillTracker] = IndexingRepository

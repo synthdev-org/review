@@ -664,3 +664,95 @@ async def test_us_pk3_finding_citing_provider_item_posts_product_knowledge_block
     assert "[Refund \\\\*policy\\\\*](https://wiki.example.com/refunds)" in posted_body
     assert "confluence" in posted_body
     assert "PROVIDER-SNIPPET-MUST-NOT-BE-ECHOED" not in posted_body
+
+
+# --- Phase 10 / Phase 6: clone_detection findings (US-C11, US-C13) ----------
+
+
+@respx.mock
+async def test_us_c13_over_ceiling_job_still_posts_security_findings_and_a_clone_finding_inline(
+    test_rsa_private_key_pem: str,
+) -> None:
+    _mock_token_exchange()
+    _mock_review_comments()
+    reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
+    respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
+
+    secret = _finding(file="s.py", line=1, severity="critical", message="leaked key")
+    clone = _finding(
+        file="dup.py",
+        line=5,
+        severity="low",
+        message="Duplicates other.py:10-30",
+        source="clone_detection",
+    )
+    # Clone arrives first among the 100 same-severity low findings, so only the
+    # ceiling ordering (not input order) can drop it.
+    lows = [
+        _finding(file="l.py", line=i, severity="low", message=f"lint issue {i}", source="ruff")
+        for i in range(100)
+    ]
+    upstream = _FakeUpstreamStep(output=_FakeUpstreamOutput(findings=[clone, *lows, secret]))
+    registry = _registry(upstream, _publisher(test_rsa_private_key_pem))
+
+    outcomes = await registry.run(_SEED_INPUT, _context())
+
+    assert outcomes["output"].status == "success"
+    comments = json.loads(reviews_route.calls.last.request.content)["comments"]
+    assert len(comments) == 100
+    assert comments[0]["path"] == "s.py"
+    assert all(c["path"] != "dup.py" for c in comments)
+
+
+@respx.mock
+async def test_us_c11_surviving_clone_finding_posts_as_an_ordinary_inline_comment(
+    test_rsa_private_key_pem: str,
+) -> None:
+    _mock_token_exchange()
+    _mock_review_comments()
+    reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
+    respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
+
+    clone = _finding(
+        file="dup.py",
+        line=5,
+        severity="low",
+        message="Duplicates other.py",
+        source="clone_detection",
+    )
+    upstream = _FakeUpstreamStep(output=_FakeUpstreamOutput(findings=[clone]))
+    registry = _registry(upstream, _publisher(test_rsa_private_key_pem))
+
+    await registry.run(_SEED_INPUT, _context())
+
+    comments = json.loads(reviews_route.calls.last.request.content)["comments"]
+    assert [(c["path"], c["line"]) for c in comments] == [("dup.py", 5)]
+    assert "Duplicates other" in comments[0]["body"]
+
+
+@respx.mock
+async def test_us_c11_clone_and_llm_finding_on_the_same_line_dedupe_under_the_existing_rule(
+    test_rsa_private_key_pem: str,
+) -> None:
+    _mock_token_exchange()
+    _mock_review_comments()
+    reviews_route = respx.post(_REVIEWS_URL).mock(return_value=httpx.Response(200, json={"id": 1}))
+    respx.post(_CHECK_RUNS_URL).mock(return_value=httpx.Response(201, json={"id": 1}))
+
+    llm = _finding(
+        file="dup.py", line=5, severity="medium", message="duplicated logic block", source="llm"
+    )
+    clone = _finding(
+        file="dup.py",
+        line=5,
+        severity="low",
+        message="duplicated logic block!",
+        source="clone_detection",
+    )
+    upstream = _FakeUpstreamStep(output=_FakeUpstreamOutput(findings=[llm, clone]))
+    registry = _registry(upstream, _publisher(test_rsa_private_key_pem))
+
+    outcomes = await registry.run(_SEED_INPUT, _context())
+
+    assert outcomes["output"].output.comment_count == 1
+    assert len(json.loads(reviews_route.calls.last.request.content)["comments"]) == 1

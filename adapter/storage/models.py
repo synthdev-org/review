@@ -47,7 +47,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # Dimension of the bundled local embedding model
@@ -153,6 +153,14 @@ class Repo(Base):
     # completed run ever advances it (Phase 7's own ordering rule, closing
     # the cursor-level poisoning path an independent security review found).
     last_indexed_commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The clone-fingerprint schema version this repo's index was last fully
+    # (re)built at (docs/plans/plan-phase-10.md Phase 2, Assumption 5): `0`
+    # until a default-branch index job completes a backfill at
+    # `indexing.clone.CLONE_FINGERPRINT_VERSION`. A repo below the current
+    # version is re-fingerprinted in full by its next default-branch job.
+    clone_fingerprint_version: Mapped[int] = mapped_column(
+        Integer(), nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -626,6 +634,57 @@ class IndexGraphEdgeRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class IndexCloneFileRow(Base):
+    """One indexed file's clone-detection data (``indexing.clone.CloneFileIndex``),
+    per ``docs/plans/plan-phase-10.md``'s Phase 2: the normalized per-token
+    hashes (so a match can be verified to token equality without refetching
+    code) and the cumulative line map. Scoped by ``(repo_id, pr_number,
+    file_path)`` exactly as ``IndexChunkRow`` is, so a PR-scoped row can never
+    collide with, or overwrite, the canonical ``pr_number = 0`` row.
+    """
+
+    __tablename__ = "index_clone_file"
+    __table_args__ = (PrimaryKeyConstraint("repo_id", "pr_number", "file_path"),)
+
+    repo_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("repo.id", ondelete="CASCADE"), nullable=False
+    )
+    pr_number: Mapped[int] = mapped_column(Integer(), nullable=False, default=0, server_default="0")
+    file_path: Mapped[str] = mapped_column(String(4096), nullable=False)
+    language: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_hashes: Mapped[list[int]] = mapped_column(ARRAY(Integer()), nullable=False)
+    line_first_token: Mapped[list[int]] = mapped_column(ARRAY(Integer()), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class IndexCloneFingerprintRow(Base):
+    """One sampled winnowing fingerprint (``indexing.clone.Fingerprint``) of an
+    indexed file, per ``docs/plans/plan-phase-10.md``'s Phase 2. Only ``hash``
+    and ``token_offset`` are stored; lines are derived from the file's own
+    ``IndexCloneFileRow.line_first_token``. The ``(repo_id, pr_number, hash)``
+    index serves the review step's batched ``hash = ANY(...)`` lookup.
+    """
+
+    __tablename__ = "index_clone_fingerprint"
+    __table_args__ = (
+        PrimaryKeyConstraint("repo_id", "pr_number", "file_path", "token_offset"),
+        Index("ix_index_clone_fingerprint_repo_pr_hash", "repo_id", "pr_number", "hash"),
+    )
+
+    repo_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("repo.id", ondelete="CASCADE"), nullable=False
+    )
+    pr_number: Mapped[int] = mapped_column(Integer(), nullable=False, default=0, server_default="0")
+    file_path: Mapped[str] = mapped_column(String(4096), nullable=False)
+    token_offset: Mapped[int] = mapped_column(Integer(), nullable=False)
+    hash: Mapped[int] = mapped_column(BigInteger(), nullable=False)
 
 
 class AdminRole(enum.StrEnum):

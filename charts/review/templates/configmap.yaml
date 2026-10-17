@@ -74,6 +74,13 @@ data:
   REVIEW_WORKER_STATIC_ANALYSIS_GOLANGCI_LINT_TIMEOUT_SECONDS: {{ . | quote }}
   {{- end }}
 
+  # --- Clone detection (docs/plans/plan-phase-10.md) ---
+  REVIEW_WORKER_CLONE_DETECTION_ENABLED: {{ .Values.worker.cloneDetection.enabled | quote }}
+  REVIEW_WORKER_CLONE_DETECTION_STEP_TIMEOUT_SECONDS: {{ .Values.worker.cloneDetection.stepTimeoutSeconds | quote }}
+  REVIEW_WORKER_CLONE_DETECTION_MIN_TOKENS: {{ .Values.worker.cloneDetection.minTokens | quote }}
+  REVIEW_WORKER_CLONE_DETECTION_MIN_LINES: {{ .Values.worker.cloneDetection.minLines | quote }}
+  REVIEW_WORKER_CLONE_DETECTION_MAX_FINDINGS: {{ .Values.worker.cloneDetection.maxFindings | quote }}
+
   # --- Product knowledge (non-secret; the token map is in secret.yaml) ---
   REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED: {{ .Values.productKnowledge.enabled | quote }}
   REVIEW_WORKER_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS: {{ .Values.productKnowledge.callTimeoutSeconds | quote }}

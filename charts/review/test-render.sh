@@ -29,6 +29,7 @@
 #   6. (Phase 9) `docker compose config` — validates the admin_api service
 #      block (US-A20's second Given/When/Then) with the required env vars
 #      set, the same way an operator's real .env would.
+#   7. (plan-phase-10) clone detection values reach the ConfigMap and Compose worker.
 #
 # Usage: run from anywhere with `helm` on PATH (and `docker compose` on
 # PATH for step 6):
@@ -343,6 +344,30 @@ assert_contains "$COMPOSE_WORKER" 'image: review-worker:compose-local' \
     "worker service has its own image tag, distinct from the shared review-app one"
 assert_not_contains "$(awk '/^  admin_api:/,/^  worker:/' <<<"$COMPOSE_OUT" | sed '$d')" 'worker-runtime' \
     "webhook_api and admin_api keep the interpreter-free runtime target"
+
+echo
+echo "=== 7. clone detection settings (plan-phase-10 Phase 6, US-C15) ==="
+CLONE_OUT=$(helm template "$RELEASE" "$CHART_DIR" --show-only templates/configmap.yaml)
+assert_contains "$CLONE_OUT" 'REVIEW_WORKER_CLONE_DETECTION_ENABLED: "true"' \
+    "ConfigMap renders the clone_detection enabled default (on)"
+assert_contains "$CLONE_OUT" 'REVIEW_WORKER_CLONE_DETECTION_MIN_TOKENS: "100"' \
+    "ConfigMap renders the min_tokens default (the winnowing floor)"
+assert_contains "$CLONE_OUT" 'REVIEW_WORKER_CLONE_DETECTION_STEP_TIMEOUT_SECONDS: "30"' \
+    "ConfigMap renders the step timeout default"
+assert_contains "$CLONE_OUT" 'REVIEW_WORKER_CLONE_DETECTION_MIN_LINES: "10"' \
+    "ConfigMap renders the min_lines default"
+assert_contains "$CLONE_OUT" 'REVIEW_WORKER_CLONE_DETECTION_MAX_FINDINGS: "5"' \
+    "ConfigMap renders the max_findings default"
+CLONE_OFF_OUT=$(helm template "$RELEASE" "$CHART_DIR" --show-only templates/configmap.yaml \
+    --set worker.cloneDetection.enabled=false --set worker.cloneDetection.minTokens=150)
+assert_contains "$CLONE_OFF_OUT" 'REVIEW_WORKER_CLONE_DETECTION_ENABLED: "false"' \
+    "worker.cloneDetection.enabled=false reaches the ConfigMap"
+assert_contains "$CLONE_OFF_OUT" 'REVIEW_WORKER_CLONE_DETECTION_MIN_TOKENS: "150"' \
+    "worker.cloneDetection.minTokens override reaches the ConfigMap"
+assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_CLONE_DETECTION_ENABLED: "true"' \
+    "docker compose config passes the clone_detection switch to the worker"
+assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_CLONE_DETECTION_MIN_TOKENS: "100"' \
+    "docker compose config passes the min_tokens default to the worker"
 
 echo
 if [[ "$FAILED" -eq 0 ]]; then

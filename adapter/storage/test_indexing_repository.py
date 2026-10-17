@@ -779,3 +779,93 @@ async def test_upsert_file_rolls_back_chunk_write_when_graph_write_fails(
             .all()
         )
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_get_clone_fingerprint_version_defaults_to_zero(
+    repository: IndexingRepository, repo_id: uuid.UUID
+) -> None:
+    assert await repository.get_clone_fingerprint_version(repo_id=repo_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_get_clone_fingerprint_version_unknown_repo_raises(
+    repository: IndexingRepository,
+) -> None:
+    with pytest.raises(IndexingRepositoryError):
+        await repository.get_clone_fingerprint_version(repo_id=uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_advance_cursor_with_clone_version_matching_cursor_writes_both(
+    repository: IndexingRepository, repo_id: uuid.UUID
+) -> None:
+    await repository.set_last_indexed_commit(repo_id=repo_id, commit_sha="a" * 40)
+
+    advanced = await repository.advance_cursor_with_clone_version(
+        repo_id=repo_id,
+        commit_sha="b" * 40,
+        expected_previous_commit="a" * 40,
+        clone_version=1,
+    )
+
+    assert advanced is True
+    assert await repository.get_last_indexed_commit(repo_id=repo_id) == "b" * 40
+    assert await repository.get_clone_fingerprint_version(repo_id=repo_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_advance_cursor_with_clone_version_none_expected_matches_unset_cursor(
+    repository: IndexingRepository, repo_id: uuid.UUID
+) -> None:
+    advanced = await repository.advance_cursor_with_clone_version(
+        repo_id=repo_id, commit_sha="b" * 40, expected_previous_commit=None, clone_version=1
+    )
+
+    assert advanced is True
+    assert await repository.get_last_indexed_commit(repo_id=repo_id) == "b" * 40
+    assert await repository.get_clone_fingerprint_version(repo_id=repo_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_advance_cursor_with_clone_version_superseded_writes_nothing(
+    repository: IndexingRepository, repo_id: uuid.UUID
+) -> None:
+    await repository.set_last_indexed_commit(repo_id=repo_id, commit_sha="a" * 40)
+    # Another job advances the cursor after this one read it.
+    await repository.set_last_indexed_commit(repo_id=repo_id, commit_sha="c" * 40)
+
+    advanced = await repository.advance_cursor_with_clone_version(
+        repo_id=repo_id,
+        commit_sha="b" * 40,
+        expected_previous_commit="a" * 40,
+        clone_version=1,
+    )
+
+    assert advanced is False
+    assert await repository.get_last_indexed_commit(repo_id=repo_id) == "c" * 40
+    assert await repository.get_clone_fingerprint_version(repo_id=repo_id) == 0
+    # A None expectation does not match a set cursor either.
+    assert (
+        await repository.advance_cursor_with_clone_version(
+            repo_id=repo_id, commit_sha="d" * 40, expected_previous_commit=None, clone_version=1
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_advance_cursor_with_clone_version_unknown_repo_returns_false(
+    repository: IndexingRepository,
+) -> None:
+    # No row matches, so nothing is written; the pipeline reads this as "superseded"
+    # (the version read that precedes it already raises for an unknown repo).
+    assert (
+        await repository.advance_cursor_with_clone_version(
+            repo_id=uuid.uuid4(),
+            commit_sha="b" * 40,
+            expected_previous_commit=None,
+            clone_version=1,
+        )
+        is False
+    )

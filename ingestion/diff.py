@@ -51,6 +51,9 @@ class DiffFile(BaseModel):
     mode: str | None = None
     blob_sha: str | None = None
     blob_size_bytes: int | None = None
+    previous_path: str | None = None
+    """The path a `renamed` file had before the PR (GitHub's `previous_filename`);
+    `None` otherwise. Lets clone detection exclude the old path's default-branch rows."""
 
 
 class Diff(BaseModel):

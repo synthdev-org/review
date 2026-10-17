@@ -102,6 +102,7 @@ from pydantic_settings import SettingsConfigDict
 
 from adapter.product_knowledge.settings import ProductKnowledgeSettingsMixin
 from adapter.telemetry.sdk import OtelSettingsMixin
+from indexing.clone import GUARANTEE_TOKENS
 from review.config import check_static_analysis_budget
 
 
@@ -237,6 +238,15 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     context_builder_step_timeout_seconds: int = 35
     context_builder_internal_timeout_seconds: int = 25
 
+    # Phase 10 (docs/plans/plan-phase-10.md, Phase 4): the clone_detection step.
+    # The step's own internal fail-open timeout is derived in main.py as
+    # step timeout minus 5 s (validated below), not a second setting.
+    clone_detection_enabled: bool = True
+    clone_detection_step_timeout_seconds: int = Field(default=30, gt=0)
+    clone_detection_min_tokens: int = Field(default=100, gt=0)
+    clone_detection_min_lines: int = Field(default=10, gt=0)
+    clone_detection_max_findings: int = Field(default=5, gt=0)
+
     # --- Job dispatch loop (Phase 3, apps/worker/dispatch.py) ---
     # How often to poll JobQueueRepository.claim_next() when the queue is
     # empty — a concrete default, not left unspecified, per the plan's
@@ -249,10 +259,9 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     # (US-V9's NFR) now that intent_summary/verification exist: 30
     # (prefilter) + 240 (static_analysis) + 35 (context_builder) + 30
     # (intent_summary) + 90 (review_generation) + 60 (verification) + 30
-    # (output) = 515 seconds. 600 gives that sum roughly 15% headroom —
-    # comfortably longer than the worst healthy-run total without leaving a
-    # genuinely stuck job unwarned for an unreasonable stretch (515 * 1.15
-    # ~= 592, rounded up).
+    # (output) + 30 (clone_detection, Phase 10) = 545 seconds. 600 gives that sum
+    # roughly 10% headroom - comfortably longer than the worst healthy-run total
+    # without leaving a genuinely stuck job unwarned for an unreasonable stretch.
     stuck_job_warning_threshold_seconds: float = 600.0
 
     # --- GitHub App auth / diff fetch (Phase 4, adapter/github/auth.py + diff.py) ---
@@ -396,8 +405,8 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     @model_validator(mode="after")
     def _stuck_job_warning_threshold_covers_worst_case_chain(self) -> WorkerSettings:
         """Enforces that ``stuck_job_warning_threshold_seconds`` never drops
-        below the seven macro steps' own worst-case sequential-run sum (the
-        515-second figure this field's own docstring comment hand-derives).
+        below the eight macro steps' own worst-case sequential-run sum (the
+        545-second figure this field's own docstring comment hand-derives).
 
         The steps run strictly sequentially, so that sum — not any single
         step's timeout — is the true worst-case healthy-run duration; a
@@ -413,6 +422,7 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
         worst_case_chain_seconds = (
             self.prefilter_step_timeout_seconds
             + self.static_analysis_step_timeout_seconds
+            + self.clone_detection_step_timeout_seconds
             + self.context_builder_step_timeout_seconds
             + self.intent_summary_step_timeout_seconds
             + self.review_generation_step_timeout_seconds
@@ -498,6 +508,28 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
                 "timeout must leave a real margin over the internal orchestration "
                 "timeout, or the outer StepRegistry could time out the whole step before "
                 "its own internal timeout ever gets a chance to degrade gracefully"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _clone_detection_settings_are_valid(self) -> WorkerSettings:
+        """The stored fingerprints guarantee detection only for runs of at least
+        ``GUARANTEE_TOKENS`` tokens (plan Assumption 1), so ``min_tokens`` may be raised but not
+        lowered below it; the derived internal timeout (step timeout minus 5 s)
+        must stay positive (Assumption 9). Positivity of each field is the
+        ``Field(gt=0)`` constraint above.
+        """
+        if self.clone_detection_min_tokens < GUARANTEE_TOKENS:
+            raise ValueError(
+                f"clone_detection_min_tokens ({self.clone_detection_min_tokens}) must be at "
+                f"least {GUARANTEE_TOKENS}: stored fingerprints only guarantee detection of "
+                "runs that long; lowering it needs a CLONE_FINGERPRINT_VERSION bump"
+            )
+        if self.clone_detection_step_timeout_seconds <= 5:
+            raise ValueError(
+                f"clone_detection_step_timeout_seconds "
+                f"({self.clone_detection_step_timeout_seconds}) must be greater than 5 - the "
+                "step's internal fail-open timeout is the step timeout minus 5 seconds"
             )
         return self
 

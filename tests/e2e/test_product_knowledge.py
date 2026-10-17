@@ -35,6 +35,7 @@ endpoints) live in ``tests/e2e/test_admin_ui.py`` (Phase 8).
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -73,6 +74,8 @@ _DISPLAY_NAME = "Wiki E2E"
 _ISSUE_KEY = "HR-77"
 _DIFF_CANARY = "return 2;"  # appears only in the diff; must never reach the provider
 
+_BLOB = b"export function helper(): number {\n  return 2;\n}\n"
+_BLOB_SHA = hashlib.sha1(_BLOB).hexdigest()
 _PATCH = "@@ -1,3 +1,3 @@\n export function helper(): number {\n-  return 1;\n+  return 2;\n }\n"
 
 
@@ -182,9 +185,19 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"changed_files": 1})
         elif re.fullmatch(rf"/repos/{re.escape(_OWNER_REPO)}/pulls/\d+/files", path):
             self._send_json(200, [{"filename": "helper.ts", "status": "modified", "patch": _PATCH}])
-        elif re.search(r"/git/(trees|blobs)/", path):
+        elif re.search(r"/git/trees/", path):
+            # The diff fetcher requires a tree entry for every changed (non-removed) file.
+            entry = {
+                "type": "blob",
+                "path": "helper.ts",
+                "mode": "100644",
+                "sha": _BLOB_SHA,
+                "size": len(_BLOB),
+            }
+            self._send_json(200, {"tree": [entry], "truncated": False})
+        elif re.search(r"/git/blobs/", path):
             self._send_json(
-                200, {"tree": [], "truncated": False, "content": "", "encoding": "base64"}
+                200, {"content": base64.b64encode(_BLOB).decode("ascii"), "encoding": "base64"}
             )
         else:
             self._send_json(404, {"message": "not found (stub)"})

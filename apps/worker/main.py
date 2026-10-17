@@ -154,6 +154,7 @@ from adapter.product_knowledge.client import ClientTimeouts
 from adapter.product_knowledge.factory import ProviderClientFactory
 from adapter.product_knowledge.provider_resolver import FailOpenProviderResolver
 from adapter.product_knowledge.transport import EgressPolicy
+from adapter.storage.clone_query import PostgresCloneIndexQuery
 from adapter.storage.context_query import PostgresGraphQuery, PostgresSimilarityQuery
 from adapter.storage.engine import create_session_factory, create_storage_engine
 from adapter.storage.indexing_repository import IndexingRepository
@@ -178,6 +179,7 @@ from llmgateway.exceptions import LLMError
 from llmgateway.routing import FallbackModelRoutingResolver
 from llmgateway.startup_check import check_llm_reachable
 from memory.reaction_poll import MemoryReactionPollJobDependencies
+from review.clone_detection import CloneDetectionStep
 from review.config import (
     NoViableStepConfigurationError,
     StepEnablement,
@@ -190,6 +192,7 @@ from review.config import (
 from review.context_builder import ContextBuilderStep
 from review.file_matchers import match_go, match_iac, match_javascript, match_php, match_python
 from review.intent_summary import IntentSummaryStep
+from review.memory_suppression import MemorySuppressionConfig
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
@@ -199,7 +202,7 @@ from review.static_analysis import (
     StaticAnalysisStep,
     gitleaks_semgrep_registrations,
 )
-from review.verification import MemorySuppressionConfig, VerificationStep
+from review.verification import VerificationStep
 
 
 def _build_llm_client(settings: WorkerSettings) -> LLMClient:
@@ -462,7 +465,7 @@ def _build_indexing_deps(
     embedding_client: LocalONNXEmbeddingClient,
     index_repository: IndexingRepository,
 ) -> IndexingJobDependencies:
-    """Bundle the indexing domain's four Protocol-typed dependencies
+    """Bundle the indexing domain's five Protocol-typed dependencies
     (indexing delivery plan's Phase 7) — `IndexingRepository` implements
     both `IndexRepository` and `IndexCommitTracker` (Assumption 13's
     split), so the same instance is passed for both roles here, the one
@@ -473,6 +476,7 @@ def _build_indexing_deps(
         embedding_client=embedding_client,
         index_repository=index_repository,
         commit_tracker=index_repository,
+        clone_backfill=index_repository,
     )
 
 
@@ -739,6 +743,7 @@ def _build_step_enablement(settings: WorkerSettings) -> StepEnablement:
     return StepEnablement(
         prefilter_enabled=settings.prefilter_enabled,
         static_analysis_enabled=settings.static_analysis_enabled,
+        clone_detection_enabled=settings.clone_detection_enabled,
         context_builder_enabled=settings.context_builder_enabled,
         intent_summary_enabled=settings.intent_summary_enabled,
         review_generation_enabled=settings.review_generation_enabled,
@@ -760,6 +765,7 @@ def _build_step_timeouts(settings: WorkerSettings) -> StepTimeouts:
         prefilter_step_timeout_seconds=settings.prefilter_step_timeout_seconds,
         static_analysis_step_timeout_seconds=settings.static_analysis_step_timeout_seconds,
         static_analysis_analyzer_timeout_seconds=settings.static_analysis_analyzer_timeout_seconds,
+        clone_detection_step_timeout_seconds=settings.clone_detection_step_timeout_seconds,
         static_analysis_ruff_timeout_seconds=settings.static_analysis_ruff_timeout_seconds,
         static_analysis_eslint_timeout_seconds=settings.static_analysis_eslint_timeout_seconds,
         static_analysis_trivy_timeout_seconds=settings.static_analysis_trivy_timeout_seconds,
@@ -833,6 +839,7 @@ def _build_review_registry(
     tree_fetcher: GitHubTreeFetcher,
     graph_query: PostgresGraphQuery,
     similarity_query: PostgresSimilarityQuery,
+    clone_query: PostgresCloneIndexQuery,
     embedding_client: LocalONNXEmbeddingClient,
     redactor: TextRedactor,
     llm_client: LLMClient,
@@ -1025,6 +1032,19 @@ def _build_review_registry(
                 # because the registry is built once at startup.
                 analyzer_slots=asyncio.Semaphore(settings.static_analysis_max_concurrent_analyzers),
                 config_fetcher=GitHubRepoConfigFetcher(tree_fetcher),
+            ),
+            CloneDetectionStep(
+                diff_fetcher,
+                clone_query,
+                # A macro step's registry timeout is fatal but US-C14 requires a timeout to
+                # fail open, so the step wraps its own work in a shorter wait_for (plan
+                # Assumption 9; settings validate the step timeout exceeds 5 s).
+                internal_timeout_seconds=float(settings.clone_detection_step_timeout_seconds - 5),
+                min_tokens=settings.clone_detection_min_tokens,
+                min_lines=settings.clone_detection_min_lines,
+                max_findings=settings.clone_detection_max_findings,
+                memory_suppression=memory_suppression,
+                depends_on=resolved["clone_detection"],
             ),
             ContextBuilderStep(
                 diff_fetcher,
@@ -1238,6 +1258,7 @@ async def _run(
     )
     graph_query = PostgresGraphQuery(session_factory)
     similarity_query = PostgresSimilarityQuery(session_factory)
+    clone_query = PostgresCloneIndexQuery(session_factory)
     registry = _build_review_registry(
         enablement,
         timeouts,
@@ -1245,6 +1266,7 @@ async def _run(
         tree_fetcher,
         graph_query,
         similarity_query,
+        clone_query,
         embedding_client,
         redactor,
         client,

@@ -75,6 +75,8 @@ from adapter.telemetry.conftest import (
 from apps.worker.dispatch import run_dispatch_loop
 from findings.models import Finding
 from findings.redact import NoOpTextRedactor
+from indexing.chunk import language_for_path, parse_file
+from indexing.clone import CloneFileIndex, build_clone_index
 from indexing.conftest import FakeEmbeddingClient, FakeRepoTreeFetcher
 from indexing.pipeline import IndexingJobDependencies
 from ingestion.diff import Diff, DiffFetcher, DiffFile
@@ -84,6 +86,13 @@ from llmgateway.models import CompletionRequest, CompletionResponse
 from memory.models import ReactionRecord
 from memory.reaction_poll import MemoryReactionPollJobDependencies
 from review import pipeline as pipeline_module
+from review.clone_detection import (
+    CloneCandidateHit,
+    CloneCandidates,
+    CloneDetectionStep,
+    CloneIndexQuery,
+    CloneQueryError,
+)
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
@@ -115,6 +124,11 @@ def test_rsa_private_key_pem() -> str:
     return pem_bytes.decode("utf-8")
 
 
+def _added_patch(data: bytes) -> str:
+    lines = data.decode(errors="replace").splitlines()
+    return f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{line}\n" for line in lines)
+
+
 class _FakeDiffFetcher:
     """A minimal `DiffFetcher` fake: `fetch()` returns a `Diff` covering
     exactly the fixture files this module was constructed with, and
@@ -124,8 +138,9 @@ class _FakeDiffFetcher:
     this module's own docstring).
     """
 
-    def __init__(self, content: dict[str, bytes]) -> None:
+    def __init__(self, content: dict[str, bytes], *, with_patches: bool = False) -> None:
         self._content = content
+        self._with_patches = with_patches
 
     async def fetch(self, **kwargs: Any) -> Diff:
         return Diff(
@@ -133,6 +148,7 @@ class _FakeDiffFetcher:
                 DiffFile(
                     path=name,
                     status="added",
+                    patch=_added_patch(data) if self._with_patches else None,
                     mode="100644",
                     blob_sha="f" * 40,
                     blob_size_bytes=len(data),
@@ -272,6 +288,8 @@ def _registry(
     publisher: Any,
     review_generation_enabled: bool = True,
     verification_llm_client: LLMClient | None = None,
+    clone_query: CloneIndexQuery | None = None,
+    clone_detection_enabled: bool = True,
 ) -> StepRegistry:
     """Builds the same macro-step registry `apps/worker/main.py` itself
     constructs, `terminal_step="output"` included — see that module's own
@@ -293,6 +311,7 @@ def _registry(
     enabled = {
         "prefilter": True,
         "static_analysis": True,
+        "clone_detection": clone_detection_enabled,
         "review_generation": review_generation_enabled,
         "verification": verification_enabled,
         "output": True,
@@ -302,12 +321,20 @@ def _registry(
     timeouts = {
         "prefilter": 10.0,
         "static_analysis": 30.0,
+        "clone_detection": 10.0,
         "review_generation": 10.0,
         "verification": 10.0,
         "output": 10.0,
         "gitleaks": 10.0,
         "semgrep": 10.0,
     }
+    # With the clone step wired and enabled the chain is static_analysis -> clone_detection ->
+    # review_generation; disabled, review_generation depends on static_analysis (baseline).
+    upstream_of_review_generation = (
+        "clone_detection"
+        if clone_query is not None and clone_detection_enabled
+        else "static_analysis"
+    )
     steps: list[Step[Any, Any]] = [
         PrefilterStep(diff_fetcher),
         StaticAnalysisStep(
@@ -323,9 +350,24 @@ def _registry(
             model="fake-model",
             timeout=10.0,
             max_diff_bytes=200_000,
+            depends_on=upstream_of_review_generation,
         ),
     ]
-    output_depends_on = "review_generation" if review_generation_enabled else "static_analysis"
+    if clone_query is not None:
+        steps.insert(
+            2,
+            CloneDetectionStep(
+                diff_fetcher,
+                clone_query,
+                internal_timeout_seconds=5.0,
+                min_tokens=100,
+                min_lines=10,
+                max_findings=5,
+            ),
+        )
+    output_depends_on = (
+        "review_generation" if review_generation_enabled else upstream_of_review_generation
+    )
     if verification_llm_client is not None:
         steps.append(
             VerificationStep(
@@ -368,7 +410,7 @@ class _NullIndexRepository:
     async def upsert_file(self, **kwargs: object) -> None:
         raise AssertionError("_NullIndexRepository.upsert_file should never be called")
 
-    async def delete_file(self, **kwargs: object) -> None:
+    async def delete_file(self, **kwargs: object) -> int:
         raise AssertionError("_NullIndexRepository.delete_file should never be called")
 
     async def get_last_indexed_commit(self, **kwargs: object) -> str | None:
@@ -826,3 +868,178 @@ async def test_review_job_produces_one_trace_with_a_child_span_per_macro_step(
         assert attrs["review.step.status"] == "success"
         assert isinstance(attrs["review.step.duration_ms"], int)
         assert attrs["review.step.duration_ms"] >= 0
+
+
+# --- Phase 10 (plan-phase-10 Phase 4): clone_detection in the real chain ----
+
+_CLONE_FIXTURES = Path(__file__).parent.parent / "indexing" / "testdata" / "clone"
+
+
+class _StoredCopyQuery:
+    """A `CloneIndexQuery` over one stored default-branch file (the committed
+    `original.ts` fixture), or one that fails like a dead database."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        language = language_for_path("src/old.ts")
+        assert language is not None
+        content = (_CLONE_FIXTURES / "original.ts").read_bytes()
+        self._stored: CloneFileIndex = build_clone_index(
+            language, "src/old.ts", parse_file(language, "src/old.ts", content)
+        )[0]
+        self._fail = fail
+
+    async def find_candidates(
+        self,
+        *,
+        repo_id: str,
+        hashes: Any,
+        excluded_paths: Any,
+        per_hash_limit: int,
+        timeout_seconds: float,
+    ) -> CloneCandidates:
+        if self._fail:
+            raise CloneQueryError(operation="find_candidates", detail="simulated outage")
+        wanted = set(hashes)
+        return CloneCandidates(
+            hits=tuple(
+                CloneCandidateHit(
+                    hash=fp.hash, file_path="src/old.ts", token_offset=fp.token_offset
+                )
+                for fp in self._stored.fingerprints
+                if fp.hash in wanted
+            )
+        )
+
+    async def load_files(
+        self, *, repo_id: str, file_paths: Any, timeout_seconds: float
+    ) -> dict[str, CloneFileIndex]:
+        return {"src/old.ts": self._stored}
+
+
+def _review_shape(body: bytes) -> tuple[str, str, list[tuple[str, int]]]:
+    """The review's stable shape: event, summary and comment locations. Comment text is
+    excluded because two Gitleaks rules fire on the same planted line and which one
+    survives dedupe varies between runs (independent of this feature)."""
+    review = json.loads(body)
+    return (
+        review["event"],
+        review["body"],
+        sorted((c["path"], c["line"]) for c in review["comments"]),
+    )
+
+
+def _clone_pr_content() -> dict[str, bytes]:
+    return {
+        "planted_secret.py": (_TESTDATA_DIR / "planted_secret.py").read_bytes(),
+        "src/pr_copy.ts": (_CLONE_FIXTURES / "renamed.ts").read_bytes(),
+    }
+
+
+async def _run_review_job(
+    migrated_engine: AsyncEngine, registry: StepRegistry, reviews_route: respx.Route
+) -> bytes:
+    """Enqueue one REVIEW job, wait for DONE, return the posted review body."""
+    before = reviews_route.call_count
+    job_queue = JobQueueRepository(create_session_factory(migrated_engine))
+    job_id = await job_queue.enqueue(JobType.REVIEW, _seed_payload())
+    async with _running_dispatch_loop(job_queue=job_queue, review_registry=registry):
+        await _wait_for_status(
+            migrated_engine, job_id, JobStatus.DONE, timeout=_WAIT_TIMEOUT_SECONDS
+        )
+    assert reviews_route.call_count == before + 1
+    body: bytes = reviews_route.calls[before].request.content
+    return body
+
+
+def _clone_registry(
+    key_pem: str,
+    *,
+    clone_query: CloneIndexQuery | None,
+    clone_detection_enabled: bool = True,
+) -> StepRegistry:
+    provider = GitHubInstallationTokenProvider(app_id=1, private_key_pem=key_pem)
+    return _registry(
+        diff_fetcher=_FakeDiffFetcher(_clone_pr_content(), with_patches=True),
+        semgrep=GitleaksAnalyzer(),
+        llm_client=_EmptyFindingsLLMClient(),
+        publisher=GitHubFindingsPublisher(
+            token_provider=provider, provenance_recorder=_FakeProvenanceRecorder()
+        ),
+        clone_query=clone_query,
+        clone_detection_enabled=clone_detection_enabled,
+    )
+
+
+@respx.mock
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_clone_detection_in_the_real_chain_posts_a_duplication_comment(
+    migrated_engine: AsyncEngine, test_rsa_private_key_pem: str
+) -> None:
+    reviews_route, _ = _mock_github(
+        reviews_url=f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews",
+        check_runs_url=f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/check-runs",
+    )
+    registry = _clone_registry(test_rsa_private_key_pem, clone_query=_StoredCopyQuery())
+
+    body = await _run_review_job(migrated_engine, registry, reviews_route)
+
+    comments = json.loads(body)["comments"]
+    assert any("Duplicates" in c["body"] and c["path"] == "src/pr_copy.ts" for c in comments)
+    assert len(comments) >= 2  # the Gitleaks finding is posted alongside it
+
+
+@respx.mock
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_clone_detection_disabled_posts_exactly_the_baseline_output(
+    migrated_engine: AsyncEngine, test_rsa_private_key_pem: str
+) -> None:
+    """US-C15: with the kill switch off the posted review is byte-for-byte the
+    one a registry without the step produces."""
+    reviews_route, _ = _mock_github(
+        reviews_url=f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews",
+        check_runs_url=f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/check-runs",
+    )
+    baseline = await _run_review_job(
+        migrated_engine,
+        _clone_registry(test_rsa_private_key_pem, clone_query=None),
+        reviews_route,
+    )
+
+    disabled = await _run_review_job(
+        migrated_engine,
+        _clone_registry(
+            test_rsa_private_key_pem, clone_query=_StoredCopyQuery(), clone_detection_enabled=False
+        ),
+        reviews_route,
+    )
+
+    assert _review_shape(disabled) == _review_shape(baseline)
+    assert b"Duplicates" not in disabled
+
+
+@respx.mock
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_clone_detection_failing_open_still_posts_the_other_findings(
+    migrated_engine: AsyncEngine, test_rsa_private_key_pem: str
+) -> None:
+    """US-C14: a clone-index outage never fails the job or drops other findings."""
+    reviews_route, _ = _mock_github(
+        reviews_url=f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews",
+        check_runs_url=f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/check-runs",
+    )
+    baseline = await _run_review_job(
+        migrated_engine,
+        _clone_registry(test_rsa_private_key_pem, clone_query=None),
+        reviews_route,
+    )
+
+    failed_open = await _run_review_job(
+        migrated_engine,
+        _clone_registry(test_rsa_private_key_pem, clone_query=_StoredCopyQuery(fail=True)),
+        reviews_route,
+    )
+
+    assert _review_shape(failed_open) == _review_shape(baseline)

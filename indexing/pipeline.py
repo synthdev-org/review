@@ -115,10 +115,21 @@ from pydantic import BaseModel, ConfigDict
 from indexing._telemetry import start_span as _shared_start_span
 from indexing._telemetry import suppress_telemetry_errors
 from indexing.chunk import ChunkLanguage, ChunkParseError, chunk_file, language_for_path
+from indexing.clone import (
+    CLONE_FINGERPRINT_VERSION,
+    CloneFileIndex,
+    CloneIndexError,
+    build_clone_index,
+)
 from indexing.embedding import EmbeddingClient, EmbeddingError
 from indexing.graph import GraphExtractionError, extract_graph
 from indexing.prefilter import filter_indexable_paths
-from indexing.repository import IndexCommitTracker, IndexingRepositoryError, IndexRepository
+from indexing.repository import (
+    CloneBackfillTracker,
+    IndexCommitTracker,
+    IndexingRepositoryError,
+    IndexRepository,
+)
 from indexing.tree import (
     RepoTreeContentFetchError,
     RepoTreeEntry,
@@ -180,6 +191,31 @@ _duration_histogram = meter.create_histogram(
     "review.indexing.duration_ms",
     unit="ms",
     description="Wall-clock duration of one indexing job, in milliseconds.",
+)
+# Clone-detection instruments (docs/plans/plan-phase-10.md Phase 2) — recorded
+# so none of these outcomes is silent: a systematic tokenizer bug, a backfill
+# that never completes, or files a backfill had to drop.
+_clone_fingerprints_written_counter = meter.create_counter(
+    "review.indexing.clone_fingerprints_written_total",
+    description="Clone-detection fingerprints written by indexing jobs.",
+)
+_clone_fingerprints_deleted_counter = meter.create_counter(
+    "review.indexing.clone_fingerprints_deleted_total",
+    description="Clone-detection fingerprints removed because their file was deleted.",
+)
+_clone_stage_failed_counter = meter.create_counter(
+    "review.indexing.clone_stage_failed_total",
+    description="Files whose clone-detection tokenization failed during indexing "
+    "(the file keeps its chunks and graph; it just has no clone data).",
+)
+_clone_backfill_counter = meter.create_counter(
+    "review.indexing.clone_backfill_total",
+    description="Clone-fingerprint backfill jobs by outcome "
+    "(complete, complete_with_drops, incomplete, superseded).",
+)
+_clone_backfill_dropped_counter = meter.create_counter(
+    "review.indexing.clone_backfill_dropped_total",
+    description="In-scope files a clone-fingerprint backfill dropped at the full-run ceilings.",
 )
 
 
@@ -264,6 +300,13 @@ class IndexingResult(BaseModel):
     chunks_created: int
     edges_created: int
     duration_seconds: float
+    fingerprints_written: int = 0
+    clone_stage_failures: int = 0
+    clone_backfill_outcome: str | None = None
+    """``None`` for a job that was not a clone-fingerprint backfill; otherwise
+    one of ``complete``, ``complete_with_drops``, ``incomplete`` (a transient
+    failure left the version unstamped) or ``superseded`` (another job
+    advanced the cursor first)."""
 
 
 class IndexingJobFailedError(Exception):
@@ -296,6 +339,12 @@ class IndexingJobDependencies:
     embedding_client: EmbeddingClient
     index_repository: IndexRepository
     commit_tracker: IndexCommitTracker
+    clone_backfill: CloneBackfillTracker | None = None
+    """The clone-fingerprint backfill state (plan Assumption 5). ``None``
+    disables the backfill entirely — a job then never reprocesses unchanged
+    files for fingerprints — which keeps every caller that predates clone
+    detection working unchanged; production wiring (``apps/worker/main.py``)
+    always passes the real tracker."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +360,14 @@ class _ResolvedFileSet:
     removed: tuple[str, ...]
     used_full_tree_fallback: bool
     tree_by_path: dict[str, RepoTreeEntry]
+    clone_backfill: bool = False
+    """Whether this ``pr_number == 0`` job is a clone-fingerprint backfill: the
+    repo's stored version is below ``CLONE_FINGERPRINT_VERSION`` (and a
+    ``CloneBackfillTracker`` is wired), so ``added_or_modified`` is every
+    in-scope path in the current tree."""
+    cursor_at_start: str | None = None
+    """The last-indexed-commit cursor this job started from — the
+    ``expected_previous_commit`` of a backfill's conditional write."""
 
 
 def _diff_trees(
@@ -354,7 +411,17 @@ async def _resolve_file_set(
     (``indexing.prefilter.filter_indexable_paths``) — an unsupported-
     language or ignored file never reaches any later stage.
     """
-    if payload.force_full_tree_fallback:
+    clone_backfill = False
+    if payload.pr_number == 0 and deps.clone_backfill is not None:
+        # A default-branch job on a repo whose clone fingerprints are missing or from an
+        # older schema version re-processes every in-scope file (plan Assumption 5).
+        stored_version = await deps.clone_backfill.get_clone_fingerprint_version(
+            repo_id=payload.repo_id
+        )
+        clone_backfill = stored_version < CLONE_FINGERPRINT_VERSION
+    use_tree_diff = payload.force_full_tree_fallback or clone_backfill
+    previous_commit_sha: str | None = None
+    if use_tree_diff:
         # Neither call's arguments depend on the other's result — run them
         # concurrently rather than paying two sequential round-trips
         # (GitHub Trees API, then Postgres) on a path that's unconditional
@@ -375,7 +442,7 @@ async def _resolve_file_set(
         )
     tree_by_path = {entry.path: entry for entry in current_tree}
 
-    if payload.force_full_tree_fallback:
+    if use_tree_diff:
         if previous_commit_sha is None:
             # No prior index exists — the degenerate "every in-scope file
             # changed" full-run case, per spec-indexing.md's Rollout &
@@ -391,6 +458,12 @@ async def _resolve_file_set(
                 commit_sha=previous_commit_sha,
             )
             added_paths, removed_paths, modified_paths = _diff_trees(current_tree, previous_tree)
+        if clone_backfill:
+            # Every in-scope path in the current tree needs fingerprints, not just the
+            # delta; deleted files are still pruned via the previous-tree diff above.
+            # Sorted so a full-run ceiling drop is reproducible (plan Assumption 5).
+            added_paths = tuple(sorted(tree_by_path))
+            modified_paths = ()
     else:
         added_paths = payload.added
         removed_paths = payload.removed
@@ -442,8 +515,10 @@ async def _resolve_file_set(
     return _ResolvedFileSet(
         added_or_modified=filter_indexable_paths(combined_added_modified),
         removed=filter_indexable_paths(removed_paths),
-        used_full_tree_fallback=payload.force_full_tree_fallback,
+        used_full_tree_fallback=use_tree_diff,
         tree_by_path=tree_by_path,
+        clone_backfill=clone_backfill,
+        cursor_at_start=previous_commit_sha,
     )
 
 
@@ -534,6 +609,23 @@ def _log_stage_failure(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _FileOutcome:
+    """One file's result, as the job loop needs it (plan Phase 2): which stage
+    (if any) failed — ``chunk``, ``graph``, ``embed`` or ``upsert`` — so the
+    backfill stamping rule can tell a transient failure from a deterministic
+    one, plus the counts to add to the job's totals. ``clone_failed`` marks a
+    tokenization failure that did *not* fail the file (it kept its chunks and
+    graph and simply has no clone data).
+    """
+
+    failed_stage: str | None = None
+    chunks_created: int = 0
+    edges_created: int = 0
+    fingerprints_written: int = 0
+    clone_failed: bool = False
+
+
 async def _process_one_added_or_modified_file(
     path: str,
     language: ChunkLanguage,
@@ -542,18 +634,25 @@ async def _process_one_added_or_modified_file(
     parsed: IndexingJobPayload,
     deps: IndexingJobDependencies,
     job_id: str,
-) -> tuple[int, int] | None:
-    """Runs one file's four isolated stages (chunk, graph, embed, upsert)
-    in strict sequence — see this module's own docstring for the full
-    per-stage isolation design. Returns ``(chunks_created, edges_created)``
-    on success, or ``None`` if any stage failed (already logged by that
-    stage's own ``except`` block) — the caller moves on to the next file
+) -> _FileOutcome:
+    """Runs one file's isolated stages (chunk, graph, clone, embed, upsert) in
+    strict sequence — see this module's own docstring for the full per-stage
+    isolation design. Returns a ``_FileOutcome``: ``failed_stage`` is set when
+    ``chunk``, ``graph``, ``embed`` or ``upsert`` failed (already logged by
+    that stage's own ``except`` block) — the caller moves on to the next file
     either way, never retrying or partially committing within this file.
 
-    ``chunk_file``/``extract_graph`` (CPU-bound Tree-sitter parsing) and
-    ``EmbeddingClient.embed`` (CPU-bound local ONNX inference) each run via
-    ``asyncio.to_thread`` — synchronous, blocking calls kept off the
-    Worker's single event loop, the same mechanism
+    The ``clone`` stage (``indexing.clone``, plan Phase 2) is the exception:
+    a ``CloneIndexError`` is logged and counted but does **not** fail the
+    file — it proceeds to ``upsert_file`` with ``clone_index=None``, which
+    removes any stale clone rows, so a tokenization problem never costs the
+    file its chunks and graph yet never leaves fingerprints for code that has
+    since changed.
+
+    ``chunk_file``/``extract_graph``/``build_clone_index`` (CPU-bound
+    Tree-sitter work) and ``EmbeddingClient.embed`` (CPU-bound local ONNX
+    inference) each run via ``asyncio.to_thread`` — synchronous, blocking
+    calls kept off the Worker's single event loop, the same mechanism
     ``adapter/github/auth.py``'s RS256 signing and
     ``adapter/analyzers/subprocess_runner.py``'s analyzer sub-steps already
     use for this exact reason.
@@ -564,7 +663,7 @@ async def _process_one_added_or_modified_file(
         _log_stage_failure(
             job_id=job_id, file_path=path, language=language, stage="chunk", error=exc
         )
-        return None
+        return _FileOutcome(failed_stage="chunk")
 
     try:
         graph_result = await asyncio.to_thread(extract_graph, language, path, chunk_result.tree)
@@ -572,7 +671,19 @@ async def _process_one_added_or_modified_file(
         _log_stage_failure(
             job_id=job_id, file_path=path, language=language, stage="graph", error=exc
         )
-        return None
+        return _FileOutcome(failed_stage="graph")
+
+    clone_index: CloneFileIndex | None = None
+    clone_failed = False
+    try:
+        clone_index, _tokens = await asyncio.to_thread(
+            build_clone_index, language, path, chunk_result.tree
+        )
+    except CloneIndexError as exc:
+        clone_failed = True
+        _log_stage_failure(
+            job_id=job_id, file_path=path, language=language, stage="clone", error=exc
+        )
 
     try:
         texts = tuple(chunk.content for chunk in chunk_result.chunks)
@@ -581,7 +692,7 @@ async def _process_one_added_or_modified_file(
         _log_stage_failure(
             job_id=job_id, file_path=path, language=language, stage="embed", error=exc
         )
-        return None
+        return _FileOutcome(failed_stage="embed")
 
     try:
         await deps.index_repository.upsert_file(
@@ -592,14 +703,20 @@ async def _process_one_added_or_modified_file(
             embeddings=embeddings,
             nodes=graph_result.nodes,
             edges=graph_result.edges,
+            clone_index=clone_index,
         )
     except IndexingRepositoryError as exc:
         _log_stage_failure(
             job_id=job_id, file_path=path, language=language, stage="upsert", error=exc
         )
-        return None
+        return _FileOutcome(failed_stage="upsert")
 
-    return len(chunk_result.chunks), len(graph_result.edges)
+    return _FileOutcome(
+        chunks_created=len(chunk_result.chunks),
+        edges_created=len(graph_result.edges),
+        fingerprints_written=len(clone_index.fingerprints) if clone_index is not None else 0,
+        clone_failed=clone_failed,
+    )
 
 
 async def run_indexing_job(
@@ -683,6 +800,10 @@ async def run_indexing_job(
             job_id=job_id,
         )
         files_skipped = len(file_set.added_or_modified) - len(added_or_modified)
+        # Files a clone-fingerprint backfill had to drop at the full-run
+        # ceilings: stamped anyway (blocking the stamp would re-run a full job
+        # on every push forever) but counted, so a partial backfill is visible.
+        backfill_ceiling_dropped = files_skipped if file_set.clone_backfill else 0
 
         entries = [
             file_set.tree_by_path[path]
@@ -731,12 +852,25 @@ async def run_indexing_job(
         files_failed = 0
         chunks_created = 0
         edges_created = 0
+        fingerprints_written = 0
+        fingerprints_deleted = 0
+        clone_stage_failures = 0
+        # Plan Assumption 5's stamping rule: only a *transient* failure (the
+        # whole-batch content fetch, a per-file upsert, or either delete site —
+        # network and database errors) leaves a backfill unstamped so the next
+        # push retries it. chunk/graph/clone/embed failures are deterministic
+        # for a given file, so they are counted, never retried forever.
+        transient_failed = content_fetch_error is not None
+        deterministic_failures = 0
 
         with _start_span("review.indexing.stage.process_files"):
             for path in added_or_modified:
                 entry = file_set.tree_by_path.get(path)
                 if entry is None:
                     files_skipped += 1
+                    # A backfilled file we cannot read has no fingerprints: count it
+                    # as a drop so the outcome never reads as a clean `complete`.
+                    backfill_ceiling_dropped += int(file_set.clone_backfill)
                     continue
                 if entry.mode in (_SYMLINK_MODE, _SUBMODULE_MODE):
                     # A path can flip from a regular file to a symlink/submodule
@@ -746,11 +880,12 @@ async def run_indexing_job(
                     # they persist indefinitely, since no other loop ever revisits
                     # a path that isn't in `file_set.removed`.
                     try:
-                        await deps.index_repository.delete_file(
+                        fingerprints_deleted += await deps.index_repository.delete_file(
                             repo_id=parsed.repo_id, pr_number=parsed.pr_number, file_path=path
                         )
                     except IndexingRepositoryError as exc:
                         files_failed += 1
+                        transient_failed = True
                         _log_stage_failure(
                             job_id=job_id, file_path=path, language=None, stage="delete", error=exc
                         )
@@ -770,6 +905,7 @@ async def run_indexing_job(
                         )
                     else:
                         files_skipped += 1
+                        backfill_ceiling_dropped += int(file_set.clone_backfill)
                         logger.info(
                             "index job: file skipped (no content available)",
                             extra={"job_id": job_id, "file_path": path},
@@ -786,19 +922,25 @@ async def run_indexing_job(
                 outcome = await _process_one_added_or_modified_file(
                     path, language, content, parsed=parsed, deps=deps, job_id=job_id
                 )
-                if outcome is None:
+                if outcome.failed_stage is not None:
                     files_failed += 1
+                    if outcome.failed_stage == "upsert":
+                        transient_failed = True
+                    else:
+                        deterministic_failures += 1
                     continue
 
-                chunk_count, edge_count = outcome
-                chunks_created += chunk_count
-                edges_created += edge_count
+                chunks_created += outcome.chunks_created
+                edges_created += outcome.edges_created
+                fingerprints_written += outcome.fingerprints_written
+                if outcome.clone_failed:
+                    clone_stage_failures += 1
                 files_processed += 1
 
         with _start_span("review.indexing.stage.delete_removed_files"):
             for path in file_set.removed:
                 try:
-                    await deps.index_repository.delete_file(
+                    fingerprints_deleted += await deps.index_repository.delete_file(
                         repo_id=parsed.repo_id, pr_number=parsed.pr_number, file_path=path
                     )
                 except IndexingRepositoryError as exc:
@@ -806,15 +948,43 @@ async def run_indexing_job(
                         job_id=job_id, file_path=path, language=None, stage="delete", error=exc
                     )
                     files_failed += 1
+                    transient_failed = True
                     continue
                 files_processed += 1
 
+        backfill_outcome: str | None = None
         if parsed.pr_number == 0:
             with _start_span("review.indexing.stage.advance_cursor"):
                 try:
-                    await deps.commit_tracker.set_last_indexed_commit(
-                        repo_id=parsed.repo_id, commit_sha=parsed.commit_sha
-                    )
+                    if file_set.clone_backfill and deps.clone_backfill is not None:
+                        if transient_failed:
+                            # Cursor still advances (today's behavior) but the
+                            # version stays stale, so the next push re-backfills.
+                            await deps.commit_tracker.set_last_indexed_commit(
+                                repo_id=parsed.repo_id, commit_sha=parsed.commit_sha
+                            )
+                            backfill_outcome = "incomplete"
+                        else:
+                            advanced = await deps.clone_backfill.advance_cursor_with_clone_version(
+                                repo_id=parsed.repo_id,
+                                commit_sha=parsed.commit_sha,
+                                expected_previous_commit=file_set.cursor_at_start,
+                                clone_version=CLONE_FINGERPRINT_VERSION,
+                            )
+                            if not advanced:
+                                backfill_outcome = "superseded"
+                            elif (
+                                backfill_ceiling_dropped
+                                or deterministic_failures
+                                or clone_stage_failures
+                            ):
+                                backfill_outcome = "complete_with_drops"
+                            else:
+                                backfill_outcome = "complete"
+                    else:
+                        await deps.commit_tracker.set_last_indexed_commit(
+                            repo_id=parsed.repo_id, commit_sha=parsed.commit_sha
+                        )
                 except IndexingRepositoryError as exc:
                     logger.error(
                         "index job: failed to advance last-indexed-commit cursor",
@@ -835,6 +1005,9 @@ async def run_indexing_job(
             chunks_created=chunks_created,
             edges_created=edges_created,
             duration_seconds=duration_seconds,
+            fingerprints_written=fingerprints_written,
+            clone_stage_failures=clone_stage_failures,
+            clone_backfill_outcome=backfill_outcome,
         )
 
         # Guarded: the job itself already completed successfully by this
@@ -854,6 +1027,31 @@ async def run_indexing_job(
             _chunks_created_counter.add(result.chunks_created)
             _edges_created_counter.add(result.edges_created)
             _duration_histogram.record(result.duration_seconds * 1000)
+            _clone_fingerprints_written_counter.add(result.fingerprints_written)
+            _clone_fingerprints_deleted_counter.add(fingerprints_deleted)
+            _clone_stage_failed_counter.add(result.clone_stage_failures)
+            if backfill_outcome is not None:
+                _clone_backfill_counter.add(1, {"outcome": backfill_outcome})
+                _clone_backfill_dropped_counter.add(backfill_ceiling_dropped)
+
+        # A tokenizer bug that fails a large share of files would otherwise
+        # empty the clone index quietly (the files keep their chunks).
+        # A clone-stage failure does not fail the file, so it is already counted
+        # in files_processed.
+        if (
+            clone_stage_failures
+            and files_processed
+            and clone_stage_failures / files_processed > FAILURE_RATIO_WARNING_THRESHOLD
+        ):
+            logger.error(
+                "index job: clone-detection tokenization failed for a large share of files",
+                extra={
+                    "job_id": job_id,
+                    "repo_id": str(parsed.repo_id),
+                    "clone_stage_failures": clone_stage_failures,
+                    "files_processed": files_processed,
+                },
+            )
 
         ratio_exceeded = files_failed > 0 and (
             files_processed == 0
@@ -874,6 +1072,10 @@ async def run_indexing_job(
                 "files_failed": files_failed,
                 "chunks_created": chunks_created,
                 "edges_created": edges_created,
+                "fingerprints_written": fingerprints_written,
+                "clone_stage_failures": clone_stage_failures,
+                "clone_backfill_outcome": backfill_outcome,
+                "clone_backfill_dropped": backfill_ceiling_dropped,
                 "duration_seconds": duration_seconds,
             },
         )

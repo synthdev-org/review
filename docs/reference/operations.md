@@ -541,3 +541,147 @@ applying.
    per-path contents lookup is the known follow-up); do not chase it.
 3. Nothing needs disabling: a fallback never fails a job. Only disable an engine if its
    own `failed`/`timeout` series is the problem.
+
+## Clone detection: switches, backfill load, rollback, alerts
+
+Context: [`docs/specs/spec-clone-detection.md`](../specs/spec-clone-detection.md) and
+[`docs/plans/plan-phase-10.md`](../plans/plan-phase-10.md). The `clone_detection` review step flags
+code a PR copies from the default branch (or from another file in the same PR) as a `low`-severity
+inline comment naming both locations. It compares normalized token fingerprints stored by indexing,
+so it makes no LLM call and needs no extra service.
+
+### Settings
+
+All five are Worker settings, mirrored one-for-one in Compose (`.env`) and Helm
+(`worker.cloneDetection.*`):
+
+| Env var (`REVIEW_WORKER_CLONE_DETECTION_`) | Helm value | Default | Notes |
+| --- | --- | --- | --- |
+| `ENABLED` | `enabled` | `true` | Kill switch for the review step only. Fingerprint writing during indexing is not gated by it. |
+| `STEP_TIMEOUT_SECONDS` | `stepTimeoutSeconds` | `30` | Must exceed 5: the step fails open after `value - 5` seconds, inside the registry timeout. |
+| `MIN_TOKENS` | `minTokens` | `100` | **Must be >= 100**, else the Worker fails startup. See below. |
+| `MIN_LINES` | `minLines` | `10` | A duplicated region shorter than this is not reported. |
+| `MAX_FINDINGS` | `maxFindings` | `5` | Per-job cap on clone comments. |
+
+The default is **on in code**, so reverting only the Helm values file does nothing once the Worker
+image ships; set `enabled: false` explicitly. For a quiet rollout set it to `false` before upgrading.
+
+**Why `MIN_TOKENS >= 100`.** Fingerprints are winnowed with gram size 25 and window 76, which
+guarantees that any duplicated run of at least 100 normalized tokens shares a stored fingerprint. That
+guarantee is baked into stored data, so `MIN_TOKENS` can be raised (a post-filter) but not lowered below
+100 without bumping `CLONE_FINGERPRINT_VERSION` in `indexing/clone.py` with new `K`/`W` and
+re-fingerprinting every repo.
+
+The Memory dismissal check (an approved dismissal suppresses a recurring clone finding) shares the one
+`REVIEW_WORKER_MEMORY_SUPPRESSION_ENABLED` flag with LLM-finding suppression: turning it off disables
+both.
+
+### Upgrade order: migrate first
+
+The chart has no migration Job or hook. Run `alembic upgrade head` (migration `0011` adds
+`index_clone_file`, `index_clone_fingerprint` and `repo.clone_fingerprint_version`) **before**
+`helm upgrade`, exactly as in "Upgrading via Helm when this release includes new migrations" above.
+Skipping it is now louder than before: the new Worker reads `repo.clone_fingerprint_version`, so its
+index jobs crash against the old schema.
+
+### Backfill: the first push per repo
+
+Existing repos have no fingerprints. The first default-branch push after the upgrade finds
+`repo.clone_fingerprint_version` below the current version (`1`) and runs the index job as a **full
+re-index of every in-scope file** (full-run ceilings: 20,000 files / 2 GB), re-chunking and re-embedding
+as well as fingerprinting. Expect one full-run-sized job per repo. Until it completes the review step
+finds no default-branch matches for that repo (in-PR duplicates are still found); that is a normal
+state, not an error. To defer the load, run with `REVIEW_WEBHOOK_API_INDEXING_ENABLED=false` (the
+code and Compose default). The Helm chart does not render this setting, so on Helm indexing is off,
+no index job is enqueued and the backfill does not run at all until an operator enables indexing by
+some other means (the chart has no extra-environment mechanism today). A backfill with a transient failure (GitHub fetch or database write)
+leaves the version unstamped and the next default-branch push retries it. Files dropped by the ceilings
+and tokenizer (`clone` stage) failures are deterministic: they are counted and the version is stamped,
+so a repo larger than the ceilings is permanently partly covered (visible as a nonzero
+`clone_backfill_dropped_total`), the same limit the initial index has.
+
+**Storage.** Measured on the fixture corpus: sampled fingerprints are about 1.9 % of tokens (the design
+figure is 2.6 %), at roughly 12 B plus index entry per row, and the per-file token-hash and line-map
+arrays cost about 4 B per token, roughly the source size, or about 4 MB per million tokens. Plan
+for a few MB of Postgres per 100 KLOC of default-branch code. Tokenize-and-fingerprint costs about
+0.45 ms of CPU per file, roughly doubling the Tree-sitter-side CPU of indexing; embedding still dominates
+a backfill's wall time.
+
+### Release note: stuck-job threshold
+
+`stuck_job_warning_threshold_seconds` must be at least the sum of the macro-step timeouts, which grows
+from 515 s to **545 s** with the 30 s `clone_detection` step. The 600 s default still holds, but an
+operator override between 515 and 545 now fails Worker startup (check the startup log); raise it, or
+lower `REVIEW_WORKER_CLONE_DETECTION_STEP_TIMEOUT_SECONDS`.
+
+### Rolling back
+
+1. Set `REVIEW_WORKER_CLONE_DETECTION_ENABLED=false` (`worker.cloneDetection.enabled: false`) and
+   restart the Workers. This alone stops all clone comments and needs no data change.
+2. If you also revert to a Worker image that predates this feature, note that old code never touches
+   the clone tables: files changed or deleted while it runs leave stale fingerprints, and a later
+   roll-forward would not repair them (the version is already stamped). Before the next roll-forward,
+   once **every old Worker has drained** (scale old Workers to zero and wait for
+   `SELECT count(*) FROM job_queue WHERE status = 'claimed';` to reach 0), force a re-backfill:
+
+   ```sql
+   UPDATE repo SET clone_fingerprint_version = 0 WHERE clone_fingerprint_version <> 0;
+   ```
+
+   Running it earlier is useless: a still-running old Worker keeps leaving stale rows behind the reset.
+   The next default-branch push per repo then re-fingerprints it in full.
+
+No down-migration is needed for safety: old code ignores the new tables and column.
+
+### Alerts and a stale-repo query
+
+Metric names are the OpenTelemetry names with dots as underscores, as on the dashboard (for example
+`review_indexing_files_processed_total`).
+
+- Stuck backfill (jobs ending `incomplete` repeatedly):
+  `increase(review_indexing_clone_backfill_total{outcome="incomplete"}[6h]) > 3`
+- Files a backfill dropped at the full-run ceilings:
+  `increase(review_indexing_clone_backfill_dropped_total[1d]) > 0`
+- Tokenizer failures, as a share of every file that reached the clone stage (a fifth is the threshold):
+  `rate(review_indexing_clone_stage_failed_total[1h]) / (rate(review_indexing_files_processed_total[1h]) + rate(review_indexing_clone_stage_failed_total[1h])) > 0.2`
+- The step failing open (query, content fetch or timeout):
+  `sum(rate(review_clone_detection_outcome_total{outcome=~"failed_open_.*"}[1h])) / sum(rate(review_clone_detection_outcome_total[1h])) > 0.2`
+
+`incomplete` only emits when a job runs, so a repo that never gets another default-branch push is
+invisible to the first rule. Count repos still awaiting backfill directly (replace `1` with the current
+`CLONE_FINGERPRINT_VERSION`):
+
+```sql
+SELECT count(*) FROM repo WHERE clone_fingerprint_version < 1;
+```
+
+### Limits and trust assumptions
+
+- **Trust assumption.** A clone comment discloses a default-branch file path and line range to anyone who
+  can read the PR, and the step acts as an oracle: any PR author can learn whether near-identical code
+  exists on the default branch. This is acceptable only because the PR author is assumed to have read
+  access to the repo (one customer's own repos). An author with narrower access (a fork author on a
+  private repo, a restricted-path setup) would learn paths they cannot read. Messages contain paths and
+  integers only, never source text.
+- **Non-default base branches.** A PR into a release or gathering branch is compared against the
+  default-branch index only. Duplication of code that exists only on the base branch is not found, and
+  code removed on the base branch can still match.
+- **Background work after a timeout.** Parsing runs in a worker thread (`asyncio.to_thread`), which
+  `wait_for` cannot cancel. After a `failed_open_timeout` the parse may keep running in the background
+  until it finishes; it is bounded by the blob-size ceiling and holds no database resources.
+
+### Noisy or wrong findings
+
+Disable the step (`ENABLED=false`, restart the Workers); no rebuild or data change is needed, and
+indexing keeps fingerprinting so re-enabling is instant. Before disabling, try raising `MIN_TOKENS` or
+`MIN_LINES`, or lowering `MAX_FINDINGS`, and have reviewers dismiss repeats: an approved dismissal
+suppresses the same clone pair on later pushes (line shifts do not defeat it), and a dismissal for one
+pair never suppresses a different pair. Check the `review_clone_detection_outcome_total` outcomes
+(`completed`, `no_matches`, `no_eligible_files`, `failed_open_*`) to tell "no matches" from "not
+working". `no_matches` cannot distinguish an un-backfilled index from a PR with no duplicates; read
+backfill coverage from `review_indexing_clone_backfill_total{outcome="complete"}` instead. For a slow
+or timed-out step, `review_clone_detection_phase_duration_ms` shows which phase (`fetch_content`,
+`prepare`, `find_candidates`, `load_files`, `match`, `memory_suppression`) is responsible;
+`candidate_cap_dropped_total{reason}` shows which fan-out cap is firing; `files_skipped_total{reason="unparseable"}`
+rising points at a parser bug; a non-zero `memory_suppression_failed_total` means dismissed clone
+findings are being re-posted because the Memory check is failing.

@@ -249,11 +249,13 @@ class _Unit:
     enclosing: Node | None
 
 
-def chunk_file(language: ChunkLanguage, path: str, content: bytes) -> ChunkResult:
+def parse_file(language: ChunkLanguage, path: str, content: bytes) -> Tree:
     """Parse ``content`` (one file's raw bytes, at ``path``, in
-    ``language``) and split it into ``Chunk``s at real syntactic
-    boundaries — see this module's own docstring for the full design.
-    Raises ``ChunkParseError`` on failure.
+    ``language``) into a Tree-sitter ``Tree`` without chunking it — the
+    parse ``chunk_file`` itself starts from, extracted so a caller that only
+    needs the tree (``review.clone_detection``'s tokenizer, which has no use
+    for chunks) doesn't pay for chunking. Raises ``ChunkParseError`` on
+    invalid UTF-8 or a parser failure.
     """
 
     try:
@@ -268,8 +270,21 @@ def chunk_file(language: ChunkLanguage, path: str, content: bytes) -> ChunkResul
         ) from exc
 
     try:
-        parser = Parser(_LANGUAGES[language])
-        tree = parser.parse(content)
+        return Parser(_LANGUAGES[language]).parse(content)
+    except Exception as exc:
+        raise ChunkParseError(file_path=path, language=language, detail=str(exc)) from exc
+
+
+def chunk_file(language: ChunkLanguage, path: str, content: bytes) -> ChunkResult:
+    """Parse ``content`` (one file's raw bytes, at ``path``, in
+    ``language``) and split it into ``Chunk``s at real syntactic
+    boundaries — see this module's own docstring for the full design.
+    Raises ``ChunkParseError`` on failure.
+    """
+
+    tree = parse_file(language, path, content)
+
+    try:
         chunks = _build_chunks(tree.root_node, language=language, path=path, content=content)
     except ChunkParseError:
         raise

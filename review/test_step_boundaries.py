@@ -99,6 +99,12 @@ _FRAMEWORK_MODULES = frozenset(
         # changed-line hunk parsing); no `Step` of their own.
         "file_matchers",
         "changed_lines",
+        # Pure helper of the clone_detection step (new-code filter, grouping, cap,
+        # message); no `Step` of its own.
+        "clone_regions",
+        # Pure helper shared by verification and clone_detection (Memory similarity
+        # suppression); no `Step` of its own.
+        "memory_suppression",
     }
 )
 

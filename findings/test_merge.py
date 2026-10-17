@@ -278,3 +278,28 @@ def test_new_static_sources_need_no_special_casing_in_merge(source: str) -> None
     ]
     late = _finding(line=999, message=f"{source} late", severity="medium", source=source)
     assert merge_findings([*llm_findings, late]).findings[0] == late
+
+
+def test_us_c13_clone_detection_sorts_last_at_equal_severity_across_120_mixed_findings() -> None:
+    """US-C13: over the ceiling, clone findings drop first at equal severity
+    while high severity and security-class survivors are untouched."""
+    high_clone = _finding(
+        line=1000, message="high clone", severity="high", source="clone_detection"
+    )
+    secret = _finding(line=1001, message="a secret", severity="critical", source="gitleaks")
+    mediums = [
+        _finding(line=i, message=f"medium issue {i}", severity="medium", source="llm")
+        for i in range(60)
+    ]
+    # Clones arrive *before* the medium llm findings so original order cannot save them.
+    clones = [
+        _finding(line=2000 + i, message=f"dup {i}", severity="medium", source="clone_detection")
+        for i in range(58)
+    ]
+
+    result = merge_findings([*clones, high_clone, secret, *mediums])  # 120 findings
+
+    assert result.dropped_by_ceiling_count == 20
+    assert result.findings[:2] == [secret, high_clone]
+    assert result.findings[2:62] == mediums
+    assert result.findings[62:] == clones[:38]

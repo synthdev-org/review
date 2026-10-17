@@ -388,6 +388,24 @@ aspirational design.
   span attribute or log field. `review/test_context_builder_step.py`
   asserts the attribute set against this table with an in-memory reader.
 
+**Clone-detection instruments (added by
+[`plan-phase-10.md`](../plans/plan-phase-10.md) Phase 4/2/7; stories US-C14 and
+US-C3 in [`spec-clone-detection.md`](spec-clone-detection.md)).** Registered with
+literal names in `review/clone_detection.py` and `indexing/pipeline.py`, covered by
+the US13 dashboard drift guard and shown in the "Clone detection" dashboard row. Fixed,
+reviewed allow-list; no path, code or message is ever an attribute:
+
+| Signal | Name | Attributes (closed sets) |
+| --- | --- | --- |
+| Counter | `review.clone_detection.outcome_total` | `outcome` ∈ {`completed`, `no_matches`, `no_eligible_files`, `failed_open_query`, `failed_open_content`, `failed_open_timeout`} |
+| Histogram | `review.clone_detection.duration_ms` | `outcome` (same set) |
+| Histogram | `review.clone_detection.phase_duration_ms` | `phase` ∈ {`fetch_content`, `prepare`, `find_candidates`, `load_files`, `match`, `memory_suppression`}; recorded even when the phase raises or the step times out |
+| Counter | `review.clone_detection.candidate_cap_dropped_total` | `reason` ∈ {`files`, `per_hash`, `candidate_files`} |
+| Counter | `review.clone_detection.files_skipped_total` | `reason` ∈ {`unparseable`, `no_content`} |
+| Counter | `review.clone_detection.candidates_total`, `.filtered_total`, `.findings_total`, `.memory_suppressed_total`, `.cap_dropped_total`, `.memory_suppression_failed_total` | none |
+| Counter | `review.indexing.clone_fingerprints_written_total`, `.clone_fingerprints_deleted_total`, `.clone_stage_failed_total`, `.clone_backfill_dropped_total` | none |
+| Counter | `review.indexing.clone_backfill_total` | `outcome` ∈ {`complete`, `complete_with_drops`, `incomplete`, `superseded`} |
+
 **Citation-quality and config-write counters (post-Phase 7 addition).**
 Registered with literal names, covered by the US13 dashboard drift guard:
 

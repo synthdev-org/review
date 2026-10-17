@@ -1030,3 +1030,22 @@ def test_config_skip_is_counted_only_when_the_repo_config_was_not_honored(
     assert _counter_points(metric_reader, "review.static_analysis.config_skipped_total") == {
         (("analyzer_name", "ruff"), ("reason", "rejected_by_tool")): 1
     }
+
+
+# --- Phase 10 / Phase 6: clone_detection sorts last at the ceiling ----------
+
+
+@pytest.mark.asyncio
+async def test_us_c13_ceiling_drops_clone_detection_first_at_equal_severity() -> None:
+    # clone_detection is not a registered analyzer today; the sort calls the
+    # shared `source_rank`, so a clone finding arriving early still drops first.
+    lint = _RecordingAnalyzer(
+        [_finding("clone_detection", 1, "medium")]
+        + [_finding("ruff", i, "medium") for i in range(2, REDACTION_FINDING_CEILING + 2)]
+    )
+    step, diff = _fake_step([AnalyzerRegistration("ruff", lint)], {"a.py": b"x"})
+
+    output = await step.run(_FakePrefilterOutput(diff=diff), _context())
+
+    assert len(output.findings) == REDACTION_FINDING_CEILING
+    assert all(f.source == "ruff" for f in output.findings)

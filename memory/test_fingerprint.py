@@ -31,3 +31,15 @@ def test_fingerprint_differs_when_any_field_differs() -> None:
     assert base != build_finding_fingerprint(file="b.py", rule_id="R1", message="m")
     assert base != build_finding_fingerprint(file="a.py", rule_id="R2", message="m")
     assert base != build_finding_fingerprint(file="a.py", rule_id="R1", message="n")
+
+
+def test_clone_message_fingerprint_is_the_unnormalized_text() -> None:
+    """Phase 10 evidence gate: shifted line ranges already embed above the threshold, so no
+    normalizer exists and a duplication message is composed like any other."""
+    message = (
+        "Duplicates 24 lines of `b.py` (lines 40\N{EN DASH}63); consider extracting shared code."
+    )
+    assert (
+        build_finding_fingerprint(file="a.py", rule_id="duplication", message=message)
+        == f"a.py\nduplication\n{message}"
+    )
