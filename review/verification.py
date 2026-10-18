@@ -205,6 +205,8 @@ class _VerificationInput(JobIdentity):
     diff: Diff
     findings: list[Finding] = Field(default_factory=list)
     context_bundle: ContextBundle | None = None
+    # Phase 12: carried forward unchanged for the walkthrough step.
+    intent_summary: str | None = None
 
 
 class VerificationOutput(JobIdentity):
@@ -222,6 +224,10 @@ class VerificationOutput(JobIdentity):
     findings: list[Finding]
     head_sha: str
     context_bundle: ContextBundle | None = None
+    # Phase 12: carried forward for the walkthrough step; `reviewed_diff` is the diff
+    # this step judged, named apart from `diff` so fix_generation's fetch is untouched.
+    intent_summary: str | None = None
+    reviewed_diff: Diff | None = None
 
 
 def _pass_through_job_fields(parsed: _VerificationInput) -> dict[str, Any]:
@@ -232,7 +238,12 @@ def _pass_through_job_fields(parsed: _VerificationInput) -> dict[str, Any]:
     end-of-method return alike) — extracted so a future field addition
     doesn't have to be kept in sync by hand across two call sites.
     """
-    return {**job_identity_fields(parsed), "context_bundle": parsed.context_bundle}
+    return {
+        **job_identity_fields(parsed),
+        "context_bundle": parsed.context_bundle,
+        "intent_summary": parsed.intent_summary,
+        "reviewed_diff": parsed.diff,
+    }
 
 
 def _render_candidate_findings(findings: list[Finding]) -> str:

@@ -8,7 +8,16 @@ phishing/notification-spam vector, not just a rendering nit.
 
 from __future__ import annotations
 
-from findings.markdown import escape_markdown, suggestion_block
+import re
+
+import pytest
+
+from findings.markdown import (
+    escape_markdown,
+    neutralize_prose,
+    strip_display_text,
+    suggestion_block,
+)
 
 
 def test_code_fence_backticks_are_escaped() -> None:
@@ -106,3 +115,75 @@ def test_suggestion_block_fence_outgrows_backticks_in_the_replacement() -> None:
 
 def test_suggestion_block_content_is_not_escaped() -> None:
     assert "<b>@user [x](y)</b>" in suggestion_block("<b>@user [x](y)</b>")
+
+
+# --- neutralize_prose (walkthrough prose pipeline) ---------------------------
+
+ZWSP = "\u200b"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["fixes #123", "see owner/repo#123", "GH-123", "gh-9", "&#35;123", r"\#123"],
+)
+def test_neutralize_prose_breaks_issue_references(text: str) -> None:
+    out = neutralize_prose(text)
+
+    assert "#123" not in out and "#9" not in out
+    assert "GH-123" not in out and "GH\\-123" not in out
+
+
+def test_neutralize_prose_breaks_hex_runs_and_keeps_short_words() -> None:
+    out = neutralize_prose("commit abcdef1234567890 and cafe")
+
+    assert "abcdef1234567890" not in out
+    assert out.startswith("commit abcdef" + ZWSP)
+    assert out.endswith("and cafe")
+    assert max(len(run) for run in re.findall(r"[0-9a-f]+", out)) < 7
+
+
+def test_neutralize_prose_breaks_urls_www_email_and_mentions() -> None:
+    out = neutralize_prose(
+        "http://evil.example www.evil.example me@evil.example @org/team &#64;user"
+    )
+
+    assert "://" not in out
+    assert "www." not in out
+    assert "@e" not in out and "@o" not in out
+    assert "&#64;" not in out
+
+
+def test_neutralize_prose_escapes_ampersand_once() -> None:
+    assert neutralize_prose("a & <b>") == "a &amp; &lt;b&gt;"
+
+
+def test_neutralize_prose_strips_hostile_characters_but_keeps_its_own_zwsp() -> None:
+    out = neutralize_prose("a\u202eb\u200bc\ud800 #1\nnext\x00")
+
+    assert "\u202e" not in out and "\ud800" not in out and "\x00" not in out
+    assert "\n" not in out
+    assert f"\\#{ZWSP}1" in out
+    assert out.count(ZWSP) == 1
+
+
+def test_neutralize_prose_collapses_whitespace_so_nothing_injects_structure() -> None:
+    out = neutralize_prose("x\n\n## Heading\n<!-- review-walkthrough:v1 -->\n---")
+
+    assert "\n" not in out
+    assert "<!--" not in out
+
+
+def test_strip_display_text_is_idempotent_and_collapses() -> None:
+    once = strip_display_text("  a \t b\u2028c\u202e ")
+
+    assert once == "a b c"
+    assert strip_display_text(once) == once
+
+
+def test_escape_markdown_is_unchanged_for_hex_and_references() -> None:
+    # The walkthrough-only breaking must not leak into finding messages.
+    assert escape_markdown("abcdef1234567 #12") == r"abcdef1234567 \#12"
+
+
+def test_escape_markdown_leaves_tilde_unchanged() -> None:
+    assert escape_markdown("~/x ~~y~~") == "~/x ~~y~~"

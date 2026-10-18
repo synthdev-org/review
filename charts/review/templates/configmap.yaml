@@ -87,6 +87,11 @@ data:
   REVIEW_WORKER_FIX_GENERATION_MAX_RANGE_LINES: {{ .Values.worker.fixGeneration.maxRangeLines | quote }}
   REVIEW_WORKER_FIX_GENERATION_MAX_REPLACEMENT_LINES: {{ .Values.worker.fixGeneration.maxReplacementLines | quote }}
   REVIEW_WORKER_FIX_GENERATION_WINDOW_LINES: {{ .Values.worker.fixGeneration.windowLines | quote }}
+  REVIEW_WORKER_WALKTHROUGH_ENABLED: {{ .Values.worker.walkthrough.enabled | quote }}
+  REVIEW_WORKER_WALKTHROUGH_STEP_TIMEOUT_SECONDS: {{ .Values.worker.walkthrough.stepTimeoutSeconds | quote }}
+  REVIEW_WORKER_WALKTHROUGH_MIN_FILES: {{ .Values.worker.walkthrough.minFiles | quote }}
+  REVIEW_WORKER_WALKTHROUGH_MAX_FILES: {{ .Values.worker.walkthrough.maxFiles | quote }}
+  REVIEW_WORKER_WALKTHROUGH_MAX_CHARS: {{ .Values.worker.walkthrough.maxChars | quote }}
 
   # --- Product knowledge (non-secret; the token map is in secret.yaml) ---
   REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED: {{ .Values.productKnowledge.enabled | quote }}

@@ -121,6 +121,43 @@ rule applies unchanged.
   by ID, formatting it, and logging on an unknown ID or a missing
   `line_range` all perform no I/O of their own; `render_citation` never
   reads a `Chunk`'s content or talks to Postgres itself).
+- Phase 1 of `docs/plans/plan-phase-12.md` (this ADR's scope extended by that
+  phase's own PR, not a second ADR): `review/walkthrough_render.py` —
+  `parse_walkthrough_response`, `reconcile_files`, `prepare_display`,
+  `redact_all` (and its `redact_for_display` wrapper; the sentinel join, split
+  and count/nonce checks, against a fake `TextRedactor` with no subprocess),
+  `render_comment` and the `WalkthroughPublisher` Protocol's data model — and
+  `findings/markdown.py`'s `strip_display_text` and `neutralize_prose`
+  (`review/test_walkthrough_render.py`, `findings/test_markdown.py`). All are
+  deterministic string/model transformations; the real Gitleaks round trip is
+  proven in `adapter/analyzers/test_gitleaks.py` and the story-level behavior by
+  the Phase 2 and 4 integration tests.
+- Phase 3 of `docs/plans/plan-phase-12.md` (this ADR's scope extended by that
+  phase's own PR, not a second ADR): `review/config.py`'s
+  `walkthrough_can_produce_value` and the `walkthrough` entries of
+  `resolve_review_pipeline_depends_on`, `check_step_configuration_viable` and
+  both `as_mapping()` methods, plus `apps/worker/settings.py`'s
+  `_walkthrough_settings_are_valid` and the conditional stuck-job sum —
+  `review/test_config.py` and `apps/worker/test_settings.py`, against
+  hand-built `StepEnablement` / environment fixtures (pure boolean, dict and
+  bounds logic over already-constructed config objects, the same shape as the
+  sibling `*_can_produce_value` predicates and `_fix_generation_settings_are_valid`).
+- Phase 4 of `docs/plans/plan-phase-12.md` (this ADR's scope extended by that
+  phase's own PR, not a second ADR): `review/walkthrough.py`'s pure helpers
+  `reviewable_files` (the file count behind the `min_files` check),
+  `_change_counts`, `build_user_content` (bounded, delimited prompt assembly) and
+  `_failure_outcome` (exception-and-stage to outcome mapping) —
+  `review/test_walkthrough_helpers.py`. The step itself (LLM call, redaction,
+  publish, timeouts, telemetry) is I/O and stays Integration tier in
+  `review/test_walkthrough_step.py`.
+- Phase 2 of `docs/plans/plan-phase-12.md` (this ADR's scope extended by that
+  phase's own PR, not a second ADR): `adapter/github/walkthrough.py`'s
+  `is_platform_comment` — the fail-closed comment-identity predicate (App id
+  compared with `type(x) is int`, marker as first body line, fixed footer line)
+  over an already-parsed comment dict, parametrized in
+  `adapter/github/test_walkthrough_posting.py`. The surrounding publisher
+  (pagination, create/edit/dedupe) is I/O and stays Integration tier against
+  `respx` cassettes in that same file.
 - Phase 5 of `docs/plans/plan-deliver-verification-pipeline.md` (this ADR's
   scope extended by that phase's own PR, not a second ADR):
   `review/config.py`'s `resolve_review_pipeline_depends_on` (Assumption 6's

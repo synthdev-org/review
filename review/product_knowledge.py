@@ -40,6 +40,8 @@ from urllib.parse import SplitResult, quote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+from findings.markdown import STRIP_CATEGORIES
+
 __all__ = [
     "CONTRACT_VERSION",
     "FETCH_CONTENT_MAX_CHARS",
@@ -440,7 +442,7 @@ def formulate_query(title: str | None, issue_keys: Sequence[str]) -> str | None:
 
 # Cs (lone surrogates) cannot be UTF-8 encoded, so they would crash URL quoting
 # and the JSON body of a posted comment; Co (private use) is never meaningful.
-_STRIP_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
+_STRIP_CATEGORIES: Final = STRIP_CATEGORIES
 _HOST_RE: Final = re.compile(r"^(?:[A-Za-z0-9._-]+|[0-9A-Fa-f:.]+)$")
 # Percent-encoding everything outside this set also encodes ``( ) [ ] < > "``
 # and space, so a URL can never terminate a Markdown ``[t](url)`` destination.

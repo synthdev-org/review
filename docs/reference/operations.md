@@ -809,3 +809,157 @@ Metric names are the OpenTelemetry names with dots as underscores, as on the das
 Set `REVIEW_WORKER_FIX_GENERATION_ENABLED=false` (`worker.fixGeneration.enabled: false`) and restart the
 Workers: instant, no cleanup, and suggestions already posted remain ordinary GitHub comments. Reverting the code
 as well (`helm rollback` or an image revert) leaves migration `0012` in place, unused; it need not be reversed.
+
+## Walkthrough: switch, data flow, outcomes, alerts, cleanup, rollout, rollback
+
+Context: [`docs/specs/spec-pr-walkthrough.md`](../specs/spec-pr-walkthrough.md) and
+[`docs/plans/plan-phase-12.md`](../plans/plan-phase-12.md). The `walkthrough` step runs after `fix_generation`
+(or `verification` when that is off) and before `output`. It asks the LLM to group the PR's changed files in
+reading order, sanitizes the answer, and creates or edits **one** PR issue comment (found by a marker and the
+GitHub App's identity). It passes its input through unchanged, so a walkthrough problem never costs the author
+a review.
+
+### What is sent where, and what it costs
+
+- **Sent:** the list of reviewable file paths, status, change counts and a patch slice per file (capped at 2,000
+  characters each, at most `MAX_FILES` files), plus the intent summary the review already computed. It goes to
+  the same LLM endpoint and with the same posture as `intent_summary`: no new party receives anything.
+- **Cost bound:** at most **one extra LLM call per reviewed push**, only for a PR with at least `MIN_FILES`
+  reviewable files. Off by default for that reason. The bound is per job, not per PR: rapid pushes multiply
+  calls, so set `REVIEW_WEBHOOK_API_REVIEW_ENQUEUE_RATE_LIMIT_PER_MINUTE` above `0` (see "Per-repo
+  review-enqueue rate limiting is disabled by default" above) before enabling it on busy repos.
+- **Fork PRs:** a fork PR's diff is sent like any other PR's; the comment is written with the App's installation
+  token on the base repository, as the review is. Enable it knowing outside contributors' code reaches your LLM.
+- **Latency trade-off (accepted):** the walkthrough runs before `output`, so findings and the check-run can
+  arrive up to `STEP_TIMEOUT_SECONDS` later than without it (typically one LLM call). This is accepted so the
+  step stays inside the fail-open pipeline; it is the reason the timeout is small.
+- **Redaction is best-effort.** Posted text passes the secret redactor (Gitleaks) and a sanitizer that makes
+  links, images, HTML, mentions and issue references inert. A secret shape Gitleaks does not know is not caught.
+
+### Settings
+
+Worker settings, mirrored in Compose (`.env`) and Helm (`worker.walkthrough.*`):
+
+| Env var (`REVIEW_WORKER_WALKTHROUGH_`) | Helm value | Default | Notes |
+| --- | --- | --- | --- |
+| `ENABLED` | `enabled` | `false` | **Off by default**; a bootstrap setting, so changing it needs a Worker restart. |
+| `STEP_TIMEOUT_SECONDS` | `stepTimeoutSeconds` | `45` | Must be at least `LLM_TIMEOUT_SECONDS + 15`; the step fails open after `value - 5` seconds. |
+| `MIN_FILES` | `minFiles` | `2` | Fewer reviewable files: no call, no write (`skipped_small_pr`). Must be at least 1. |
+| `MAX_FILES` | `maxFiles` | `60` | Files sent to the model; 1 to 200. The rest are counted in a "N more files not shown" line. |
+| `MAX_CHARS` | `maxChars` | `6000` | Rendered comment ceiling, cut at a group boundary; 500 to 60000. |
+
+Model choice is the Admin UI's model-routing row `walkthrough`. The companion settings are validated only when
+`ENABLED` is true.
+
+### Enabled but ineffective: the startup warning
+
+The step is effective only when `ENABLED` is true **and** `review_generation_enabled` **and**
+`secret_redaction_enabled` are both on (the redactor is what stops a secret reaching a public comment). If it is
+not, the Worker starts normally, builds no walkthrough step, and logs at WARNING:
+
+> `walkthrough_enabled is true but the walkthrough step is ineffective and will not run: it requires review_generation_enabled and secret_redaction_enabled`
+
+Causes and fixes:
+
+1. `REVIEW_WORKER_REVIEW_GENERATION_ENABLED=false`: turn review generation back on.
+2. `REVIEW_WORKER_SECRET_REDACTION_ENABLED=false`: turn redaction back on. Never disable it to get a walkthrough.
+3. The flag is mis-set so that the Worker does not see `true`: a wrong variable name, a Helm value under the
+   wrong key, or a Worker not restarted after the change. **This one logs no warning**, because the Worker
+   believes the step is off; confirm the effective value in the `step configuration valid` log line
+   (`enabled_steps.walkthrough`).
+
+In the ineffective state **no outcome metric is emitted** (the step does not exist). That is why the rollout
+check greps for the warning rather than waiting for a metric.
+
+### Outcome meanings
+
+`review_walkthrough_outcome_total{outcome}` counts each step run once:
+
+| `outcome` | Meaning |
+| --- | --- |
+| `posted` | The first walkthrough comment was created. |
+| `updated` | The PR's existing comment was edited in place. |
+| `skipped_small_pr` | Fewer than `MIN_FILES` reviewable files. Expected traffic. |
+| `skipped_comment_limit` | The PR has more than 500 comments (five pages of 100) and none was the walkthrough, so none is written. Documented and accepted, **not alerted**; watch its panel during the pilot. |
+| `llm_timeout` | The LLM call timed out, the endpoint was unreachable, or the step timeout fired during the call. |
+| `parse_failure` | The model's reply was not the fixed JSON shape. |
+| `github_error` | A comment list, create or edit call failed, or the publish deadline passed. |
+| `dedupe_failed` | Two jobs raced to create the comment and convergence failed: a duplicate may remain (see cleanup). |
+| `internal_error` | Anything else; fail-closed paths land here. |
+
+`llm_timeout`, `parse_failure`, `github_error` and `internal_error` on any push after the first can **leave a
+stale comment** in place: its footer names the commit it describes ("Describes commit `<sha>`"), so a reader can
+tell. The next successful push edits it.
+
+`internal_error` has known causes: a redactor or Gitleaks outage or timeout, and a multi-line scanner rule that
+spans the sentinel lines on a hostile PR; both fail closed (nothing is posted). Tell causes apart by the `stage`
+field the Worker logs with `walkthrough finished` (`validate`, `prompt`, `llm`, `parse`, `redact`, `sentinel`,
+`render`, `publish`) and `exc_type`. For example, with the Worker's log stream in Loki:
+
+```
+{app="review-worker"} |= "walkthrough finished" | json | outcome="internal_error" | line_format "{{.stage}} {{.exc_type}}"
+```
+
+(Adjust the stream selector to your log labels.) Logs carry counts and identifiers only, never comment text.
+
+`review_walkthrough_outcome_total` also carries a `stage` label, set only on `internal_error`, so a redaction
+failure (`sentinel`) reads apart from input plumbing (`validate`) on the dashboard. Every non-ok
+`walkthrough finished` log line carries `exc_type` and, when the failure was an HTTP error, `status_code`: a
+`github_error` with `status_code=403` on every PR is a GitHub App missing `issues:write`, not a transient outage.
+
+### Tuning metrics
+
+- `review_walkthrough_files_not_shown_total{reason}`: files left out of the comment. `max_files` are files past
+  `WALKTHROUGH_MAX_FILES` (never sent to the model); `max_chars` are files dropped to fit `WALKTHROUGH_MAX_CHARS`.
+  `rendered_chars` is capped by that setting, so only this counter shows how much was cut.
+- `review_walkthrough_reconciled_total{kind}`: `unknown_path` and `duplicate_path` are paths the model invented
+  or repeated; `omitted` are files it left out (shown under "Other files"). Compare before and after changing the
+  `walkthrough` model-routing row.
+
+### Alerts
+
+Starting values, tuned after a pilot. Metric names are the OpenTelemetry names with dots as underscores.
+
+- **(a) Failing endpoint, redactor or GitHub, by share.** Skipped outcomes stay in the denominator; 6 is the
+  minimum-volume guard:
+  `sum(increase(review_walkthrough_outcome_total{outcome=~"llm_timeout|parse_failure|github_error|dedupe_failed|internal_error"}[1h])) / sum(increase(review_walkthrough_outcome_total[1h])) > 0.33 and sum(increase(review_walkthrough_outcome_total[1h])) >= 6`
+- **(b) Orphan duplicates or an unupdated comment**, sustained for 1 h:
+  `sum(increase(review_walkthrough_outcome_total{outcome=~"github_error|dedupe_failed"}[1h])) > 0`
+
+Alert (b) fires for the outcomes that leave a duplicate or an unupdated comment. Alert (a) is what covers the
+other stale-comment outcomes and a redactor outage, which can hide below the 0.33 share for a single tenant.
+
+### Cleanup: finding and deleting a walkthrough comment
+
+Every walkthrough comment starts with the marker `<!-- review-walkthrough:v1 -->` and is authored by the GitHub
+App. To find them, list a repo's PR issue comments
+(`GET /repos/{owner}/{repo}/issues/{pr}/comments`, or the repo-wide
+`GET /repos/{owner}/{repo}/issues/comments`) and keep those whose body begins with the marker **and** whose
+`performed_via_github_app.id` is the platform's App id. Delete one with
+`DELETE /repos/{owner}/{repo}/issues/comments/{id}`. Do this for a bad or leaked comment, for a duplicate after
+`dedupe_failed`, and after a sanitizer fix (the next push re-creates a clean one). The platform itself never
+edits or deletes a marker comment that another author wrote.
+
+### Stuck-job arithmetic, rollback and rollout
+
+- The macro-step timeouts sum to **680 s** with the flag on (635 s plus the 45 s step), under the unchanged 700 s
+  `stuck_job_warning_threshold_seconds`. An operator override below 680 s, or raising `llm_timeout_seconds`
+  above 30 with the flag on, fails Worker startup naming the setting. Both validators key on the raw flag, so
+  they apply even when the step is ineffective.
+- **Rollback is the flag:** set `REVIEW_WORKER_WALKTHROUGH_ENABLED=false` (`worker.walkthrough.enabled: false`)
+  and restart the Workers. It is a restart, not a live toggle. Already-posted comments stay in place; delete them
+  as above if wanted. No migration is involved.
+- **Rollout check:** after enabling and restarting, confirm the "enabled but ineffective" warning is **absent**
+  and `enabled_steps.walkthrough` is `true`; open a two-file PR and confirm one comment appears and a second push
+  edits it; then watch the "PR walkthrough" dashboard row for a week before widening.
+
+### Manual release gate (REQUIRED, not yet recorded)
+
+Run on a throwaway test-org repo with the real GitHub App. **A recorded result of "passed" for both items is
+required before the flag is recommended to any customer, and both must be re-run after any change to
+`neutralize`.** Like the other unexercised real-repo checks this is a release gate, not a CI gate.
+
+| # | Check | Result |
+| --- | --- | --- |
+| 1 | The App's existing permissions allow creating, editing and deleting its own PR comments, and the real `performed_via_github_app` shape matches the recorded Phase 2 cassette. | **Not run. Required.** |
+| 2 | The hostile-fixture PR from Phase 1 renders with no active link, image, notification or cross-reference. | **Not run. Required.** |

@@ -85,6 +85,7 @@ from review.context_builder import CallerHit
 from review.pipeline import StepRegistry
 from review.step import StepContext
 from review.verification import VerificationStep
+from review.walkthrough_render import WalkthroughPublisher
 
 
 @pytest.fixture(autouse=True)
@@ -412,6 +413,7 @@ def _capture_redactor(
         memory_matcher: PostgresMemoryRepository,
         model_resolver: FallbackModelRoutingResolver | None,
         product_knowledge: ProductKnowledgeWiring | None = None,
+        walkthrough_publisher: WalkthroughPublisher | None = None,
     ) -> StepRegistry:
         captured.append(redactor)
         return original(
@@ -430,6 +432,7 @@ def _capture_redactor(
             memory_matcher,
             model_resolver,
             product_knowledge,
+            walkthrough_publisher,
         )
 
     monkeypatch.setattr(worker_main, "_build_review_registry", _capturing)
@@ -1284,6 +1287,7 @@ def test_step_configuration_valid_log_includes_resolved_depends_on(
         "review_generation": "intent_summary",
         "verification": "review_generation",
         "fix_generation": "verification",
+        "walkthrough": "verification",
         "output": "verification",
     }
 
@@ -1712,3 +1716,36 @@ def test_memory_suppression_config_is_shared_by_clone_and_verification_steps(
     else:
         assert clone._memory_suppression is None
         assert verification._memory_suppression is None
+
+
+# --- Phase 12: walkthrough enablement wiring ---------------------------------
+
+
+def test_build_step_enablement_maps_walkthrough_and_redaction_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_WALKTHROUGH_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_SECRET_REDACTION_ENABLED", "false")
+    settings = WorkerSettings(_env_file=None)
+
+    enablement = worker_main._build_step_enablement(settings)
+    timeouts = worker_main._build_step_timeouts(settings)
+
+    assert enablement.walkthrough_enabled is True
+    assert enablement.secret_redaction_enabled is False
+    assert timeouts.walkthrough_step_timeout_seconds == settings.walkthrough_step_timeout_seconds
+
+
+def test_check_step_configuration_warns_when_walkthrough_is_ineffective(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("REVIEW_WORKER_ENVIRONMENT", "development")
+    monkeypatch.setenv("REVIEW_WORKER_WALKTHROUGH_ENABLED", "true")
+    monkeypatch.setenv("REVIEW_WORKER_SECRET_REDACTION_ENABLED", "false")
+    settings = WorkerSettings(_env_file=None)
+
+    with caplog.at_level(logging.WARNING):
+        worker_main._check_step_configuration(settings, logging.getLogger("test"))
+
+    assert "walkthrough step is ineffective" in caplog.text

@@ -1284,3 +1284,17 @@ async def test_pr_metadata_is_forwarded_to_the_real_output() -> None:
     assert output.pr_head_ref == "bugfix/PROJ-9"
     assert output.pr_issue_keys == ("PROJ-9", "#41")
     assert output.pr_is_fork is False
+
+
+@pytest.mark.asyncio
+async def test_phase12_intent_summary_is_carried_forward_unchanged() -> None:
+    step = _review_generation_step(llm_client=_FakeLLMClient(), redactor=_RecordingTextRedactor())
+
+    carried = await step.run(
+        _FakeStaticAnalysisOutput(diff=_diff_with_patch(), intent_summary="Refactors."),
+        _context(),
+    )
+    absent = await step.run(_FakeStaticAnalysisOutput(diff=_diff_with_patch()), _context())
+
+    assert carried.intent_summary == "Refactors."
+    assert absent.intent_summary is None
