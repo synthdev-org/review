@@ -64,6 +64,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from adapter.analyzers.gitleaks import GitleaksAnalyzer
+from adapter.analyzers.ruff import RuffAnalyzer
 from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.posting import GitHubFindingsPublisher
 from adapter.storage.engine import create_session_factory
@@ -93,11 +94,17 @@ from review.clone_detection import (
     CloneIndexQuery,
     CloneQueryError,
 )
+from review.file_matchers import match_python
+from review.fix_generation import FixGenerationStep
 from review.output import FindingsOutputStep
 from review.pipeline import FailurePolicy, StepRegistry
 from review.prefilter import PrefilterStep
 from review.review_generation import ReviewGenerationStep
-from review.static_analysis import StaticAnalysisStep, gitleaks_semgrep_registrations
+from review.static_analysis import (
+    AnalyzerRegistration,
+    StaticAnalysisStep,
+    gitleaks_semgrep_registrations,
+)
 from review.step import JobIdentity, Step, StepContext
 from review.verification import VerificationStep
 
@@ -290,6 +297,8 @@ def _registry(
     verification_llm_client: LLMClient | None = None,
     clone_query: CloneIndexQuery | None = None,
     clone_detection_enabled: bool = True,
+    fix_step: FixGenerationStep | None = None,
+    extra_registrations: list[AnalyzerRegistration] | None = None,
 ) -> StepRegistry:
     """Builds the same macro-step registry `apps/worker/main.py` itself
     constructs, `terminal_step="output"` included — see that module's own
@@ -308,7 +317,10 @@ def _registry(
     """
     redactor = NoOpTextRedactor()
     verification_enabled = verification_llm_client is not None
+    extras = extra_registrations or []
     enabled = {
+        **{r.name: True for r in extras},
+        "fix_generation": fix_step is not None,
         "prefilter": True,
         "static_analysis": True,
         "clone_detection": clone_detection_enabled,
@@ -319,6 +331,8 @@ def _registry(
         "semgrep": True,
     }
     timeouts = {
+        **{r.name: 30.0 for r in extras},
+        "fix_generation": 10.0,
         "prefilter": 10.0,
         "static_analysis": 30.0,
         "clone_detection": 10.0,
@@ -339,7 +353,7 @@ def _registry(
         PrefilterStep(diff_fetcher),
         StaticAnalysisStep(
             diff_fetcher,
-            registrations=gitleaks_semgrep_registrations(GitleaksAnalyzer(), semgrep),
+            registrations=[*gitleaks_semgrep_registrations(GitleaksAnalyzer(), semgrep), *extras],
             redactor=redactor,
             enabled=enabled,
             timeouts=timeouts,
@@ -378,6 +392,9 @@ def _registry(
             )
         )
         output_depends_on = "verification"
+    if fix_step is not None:
+        steps.append(fix_step)
+        output_depends_on = "fix_generation"
     steps.append(FindingsOutputStep(publisher, depends_on=output_depends_on))
 
     return StepRegistry(
@@ -1043,3 +1060,83 @@ async def test_clone_detection_failing_open_still_posts_the_other_findings(
     )
 
     assert _review_shape(failed_open) == _review_shape(baseline)
+
+
+class _AlwaysUnreachableLLM:
+    """The fix step's LLM: every call fails, as an LLM outage would."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, request: CompletionRequest, *, timeout: float) -> CompletionResponse:
+        self.calls += 1
+        raise LLMUnreachableError(endpoint="stub", detail="down")
+
+
+class _NeverCalledReanalyzer:
+    async def rerun(self, *args: Any, **kwargs: Any) -> str:
+        raise AssertionError("the generation call fails first")
+
+
+@respx.mock
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_fix_generation_failing_every_attempt_still_completes_and_posts_the_baseline(
+    migrated_engine: AsyncEngine, test_rsa_private_key_pem: str
+) -> None:
+    """US-AF12: every fix attempt failing never fails the job or changes the posted review."""
+    reviews_route, _ = _mock_github(
+        reviews_url=f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/pulls/{_PR_NUMBER}/reviews",
+        check_runs_url=f"{_GITHUB_BASE}/repos/{_OWNER_REPO}/check-runs",
+    )
+    content = {
+        "planted_secret.py": (_TESTDATA_DIR / "planted_secret.py").read_bytes(),
+        "unused.py": b"import os\n",
+    }
+    ruff = AnalyzerRegistration(
+        "ruff", RuffAnalyzer(), matches=match_python, changed_lines_only=True
+    )
+    provider = GitHubInstallationTokenProvider(app_id=1, private_key_pem=test_rsa_private_key_pem)
+    fetcher = _FakeDiffFetcher(content, with_patches=True)
+    fix_llm = _AlwaysUnreachableLLM()
+
+    def registry(fix_step: FixGenerationStep | None) -> StepRegistry:
+        return _registry(
+            diff_fetcher=fetcher,
+            semgrep=GitleaksAnalyzer(),
+            llm_client=_EmptyFindingsLLMClient(),
+            publisher=GitHubFindingsPublisher(
+                token_provider=provider, provenance_recorder=_FakeProvenanceRecorder()
+            ),
+            clone_detection_enabled=False,
+            extra_registrations=[ruff],
+            fix_step=fix_step,
+        )
+
+    baseline = await _run_review_job(migrated_engine, registry(None), reviews_route)
+    with_fix = await _run_review_job(
+        migrated_engine,
+        registry(
+            FixGenerationStep(
+                fetcher,
+                fix_llm,
+                _NeverCalledReanalyzer(),
+                NoOpTextRedactor(),
+                model="fake-model",
+                timeout=5.0,
+                internal_timeout_seconds=5.0,
+                max_fixes_per_job=5,
+                max_range_lines=20,
+                max_replacement_lines=40,
+                window_lines=60,
+                verification_enabled=False,
+                depends_on="review_generation",
+            )
+        ),
+        reviews_route,
+    )
+
+    assert ("unused.py", 1) in _review_shape(baseline)[2]
+    assert fix_llm.calls >= 1
+    assert _review_shape(with_fix) == _review_shape(baseline)
+    assert b"```suggestion" not in with_fix

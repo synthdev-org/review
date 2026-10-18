@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from findings.models import Finding
+from findings.models import Finding, Suggestion
 
 
 def _finding(**overrides: object) -> Finding:
@@ -73,3 +73,16 @@ def test_every_producer_is_a_valid_source(source: str) -> None:
 def test_unknown_source_is_rejected() -> None:
     with pytest.raises(ValidationError):
         _finding(source="pylint")
+
+
+def test_suggestion_defaults_to_none() -> None:
+    assert _finding().suggestion is None
+
+
+def test_finding_with_a_suggestion_stays_hashable_and_frozen() -> None:
+    finding = _finding(suggestion=Suggestion(start_line=1, end_line=2, replacement="x"))
+
+    assert isinstance(hash(finding), int)
+    assert finding.suggestion is not None and finding.suggestion.end_line == 2
+    with pytest.raises(ValidationError):
+        finding.suggestion.replacement = "y"  # type: ignore[misc]

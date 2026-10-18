@@ -84,3 +84,17 @@ def escape_markdown(text: str) -> str:
     escaped = _ESCAPE_CHARS_RE.sub(r"\\\1", escaped)
     escaped = escaped.replace("<", "&lt;").replace(">", "&gt;")
     return escaped
+
+
+def suggestion_block(replacement: str) -> str:
+    """A GitHub ``suggestion`` fenced block for ``replacement`` (empty means
+    delete the range). Deliberately *not* passed through ``escape_markdown``:
+    the content must render verbatim as code. Safety instead comes from the
+    fence being longer than any backtick run inside the replacement, so the
+    content can never close its own block."""
+    longest = max((len(run) for run in re.findall(r"`+", replacement)), default=0)
+    fence = "`" * max(3, longest + 1)
+    if not replacement:
+        return f"{fence}suggestion\n{fence}"
+    body = replacement if replacement.endswith("\n") else replacement + "\n"
+    return f"{fence}suggestion\n{body}{fence}"

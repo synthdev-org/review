@@ -105,6 +105,11 @@ _FRAMEWORK_MODULES = frozenset(
         # Pure helper shared by verification and clone_detection (Memory similarity
         # suppression); no `Step` of its own.
         "memory_suppression",
+        # Pure helpers of the fix_generation step (patch validation, candidate
+        # selection, analyzer re-run); no `Step` of their own.
+        "fix_validation",
+        "fix_candidates",
+        "analyzer_rerun",
     }
 )
 

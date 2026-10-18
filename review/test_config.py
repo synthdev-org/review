@@ -29,6 +29,7 @@ from review.config import (
     StepEnablement,
     check_step_configuration_viable,
     clone_detection_can_produce_value,
+    fix_generation_can_produce_value,
     intent_summary_can_produce_value,
     resolve_review_pipeline_depends_on,
 )
@@ -45,7 +46,8 @@ def test_all_steps_enabled_resolves_the_ordinary_six_step_chain() -> None:
         "intent_summary": "context_builder",
         "review_generation": "intent_summary",
         "verification": "review_generation",
-        "output": "verification",
+        "fix_generation": "verification",
+        "output": "verification",  # fix_generation is off by default
     }
 
 
@@ -419,3 +421,75 @@ def test_clone_detection_enabled_with_prefilter_disabled_is_rejected() -> None:
 
     with pytest.raises(NoViableStepConfigurationError, match="clone_detection"):
         check_step_configuration_viable(enablement)
+
+
+# --- fix_generation (plan-phase-11 Phase 3) ---------------------------------
+
+
+def test_fix_generation_enabled_wires_output_after_it() -> None:
+    resolved = resolve_review_pipeline_depends_on(StepEnablement(fix_generation_enabled=True))
+
+    assert resolved["fix_generation"] == "verification"
+    assert resolved["output"] == "fix_generation"
+
+
+def test_fix_generation_with_verification_disabled_follows_review_generation() -> None:
+    resolved = resolve_review_pipeline_depends_on(
+        StepEnablement(fix_generation_enabled=True, verification_enabled=False)
+    )
+
+    assert resolved["fix_generation"] == "review_generation"
+    assert resolved["output"] == "fix_generation"
+
+
+def test_fix_generation_disabled_leaves_output_wired_as_before() -> None:
+    resolved = resolve_review_pipeline_depends_on(StepEnablement())
+
+    assert resolved["output"] == "verification"
+
+
+@pytest.mark.parametrize("review_generation", [True, False])
+@pytest.mark.parametrize("verification", [True, False])
+@pytest.mark.parametrize("analyzers", [True, False])
+def test_fix_generation_can_produce_value_needs_an_eligible_producer(
+    review_generation: bool, verification: bool, analyzers: bool
+) -> None:
+    enablement = StepEnablement(
+        fix_generation_enabled=True,
+        review_generation_enabled=review_generation,
+        verification_enabled=verification,
+        static_analysis_gitleaks_enabled=analyzers,
+        static_analysis_semgrep_enabled=analyzers,
+        static_analysis_ruff_enabled=analyzers,
+        static_analysis_eslint_enabled=analyzers,
+        static_analysis_trivy_enabled=analyzers,
+        static_analysis_phpstan_enabled=analyzers,
+        static_analysis_golangci_lint_enabled=analyzers,
+    )
+
+    assert fix_generation_can_produce_value(enablement) is (
+        analyzers or (review_generation and verification)
+    )
+    resolved = resolve_review_pipeline_depends_on(enablement)
+    if analyzers or (review_generation and verification):
+        assert resolved["output"] == "fix_generation"
+    if analyzers or review_generation:  # otherwise no review is possible at all
+        check_step_configuration_viable(enablement)
+
+
+def test_fix_generation_on_with_no_producer_leaves_output_wired_as_today() -> None:
+    enablement = StepEnablement(
+        fix_generation_enabled=True,
+        static_analysis_enabled=False,
+        review_generation_enabled=True,
+        verification_enabled=False,
+    )
+
+    assert fix_generation_can_produce_value(enablement) is False
+    assert resolve_review_pipeline_depends_on(enablement)["output"] == "review_generation"
+    check_step_configuration_viable(enablement)
+
+
+def test_fix_generation_flags_reach_the_registry_mappings() -> None:
+    assert StepEnablement(fix_generation_enabled=True).as_mapping()["fix_generation"] is True
+    assert StepEnablement().as_mapping()["fix_generation"] is False

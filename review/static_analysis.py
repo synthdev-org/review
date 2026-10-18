@@ -23,7 +23,7 @@ explicit timeout value to bound its own subprocess call directly
 (``adapter/analyzers/subprocess_runner.py``'s kill-and-reap), not only the
 inner registry's own ``asyncio.wait_for`` wrapping — belt-and-braces
 subprocess-level enforcement, since only the former actually kills the
-underlying OS process. ``_AnalyzerSubStep`` (private to this module) adapts
+underlying OS process. ``AnalyzerSubStep`` adapts
 each ``StaticAnalyzer`` into a ``review.step.Step`` for registration into
 the inner registry.
 
@@ -283,7 +283,7 @@ class _AnalyzerSubStepInput(BaseModel):
     config_files: dict[str, bytes] = {}
 
 
-class _AnalyzerSubStep:
+class AnalyzerSubStep:
     """Adapts one ``AnalyzerRegistration`` into a ``review.step.Step`` for
     registration into this macro step's own inner registry: routes files to
     the analyzer (skipping it when none match), runs it, then applies the
@@ -399,7 +399,7 @@ class StaticAnalysisStep:
             analyzer_timeouts[registration.name] = timeout
 
         sub_steps: list[Step[Any, Any]] = [
-            _AnalyzerSubStep(registration, timeouts=analyzer_timeouts)
+            AnalyzerSubStep(registration, timeouts=analyzer_timeouts)
             for registration in self._registrations
         ]
         self._inner_registry = StepRegistry(

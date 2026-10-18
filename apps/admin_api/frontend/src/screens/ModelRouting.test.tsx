@@ -29,6 +29,7 @@ const view: ModelRoutingView = {
     { stage: "intent_summary", model_name: "local-model", source: "static_default" },
     { stage: "review_generation", model_name: "local-model", source: "static_default" },
     { stage: "verification", model_name: "local-model", source: "static_default" },
+    { stage: "fix_generation", model_name: "local-model", source: "static_default" },
   ],
 };
 
@@ -57,6 +58,8 @@ describe("ModelRoutingScreen", () => {
     getModelRouting.mockResolvedValue(view);
     render(<ModelRoutingScreen />);
     expect(await screen.findByText("review_generation")).toBeInTheDocument();
+    expect(screen.getAllByText("fix_generation")).toHaveLength(2); // table row + stage option
+    expect(screen.getByRole("option", { name: "fix_generation" })).toBeInTheDocument();
     expect(screen.getAllByText("local-model").length).toBeGreaterThan(0);
     expect(screen.getAllByText("static_default").length).toBeGreaterThan(0);
   });

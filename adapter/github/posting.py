@@ -50,6 +50,7 @@ import logging
 from typing import Any
 
 import httpx
+from opentelemetry import metrics
 
 from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.exceptions import (
@@ -59,13 +60,20 @@ from adapter.github.exceptions import (
     GitHubRetryExhaustedError,
 )
 from adapter.github.http import auth_headers, client_context, request_with_retry, split_owner_repo
-from findings.markdown import escape_markdown
+from findings.markdown import escape_markdown, suggestion_block
 from findings.models import Finding
 from memory.models import PostedComment
 from memory.store import MemorySignalRecorder, MemoryStoreError
 from review.output import FindingsPublisher
 
 logger = logging.getLogger(__name__)
+
+# Literal name so scripts/check-dashboard-metrics.py finds it. Lets suggestion-bearing
+# comments be compared against plain ones (e.g. dismissal rate) to judge auto-fix value.
+_comments_counter = metrics.get_meter("review.posting").create_counter(
+    "review.posting.comments_total",
+    description="Inline review comments posted, by `carried_suggestion`.",
+)
 
 _DEFAULT_GITHUB_API_BASE_URL = "https://api.github.com"
 _CHECK_RUN_NAME = "review"
@@ -98,7 +106,33 @@ def _finding_body(finding: Finding) -> str:
         # instead of the intended bold/code styling. See
         # `Finding.citation_markdown`'s own docstring for the full reasoning.
         detail += f"\n\n{finding.citation_markdown}"
+    if finding.suggestion is not None:
+        # Unescaped on purpose: the block must render verbatim as code;
+        # `suggestion_block` makes the fence longer than any backtick run.
+        detail += f"\n\n{suggestion_block(finding.suggestion.replacement)}"
     return detail
+
+
+def _comment_line(finding: Finding) -> int | None:
+    """The line GitHub echoes back for this finding's comment: a suggestion
+    comment is anchored at the range's end line, otherwise the finding's own."""
+    if finding.suggestion is not None:
+        return finding.suggestion.end_line
+    return finding.line
+
+
+def _review_comment(finding: Finding) -> dict[str, Any]:
+    comment: dict[str, Any] = {
+        "path": finding.file,
+        "line": _comment_line(finding),
+        "body": _finding_body(finding),
+    }
+    suggestion = finding.suggestion
+    if suggestion is not None and suggestion.start_line < suggestion.end_line:
+        comment["start_line"] = suggestion.start_line
+        comment["start_side"] = "RIGHT"
+        comment["side"] = "RIGHT"
+    return comment
 
 
 def _review_comments(line_findings: list[Finding]) -> list[dict[str, Any]]:
@@ -106,10 +140,7 @@ def _review_comments(line_findings: list[Finding]) -> list[dict[str, Any]]:
     inline comment — only findings with a real ``line`` can be posted this
     way; a file-level finding (``line is None``) is folded into the
     review's own top-level ``body`` instead (see ``_review_body`` below)."""
-    return [
-        {"path": finding.file, "line": finding.line, "body": _finding_body(finding)}
-        for finding in line_findings
-    ]
+    return [_review_comment(finding) for finding in line_findings]
 
 
 def _review_body(file_level_findings: list[Finding], total_count: int) -> str:
@@ -192,6 +223,11 @@ class GitHubFindingsPublisher:
             url=f"{self._github_api_base_url}/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
             json_body=body,
         )
+
+        for carried in (True, False):
+            count = sum((f.suggestion is not None) == carried for f in line_findings)
+            if count:
+                _comments_counter.add(count, {"carried_suggestion": str(carried).lower()})
 
         # File-level-only findings never posted a line comment in the first
         # place (see `_review_comments` above) — nothing to correlate, and
@@ -299,7 +335,7 @@ class GitHubFindingsPublisher:
         # correctly disambiguated.
         submitted: dict[tuple[str, int | None, str], list[Finding]] = {}
         for finding in line_findings:
-            key = (finding.file, finding.line, _finding_body(finding))
+            key = (finding.file, _comment_line(finding), _finding_body(finding))
             submitted.setdefault(key, []).append(finding)
 
         matched: list[PostedComment] = []
@@ -323,6 +359,7 @@ class GitHubFindingsPublisher:
                     line=matched_finding.line,
                     rule_id=matched_finding.rule_id,
                     message=matched_finding.message,
+                    carried_suggestion=matched_finding.suggestion is not None,
                 )
             )
 

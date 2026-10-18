@@ -1283,6 +1283,7 @@ def test_step_configuration_valid_log_includes_resolved_depends_on(
         "intent_summary": "context_builder",
         "review_generation": "intent_summary",
         "verification": "review_generation",
+        "fix_generation": "verification",
         "output": "verification",
     }
 

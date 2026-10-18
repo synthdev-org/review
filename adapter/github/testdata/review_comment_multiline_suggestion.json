@@ -1,0 +1,32 @@
+{
+  "create_review_response": {
+    "id": 99
+  },
+  "review_comments": [
+    {
+      "id": 2001,
+      "path": "app.py",
+      "line": 10,
+      "side": "RIGHT",
+      "body": "**[high]** rename\n\n_source: semgrep_\n\n```suggestion\nx = 1\n```"
+    },
+    {
+      "id": 2002,
+      "path": "app.py",
+      "line": 22,
+      "start_line": 20,
+      "side": "RIGHT",
+      "start_side": "RIGHT",
+      "body": "**[high]** simplify\n\n_source: semgrep_\n\n```suggestion\nreturn 2\n```"
+    },
+    {
+      "id": 2003,
+      "path": "lib.py",
+      "line": 31,
+      "start_line": 30,
+      "side": "RIGHT",
+      "start_side": "RIGHT",
+      "body": "**[high]** remove\n\n_source: semgrep_\n\n```suggestion\n```"
+    }
+  ]
+}

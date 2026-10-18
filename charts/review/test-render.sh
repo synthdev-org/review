@@ -370,6 +370,34 @@ assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_CLONE_DETECTION_MIN_TOKENS: "10
     "docker compose config passes the min_tokens default to the worker"
 
 echo
+echo "=== 8. fix generation settings (plan-phase-11 Phase 3, US-AF15) ==="
+FIX_OUT=$(helm template "$RELEASE" "$CHART_DIR" --show-only templates/configmap.yaml)
+assert_contains "$FIX_OUT" 'REVIEW_WORKER_FIX_GENERATION_ENABLED: "false"' \
+    "ConfigMap renders the fix_generation enabled default (off)"
+assert_contains "$FIX_OUT" 'REVIEW_WORKER_FIX_GENERATION_STEP_TIMEOUT_SECONDS: "90"' \
+    "ConfigMap renders the fix_generation step timeout default"
+assert_contains "$FIX_OUT" 'REVIEW_WORKER_FIX_GENERATION_MAX_FIXES_PER_JOB: "5"' \
+    "ConfigMap renders the max fixes per job default"
+assert_contains "$FIX_OUT" 'REVIEW_WORKER_FIX_GENERATION_MAX_RANGE_LINES: "20"' \
+    "ConfigMap renders the max range lines default"
+assert_contains "$FIX_OUT" 'REVIEW_WORKER_FIX_GENERATION_MAX_REPLACEMENT_LINES: "40"' \
+    "ConfigMap renders the max replacement lines default"
+assert_contains "$FIX_OUT" 'REVIEW_WORKER_FIX_GENERATION_WINDOW_LINES: "60"' \
+    "ConfigMap renders the window lines default"
+FIX_ON_OUT=$(helm template "$RELEASE" "$CHART_DIR" --show-only templates/configmap.yaml \
+    --set worker.fixGeneration.enabled=true --set worker.fixGeneration.maxFixesPerJob=3)
+assert_contains "$FIX_ON_OUT" 'REVIEW_WORKER_FIX_GENERATION_ENABLED: "true"' \
+    "worker.fixGeneration.enabled=true reaches the ConfigMap"
+assert_contains "$FIX_ON_OUT" 'REVIEW_WORKER_FIX_GENERATION_MAX_FIXES_PER_JOB: "3"' \
+    "worker.fixGeneration.maxFixesPerJob override reaches the ConfigMap"
+assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_FIX_GENERATION_ENABLED: "false"' \
+    "docker compose config passes the fix_generation switch (off) to the worker"
+assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_STUCK_JOB_WARNING_THRESHOLD_SECONDS: "700"' \
+    "docker compose default stuck-job threshold covers the fix_generation chain"
+assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_FIX_GENERATION_WINDOW_LINES: "60"' \
+    "docker compose config passes the window_lines default to the worker"
+
+echo
 if [[ "$FAILED" -eq 0 ]]; then
     echo "All Helm chart render checks passed."
 else

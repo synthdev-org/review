@@ -8,7 +8,7 @@ phishing/notification-spam vector, not just a rendering nit.
 
 from __future__ import annotations
 
-from findings.markdown import escape_markdown
+from findings.markdown import escape_markdown, suggestion_block
 
 
 def test_code_fence_backticks_are_escaped() -> None:
@@ -82,3 +82,27 @@ def test_plain_text_with_no_special_characters_is_unchanged() -> None:
     assert escape_markdown("this is an ordinary finding message") == (
         "this is an ordinary finding message"
     )
+
+
+def test_suggestion_block_wraps_replacement_in_a_suggestion_fence() -> None:
+    assert suggestion_block("x = 1") == "```suggestion\nx = 1\n```"
+
+
+def test_suggestion_block_does_not_double_a_trailing_newline() -> None:
+    assert suggestion_block("x = 1\n") == "```suggestion\nx = 1\n```"
+
+
+def test_suggestion_block_empty_replacement_is_a_deletion() -> None:
+    assert suggestion_block("") == "```suggestion\n```"
+
+
+def test_suggestion_block_fence_outgrows_backticks_in_the_replacement() -> None:
+    block = suggestion_block("a\n```\nb")
+
+    assert block == "````suggestion\na\n```\nb\n````"
+    longer = suggestion_block("````\n")
+    assert longer.startswith("`````suggestion\n") and longer.endswith("\n`````")
+
+
+def test_suggestion_block_content_is_not_escaped() -> None:
+    assert "<b>@user [x](y)</b>" in suggestion_block("<b>@user [x](y)</b>")

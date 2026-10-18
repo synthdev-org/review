@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Sequence
+from pathlib import Path
 
 import httpx
 import pytest
@@ -670,3 +671,161 @@ async def test_post_review_comment_missing_id_is_skipped_not_raised(
     unmatched_logs = [r for r in caplog.records if "did not correlate" in r.getMessage()]
     assert len(unmatched_logs) == 1
     assert unmatched_logs[0].__dict__["comment_id"] is None
+
+
+# --- Phase 11 (auto-fix): suggestion blocks -------------------------------
+
+_CASSETTE = json.loads(
+    (Path(__file__).parent / "testdata" / "review_comment_multiline_suggestion.json").read_text()
+)
+
+
+def _suggestion_findings() -> list[Finding]:
+    def make(file: str, line: int, message: str, start: int, end: int, text: str) -> Finding:
+        return _finding(
+            file=file,
+            line=line,
+            message=message,
+            source="semgrep",
+            suggestion={"start_line": start, "end_line": end, "replacement": text},
+        )
+
+    return [
+        make("app.py", 10, "rename", 10, 10, "x = 1\n"),
+        make("app.py", 21, "simplify", 20, 22, "return 2\n"),
+        make("lib.py", 30, "remove", 30, 31, ""),
+    ]
+
+
+async def _publish(key: str, findings: list[Finding], recorder: _FakeProvenanceRecorder) -> None:
+    await _publisher(key, provenance_recorder=recorder).post_review(
+        installation_id=_INSTALLATION_ID,
+        repo_full_name=_OWNER_REPO,
+        repo_id=_REPO_ID,
+        pr_number=_PR_NUMBER,
+        head_sha=_HEAD_SHA,
+        findings=findings,
+    )
+
+
+@respx.mock
+async def test_suggestions_post_payload_and_correlate_provenance_against_cassette(
+    test_rsa_private_key_pem: str,
+) -> None:
+    """US-AF1/US-AF9/US-AF13: one suggestion block per comment, multi-line
+    anchoring, provenance matched on the posted (end) line, and no write
+    beyond the review POST, comments GET and (token exchange aside) nothing else."""
+    token = respx.post(f"{_BASE}/app/installations/{_INSTALLATION_ID}/access_tokens").mock(
+        return_value=httpx.Response(
+            201, json={"token": "ghs_test_token", "expires_at": "2999-01-01T00:00:00Z"}
+        )
+    )
+    review = respx.post(_REVIEWS_URL).mock(
+        return_value=httpx.Response(200, json=_CASSETTE["create_review_response"])
+    )
+    echo = respx.get(_REVIEW_COMMENTS_URL).mock(
+        return_value=httpx.Response(200, json=_CASSETTE["review_comments"])
+    )
+    recorder = _FakeProvenanceRecorder()
+
+    findings = _suggestion_findings()
+    await _publish(test_rsa_private_key_pem, findings, recorder)
+
+    payload = json.loads(review.calls.last.request.content)
+    assert payload["event"] == "COMMENT"
+    one, multi, deletion = payload["comments"]
+    assert "start_line" not in one and one["line"] == 10
+    assert (multi["start_line"], multi["line"]) == (20, 22)
+    assert multi["start_side"] == multi["side"] == "RIGHT"
+    assert (deletion["start_line"], deletion["line"]) == (30, 31)
+    for comment, recorded in zip(payload["comments"], _CASSETTE["review_comments"], strict=True):
+        assert comment["body"] == recorded["body"]
+        assert comment["body"].count("```suggestion") == 1
+    # Only the review POST, the comments GET and the token exchange happened.
+    assert review.call_count == echo.call_count == token.call_count == 1
+    assert len(respx.calls) == 3
+
+    _, _, _, comments = recorder.calls[0]
+    assert {c.comment_id: c.line for c in comments} == {2001: 10, 2002: 21, 2003: 30}
+
+
+@respx.mock
+async def test_suggestion_with_backtick_fence_keeps_surrounding_text_escaped(
+    test_rsa_private_key_pem: str,
+) -> None:
+    """US-AF10: a replacement containing a ``` fence gets a longer fence, the
+    replacement itself is unescaped, the message still is."""
+    _mock_token_exchange()
+    review = _mock_reviews_post()
+    _mock_review_comments()
+    finding = _finding(
+        message="*bold*",
+        suggestion={"start_line": 10, "end_line": 10, "replacement": "```\n*x*\n```\n"},
+    )
+    await _publish(test_rsa_private_key_pem, [finding], _FakeProvenanceRecorder())
+
+    body = json.loads(review.calls.last.request.content)["comments"][0]["body"]
+    assert "\\*bold\\*" in body
+    assert "````suggestion\n```\n*x*\n```\n````" in body
+
+
+@respx.mock
+async def test_unmatched_multiline_comment_is_logged_not_raised(
+    test_rsa_private_key_pem: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """US-AF13: a comment echoed on the start line (wrong anchor) is skipped."""
+    _mock_token_exchange()
+    _mock_reviews_post()
+    finding = _suggestion_findings()[1]
+    echoed = {**_CASSETTE["review_comments"][1], "line": 20}
+    _mock_review_comments([echoed])
+    recorder = _FakeProvenanceRecorder()
+
+    with caplog.at_level(logging.WARNING, logger="adapter.github.posting"):
+        await _publish(test_rsa_private_key_pem, [finding], recorder)
+
+    assert recorder.calls == []
+    assert any("did not correlate" in r.message for r in caplog.records)
+
+
+async def test_comment_line_and_payload_helpers_are_pure() -> None:
+    plain = _finding(line=7)
+    assert posting_module._comment_line(plain) == 7
+    assert posting_module._review_comment(plain) == {
+        "path": "app.py",
+        "line": 7,
+        "body": posting_module._finding_body(plain),
+    }
+    ranged = _suggestion_findings()[1]
+    assert posting_module._comment_line(ranged) == 22
+
+
+@respx.mock
+async def test_post_review_counts_comments_by_carried_suggestion(
+    test_rsa_private_key_pem: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adds: list[tuple[int, dict[str, str]]] = []
+
+    class _Counter:
+        def add(self, value: int, attributes: dict[str, str]) -> None:
+            adds.append((value, attributes))
+
+    monkeypatch.setattr(posting_module, "_comments_counter", _Counter())
+    _mock_token_exchange()
+    _mock_reviews_post()
+    _mock_review_comments()
+    fix = {"start_line": 11, "end_line": 11, "replacement": "x = 1"}
+
+    await _publisher(test_rsa_private_key_pem).post_review(
+        installation_id=_INSTALLATION_ID,
+        repo_full_name=_OWNER_REPO,
+        repo_id=_REPO_ID,
+        pr_number=_PR_NUMBER,
+        head_sha=_HEAD_SHA,
+        findings=[_finding(line=11, suggestion=fix), _finding(line=20), _finding(line=21)],
+    )
+
+    assert sorted(adds, key=lambda a: a[1]["carried_suggestion"]) == [
+        (2, {"carried_suggestion": "false"}),
+        (1, {"carried_suggestion": "true"}),
+    ]

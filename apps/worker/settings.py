@@ -247,6 +247,15 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     clone_detection_min_lines: int = Field(default=10, gt=0)
     clone_detection_max_findings: int = Field(default=5, gt=0)
 
+    # Phase 11 (docs/plans/plan-phase-11.md, Phase 3): the fix_generation step, off by
+    # default (spec D8). Its internal fail-open timeout is the step timeout minus 5 s.
+    fix_generation_enabled: bool = False
+    fix_generation_step_timeout_seconds: int = Field(default=90, gt=0)
+    fix_generation_max_fixes_per_job: int = Field(default=5, gt=0)
+    fix_generation_max_range_lines: int = Field(default=20, gt=0)
+    fix_generation_max_replacement_lines: int = Field(default=40, gt=0)
+    fix_generation_window_lines: int = Field(default=60, gt=0)
+
     # --- Job dispatch loop (Phase 3, apps/worker/dispatch.py) ---
     # How often to poll JobQueueRepository.claim_next() when the queue is
     # empty — a concrete default, not left unspecified, per the plan's
@@ -259,10 +268,10 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     # (US-V9's NFR) now that intent_summary/verification exist: 30
     # (prefilter) + 240 (static_analysis) + 35 (context_builder) + 30
     # (intent_summary) + 90 (review_generation) + 60 (verification) + 30
-    # (output) + 30 (clone_detection, Phase 10) = 545 seconds. 600 gives that sum
-    # roughly 10% headroom - comfortably longer than the worst healthy-run total
-    # without leaving a genuinely stuck job unwarned for an unreasonable stretch.
-    stuck_job_warning_threshold_seconds: float = 600.0
+    # (output) + 30 (clone_detection, Phase 10) + 90 (fix_generation, Phase 11) = 635
+    # seconds. 700 gives that sum roughly 10% headroom - comfortably longer than the worst
+    # healthy-run total without leaving a genuinely stuck job unwarned for an unreasonable stretch.
+    stuck_job_warning_threshold_seconds: float = 700.0
 
     # --- GitHub App auth / diff fetch (Phase 4, adapter/github/auth.py + diff.py) ---
     # Required, no default: adapter/github/auth.py's JWT signing (the
@@ -405,8 +414,8 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     @model_validator(mode="after")
     def _stuck_job_warning_threshold_covers_worst_case_chain(self) -> WorkerSettings:
         """Enforces that ``stuck_job_warning_threshold_seconds`` never drops
-        below the eight macro steps' own worst-case sequential-run sum (the
-        545-second figure this field's own docstring comment hand-derives).
+        below the nine macro steps' own worst-case sequential-run sum (the
+        635-second figure this field's own docstring comment hand-derives).
 
         The steps run strictly sequentially, so that sum — not any single
         step's timeout — is the true worst-case healthy-run duration; a
@@ -428,6 +437,7 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
             + self.review_generation_step_timeout_seconds
             + self.verification_step_timeout_seconds
             + self.output_step_timeout_seconds
+            + self.fix_generation_step_timeout_seconds
         )
         if self.stuck_job_warning_threshold_seconds < worst_case_chain_seconds:
             raise ValueError(
@@ -530,6 +540,27 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
                 f"clone_detection_step_timeout_seconds "
                 f"({self.clone_detection_step_timeout_seconds}) must be greater than 5 - the "
                 "step's internal fail-open timeout is the step timeout minus 5 seconds"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _fix_generation_settings_are_valid(self) -> WorkerSettings:
+        """The derived internal timeout (step timeout minus 5 s) must stay positive, and
+        the prompt window must hold the longest allowed range plus a line of context on
+        each side. Positivity of each field is the ``Field(gt=0)`` constraint above.
+        """
+        if self.fix_generation_step_timeout_seconds <= 5:
+            raise ValueError(
+                f"fix_generation_step_timeout_seconds "
+                f"({self.fix_generation_step_timeout_seconds}) must be greater than 5 - the "
+                "step's internal fail-open timeout is the step timeout minus 5 seconds"
+            )
+        if self.fix_generation_window_lines < self.fix_generation_max_range_lines + 2:
+            raise ValueError(
+                f"fix_generation_window_lines ({self.fix_generation_window_lines}) must be at "
+                f"least fix_generation_max_range_lines + 2 "
+                f"({self.fix_generation_max_range_lines + 2}) so the window can contain the "
+                "longest allowed range with context"
             )
         return self
 

@@ -312,7 +312,7 @@ deploy.
 **US-A14 — View current model routing**
 As a platform admin, I want to see which model serves each LLM-calling
 pipeline stage (`intent_summary`, `review_generation`, `verification` —
-the three stages that call the LLM Gateway today), so that I know what's
+the three stages that call the LLM Gateway at the time of writing; the stage list is four from Phase 11, which adds `fix_generation`), so that I know what's
 actually running before I change it.
 - Given `ModelRoutingConfig` rows exist for some stages/orgs, When I open
   the model routing screen, Then I see, per stage, the effective model

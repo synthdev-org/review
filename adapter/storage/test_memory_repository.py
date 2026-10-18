@@ -38,8 +38,11 @@ from adapter.storage.models import (
     Repo,
     Team,
 )
+from findings.models import Finding
+from indexing.embedding import EmbeddingVector
 from memory.models import PostedComment
 from memory.store import MemoryEntryNotFoundError, MemoryStoreError
+from review.memory_suppression import MemorySuppressionConfig, suppress_via_memory
 
 pytestmark = pytest.mark.integration
 
@@ -161,6 +164,106 @@ async def test_record_comment_provenance_persists_one_row_per_comment(
     assert by_id[9001].finding_message == "m1"
     assert by_id[9002].finding_line is None
     assert by_id[9002].finding_rule_id is None
+
+
+@pytest.mark.asyncio
+async def test_provenance_stores_carried_suggestion_and_list_view_exposes_it(
+    repository: PostgresMemoryRepository, repo_id: uuid.UUID
+) -> None:
+    """US-AF13: a suggestion comment stores the marker, an ordinary one
+    `false`; a captured signal on it is `pending` with `entry_type` unset and
+    the list view carries the flag."""
+    await repository.record_comment_provenance(
+        repo_id=str(repo_id),
+        pr_number=43,
+        commit_sha="deadbeef",
+        comments=(
+            PostedComment(
+                comment_id=9101,
+                file="a.py",
+                line=1,
+                rule_id="r",
+                message="m",
+                carried_suggestion=True,
+            ),
+            PostedComment(comment_id=9102, file="b.py", line=2, rule_id="r", message="m"),
+        ),
+    )
+    for comment_id in (9101, 9102):
+        assert await repository.record_signal(
+            posted_finding_comment_id=comment_id,
+            raw_signal_type="reaction",
+            raw_signal_detail={"emoji": "+1"},
+            github_comment_id=None,
+        )
+
+    entries, _ = await repository.list_entries(
+        org_id=None, repo_id=str(repo_id), team_id=None, status=None, limit=50, offset=0
+    )
+    flags = {e.posted_finding_comment_id: e.carried_suggestion for e in entries}
+    assert flags == {9101: True, 9102: False}
+    assert all(e.status == "pending" and e.entry_type is None for e in entries)
+
+
+class _FixedEmbedder:
+    def embed(self, texts: Any) -> tuple[EmbeddingVector, ...]:
+        return tuple(
+            EmbeddingVector(values=_vector(1.0), dimension=_EMBEDDING_DIMENSION) for _ in texts
+        )
+
+
+@pytest.mark.asyncio
+async def test_approved_dismissal_of_a_suggestion_comment_still_suppresses_a_similar_finding(
+    repository: PostgresMemoryRepository, repo_id: uuid.UUID
+) -> None:
+    """US-AF13: the suggestion marker changes nothing about suppression, which
+    runs in verification, before fix generation."""
+    await repository.record_comment_provenance(
+        repo_id=str(repo_id),
+        pr_number=44,
+        commit_sha="deadbeef",
+        comments=(
+            PostedComment(
+                comment_id=9201,
+                file="a.py",
+                line=1,
+                rule_id="r",
+                message="m",
+                carried_suggestion=True,
+            ),
+        ),
+    )
+    await repository.record_signal(
+        posted_finding_comment_id=9201,
+        raw_signal_type="reply",
+        raw_signal_detail={"body": "not applicable"},
+        github_comment_id=None,
+    )
+    entries, _ = await repository.list_entries(
+        org_id=None, repo_id=str(repo_id), team_id=None, status=None, limit=10, offset=0
+    )
+    await repository.set_status(
+        entry_id=entries[0].id,
+        status="approved",
+        entry_type="dismissed_finding",
+        embedding=_vector(1.0),
+        approved_by_user_id=None,
+    )
+    later = Finding(file="a.py", line=1, severity="medium", message="m", source="llm", rule_id="r")
+
+    kept, suppressed = await suppress_via_memory(
+        [later],
+        config=MemorySuppressionConfig(
+            memory_matcher=repository,
+            embedding_client=_FixedEmbedder(),
+            similarity_threshold=0.9,
+            decay_half_life_days=180.0,
+            enabled=True,
+        ),
+        repo_id=str(repo_id),
+    )
+
+    assert (kept, suppressed) == ([], 1)
 
 
 @pytest.mark.asyncio

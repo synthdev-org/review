@@ -130,6 +130,7 @@ async def _seed_pending_entry(
     entry_type: str | None = None,
     org_id: uuid.UUID | None = None,
     team_id: uuid.UUID | None = None,
+    carried_suggestion: bool = False,
 ) -> str:
     """Seeds a real `posted_finding_comment` row plus the `memory_entry`
     row that references it, directly via SQLAlchemy — the admin API only
@@ -149,6 +150,7 @@ async def _seed_pending_entry(
                 finding_line=10,
                 finding_rule_id=rule_id,
                 finding_message=message,
+                carried_suggestion=carried_suggestion,
             )
         )
     async with session_factory() as session, session.begin():
@@ -272,6 +274,27 @@ def test_list_empty_returns_200_with_empty_list_and_zero_total(
 
 
 @pytest.mark.asyncio
+async def test_list_exposes_carried_suggestion_flag(
+    migrated_engine: AsyncEngine,
+    session_factory: async_sessionmaker[Any],
+    repo_id: uuid.UUID,
+) -> None:
+    await _seed_pending_entry(
+        session_factory, repo_id=repo_id, comment_id=8101, carried_suggestion=True
+    )
+    await _seed_pending_entry(session_factory, repo_id=repo_id, comment_id=8102)
+
+    with TestClient(create_app(_settings(dsn=_dsn(migrated_engine)))) as client:
+        _login_as_bootstrap_admin(client)
+        response = client.get("/api/v1/memory-entries", params={"repo_id": str(repo_id)})
+
+    flags = {
+        e["posted_finding_comment_id"]: e["carried_suggestion"] for e in response.json()["entries"]
+    }
+    assert flags == {8101: True, 8102: False}
+
+
+@pytest.mark.asyncio
 async def test_list_filters_by_repo_and_status(
     migrated_engine: AsyncEngine,
     session_factory: async_sessionmaker[Any],
@@ -306,6 +329,7 @@ async def test_list_filters_by_repo_and_status(
     assert body["total"] == 1
     assert len(body["entries"]) == 1
     assert body["entries"][0]["posted_finding_comment_id"] == 8001
+    assert body["entries"][0]["carried_suggestion"] is False
     assert response_wrong_status.json() == {"entries": [], "total": 0}
 
 

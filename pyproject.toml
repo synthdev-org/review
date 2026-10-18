@@ -134,6 +134,8 @@ package = false
 target-version = "py312"
 line-length = 100
 src = ["."]
+# Fixture corpus holds deliberately syntax-broken source (review/testdata/fix).
+extend-exclude = ["review/testdata/fix"]
 
 [tool.ruff.lint]
 select = [
@@ -187,6 +189,8 @@ indent-style = "space"
 plugins = ["pydantic.mypy"]
 python_version = "3.12"
 strict = true
+# Deliberately broken fixtures for the fix syntax gate.
+exclude = ["^review/testdata/fix/"]
 files = [
     "ingestion",
     "indexing",

@@ -100,6 +100,7 @@ def test_posted_comment_allows_a_file_level_finding_with_no_line() -> None:
     comment = PostedComment(comment_id=1, file="app/main.py", line=None, rule_id=None, message="x")
 
     assert comment.line is None
+    assert comment.carried_suggestion is False
     assert comment.rule_id is None
 
 

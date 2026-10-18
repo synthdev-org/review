@@ -1,0 +1,116 @@
+{
+  "typescript": {
+    "original": "original.ts",
+    "preexisting": "preexisting.ts",
+    "valid": {
+      "start_line": 3,
+      "end_line": 3,
+      "replacement": "  return a + b;"
+    },
+    "broken": {
+      "start_line": 3,
+      "end_line": 3,
+      "replacement": "  return (a + b;"
+    },
+    "deletion": {
+      "start_line": 2,
+      "end_line": 2,
+      "replacement": ""
+    }
+  },
+  "tsx": {
+    "original": "original.tsx",
+    "preexisting": "preexisting.tsx",
+    "valid": {
+      "start_line": 3,
+      "end_line": 3,
+      "replacement": "  return <div>{props.name}</div>;"
+    },
+    "broken": {
+      "start_line": 3,
+      "end_line": 3,
+      "replacement": "  return <div>{props.name};"
+    },
+    "deletion": {
+      "start_line": 2,
+      "end_line": 2,
+      "replacement": ""
+    }
+  },
+  "javascript": {
+    "original": "original.js",
+    "preexisting": "preexisting.js",
+    "valid": {
+      "start_line": 3,
+      "end_line": 3,
+      "replacement": "  return b + a;"
+    },
+    "broken": {
+      "start_line": 3,
+      "end_line": 3,
+      "replacement": "  return (a + b;"
+    },
+    "deletion": {
+      "start_line": 2,
+      "end_line": 2,
+      "replacement": ""
+    }
+  },
+  "php": {
+    "original": "original.php",
+    "preexisting": "preexisting.php",
+    "valid": {
+      "start_line": 6,
+      "end_line": 6,
+      "replacement": "    return $b + $a;"
+    },
+    "broken": {
+      "start_line": 6,
+      "end_line": 6,
+      "replacement": "    return ($a + $b;"
+    },
+    "deletion": {
+      "start_line": 5,
+      "end_line": 5,
+      "replacement": ""
+    }
+  },
+  "go": {
+    "original": "original.go",
+    "preexisting": "preexisting.go",
+    "valid": {
+      "start_line": 5,
+      "end_line": 5,
+      "replacement": "\treturn b + a"
+    },
+    "broken": {
+      "start_line": 5,
+      "end_line": 5,
+      "replacement": "\treturn (a + b"
+    },
+    "deletion": {
+      "start_line": 4,
+      "end_line": 4,
+      "replacement": ""
+    }
+  },
+  "python": {
+    "original": "original.py",
+    "preexisting": "preexisting.py",
+    "valid": {
+      "start_line": 6,
+      "end_line": 6,
+      "replacement": "    return b + a"
+    },
+    "broken": {
+      "start_line": 6,
+      "end_line": 6,
+      "replacement": "    return (a + b"
+    },
+    "deletion": {
+      "start_line": 5,
+      "end_line": 5,
+      "replacement": ""
+    }
+  }
+}

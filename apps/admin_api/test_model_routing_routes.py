@@ -116,7 +116,12 @@ def test_get_model_routing_with_no_rows_returns_static_default_for_every_stage(
     body = response.json()
     assert body["org_id"] is None
     stages = {s["stage"]: s for s in body["stages"]}
-    assert set(stages) == {"intent_summary", "review_generation", "verification"}
+    assert set(stages) == {
+        "intent_summary",
+        "review_generation",
+        "verification",
+        "fix_generation",
+    }
     for stage_view in stages.values():
         assert stage_view["model_name"] == "local-model"
         assert stage_view["source"] == "static_default"
