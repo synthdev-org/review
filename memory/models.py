@@ -82,6 +82,9 @@ class MemoryEntry(BaseModel):
     approved_by_user_id: str | None
     created_at: datetime
     updated_at: datetime
+    # Read-only list-view flag from the source comment; ``False`` where the
+    # repository did not join the comment (e.g. ``set_status`` responses).
+    carried_suggestion: bool = False
 
 
 class PostedComment(BaseModel):
@@ -100,6 +103,9 @@ class PostedComment(BaseModel):
     line: int | None
     rule_id: str | None
     message: str
+    # True when the posted comment carried a suggested-change block (auto-fix);
+    # read-only provenance so the Admin Memory list can mark fix threads.
+    carried_suggestion: bool = False
 
 
 class ReactionRecord(BaseModel):

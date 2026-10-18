@@ -80,6 +80,19 @@ def source_rank(source: Source) -> int:
     return _SOURCE_TRUST_RANK.get(source, 0)
 
 
+class Suggestion(BaseModel):
+    """A validated single-range fix (docs/specs/spec-auto-fix.md): replace the
+    1-based inclusive new-file lines ``start_line..end_line`` with
+    ``replacement`` (empty means delete the range). Frozen so ``Finding``
+    stays hashable."""
+
+    model_config = ConfigDict(frozen=True)
+
+    start_line: int
+    end_line: int
+    replacement: str
+
+
 class Finding(BaseModel):
     """One normalized finding from any producer, per the PRD's US4/US5
     structured schema ("file, line, severity, message").
@@ -151,6 +164,13 @@ class Finding(BaseModel):
     today; the ``"rejected"`` literal exists in the schema because it's part
     of the field's own documented vocabulary (per the spec), not because any
     current producer sets it.
+
+    ``suggestion`` — set by ``review.fix_generation.FixGenerationStep``
+    (docs/plans/plan-phase-11.md), never by a finding producer directly: a
+    validated single-range fix rendered as a GitHub suggestion block. A
+    frozen ``Suggestion`` (not a mutable value), so ``Finding`` stays
+    hashable; defaults to ``None`` so every existing construction site is
+    unaffected.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -164,3 +184,4 @@ class Finding(BaseModel):
     context_ref_ids: tuple[int, ...] | None = None
     citation_markdown: str | None = None
     verification_status: Literal["verified", "rejected"] | None = None
+    suggestion: Suggestion | None = None

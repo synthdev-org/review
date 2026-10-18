@@ -74,9 +74,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from review.fix_generation import GENERATION_MARKER, RUBRIC_MARKER
 from tests.e2e.conftest import (
     base_compose_env,
     compose,
@@ -338,6 +340,9 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
         if call_number <= 1:
             return self._INTENT_SUMMARY_CONTENT
         if call_number == 2:
+            custom = getattr(self.server, "review_generation_content", None)
+            if custom is not None:
+                return str(custom)
             scenario = getattr(self.server, "review_generation_scenario", "zero_findings")
             return (
                 self._ONE_FINDING_CONTENT
@@ -349,6 +354,29 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             return self._VERDICT_REJECTED_CONTENT
         return self._VERDICT_VERIFIED_CONTENT
 
+    def _fix_content(self, request: dict[str, Any]) -> str | None:
+        """Auto-fix calls (plan-phase-11 Assumption 15) are recognized by the
+        fixed marker in their system message, not by call position: they come
+        after `verification`, in variable number and concurrently. Answered from
+        `self.server.fix_scenario` (`{path: {"generation": ..., "rubric": ...}}`);
+        a path with no entry gets an unparseable generation reply, which the
+        step rejects. Returns None for any other call."""
+        system = next(
+            (m["content"] for m in request.get("messages", []) if m.get("role") == "system"), ""
+        )
+        for marker, key in ((GENERATION_MARKER, "generation"), (RUBRIC_MARKER, "rubric")):
+            if marker not in str(system):
+                continue
+            user = "".join(
+                m["content"] for m in request.get("messages", []) if m.get("role") == "user"
+            )
+            match = re.search(r"^File (\S+), numbered lines", user, re.MULTILINE)
+            path = match.group(1) if match else "?"
+            self.server.fix_calls.append(f"{key}:{path}")  # type: ignore[attr-defined]
+            scenario = getattr(self.server, "fix_scenario", {})
+            return str(scenario.get(path, {}).get(key, "not json"))
+        return None
+
     def do_POST(self) -> None:
         mode = getattr(self.server, "mode", "success")
         if mode == "llm_failure":
@@ -356,6 +384,19 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"error": "simulated failure"}')
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            request = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            request = {}
+        fix_content = self._fix_content(request) if isinstance(request, dict) else None
+        if fix_content is not None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(self._completion_body(fix_content))
             return
 
         call_number = getattr(self.server, "call_count", 0) + 1
@@ -374,6 +415,9 @@ def stub_llm_review_server() -> Iterator[HTTPServer]:
     server.call_count = 0  # type: ignore[attr-defined]
     server.review_generation_scenario = "zero_findings"  # type: ignore[attr-defined]
     server.verification_scenario = "verified"  # type: ignore[attr-defined]
+    server.review_generation_content = None  # type: ignore[attr-defined]
+    server.fix_scenario = {}  # type: ignore[attr-defined]
+    server.fix_calls = []  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -389,6 +433,8 @@ def _reset_llm_scenario(
     mode: str = "success",
     review_generation: str = "zero_findings",
     verification: str = "verified",
+    review_generation_content: str | None = None,
+    fix_scenario: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """Resets the stub LLM Gateway server's per-test scenario state —
     mirrors `_reset_github_scenario`'s own shape. Called at the start of
@@ -405,6 +451,9 @@ def _reset_llm_scenario(
     server.call_count = 0  # type: ignore[attr-defined]
     server.review_generation_scenario = review_generation  # type: ignore[attr-defined]
     server.verification_scenario = verification  # type: ignore[attr-defined]
+    server.review_generation_content = review_generation_content  # type: ignore[attr-defined]
+    server.fix_scenario = fix_scenario or {}  # type: ignore[attr-defined]
+    server.fix_calls = []  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

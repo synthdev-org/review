@@ -127,6 +127,7 @@ _EXPECTED_COLUMNS = {
         "finding_line",
         "finding_rule_id",
         "finding_message",
+        "carried_suggestion",
         "created_at",
     },
     "memory_entry": {
@@ -289,5 +290,42 @@ async def test_0011_up_down_on_a_populated_schema(pgvector_container) -> None:  
         assert not {"index_clone_file", "index_clone_fingerprint"} & tables
         assert "clone_fingerprint_version" not in await _column_names(dsn, "repo")
         assert await _scalar(dsn, "SELECT count(*) FROM repo") == 1
+    finally:
+        await asyncio.to_thread(command.downgrade, config, "base")
+
+
+@pytest.mark.asyncio
+async def test_0012_up_down_on_a_populated_schema(pgvector_container) -> None:  # type: ignore[no-untyped-def]
+    """Plan Phase 11/6: an existing provenance row reads `false` after upgrade
+    and a downgrade drops only the new column."""
+    dsn = pgvector_container.get_connection_url()
+    config = alembic_config_for(dsn)
+
+    await asyncio.to_thread(command.upgrade, config, "0011")
+    try:
+        await _execute(
+            dsn,
+            "INSERT INTO org (id, name, slug) VALUES "
+            "('00000000-0000-0000-0000-000000000001', 'o', 'o')",
+        )
+        await _execute(
+            dsn,
+            "INSERT INTO repo (id, org_id, name, full_name) VALUES "
+            "('00000000-0000-0000-0000-000000000002', "
+            "'00000000-0000-0000-0000-000000000001', 'r', 'o/r')",
+        )
+        await _execute(
+            dsn,
+            "INSERT INTO posted_finding_comment (id, repo_id, pr_number, commit_sha, "
+            "finding_file, finding_message) VALUES (1, "
+            "'00000000-0000-0000-0000-000000000002', 1, 'abc', 'a.py', 'm')",
+        )
+
+        await asyncio.to_thread(command.upgrade, config, "0012")
+        assert await _scalar(dsn, "SELECT carried_suggestion FROM posted_finding_comment") is False
+
+        await asyncio.to_thread(command.downgrade, config, "0011")
+        assert "carried_suggestion" not in await _column_names(dsn, "posted_finding_comment")
+        assert await _scalar(dsn, "SELECT count(*) FROM posted_finding_comment") == 1
     finally:
         await asyncio.to_thread(command.downgrade, config, "base")

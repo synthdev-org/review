@@ -1564,6 +1564,261 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 52,
+      "type": "row",
+      "title": "Auto-fix suggestions",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 127
+      },
+      "panels": []
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Fix attempt outcomes",
+      "description": "review.fix_generation.outcome_total by outcome: accepted fixes (posted as a committable suggestion) against every rejection reason. A low accepted share is expected; the rejection mix is in the next panel (docs/reference/operations.md, Fix generation).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 128
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_fix_generation_outcome_total[1h])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Fix rejection reasons",
+      "description": "Non-accepted fix outcomes by reason. A sustained parse_error, timeout or fetch_failed rate means a failing LLM endpoint, prompt or GitHub content fetch; the rest are the validation gates doing their job.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 128
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_fix_generation_outcome_total{outcome!=\"accepted\"}[1h])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 55,
+      "type": "timeseries",
+      "title": "Fix generation phase duration (p95)",
+      "description": "review.fix_generation.phase_duration_ms by phase: fetch_content (GitHub), generate (LLM), validate, reanalyze (analyzer re-run) and rubric (LLM). Recorded even for a phase that raised or timed out, so a step timeout can be traced to its slow phase.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 128
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_fix_generation_phase_duration_ms_milliseconds_bucket[1h])) by (le, phase))",
+          "legendFormat": "{{phase}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 56,
+      "type": "timeseries",
+      "title": "Fix candidates / attempts / skipped by cap",
+      "description": "candidates_total (eligible findings), attempts_total (after the per-job cap) and skipped_cap_total (candidates over fix_generation_max_fixes_per_job). Persistent skips mean the cap is lower than the demand.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 136
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_fix_generation_candidates_total[1h]))",
+          "legendFormat": "candidates"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(review_fix_generation_attempts_total[1h]))",
+          "legendFormat": "attempts"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(review_fix_generation_skipped_cap_total[1h]))",
+          "legendFormat": "skipped by cap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "Fix LLM token usage",
+      "description": "review.llm.tokens_total for the two fix calls: stage fix_generation (the patch) and fix_verification (the rubric check of an LLM finding's fix), by model and token type.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 136
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_llm_tokens_total{stage=~\"fix_generation|fix_verification\"}[1h])) by (stage, model, token_type)",
+          "legendFormat": "{{stage}} / {{model}} / {{token_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "Fix analyzer re-run results",
+      "description": "review.fix_generation.reanalysis_total by analyzer and result. `rejected` is the gate working; a sustained `failed` share means the analyzer binary, its timeout or the config fetch is broken, which silently zeroes the accept rate for that analyzer's findings.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 136
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_fix_generation_reanalysis_total[1h])) by (analyzer, result)",
+          "legendFormat": "{{analyzer}} / {{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 59,
+      "type": "timeseries",
+      "title": "Fix acceptance rate by source",
+      "description": "Share of fix attempts accepted, split by finding source (llm = rubric check, analyzer = analyzer re-run). Shows which validation path regressed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 144
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_fix_generation_outcome_total{outcome=\"accepted\"}[1h])) by (source) / sum(rate(review_fix_generation_outcome_total[1h])) by (source)",
+          "legendFormat": "{{source}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "Posted comments by suggestion",
+      "description": "review.posting.comments_total by carried_suggestion: how many inline comments carry a committable fix. Compare dismissal/feedback rates between the two to judge whether auto-fix is worth its LLM cost.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 144
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_posting_comments_total[1h])) by (carried_suggestion)",
+          "legendFormat": "carried_suggestion={{carried_suggestion}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
     }
   ]
 }

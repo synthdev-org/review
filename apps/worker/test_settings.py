@@ -135,7 +135,7 @@ def test_new_verification_pipeline_step_fields_default_per_the_plan(
     assert settings.verification_enabled is True
     assert settings.intent_summary_step_timeout_seconds == 30
     assert settings.verification_step_timeout_seconds == 60
-    assert settings.stuck_job_warning_threshold_seconds == 600.0
+    assert settings.stuck_job_warning_threshold_seconds == 700.0
 
 
 def test_new_verification_pipeline_step_fields_are_overridable_from_env(
@@ -895,14 +895,74 @@ def test_clone_detection_step_timeout_must_exceed_the_internal_margin(
 def test_stuck_job_threshold_must_cover_the_clone_detection_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 545 s is the new worst-case chain (515 + 30); 530 covered the old sum only.
-    _clone_env(monkeypatch, STUCK_JOB_WARNING_THRESHOLD_SECONDS="530")
+    # 635 s is the worst-case chain (545 + 90 for fix_generation); 600 covered the old default only.
+    _clone_env(monkeypatch, STUCK_JOB_WARNING_THRESHOLD_SECONDS="600")
 
-    with pytest.raises(ValidationError, match="545"):
+    with pytest.raises(ValidationError, match="635"):
         WorkerSettings(_env_file=None)
 
 
 def test_stuck_job_threshold_accepts_the_new_chain_sum(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clone_env(monkeypatch, STUCK_JOB_WARNING_THRESHOLD_SECONDS="545")
+    _clone_env(monkeypatch, STUCK_JOB_WARNING_THRESHOLD_SECONDS="635")
 
-    assert WorkerSettings(_env_file=None).stuck_job_warning_threshold_seconds == 545.0
+    assert WorkerSettings(_env_file=None).stuck_job_warning_threshold_seconds == 635.0
+
+
+def test_fix_generation_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clone_env(monkeypatch)
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.fix_generation_enabled is False
+    assert settings.fix_generation_step_timeout_seconds == 90
+    assert settings.fix_generation_max_fixes_per_job == 5
+    assert settings.fix_generation_max_range_lines == 20
+    assert settings.fix_generation_max_replacement_lines == 40
+    assert settings.fix_generation_window_lines == 60
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "FIX_GENERATION_STEP_TIMEOUT_SECONDS",
+        "FIX_GENERATION_MAX_FIXES_PER_JOB",
+        "FIX_GENERATION_MAX_RANGE_LINES",
+        "FIX_GENERATION_MAX_REPLACEMENT_LINES",
+        "FIX_GENERATION_WINDOW_LINES",
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_fix_generation_non_positive_values_fail_startup(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    _clone_env(monkeypatch, **{name: value})
+
+    with pytest.raises(ValidationError):
+        WorkerSettings(_env_file=None)
+
+
+@pytest.mark.parametrize("value", ["5", "3"])
+def test_fix_generation_step_timeout_must_exceed_the_internal_margin(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    _clone_env(monkeypatch, FIX_GENERATION_STEP_TIMEOUT_SECONDS=value)
+
+    with pytest.raises(ValidationError, match="greater than 5"):
+        WorkerSettings(_env_file=None)
+
+
+def test_fix_generation_window_must_hold_the_longest_range_plus_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clone_env(monkeypatch, FIX_GENERATION_MAX_RANGE_LINES="20", FIX_GENERATION_WINDOW_LINES="21")
+
+    with pytest.raises(ValidationError, match="max_range_lines"):
+        WorkerSettings(_env_file=None)
+
+
+def test_fix_generation_window_at_the_minimum_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clone_env(monkeypatch, FIX_GENERATION_MAX_RANGE_LINES="20", FIX_GENERATION_WINDOW_LINES="22")
+
+    assert WorkerSettings(_env_file=None).fix_generation_window_lines == 22

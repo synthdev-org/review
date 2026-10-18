@@ -42,6 +42,7 @@ export interface MemoryEntry {
   raw_signal_type: string;
   raw_signal_detail: Record<string, unknown>;
   posted_finding_comment_id: number;
+  carried_suggestion: boolean;
   embedding: number[] | null;
   approved_at: string | null;
   approved_by: string | null;
@@ -153,7 +154,12 @@ export interface TestConnectionResult {
 
 export type ModelRoutingSource = "org" | "platform" | "static_default" | "fallback_on_error";
 
-export const MODEL_ROUTING_STAGES = ["intent_summary", "review_generation", "verification"] as const;
+export const MODEL_ROUTING_STAGES = [
+  "intent_summary",
+  "review_generation",
+  "verification",
+  "fix_generation",
+] as const;
 export type ModelRoutingStage = (typeof MODEL_ROUTING_STAGES)[number];
 
 export interface ModelRoutingStageView {

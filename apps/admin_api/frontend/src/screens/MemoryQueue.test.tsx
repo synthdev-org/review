@@ -40,6 +40,7 @@ const pendingEntry: MemoryEntry = {
   raw_signal_type: "review_comment_reaction",
   raw_signal_detail: {},
   posted_finding_comment_id: 42,
+  carried_suggestion: false,
   embedding: null,
   approved_at: null,
   approved_by: null,
@@ -70,6 +71,15 @@ describe("MemoryQueueScreen", () => {
     listMemoryEntries.mockReturnValue(new Promise(() => {}));
     render(<MemoryQueueScreen />);
     expect(screen.getByText(/loading memory queue/i)).toBeInTheDocument();
+  });
+
+  it("marks entries whose source comment carried a suggested change", async () => {
+    listMemoryEntries.mockResolvedValue({
+      entries: [pendingEntry, { ...secondPendingEntry, carried_suggestion: true }],
+      total: 2,
+    });
+    render(<MemoryQueueScreen />);
+    expect(await screen.findAllByText("Suggested change")).toHaveLength(1);
   });
 
   it("shows an empty state when nothing is pending", async () => {

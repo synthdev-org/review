@@ -56,7 +56,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -83,7 +83,7 @@ from memory.store import (
 )
 
 
-def _to_entry(row: MemoryEntryRow) -> MemoryEntry:
+def _to_entry(row: MemoryEntryRow, *, carried_suggestion: bool = False) -> MemoryEntry:
     # `memory_entry.repo_id` is a nullable FK at the schema level (the same
     # "narrow the scope" convention as org_id/team_id), but
     # `memory.models.MemoryEntry.repo_id` is a required `str` — every writer
@@ -113,6 +113,7 @@ def _to_entry(row: MemoryEntryRow) -> MemoryEntry:
         ),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        carried_suggestion=carried_suggestion,
     )
 
 
@@ -175,6 +176,7 @@ class PostgresMemoryRepository:
                         finding_line=comment.line,
                         finding_rule_id=comment.rule_id,
                         finding_message=comment.message,
+                        carried_suggestion=comment.carried_suggestion,
                     )
                     for comment in comments_tuple
                 ]
@@ -360,16 +362,20 @@ class PostgresMemoryRepository:
         if status is not None:
             conditions.append(MemoryEntryRow.status == MemoryEntryStatus(status))
 
-        async def _read(session: AsyncSession) -> tuple[Sequence[MemoryEntryRow], int]:
+        async def _read(session: AsyncSession) -> tuple[Sequence[Any], int]:
             entries_statement = (
-                select(MemoryEntryRow)
+                select(MemoryEntryRow, PostedFindingCommentRow.carried_suggestion)
+                .join(
+                    PostedFindingCommentRow,
+                    PostedFindingCommentRow.id == MemoryEntryRow.posted_finding_comment_id,
+                )
                 .where(*conditions)
                 .order_by(MemoryEntryRow.created_at.desc())
                 .limit(limit)
                 .offset(offset)
             )
             entries_result = await session.execute(entries_statement)
-            rows = entries_result.scalars().all()
+            rows = entries_result.all()
 
             count_statement = select(func.count()).select_from(MemoryEntryRow).where(*conditions)
             count_result = await session.execute(count_statement)
@@ -377,7 +383,7 @@ class PostgresMemoryRepository:
             return rows, total
 
         rows, total = await self._run(operation="list_entries", fn=_read)
-        return tuple(_to_entry(row) for row in rows), total
+        return tuple(_to_entry(row, carried_suggestion=carried) for row, carried in rows), total
 
     async def set_status(
         self,
@@ -457,6 +463,7 @@ class PostgresMemoryRepository:
             line=row.finding_line,
             rule_id=row.finding_rule_id,
             message=row.finding_message,
+            carried_suggestion=row.carried_suggestion,
         )
 
     # -- ReactionDedupStore (Phase 4, Unit D) ---------------------------------

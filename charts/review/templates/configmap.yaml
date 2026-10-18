@@ -80,6 +80,13 @@ data:
   REVIEW_WORKER_CLONE_DETECTION_MIN_TOKENS: {{ .Values.worker.cloneDetection.minTokens | quote }}
   REVIEW_WORKER_CLONE_DETECTION_MIN_LINES: {{ .Values.worker.cloneDetection.minLines | quote }}
   REVIEW_WORKER_CLONE_DETECTION_MAX_FINDINGS: {{ .Values.worker.cloneDetection.maxFindings | quote }}
+  # --- Auto-fix suggestions (docs/plans/plan-phase-11.md) ---
+  REVIEW_WORKER_FIX_GENERATION_ENABLED: {{ .Values.worker.fixGeneration.enabled | quote }}
+  REVIEW_WORKER_FIX_GENERATION_STEP_TIMEOUT_SECONDS: {{ .Values.worker.fixGeneration.stepTimeoutSeconds | quote }}
+  REVIEW_WORKER_FIX_GENERATION_MAX_FIXES_PER_JOB: {{ .Values.worker.fixGeneration.maxFixesPerJob | quote }}
+  REVIEW_WORKER_FIX_GENERATION_MAX_RANGE_LINES: {{ .Values.worker.fixGeneration.maxRangeLines | quote }}
+  REVIEW_WORKER_FIX_GENERATION_MAX_REPLACEMENT_LINES: {{ .Values.worker.fixGeneration.maxReplacementLines | quote }}
+  REVIEW_WORKER_FIX_GENERATION_WINDOW_LINES: {{ .Values.worker.fixGeneration.windowLines | quote }}
 
   # --- Product knowledge (non-secret; the token map is in secret.yaml) ---
   REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED: {{ .Values.productKnowledge.enabled | quote }}

@@ -261,7 +261,15 @@ export function MemoryQueueScreen(): JSX.Element {
                       </td>
                     )}
                     <td>{entry.status}</td>
-                    <td>{entry.entry_type ?? "—"}</td>
+                    <td>
+                      {entry.entry_type ?? "—"}
+                      {entry.carried_suggestion && (
+                        <>
+                          {" "}
+                          <span className="badge">Suggested change</span>
+                        </>
+                      )}
+                    </td>
                     <td>{entry.repo_id}</td>
                     <td>{new Date(entry.created_at).toLocaleString()}</td>
                     {isAdmin && (

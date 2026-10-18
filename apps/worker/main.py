@@ -179,6 +179,7 @@ from llmgateway.exceptions import LLMError
 from llmgateway.routing import FallbackModelRoutingResolver
 from llmgateway.startup_check import check_llm_reachable
 from memory.reaction_poll import MemoryReactionPollJobDependencies
+from review.analyzer_rerun import AnalyzerRerunner
 from review.clone_detection import CloneDetectionStep
 from review.config import (
     NoViableStepConfigurationError,
@@ -191,6 +192,7 @@ from review.config import (
 )
 from review.context_builder import ContextBuilderStep
 from review.file_matchers import match_go, match_iac, match_javascript, match_php, match_python
+from review.fix_generation import FixGenerationStep
 from review.intent_summary import IntentSummaryStep
 from review.memory_suppression import MemorySuppressionConfig
 from review.output import FindingsOutputStep
@@ -744,6 +746,7 @@ def _build_step_enablement(settings: WorkerSettings) -> StepEnablement:
         prefilter_enabled=settings.prefilter_enabled,
         static_analysis_enabled=settings.static_analysis_enabled,
         clone_detection_enabled=settings.clone_detection_enabled,
+        fix_generation_enabled=settings.fix_generation_enabled,
         context_builder_enabled=settings.context_builder_enabled,
         intent_summary_enabled=settings.intent_summary_enabled,
         review_generation_enabled=settings.review_generation_enabled,
@@ -766,6 +769,7 @@ def _build_step_timeouts(settings: WorkerSettings) -> StepTimeouts:
         static_analysis_step_timeout_seconds=settings.static_analysis_step_timeout_seconds,
         static_analysis_analyzer_timeout_seconds=settings.static_analysis_analyzer_timeout_seconds,
         clone_detection_step_timeout_seconds=settings.clone_detection_step_timeout_seconds,
+        fix_generation_step_timeout_seconds=settings.fix_generation_step_timeout_seconds,
         static_analysis_ruff_timeout_seconds=settings.static_analysis_ruff_timeout_seconds,
         static_analysis_eslint_timeout_seconds=settings.static_analysis_eslint_timeout_seconds,
         static_analysis_trivy_timeout_seconds=settings.static_analysis_trivy_timeout_seconds,
@@ -980,58 +984,65 @@ def _build_review_registry(
         else None
     )
 
+    analyzer_registrations = [
+        *gitleaks_semgrep_registrations(GitleaksAnalyzer(), SemgrepAnalyzer()),
+        AnalyzerRegistration(
+            "ruff",
+            RuffAnalyzer(),
+            matches=match_python,
+            changed_lines_only=True,
+            config_filenames=RUFF_CONFIG_FILENAMES,
+        ),
+        AnalyzerRegistration(
+            "eslint",
+            EslintAnalyzer(),
+            matches=match_javascript,
+            changed_lines_only=True,
+            config_filenames=ESLINT_CONFIG_FILENAMES,
+        ),
+        AnalyzerRegistration(
+            "phpstan",
+            PhpstanAnalyzer(),
+            matches=match_php,
+            changed_lines_only=True,
+            config_filenames=PHPSTAN_CONFIG_FILENAMES,
+        ),
+        AnalyzerRegistration(
+            "golangci_lint",
+            GolangciLintAnalyzer(),
+            matches=match_go,
+            changed_lines_only=True,
+            config_filenames=GOLANGCI_CONFIG_FILENAMES,
+        ),
+        # Not changed_lines_only: Trivy maps a resource's line range
+        # to added lines itself (adapter/analyzers/trivy.py, US-A3).
+        AnalyzerRegistration(
+            "trivy",
+            TrivyAnalyzer(),
+            matches=match_iac,
+            security_class=True,
+            config_filenames=TRIVY_CONFIG_FILENAMES,
+        ),
+    ]
+    analyzer_slots = asyncio.Semaphore(settings.static_analysis_max_concurrent_analyzers)
+    config_fetcher = GitHubRepoConfigFetcher(tree_fetcher)
+    analyzer_rerunner = AnalyzerRerunner(
+        analyzer_registrations, analyzer_slots, timeouts_mapping, config_fetcher
+    )
+
     return StepRegistry(
         steps=[
             PrefilterStep(diff_fetcher),
             StaticAnalysisStep(
                 diff_fetcher,
-                registrations=[
-                    *gitleaks_semgrep_registrations(GitleaksAnalyzer(), SemgrepAnalyzer()),
-                    AnalyzerRegistration(
-                        "ruff",
-                        RuffAnalyzer(),
-                        matches=match_python,
-                        changed_lines_only=True,
-                        config_filenames=RUFF_CONFIG_FILENAMES,
-                    ),
-                    AnalyzerRegistration(
-                        "eslint",
-                        EslintAnalyzer(),
-                        matches=match_javascript,
-                        changed_lines_only=True,
-                        config_filenames=ESLINT_CONFIG_FILENAMES,
-                    ),
-                    AnalyzerRegistration(
-                        "phpstan",
-                        PhpstanAnalyzer(),
-                        matches=match_php,
-                        changed_lines_only=True,
-                        config_filenames=PHPSTAN_CONFIG_FILENAMES,
-                    ),
-                    AnalyzerRegistration(
-                        "golangci_lint",
-                        GolangciLintAnalyzer(),
-                        matches=match_go,
-                        changed_lines_only=True,
-                        config_filenames=GOLANGCI_CONFIG_FILENAMES,
-                    ),
-                    # Not changed_lines_only: Trivy maps a resource's line range
-                    # to added lines itself (adapter/analyzers/trivy.py, US-A3).
-                    AnalyzerRegistration(
-                        "trivy",
-                        TrivyAnalyzer(),
-                        matches=match_iac,
-                        security_class=True,
-                        config_filenames=TRIVY_CONFIG_FILENAMES,
-                    ),
-                ],
+                registrations=analyzer_registrations,
                 redactor=redactor,
                 enabled=enabled_mapping,
                 timeouts=timeouts_mapping,
                 # One semaphore per Worker process (US-A8), shared by every job
                 # because the registry is built once at startup.
-                analyzer_slots=asyncio.Semaphore(settings.static_analysis_max_concurrent_analyzers),
-                config_fetcher=GitHubRepoConfigFetcher(tree_fetcher),
+                analyzer_slots=analyzer_slots,
+                config_fetcher=config_fetcher,
             ),
             CloneDetectionStep(
                 diff_fetcher,
@@ -1088,6 +1099,24 @@ def _build_review_registry(
                 model_resolver=model_resolver,
                 depends_on=resolved["verification"],
                 memory_suppression=memory_suppression,
+            ),
+            FixGenerationStep(
+                diff_fetcher,
+                llm_client,
+                analyzer_rerunner,
+                redactor,
+                model=settings.llm_model,
+                timeout=settings.llm_timeout_seconds,
+                # Fail open on timeout (US-AF12): the step wraps its own work in a
+                # shorter wait_for, as CloneDetectionStep does (settings validate > 5 s).
+                internal_timeout_seconds=float(settings.fix_generation_step_timeout_seconds - 5),
+                max_fixes_per_job=settings.fix_generation_max_fixes_per_job,
+                max_range_lines=settings.fix_generation_max_range_lines,
+                max_replacement_lines=settings.fix_generation_max_replacement_lines,
+                window_lines=settings.fix_generation_window_lines,
+                verification_enabled=enablement.verification_enabled,
+                model_resolver=model_resolver,
+                depends_on=resolved["fix_generation"],
             ),
             FindingsOutputStep(
                 publisher,

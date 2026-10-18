@@ -73,6 +73,7 @@ from typing import Any
 import asyncpg
 import pytest
 
+from review.fix_generation import GENERATION_MARKER, RUBRIC_MARKER
 from tests.e2e.conftest import (
     base_compose_env,
     compose,
@@ -132,6 +133,11 @@ _FAILURE_PR_NUMBER = 100
 # back to default profiles and the config-fallback panel gets a real sample.
 _FALLBACK_HEAD_SHA = "f" * 40
 _FALLBACK_PR_NUMBER = 101
+
+# Phase 11: a PR on the main scenario's tree whose stub fix reply is unparseable,
+# so the fix-rejection panels get a real `parse_error` sample.
+_FIX_REJECT_HEAD_SHA = "9" * 40
+_FIX_REJECT_PR_NUMBER = 102
 
 _HELPER_BASE_BLOB_SHA = "1" * 40
 _HELPER_HEAD_BLOB_SHA = "2" * 40
@@ -203,6 +209,10 @@ _TREES_BY_SHA: dict[str, list[dict[str, object]]] = {
     ],
     _INDEX_COMMIT_SHA: [
         _tree_entry("helper.ts", _HELPER_BASE_BLOB_SHA, _HELPER_TS_BASE),
+        _tree_entry("caller.ts", _CALLER_BLOB_SHA, _CALLER_TS),
+    ],
+    _FIX_REJECT_HEAD_SHA: [
+        _tree_entry("helper.ts", _HELPER_HEAD_BLOB_SHA, _HELPER_TS_HEAD),
         _tree_entry("caller.ts", _CALLER_BLOB_SHA, _CALLER_TS),
     ],
     _FALLBACK_HEAD_SHA: [
@@ -368,9 +378,34 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             return self._FINDINGS_CONTENT
         return self._VERDICT_VERIFIED_CONTENT
 
+    def _fix_content(self, request: dict[str, Any]) -> str | None:
+        """Auto-fix calls are recognized by their prompt marker, not call
+        position (plan-phase-11 Assumption 15): a valid patch and an all-true
+        rubric, so the `accepted` outcome, both fix LLM-usage stages and the
+        generate/validate/rubric phases all get real samples."""
+        system = " ".join(
+            str(m["content"]) for m in request.get("messages", []) if m.get("role") == "system"
+        )
+        if GENERATION_MARKER in system:
+            if getattr(self.server, "fix_reply_unparseable", False):
+                return "not json"
+            return json.dumps({"start_line": 9, "end_line": 9, "replacement": "  return 3;"})
+        if RUBRIC_MARKER in system:
+            return json.dumps(
+                {"resolves": True, "minimal": True, "safe": True, "compiles_in_context": True}
+            )
+        return None
+
     def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            request = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            request = {}
+        fix_content = self._fix_content(request) if isinstance(request, dict) else None
         call_number = getattr(self.server, "call_count", 0) + 1
-        self.server.call_count = call_number  # type: ignore[attr-defined]
+        if fix_content is None:
+            self.server.call_count = call_number  # type: ignore[attr-defined]
 
         body = json.dumps(
             {
@@ -383,7 +418,11 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": self._content_for_call(call_number),
+                            "content": (
+                                fix_content
+                                if fix_content is not None
+                                else self._content_for_call(call_number)
+                            ),
                         },
                         "finish_reason": "stop",
                     }
@@ -423,6 +462,8 @@ def _e2e_env() -> dict[str, str]:
         REVIEW_WORKER_GITHUB_API_BASE_URL=f"http://host.docker.internal:{STUB_GITHUB_PORT}",
         REVIEW_WORKER_POLL_INTERVAL_SECONDS="0.2",
         REVIEW_WEBHOOK_API_INDEXING_ENABLED="true",
+        # Phase 11: the fix panels only get data when the (default-off) step runs.
+        REVIEW_WORKER_FIX_GENERATION_ENABLED="true",
         # The one manual step .env.example documents: point both
         # entrypoints at the bundled collector's in-network address, the
         # same value an operator would set in their own `.env`. Always
@@ -897,6 +938,21 @@ def test_dashboard_panels_resolve_real_data_within_two_minutes(
     assert fallback_status == 200
     _wait_until_check_run_count_at_least(calls, 3)
     assert str(calls.check_run_bodies[-1]["conclusion"]) == "neutral"
+
+    # 3c. Phase 11: the fix-rejection panels need a rejected attempt. Same tree as
+    #     the main PR, but the stub's fix reply is not JSON, so the step records a
+    #     real `parse_error` outcome (the review still posts).
+    stub_llm_review_server.call_count = 0  # type: ignore[attr-defined]  # fresh 3-call sequence
+    stub_llm_review_server.fix_reply_unparseable = True  # type: ignore[attr-defined]
+    reject_body = _pull_request_payload(
+        pr_number=_FIX_REJECT_PR_NUMBER, head_sha=_FIX_REJECT_HEAD_SHA
+    )
+    reject_status = _post_webhook(
+        env, body=reject_body, signature=_sign(reject_body), event_type="pull_request"
+    )
+    assert reject_status == 200
+    _wait_until_check_run_count_at_least(calls, 4)
+    stub_llm_review_server.fix_reply_unparseable = False  # type: ignore[attr-defined]
 
     # 4. Now the part US11/US12 actually own: poll Grafana's own HTTP API
     #    (not Prometheus directly, not "containers started") until every

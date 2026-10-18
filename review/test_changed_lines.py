@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from findings.models import Finding
-from review.changed_lines import changed_lines, filter_to_changed_lines
+from review.changed_lines import changed_lines, filter_to_changed_lines, hunk_line_ranges
 
 _PATCH = """@@ -1,3 +1,4 @@
  import os
@@ -63,3 +63,26 @@ def test_filter_with_no_findings_or_unknown_file() -> None:
     assert filter_to_changed_lines([], {}) == ([], 0)
     kept, filtered = filter_to_changed_lines([_finding("missing.py", 1)], {})
     assert (kept, filtered) == ([], 1)
+
+
+def test_hunk_line_ranges_cover_context_and_added_lines_per_hunk() -> None:
+    # Hunk 1: new lines 1-4 (context, +, +, context); hunk 2: 11-13.
+    assert hunk_line_ranges(_PATCH) == (range(1, 5), range(11, 14))
+
+
+def test_hunk_line_ranges_ignore_deleted_lines_and_no_newline_marker() -> None:
+    patch = "@@ -5,3 +5,1 @@\n-a\n-b\n c\n\\ No newline at end of file\n"
+
+    assert hunk_line_ranges(patch) == (range(5, 6),)
+
+
+def test_hunk_line_ranges_skip_pure_deletion_hunks_and_empty_patches() -> None:
+    assert hunk_line_ranges("@@ -1,2 +0,0 @@\n-a\n-b\n") == ()
+    assert hunk_line_ranges(None) == ()
+    assert hunk_line_ranges("") == ()
+
+
+def test_hunk_line_ranges_for_a_rename_patch() -> None:
+    patch = "@@ -3,2 +3,2 @@ def f():\n-old\n+new\n same\n"
+
+    assert hunk_line_ranges(patch) == (range(3, 5),)

@@ -129,6 +129,16 @@ worker:
     minTokens: 100
     minLines: 10
     maxFindings: 5
+  # Auto-fix suggestions (docs/plans/plan-phase-11.md). Default off; the
+  # step spends LLM budget, so enable it deliberately. stepTimeoutSeconds
+  # must exceed 5; windowLines must be >= maxRangeLines + 2.
+  fixGeneration:
+    enabled: false
+    stepTimeoutSeconds: 90
+    maxFixesPerJob: 5
+    maxRangeLines: 20
+    maxReplacementLines: 40
+    windowLines: 60
   # Phase 5: non-empty defaults, closing the gap between the pipeline's own
   # per-step timeout (Phase 2) and actual container enforcement — a
   # pathological diff or a misbehaving analyzer subprocess (Gitleaks,

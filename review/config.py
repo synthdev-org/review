@@ -44,6 +44,8 @@ class StepEnablement(BaseModel):
     static_analysis_enabled: bool = True
     # Phase 10 (docs/plans/plan-phase-10.md): the clone_detection step's kill switch.
     clone_detection_enabled: bool = True
+    # Phase 11 (docs/plans/plan-phase-11.md): the fix_generation step; off by default (spec D8).
+    fix_generation_enabled: bool = False
     # Added by docs/plans/plan-deliver-context-builder.md's Phase 5 section —
     # the context_builder step's own kill switch (spec-context-builder.md's
     # Rollout & Release Safety "decided" flag), default `True`, mirroring
@@ -97,6 +99,7 @@ class StepEnablement(BaseModel):
             "prefilter": self.prefilter_enabled,
             "static_analysis": self.static_analysis_enabled,
             "clone_detection": self.clone_detection_enabled,
+            "fix_generation": self.fix_generation_enabled,
             "context_builder": self.context_builder_enabled,
             "intent_summary": self.intent_summary_enabled,
             "review_generation": self.review_generation_enabled,
@@ -151,6 +154,8 @@ class StepTimeouts(BaseModel):
     # section for the full worst-case-chain-sum reasoning).
     verification_step_timeout_seconds: int = 60
     output_step_timeout_seconds: int = 30
+    # Phase 11: the outer timeout; the step's own internal wait_for is this minus 5 s.
+    fix_generation_step_timeout_seconds: int = 90
 
     def as_mapping(self) -> dict[str, int]:
         """See ``StepEnablement.as_mapping``'s docstring — the same
@@ -167,6 +172,7 @@ class StepTimeouts(BaseModel):
             "review_generation": self.review_generation_step_timeout_seconds,
             "verification": self.verification_step_timeout_seconds,
             "output": self.output_step_timeout_seconds,
+            "fix_generation": self.fix_generation_step_timeout_seconds,
             "gitleaks": self.static_analysis_analyzer_timeout_seconds,
             "semgrep": self.static_analysis_analyzer_timeout_seconds,
             "ruff": self.static_analysis_ruff_timeout_seconds
@@ -267,6 +273,18 @@ def clone_detection_can_produce_value(enablement: StepEnablement) -> bool:
     return enablement.clone_detection_enabled
 
 
+def fix_generation_can_produce_value(enablement: StepEnablement) -> bool:
+    """Whether running ``FixGenerationStep`` can produce value: it is enabled and at
+    least one eligible finding producer (spec D2) can run - static analysis, or
+    LLM review generation together with verification. Shared by the registry wiring
+    and ``check_step_configuration_viable`` so the two can't drift.
+    """
+    return enablement.fix_generation_enabled and (
+        static_analysis_can_produce_findings(enablement)
+        or (enablement.review_generation_enabled and enablement.verification_enabled)
+    )
+
+
 def intent_summary_can_produce_value(enablement: StepEnablement) -> bool:
     """Whether running ``IntentSummaryStep`` can actually produce any value
     under ``enablement`` — true only when the step itself is enabled *and*
@@ -284,7 +302,7 @@ def intent_summary_can_produce_value(enablement: StepEnablement) -> bool:
 def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, str]:
     """Resolves ``depends_on`` for the six dynamically-wired steps in the
     one review pipeline this codebase has (``clone_detection -> context_builder ->
-    intent_summary -> review_generation -> verification -> output``) —
+    intent_summary -> review_generation -> verification -> fix_generation -> output``) —
     **one small, concrete, hard-coded-to-this-one-chain function, not a
     general-purpose, arbitrary-chain-length utility** (Assumption 6 of
     docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section: an
@@ -328,8 +346,14 @@ def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, 
         else upstream_of_review_generation
     )
 
-    output_depends_on = (
+    fix_generation_depends_on = (
         "verification" if enablement.verification_enabled else verification_depends_on
+    )
+
+    output_depends_on = (
+        "fix_generation"
+        if fix_generation_can_produce_value(enablement)
+        else fix_generation_depends_on
     )
 
     return {
@@ -338,6 +362,7 @@ def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, 
         "intent_summary": intent_summary_depends_on,
         "review_generation": upstream_of_review_generation,
         "verification": verification_depends_on,
+        "fix_generation": fix_generation_depends_on,
         "output": output_depends_on,
     }
 
@@ -435,6 +460,7 @@ def check_step_configuration_viable(enablement: StepEnablement) -> None:
         "intent_summary": intent_summary_can_produce_value(enablement),
         "review_generation": enablement.review_generation_enabled,
         "verification": enablement.verification_enabled,
+        "fix_generation": fix_generation_can_produce_value(enablement),
         "output": enablement.output_enabled,
     }
     for step_name, target_name in resolved_depends_on.items():

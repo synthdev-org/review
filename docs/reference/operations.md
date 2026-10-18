@@ -685,3 +685,127 @@ or timed-out step, `review_clone_detection_phase_duration_ms` shows which phase 
 `candidate_cap_dropped_total{reason}` shows which fan-out cap is firing; `files_skipped_total{reason="unparseable"}`
 rising points at a parser bug; a non-zero `memory_suppression_failed_total` means dismissed clone
 findings are being re-posted because the Memory check is failing.
+
+## Fix generation: switch, cost, outcomes, rollout, rollback
+
+Context: [`docs/specs/spec-auto-fix.md`](../specs/spec-auto-fix.md),
+[`docs/plans/plan-phase-11.md`](../plans/plan-phase-11.md) and
+[ADR-0015](../adr/0015-fix-generation-step-and-validation-gate.md). The `fix_generation` step runs after
+`verification` and attaches a GitHub suggested change (a one-click-committable block) to eligible findings in
+their existing inline comment. It never commits anything: a person clicks "Commit suggestion" in GitHub.
+
+### What leaves the deployment, and what it costs
+
+Per attempted fix the Worker sends the configured LLM endpoint a window of the file
+(`FIX_GENERATION_WINDOW_LINES`, default 60 numbered lines) plus the finding text; a verified LLM finding's fix
+sends a second, smaller call (the finding, the window and the proposed replacement) for the rubric check. That
+is the same class of data the review already sends (the diff and context) to the same endpoint; nothing goes to
+any new party. Secret-shaped replacements are rejected before display, and Gitleaks findings are never
+candidates. At the defaults the cost bound is **at most 10 extra LLM calls per job** (5 fixes, up to 2 calls
+each); analyzer findings use one call, since the originating analyzer's re-run is the second check.
+
+### Settings
+
+Worker settings, mirrored in Compose (`.env`) and Helm (`worker.fixGeneration.*`):
+
+| Env var (`REVIEW_WORKER_FIX_GENERATION_`) | Helm value | Default | Notes |
+| --- | --- | --- | --- |
+| `ENABLED` | `enabled` | `false` | **Off by default**: it spends LLM budget on calls nobody asked for. |
+| `STEP_TIMEOUT_SECONDS` | `stepTimeoutSeconds` | `90` | Must exceed 5: the step fails open after `value - 5` seconds, keeping the fixes already accepted. |
+| `MAX_FIXES_PER_JOB` | `maxFixesPerJob` | `5` | Candidates over the cap are counted in `skipped_cap_total`; the best-ranked are kept. |
+| `MAX_RANGE_LINES` | `maxRangeLines` | `20` | Longest line range a fix may replace. |
+| `MAX_REPLACEMENT_LINES` | `maxReplacementLines` | `40` | Longest replacement text. |
+| `WINDOW_LINES` | `windowLines` | `60` | Must be at least `MAX_RANGE_LINES + 2`. |
+
+Model choice is the Admin UI's model-routing row `fix_generation`; the rubric call reuses the `verification` row.
+
+**Pair enabling it with the review-enqueue rate limiter.** Every push re-runs the review and no fix is reused
+across pushes (each `synchronize` enqueues a fresh review; no cross-push de-duplication exists), so spend is
+bounded per job, not per PR. Set `REVIEW_WEBHOOK_API_REVIEW_ENQUEUE_RATE_LIMIT_PER_MINUTE` above `0` (see
+"Per-repo review-enqueue rate limiting is disabled by default" above) before enabling fix generation on repos
+open to outside contributors.
+
+### Upgrade order and the stuck-job threshold
+
+Run `alembic upgrade head` **before** the Worker rolls (migration `0012` adds
+`posted_finding_comment.carried_suggestion`), as in "Upgrading via Helm when this release includes new
+migrations". The opposite order is fail-safe: the column is defaulted and an old Worker never writes it.
+
+`stuck_job_warning_threshold_seconds` must be at least the sum of every macro-step timeout, which grows from
+545 s to **635 s** with the 90 s `fix_generation` step (counted whether or not the step is enabled). The
+default rises from 600 s to **700 s**; an operator override between 545 s and 635 s now fails Worker startup
+(the log names the required minimum). Raise it, or lower `STEP_TIMEOUT_SECONDS`.
+
+### Outcome meanings
+
+`review_fix_generation_outcome_total{outcome,source}` counts each attempt once (`source` is `llm` for the rubric path, `analyzer` for the re-run path):
+
+| `outcome` | Meaning |
+| --- | --- |
+| `accepted` | Passed every gate; posted as a suggestion. |
+| `syntax_error` | The patched file has more parse errors than the original (or does not parse, for Python). |
+| `reanalysis_failed` | The originating analyzer still reports the finding, reports something new, or could not re-run. |
+| `rubric_failed` | A verified LLM finding's fix failed the four-criteria rubric, or the verdict was unparseable. |
+| `noop` | The replacement equals the text it replaces. |
+| `redaction` | The replacement looked like a secret (or the redactor failed). |
+| `oversized` | The replacement is longer than `MAX_REPLACEMENT_LINES`. |
+| `out_of_range` | The range misses the finding's line, exceeds `MAX_RANGE_LINES`, leaves its hunk, or leaves the window. |
+| `invalid_text` | The replacement contains a carriage return or NUL, which a suggestion cannot carry. |
+| `overlap` | Two accepted fixes overlapped; only the better-ranked is kept. |
+| `parse_error` | The model's reply was not the fixed JSON shape. |
+| `timeout` | The LLM call timed out or the endpoint was unreachable, or the step timeout abandoned the attempt. |
+| `fetch_failed` | The file content could not be fetched or decoded. |
+
+A rejection is a safe outcome: the finding still posts, without a suggestion. Many rejections at the start is
+normal; read the mix before tuning anything.
+
+`reanalysis_failed` mixes the gate working with the re-run breaking, so read
+`review_fix_generation_reanalysis_total{analyzer,result}` beside it: `rejected` is the gate working, `failed` means
+the analyzer errored, timed out or is unknown, and `no_rule` means the finding had no `rule_id`.
+`review_posting_comments_total{carried_suggestion}` counts posted inline comments with and without a fix, so
+dismissal or feedback rates can be compared between the two.
+
+### Alerts
+
+Metric names are the OpenTelemetry names with dots as underscores, as on the dashboard.
+
+- An analyzer whose re-run keeps breaking (every fix for its findings is rejected regardless of quality):
+  `sum(rate(review_fix_generation_reanalysis_total{result="failed"}[1h])) by (analyzer) / sum(rate(review_fix_generation_reanalysis_total[1h])) by (analyzer) > 0.5`
+
+- A failing endpoint, prompt or content fetch (the share of attempts ending in `parse_error`, `timeout` or
+  `fetch_failed` over an hour; a third is the threshold):
+  `sum(rate(review_fix_generation_outcome_total{outcome=~"parse_error|timeout|fetch_failed"}[1h])) / sum(rate(review_fix_generation_outcome_total[1h])) > 0.33`
+- A broken multi-line correlation: after enabling, the Worker log line `posting: provenance capture
+  correlation summary` should not appear with a sustained non-zero `unmatched_count`. A multi-line suggestion
+  comment is anchored at its end line; if GitHub's echoed comments stopped matching, Memory would stop
+  capturing fix comments (the review itself is unaffected). Alert on that line's rate where logs are queryable.
+
+### Limits
+
+- **One suggestion at a time.** Each fix is validated alone against the file as the PR has it. GitHub applies
+  suggestions one at a time, but two accepted, non-overlapping fixes are never validated *together*; committing
+  both can in principle interact. The reviewer sees each in context.
+- **Re-pushes.** A new push produces a new review with new fix attempts. Nothing is cached or reused.
+- **Languages.** TypeScript, JavaScript, PHP, Go and Python only (the syntax gate's reach). JavaScript is
+  parsed with the TSX grammar, which can accept some invalid JavaScript; ESLint's re-run, which parses it as
+  JavaScript, catches those.
+- **Correctness bar.** An accepted fix passed the syntax gate and the analyzer's (or the rubric's) judgment. It
+  is not run, tested or sandboxed; a reader still decides.
+- **Applied rate is not measured.** GitHub sends no webhook for a committed suggestion. Memory marks comments
+  that carried a suggestion so a person can classify them `accepted_fix` at approval; nothing reads those yet.
+
+### Verifying a rollout
+
+1. Deploy with `enabled: false`; confirm the migration applied (`\d posted_finding_comment` shows
+   `carried_suggestion`).
+2. Enable on one staging deployment or org. Open a PR with a known Ruff finding (for example an unused import).
+3. Check the posted comment carries a `suggestion` block, the Worker log line `fix_generation completed` shows
+   `accepted >= 1`, and the "Auto-fix suggestions" dashboard row shows `accepted` outcomes and `fix_generation`
+   token usage.
+4. Watch the rejection mix and the fix LLM spend for a week before widening.
+
+### Rolling back
+
+Set `REVIEW_WORKER_FIX_GENERATION_ENABLED=false` (`worker.fixGeneration.enabled: false`) and restart the
+Workers: instant, no cleanup, and suggestions already posted remain ordinary GitHub comments. Reverting the code
+as well (`helm rollback` or an image revert) leaves migration `0012` in place, unused; it need not be reversed.
