@@ -150,6 +150,7 @@ class _FakeReviewGenerationOutput:
     pr_number: int = 42
     head_sha: str = "deadbeef"
     context_bundle: ContextBundle | None = None
+    intent_summary: str | None = None
 
 
 class _FakeReviewGenerationStep:
@@ -1566,3 +1567,40 @@ async def test_pr_metadata_is_forwarded_to_the_real_output() -> None:
     assert output.pr_head_ref == "bugfix/PROJ-9"
     assert output.pr_issue_keys == ("PROJ-9", "#41")
     assert output.pr_is_fork is False
+
+
+@pytest.mark.asyncio
+async def test_phase12_intent_summary_and_reviewed_diff_are_carried_on_the_no_findings_path() -> (
+    None
+):
+    diff = _diff_with_patch()
+    upstream = _FakeReviewGenerationOutput(diff=diff, intent_summary="Refactors the loader.")
+
+    output = await _verification_step(llm_client=_FakeLLMClient()).run(upstream, _context())
+
+    assert output.intent_summary == "Refactors the loader."
+    assert output.reviewed_diff == diff
+
+
+@pytest.mark.asyncio
+async def test_phase12_intent_summary_and_reviewed_diff_are_carried_on_the_normal_path() -> None:
+    diff = _diff_with_patch()
+    llm_client = _FakeLLMClient(response_content=_verdicts_response_json([_passing_verdict(0)]))
+    upstream = _FakeReviewGenerationOutput(
+        diff=diff, findings=[_llm_finding(0)], intent_summary="Refactors the loader."
+    )
+
+    output = await _verification_step(llm_client=llm_client).run(upstream, _context())
+
+    assert len(llm_client.calls) == 1
+    assert output.intent_summary == "Refactors the loader."
+    assert output.reviewed_diff == diff
+
+
+@pytest.mark.asyncio
+async def test_phase12_absent_intent_summary_stays_none() -> None:
+    upstream = _FakeReviewGenerationOutput(diff=_diff_with_patch())
+
+    output = await _verification_step(llm_client=_FakeLLMClient()).run(upstream, _context())
+
+    assert output.intent_summary is None

@@ -43,6 +43,13 @@ from review.step import StepContext
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
+
+@pytest.fixture(autouse=True)
+def _reenable_fix_generation_logger() -> None:
+    # Alembic's env.py fileConfig() (migrated_engine in earlier tests) disables existing loggers.
+    logging.getLogger("review.fix_generation").disabled = False
+
+
 _ORIGINAL = "import os\n\n\ndef f():\n    return 1\n"
 _PATCH = "@@ -0,0 +1,5 @@\n+import os\n+\n+\n+def f():\n+    return 1\n"
 _DELETE_IMPORT = {"start_line": 1, "end_line": 1, "replacement": ""}
@@ -644,3 +651,71 @@ def test_window_is_centered_clamped_and_never_larger_than_the_file() -> None:
     assert _window_bounds(2, 200, 60) == (1, 60)
     assert _window_bounds(199, 200, 60) == (141, 200)
     assert _window_bounds(3, 5, 60) == (1, 5)
+
+
+# --- Phase 12: intent_summary / reviewed_diff are carried, never fetched ----------------------
+
+
+def _carrying(
+    inp: _Input, *, reviewed: Diff | None = None, summary: str | None = "Refactors."
+) -> _Input:
+    inp.intent_summary = summary  # type: ignore[attr-defined]
+    inp.reviewed_diff = reviewed  # type: ignore[attr-defined]
+    return inp
+
+
+async def test_phase12_fields_are_carried_on_the_normal_and_no_findings_paths() -> None:
+    reviewed = _diff(path="r.py")
+    normal = await _run(_step(_LLM()), _carrying(_Input([_ruff()]), reviewed=reviewed))
+    empty = await _run(_step(_LLM()), _carrying(_Input([]), reviewed=reviewed))
+
+    for output in (normal, empty):
+        assert output.intent_summary == "Refactors."
+        assert output.reviewed_diff == reviewed
+
+
+async def test_phase12_review_generation_predecessor_carries_its_diff_as_reviewed_diff() -> None:
+    diff = _diff(path="d.py")
+
+    output = await _run(_step(_LLM()), _carrying(_Input([_ruff()], diff)))
+
+    assert output.reviewed_diff == diff
+
+
+async def test_phase12_timeout_path_still_carries_the_fields() -> None:
+    class _Slow(_Reanalyzer):
+        async def rerun(self, *args: Any, **kw: Any) -> str:
+            await asyncio.sleep(10)
+            return "passed"
+
+    reviewed = _diff(path="r.py")
+    step = _step(_LLM(), reanalyzer=_Slow(), internal_timeout=0.05)
+
+    output = await _run(step, _carrying(_Input([_ruff()]), reviewed=reviewed))
+
+    assert output.intent_summary == "Refactors."
+    assert output.reviewed_diff == reviewed
+
+
+async def test_phase12_a_fetched_diff_is_never_carried_and_the_fetch_is_unchanged() -> None:
+    fetcher = _Fetcher()
+    plain = await _run(_step(_LLM(), fetcher=_Fetcher()), _Input([_ruff()], no_diff=True))
+
+    output = await _run(_step(_LLM(), fetcher=fetcher), _carrying(_Input([_ruff()], no_diff=True)))
+
+    assert fetcher.fetch_calls == 1  # reviewed_diff absent: Phase 11's fetch is untouched
+    assert output.reviewed_diff is None
+    assert output.findings == plain.findings
+
+
+async def test_phase12_reviewed_diff_present_does_not_change_the_fetch_or_content_base() -> None:
+    plain_fetcher, carried_fetcher = _Fetcher(), _Fetcher()
+    await _run(_step(_LLM(), fetcher=plain_fetcher), _Input([_ruff()], no_diff=True))
+
+    await _run(
+        _step(_LLM(), fetcher=carried_fetcher),
+        _carrying(_Input([_ruff()], no_diff=True), reviewed=_diff(path="r.py")),
+    )
+
+    assert carried_fetcher.fetch_calls == plain_fetcher.fetch_calls == 1
+    assert carried_fetcher.fetch_content_calls == plain_fetcher.fetch_content_calls

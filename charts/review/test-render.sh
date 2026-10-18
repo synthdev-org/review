@@ -398,6 +398,30 @@ assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_FIX_GENERATION_WINDOW_LINES: "6
     "docker compose config passes the window_lines default to the worker"
 
 echo
+echo "=== 9. walkthrough settings (plan-phase-12 Phase 3, US-W9/W11) ==="
+WT_OUT=$(helm template "$RELEASE" "$CHART_DIR" --show-only templates/configmap.yaml)
+assert_contains "$WT_OUT" 'REVIEW_WORKER_WALKTHROUGH_ENABLED: "false"' \
+    "ConfigMap renders the walkthrough enabled default (off)"
+assert_contains "$WT_OUT" 'REVIEW_WORKER_WALKTHROUGH_STEP_TIMEOUT_SECONDS: "45"' \
+    "ConfigMap renders the walkthrough step timeout default"
+assert_contains "$WT_OUT" 'REVIEW_WORKER_WALKTHROUGH_MIN_FILES: "2"' \
+    "ConfigMap renders the walkthrough min files default"
+assert_contains "$WT_OUT" 'REVIEW_WORKER_WALKTHROUGH_MAX_FILES: "60"' \
+    "ConfigMap renders the walkthrough max files default"
+assert_contains "$WT_OUT" 'REVIEW_WORKER_WALKTHROUGH_MAX_CHARS: "6000"' \
+    "ConfigMap renders the walkthrough max chars default"
+WT_ON_OUT=$(helm template "$RELEASE" "$CHART_DIR" --show-only templates/configmap.yaml \
+    --set worker.walkthrough.enabled=true --set worker.walkthrough.maxFiles=40)
+assert_contains "$WT_ON_OUT" 'REVIEW_WORKER_WALKTHROUGH_ENABLED: "true"' \
+    "worker.walkthrough.enabled=true reaches the ConfigMap"
+assert_contains "$WT_ON_OUT" 'REVIEW_WORKER_WALKTHROUGH_MAX_FILES: "40"' \
+    "worker.walkthrough.maxFiles override reaches the ConfigMap"
+assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_WALKTHROUGH_ENABLED: "false"' \
+    "docker compose config passes the walkthrough switch (off) to the worker"
+assert_contains "$COMPOSE_WORKER" 'REVIEW_WORKER_WALKTHROUGH_STEP_TIMEOUT_SECONDS: "45"' \
+    "docker compose config passes the walkthrough timeout default to the worker"
+
+echo
 if [[ "$FAILED" -eq 0 ]]; then
     echo "All Helm chart render checks passed."
 else

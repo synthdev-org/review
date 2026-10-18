@@ -966,3 +966,95 @@ def test_fix_generation_window_at_the_minimum_is_accepted(
     _clone_env(monkeypatch, FIX_GENERATION_MAX_RANGE_LINES="20", FIX_GENERATION_WINDOW_LINES="22")
 
     assert WorkerSettings(_env_file=None).fix_generation_window_lines == 22
+
+
+# --- Phase 12: walkthrough settings (US-W11) ---------------------------------
+
+
+def test_walkthrough_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clone_env(monkeypatch)
+
+    settings = WorkerSettings(_env_file=None)
+
+    assert settings.walkthrough_enabled is False
+    assert settings.walkthrough_step_timeout_seconds == 45
+    assert settings.walkthrough_min_files == 2
+    assert settings.walkthrough_max_files == 60
+    assert settings.walkthrough_max_chars == 6000
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("WALKTHROUGH_MIN_FILES", "0"),
+        ("WALKTHROUGH_MAX_FILES", "0"),
+        ("WALKTHROUGH_MAX_FILES", "201"),
+        ("WALKTHROUGH_MAX_CHARS", "499"),
+        ("WALKTHROUGH_MAX_CHARS", "60001"),
+        ("WALKTHROUGH_STEP_TIMEOUT_SECONDS", "44"),
+    ],
+)
+def test_walkthrough_bad_values_fail_startup_naming_the_setting(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    _clone_env(monkeypatch, WALKTHROUGH_ENABLED="true", **{name: value})
+
+    with pytest.raises(ValidationError, match=name.lower()) as excinfo:
+        WorkerSettings(_env_file=None)
+
+    assert "or set walkthrough_enabled=false" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("WALKTHROUGH_MIN_FILES", "1"),
+        ("WALKTHROUGH_MAX_FILES", "200"),
+        ("WALKTHROUGH_MAX_CHARS", "500"),
+        ("WALKTHROUGH_MAX_CHARS", "60000"),
+        ("WALKTHROUGH_STEP_TIMEOUT_SECONDS", "45"),
+    ],
+)
+def test_walkthrough_boundary_values_are_accepted(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    _clone_env(monkeypatch, WALKTHROUGH_ENABLED="true", **{name: value})
+
+    WorkerSettings(_env_file=None)
+
+
+def test_walkthrough_disabled_skips_companion_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clone_env(
+        monkeypatch,
+        WALKTHROUGH_MIN_FILES="0",
+        WALKTHROUGH_MAX_FILES="999",
+        WALKTHROUGH_MAX_CHARS="1",
+        WALKTHROUGH_STEP_TIMEOUT_SECONDS="1",
+    )
+
+    assert WorkerSettings(_env_file=None).walkthrough_enabled is False
+
+
+def test_walkthrough_timeout_is_coupled_to_the_llm_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clone_env(monkeypatch, WALKTHROUGH_ENABLED="true", LLM_TIMEOUT_SECONDS="40")
+
+    with pytest.raises(ValidationError, match="llm_timeout_seconds"):
+        WorkerSettings(_env_file=None)
+
+
+def test_stuck_job_sum_includes_walkthrough_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clone_env(monkeypatch, WALKTHROUGH_ENABLED="true", STUCK_JOB_WARNING_THRESHOLD_SECONDS="679")
+    with pytest.raises(ValidationError, match="680"):
+        WorkerSettings(_env_file=None)
+
+    _clone_env(monkeypatch, WALKTHROUGH_ENABLED="true", STUCK_JOB_WARNING_THRESHOLD_SECONDS="680")
+    assert WorkerSettings(_env_file=None).stuck_job_warning_threshold_seconds == 680.0
+
+    _clone_env(monkeypatch, WALKTHROUGH_ENABLED="false", STUCK_JOB_WARNING_THRESHOLD_SECONDS="635")
+    assert WorkerSettings(_env_file=None).stuck_job_warning_threshold_seconds == 635.0

@@ -46,6 +46,15 @@ here at all, by design, not a Protocol placed somewhere other than its
 first consumer) and stands on its own reasoning, per that ADR's own scope
 note.
 
+**Walkthrough prose (``neutralize_prose``).** ``escape_markdown`` backslash-
+escapes, but GitHub links ``#123``, ``owner/repo#123``, ``GH-123`` and 7-40
+character hex runs on the *rendered* text, so ``\\#123`` still renders and
+links as ``#123`` (and still creates a cross-reference). The PR walkthrough
+comment, whose prose is wholly LLM-authored and must be inert, therefore also
+breaks those with a zero-width space. That is a separate function rather than a
+change to ``escape_markdown`` on purpose: breaking every hex run and reference
+would corrupt legitimate finding messages (``abcdef1234`` in a quoted line).
+
 ``adapter/github/posting.py`` calls this for **both** surfaces it builds —
 comment bodies and the check-run's own summary text — never passing raw
 PR-derived or LLM-derived text through unescaped on either one.
@@ -54,6 +63,14 @@ PR-derived or LLM-derived text through unescaped on either one.
 from __future__ import annotations
 
 import re
+import unicodedata
+from typing import Final
+
+# Control, format, surrogate, private-use and line/paragraph-separator
+# characters (bidi overrides, zero-width characters, ...). Cs cannot be UTF-8
+# encoded, so it would crash the JSON body of a posted comment. Shared with
+# ``review.product_knowledge``.
+STRIP_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
 
 # Standard Markdown/GFM special characters, backslash-escaped so none of
 # them can form a structural construct (code fence, link, image, emphasis,
@@ -98,3 +115,45 @@ def suggestion_block(replacement: str) -> str:
         return f"{fence}suggestion\n{fence}"
     body = replacement if replacement.endswith("\n") else replacement + "\n"
     return f"{fence}suggestion\n{body}{fence}"
+
+
+def strip_display_text(text: str) -> str:
+    """Remove ``STRIP_CATEGORIES`` characters and collapse every whitespace run
+    (newlines and tabs included) to one space, so a string can never inject a
+    heading, a second marker or a fake footer. Idempotent."""
+    kept = "".join(
+        c for c in text if c.isspace() or unicodedata.category(c) not in STRIP_CATEGORIES
+    )
+    return " ".join(kept.split())
+
+
+_ISSUE_REF_RE = re.compile(r"(#|\bGH-)(?=\d)", re.IGNORECASE)
+_HEX_RUN_RE = re.compile(r"[0-9a-fA-F]{7,}")
+_URL_SCHEME_RE = re.compile(r"://")
+_WWW_RE = re.compile(r"\bwww(?=\.)", re.IGNORECASE)
+
+
+def _break_hex_run(match: re.Match[str]) -> str:
+    run = match.group(0)
+    return _ZERO_WIDTH_SPACE.join(run[i : i + 6] for i in range(0, len(run), 6))
+
+
+def neutralize_prose(text: str) -> str:
+    """Make LLM-authored prose inert on a GitHub-rendered surface: strip control
+    and format characters and collapse whitespace first (the zero-width spaces
+    inserted below are themselves Cf, so stripping afterwards would undo them),
+    then break issue references, commit-SHA-like hex runs, URLs and ``www.``
+    with a zero-width space on the raw text (before ``escape_markdown``, whose
+    backslashes would otherwise sit between the characters these match), escape
+    ``&`` (before ``escape_markdown`` emits its own ``&lt;``), and finally
+    ``escape_markdown`` (which also breaks ``@mentions`` and email ``@``).
+    Not for file paths: those render in a code span, where breaking would
+    corrupt the path."""
+    out = strip_display_text(text)
+    out = _ISSUE_REF_RE.sub(lambda m: m.group(1) + _ZERO_WIDTH_SPACE, out)
+    out = _HEX_RUN_RE.sub(_break_hex_run, out)
+    out = _URL_SCHEME_RE.sub(f":{_ZERO_WIDTH_SPACE}//", out)
+    out = _WWW_RE.sub(lambda m: m.group(0) + _ZERO_WIDTH_SPACE, out)
+    out = out.replace("&", "&amp;")
+    # ``~`` stays out of escape_markdown (finding text like ``~/x`` must not change).
+    return escape_markdown(out).replace("~", "\\~")

@@ -131,3 +131,28 @@ async def test_gitleaks_analyzer_routes_through_the_shared_retry_helper(
 
     assert len(calls) == 1
     assert calls[0][0] == "gitleaks"
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_characterization_a_gitleaks_allow_line_is_skipped_by_the_pinned_binary() -> None:
+    """Records (plan-phase-12, Assumption 7(c)) that the pinned Gitleaks honors an inline
+    ``gitleaks:allow`` marker, which is why the walkthrough strips the marker
+    unconditionally before redacting: it must not depend on this answer."""
+    redactor = GitleaksTextRedactor()
+    line = f"{_PLANTED_SECRET} # gitleaks:allow"
+
+    redacted = await redactor.redact(line)
+
+    assert redacted == line
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_the_line_with_its_allow_marker_stripped_is_redacted() -> None:
+    redactor = GitleaksTextRedactor()
+    stripped = f"{_PLANTED_SECRET} # gitleaks:allow".replace("gitleaks:allow", "")
+
+    redacted = await redactor.redact(stripped)
+
+    assert "ghp_1234567890abcdefghijklmnopqrstuvwxyz12" not in redacted

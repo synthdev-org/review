@@ -139,6 +139,15 @@ worker:
     maxRangeLines: 20
     maxReplacementLines: 40
     windowLines: 60
+  # Phase 12: the PR walkthrough comment, off by default. A Worker bootstrap
+  # setting, so changing it needs a rolling restart. When enabled, stepTimeoutSeconds
+  # must be >= the LLM timeout + 15 (the stuck-job sum then grows by it).
+  walkthrough:
+    enabled: false
+    stepTimeoutSeconds: 45
+    minFiles: 2
+    maxFiles: 60
+    maxChars: 6000
   # Phase 5: non-empty defaults, closing the gap between the pipeline's own
   # per-step timeout (Phase 2) and actual container enforcement — a
   # pathological diff or a misbehaving analyzer subprocess (Gitleaks,

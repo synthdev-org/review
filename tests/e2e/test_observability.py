@@ -81,6 +81,11 @@ from tests.e2e.conftest import (
     wait_for_healthy,
     wait_for_log_line,
 )
+from tests.e2e.test_review_pipeline import (
+    _IssueComments,
+    serve_issue_comments,
+)
+from tests.e2e.test_review_pipeline import _StubLLMHandler as _PipelineLLMHandler
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DASHBOARD_PATH = REPO_ROOT / "charts" / "review" / "dashboards" / "review.json"
@@ -139,6 +144,24 @@ _FALLBACK_PR_NUMBER = 101
 _FIX_REJECT_HEAD_SHA = "9" * 40
 _FIX_REJECT_PR_NUMBER = 102
 
+# Phase 12: PRs on a two-file diff (so the walkthrough runs), one per walkthrough outcome the
+# stub can drive. Each head SHA serves the main scenario's tree.
+_WT_PR_NUMBER = 103  # posted, then updated by a second push
+_WT_HEAD_SHA = "a1" * 20
+_WT_SECOND_HEAD_SHA = "a2" * 20
+_WT_TIMEOUT_PR_NUMBER, _WT_TIMEOUT_HEAD_SHA = 104, "a3" * 20
+_WT_GARBAGE_PR_NUMBER, _WT_GARBAGE_HEAD_SHA = 105, "a4" * 20
+_WT_GITHUB_ERROR_PR_NUMBER, _WT_GITHUB_ERROR_HEAD_SHA = 106, "a5" * 20
+_WT_LIMIT_PR_NUMBER, _WT_LIMIT_HEAD_SHA = 107, "a6" * 20
+_WT_SHAS = (
+    _WT_HEAD_SHA,
+    _WT_SECOND_HEAD_SHA,
+    _WT_TIMEOUT_HEAD_SHA,
+    _WT_GARBAGE_HEAD_SHA,
+    _WT_GITHUB_ERROR_HEAD_SHA,
+    _WT_LIMIT_HEAD_SHA,
+)
+
 _HELPER_BASE_BLOB_SHA = "1" * 40
 _HELPER_HEAD_BLOB_SHA = "2" * 40
 _CALLER_BLOB_SHA = "3" * 40
@@ -165,6 +188,8 @@ _CALLER_TS = (
     b"}\n"
 )
 _SECOND_FILE_TS = b"export function second(): number {\n  return 3;\n}\n"
+
+_CALLER_PATCH = "@@ -0,0 +1,5 @@\n" + "\n".join(f"+line {i}" for i in range(5))
 
 _HELPER_PATCH = (
     "@@ -1,10 +1,10 @@\n"
@@ -221,6 +246,9 @@ _TREES_BY_SHA: dict[str, list[dict[str, object]]] = {
     ],
     _SECOND_PUSH_COMMIT_SHA: [_tree_entry("second.ts", _SECOND_FILE_BLOB_SHA, _SECOND_FILE_TS)],
 }
+for _sha in _WT_SHAS:
+    _TREES_BY_SHA[_sha] = _TREES_BY_SHA[_HEAD_SHA]
+
 _BLOBS: dict[str, bytes] = {
     _HELPER_BASE_BLOB_SHA: _HELPER_TS_BASE,
     _HELPER_HEAD_BLOB_SHA: _HELPER_TS_HEAD,
@@ -271,14 +299,31 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
             self._send_json(201, {"id": 1})
             return
 
+        if serve_issue_comments(self, "POST", path, "", _OWNER_REPO):
+            return
+
         self._send_json(404, {"message": "not found (stub)"})
+
+    def do_PATCH(self) -> None:
+        self._calls().calls.append(f"PATCH {self.path}")
+        if not serve_issue_comments(self, "PATCH", self.path, "", _OWNER_REPO):
+            self._send_json(404, {"message": "not found (stub)"})
+
+    def do_DELETE(self) -> None:
+        self._calls().calls.append(f"DELETE {self.path}")
+        if not serve_issue_comments(self, "DELETE", self.path, "", _OWNER_REPO):
+            self._send_json(404, {"message": "not found (stub)"})
 
     def do_GET(self) -> None:
         path_only = self.path.split("?", 1)[0]
         self._calls().calls.append(f"GET {self.path}")
+        if serve_issue_comments(self, "GET", path_only, self.path.partition("?")[2], _OWNER_REPO):
+            return
 
         if re.fullmatch(rf"/repos/{re.escape(_OWNER_REPO)}/pulls/\d+", path_only):
-            self._send_json(200, {"changed_files": 1})
+            self._send_json(
+                200, {"changed_files": 2 if getattr(self.server, "two_files", False) else 1}
+            )
             return
 
         if re.fullmatch(rf"/repos/{re.escape(_OWNER_REPO)}/pulls/\d+/files", path_only):
@@ -296,9 +341,10 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
             if status != 200:
                 self._send_json(status, {"message": "simulated files-endpoint failure (stub)"})
                 return
-            self._send_json(
-                200, [{"filename": "helper.ts", "status": "modified", "patch": _HELPER_PATCH}]
-            )
+            files = [{"filename": "helper.ts", "status": "modified", "patch": _HELPER_PATCH}]
+            if getattr(self.server, "two_files", False):
+                files.append({"filename": "caller.ts", "status": "added", "patch": _CALLER_PATCH})
+            self._send_json(200, files)
             return
 
         match = re.fullmatch(rf"/repos/{re.escape(_OWNER_REPO)}/git/trees/(\w+)", path_only)
@@ -328,6 +374,7 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
 def stub_github_server() -> Iterator[HTTPServer]:
     server = HTTPServer(("0.0.0.0", STUB_GITHUB_PORT), _StubGitHubHandler)
     server.calls = _CallLog()  # type: ignore[attr-defined]
+    server.issue_comments = _IssueComments()  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -378,6 +425,11 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             return self._FINDINGS_CONTENT
         return self._VERDICT_VERIFIED_CONTENT
 
+    # Phase 12: the walkthrough call is recognized by its marker, not call position, and its
+    # scenario (ok | garbage | delay) is `server.walkthrough_scenario`.
+    def _walkthrough_content(self, request: dict[str, Any]) -> str | None:
+        return _PipelineLLMHandler._walkthrough_content(self, request)  # type: ignore[arg-type]
+
     def _fix_content(self, request: dict[str, Any]) -> str | None:
         """Auto-fix calls are recognized by their prompt marker, not call
         position (plan-phase-11 Assumption 15): a valid patch and an all-true
@@ -403,6 +455,8 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             request = {}
         fix_content = self._fix_content(request) if isinstance(request, dict) else None
+        if fix_content is None and isinstance(request, dict):
+            fix_content = self._walkthrough_content(request)
         call_number = getattr(self.server, "call_count", 0) + 1
         if fix_content is None:
             self.server.call_count = call_number  # type: ignore[attr-defined]
@@ -440,6 +494,9 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
 def stub_llm_review_server() -> Iterator[HTTPServer]:
     server = HTTPServer(("0.0.0.0", STUB_LLM_REVIEW_PORT), _StubLLMHandler)
     server.call_count = 0  # type: ignore[attr-defined]
+    server.walkthrough_scenario = "ok"  # type: ignore[attr-defined]
+    server.walkthrough_calls = 0  # type: ignore[attr-defined]
+    server.walkthrough_delay_seconds = 14.0  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -464,6 +521,13 @@ def _e2e_env() -> dict[str, str]:
         REVIEW_WEBHOOK_API_INDEXING_ENABLED="true",
         # Phase 11: the fix panels only get data when the (default-off) step runs.
         REVIEW_WORKER_FIX_GENERATION_ENABLED="true",
+        # Phase 12: the walkthrough panels only get data when the (default-off) step runs; the
+        # smallest legal step timeout (LLM timeout 10 s + 15) keeps the timeout case quick.
+        REVIEW_WORKER_WALKTHROUGH_ENABLED="true",
+        REVIEW_WORKER_WALKTHROUGH_STEP_TIMEOUT_SECONDS="25",
+        # The default 5/min index limit would roll back the whole delivery (review job included)
+        # once the walkthrough PRs push past it.
+        REVIEW_WEBHOOK_API_INDEX_ENQUEUE_RATE_LIMIT_PER_MINUTE="1000",
         # The one manual step .env.example documents: point both
         # entrypoints at the bundled collector's in-network address, the
         # same value an operator would set in their own `.env`. Always
@@ -545,13 +609,17 @@ def _push_payload(*, commit_sha: str, added_files: list[str]) -> bytes:
 
 
 def _pull_request_payload(
-    *, pr_number: int = _PR_NUMBER, head_sha: str = _HEAD_SHA, base_sha: str = _INDEX_COMMIT_SHA
+    *,
+    pr_number: int = _PR_NUMBER,
+    head_sha: str = _HEAD_SHA,
+    base_sha: str = _INDEX_COMMIT_SHA,
+    action: str = "opened",
 ) -> bytes:
     return json.dumps(
         {
             "installation": {"id": _INSTALLATION_ID},
             "repository": {"full_name": _OWNER_REPO},
-            "action": "opened",
+            "action": action,
             "pull_request": {
                 "number": pr_number,
                 "head": {"sha": head_sha},
@@ -818,6 +886,12 @@ _PANELS_WITHOUT_E2E_TRAFFIC = frozenset(
         "Config skipped (repo config ignored)",
         "Findings dropped (ceiling / unchanged lines)",
         "Analyzer runs skipped (no matching files)",
+        # Phase 12: a duplicate-comment convergence failure and an unexpected internal failure
+        # (redactor outage, hostile multi-line scanner rule) cannot be provoked from stub
+        # traffic; review/test_walkthrough_step.py and adapter/github/test_walkthrough_posting.py
+        # cover both.
+        "Walkthrough outcome: dedupe_failed",
+        "Walkthrough outcome: internal_error",
     }
 )
 
@@ -953,6 +1027,36 @@ def test_dashboard_panels_resolve_real_data_within_two_minutes(
     assert reject_status == 200
     _wait_until_check_run_count_at_least(calls, 4)
     stub_llm_review_server.fix_reply_unparseable = False  # type: ignore[attr-defined]
+
+    # 3d. Phase 12: the walkthrough panels. The main PR above is one file, so it already gave
+    #     `skipped_small_pr` its sample; the PRs below serve a two-file diff. A push creates the
+    #     comment (`posted`), the next push edits it (`updated`), and one PR per failure mode
+    #     the stub can drive: LLM delay (`llm_timeout`), garbage (`parse_failure`), comment
+    #     writes answering 500 (`github_error`) and a 501-comment PR (`skipped_comment_limit`).
+    #     `dedupe_failed` and `internal_error` cannot be provoked from stub traffic.
+    stub_github_server.two_files = True  # type: ignore[attr-defined]
+    llm = stub_llm_review_server
+    store: _IssueComments = stub_github_server.issue_comments  # type: ignore[attr-defined]
+    for number, sha, action, scenario, mode in (
+        (_WT_PR_NUMBER, _WT_HEAD_SHA, "opened", "ok", "normal"),
+        (_WT_PR_NUMBER, _WT_SECOND_HEAD_SHA, "synchronize", "ok", "normal"),
+        (_WT_TIMEOUT_PR_NUMBER, _WT_TIMEOUT_HEAD_SHA, "opened", "delay", "normal"),
+        (_WT_GARBAGE_PR_NUMBER, _WT_GARBAGE_HEAD_SHA, "opened", "garbage", "normal"),
+        (_WT_GITHUB_ERROR_PR_NUMBER, _WT_GITHUB_ERROR_HEAD_SHA, "opened", "ok", "write_error"),
+        (_WT_LIMIT_PR_NUMBER, _WT_LIMIT_HEAD_SHA, "opened", "ok", "limit"),
+    ):
+        llm.call_count = 0  # type: ignore[attr-defined]  # fresh 3-call sequence
+        llm.walkthrough_scenario = scenario  # type: ignore[attr-defined]
+        store.mode = mode
+        before = len(calls.check_run_bodies)
+        wt_body = _pull_request_payload(pr_number=number, head_sha=sha, action=action)
+        assert (
+            _post_webhook(env, body=wt_body, signature=_sign(wt_body), event_type="pull_request")
+            == 200
+        )
+        _wait_until_check_run_count_at_least(calls, before + 1)
+    stub_github_server.two_files = False  # type: ignore[attr-defined]
+    assert len(store.items) == 1  # the one comment, created then edited in place
 
     # 4. Now the part US11/US12 actually own: poll Grafana's own HTTP API
     #    (not Prometheus directly, not "containers started") until every

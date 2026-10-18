@@ -30,6 +30,9 @@ class StepEnablement(BaseModel):
     — per US-F4, Gitleaks and Semgrep genuinely need to be toggled
     separately.
 
+    Phase 12: ``secret_redaction_enabled`` is the one non-step input field (it gates
+    ``walkthrough_can_produce_value``); it is excluded from ``as_mapping()``.
+
     ``as_mapping()``'s returned dict carries both macro-step and analyzer-
     sub-step keys in one shape — the same single instance
     ``apps/worker/main.py`` builds once from ``WorkerSettings`` is passed
@@ -46,6 +49,11 @@ class StepEnablement(BaseModel):
     clone_detection_enabled: bool = True
     # Phase 11 (docs/plans/plan-phase-11.md): the fix_generation step; off by default (spec D8).
     fix_generation_enabled: bool = False
+    # Phase 12 (docs/plans/plan-phase-12.md, Phase 3): the walkthrough step; off by default.
+    walkthrough_enabled: bool = False
+    # Not a step and not in as_mapping(): a real secret redactor is a precondition of
+    # walkthrough_can_produce_value, so the one answer is shared by resolver, check and registry.
+    secret_redaction_enabled: bool = True
     # Added by docs/plans/plan-deliver-context-builder.md's Phase 5 section —
     # the context_builder step's own kill switch (spec-context-builder.md's
     # Rollout & Release Safety "decided" flag), default `True`, mirroring
@@ -100,6 +108,7 @@ class StepEnablement(BaseModel):
             "static_analysis": self.static_analysis_enabled,
             "clone_detection": self.clone_detection_enabled,
             "fix_generation": self.fix_generation_enabled,
+            "walkthrough": self.walkthrough_enabled,
             "context_builder": self.context_builder_enabled,
             "intent_summary": self.intent_summary_enabled,
             "review_generation": self.review_generation_enabled,
@@ -156,6 +165,8 @@ class StepTimeouts(BaseModel):
     output_step_timeout_seconds: int = 30
     # Phase 11: the outer timeout; the step's own internal wait_for is this minus 5 s.
     fix_generation_step_timeout_seconds: int = 90
+    # Phase 12: the outer timeout; the step's own internal wait_for is this minus a publish reserve.
+    walkthrough_step_timeout_seconds: int = 45
 
     def as_mapping(self) -> dict[str, int]:
         """See ``StepEnablement.as_mapping``'s docstring — the same
@@ -173,6 +184,7 @@ class StepTimeouts(BaseModel):
             "verification": self.verification_step_timeout_seconds,
             "output": self.output_step_timeout_seconds,
             "fix_generation": self.fix_generation_step_timeout_seconds,
+            "walkthrough": self.walkthrough_step_timeout_seconds,
             "gitleaks": self.static_analysis_analyzer_timeout_seconds,
             "semgrep": self.static_analysis_analyzer_timeout_seconds,
             "ruff": self.static_analysis_ruff_timeout_seconds
@@ -285,6 +297,18 @@ def fix_generation_can_produce_value(enablement: StepEnablement) -> bool:
     )
 
 
+def walkthrough_can_produce_value(enablement: StepEnablement) -> bool:
+    """Whether the walkthrough step is effective: enabled, a review_generation step
+    exists (the one configuration where every predecessor carries a diff), and a real
+    secret redactor is configured (its posted text is unredacted otherwise).
+    """
+    return (
+        enablement.walkthrough_enabled
+        and enablement.review_generation_enabled
+        and enablement.secret_redaction_enabled
+    )
+
+
 def intent_summary_can_produce_value(enablement: StepEnablement) -> bool:
     """Whether running ``IntentSummaryStep`` can actually produce any value
     under ``enablement`` — true only when the step itself is enabled *and*
@@ -350,10 +374,13 @@ def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, 
         "verification" if enablement.verification_enabled else verification_depends_on
     )
 
-    output_depends_on = (
+    walkthrough_depends_on = (
         "fix_generation"
         if fix_generation_can_produce_value(enablement)
         else fix_generation_depends_on
+    )
+    output_depends_on = (
+        "walkthrough" if walkthrough_can_produce_value(enablement) else walkthrough_depends_on
     )
 
     return {
@@ -363,6 +390,7 @@ def resolve_review_pipeline_depends_on(enablement: StepEnablement) -> dict[str, 
         "review_generation": upstream_of_review_generation,
         "verification": verification_depends_on,
         "fix_generation": fix_generation_depends_on,
+        "walkthrough": walkthrough_depends_on,
         "output": output_depends_on,
     }
 
@@ -461,6 +489,7 @@ def check_step_configuration_viable(enablement: StepEnablement) -> None:
         "review_generation": enablement.review_generation_enabled,
         "verification": enablement.verification_enabled,
         "fix_generation": fix_generation_can_produce_value(enablement),
+        "walkthrough": walkthrough_can_produce_value(enablement),
         "output": enablement.output_enabled,
     }
     for step_name, target_name in resolved_depends_on.items():

@@ -256,6 +256,15 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     fix_generation_max_replacement_lines: int = Field(default=40, gt=0)
     fix_generation_window_lines: int = Field(default=60, gt=0)
 
+    # Phase 12 (docs/plans/plan-phase-12.md, Phase 3): the walkthrough step, off by
+    # default. Companion settings are validated only when the flag is on, so a stale
+    # value never blocks a rollback.
+    walkthrough_enabled: bool = False
+    walkthrough_step_timeout_seconds: int = 45
+    walkthrough_min_files: int = 2
+    walkthrough_max_files: int = 60
+    walkthrough_max_chars: int = 6000
+
     # --- Job dispatch loop (Phase 3, apps/worker/dispatch.py) ---
     # How often to poll JobQueueRepository.claim_next() when the queue is
     # empty — a concrete default, not left unspecified, per the plan's
@@ -269,7 +278,8 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     # (prefilter) + 240 (static_analysis) + 35 (context_builder) + 30
     # (intent_summary) + 90 (review_generation) + 60 (verification) + 30
     # (output) + 30 (clone_detection, Phase 10) + 90 (fix_generation, Phase 11) = 635
-    # seconds. 700 gives that sum roughly 10% headroom - comfortably longer than the worst
+    # seconds (+ 45 walkthrough, Phase 12, only when walkthrough_enabled = 680; 3%
+    # headroom). 700 gives the 635 sum roughly 10% headroom - comfortably longer than the worst
     # healthy-run total without leaving a genuinely stuck job unwarned for an unreasonable stretch.
     stuck_job_warning_threshold_seconds: float = 700.0
 
@@ -414,8 +424,11 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
     @model_validator(mode="after")
     def _stuck_job_warning_threshold_covers_worst_case_chain(self) -> WorkerSettings:
         """Enforces that ``stuck_job_warning_threshold_seconds`` never drops
-        below the nine macro steps' own worst-case sequential-run sum (the
-        635-second figure this field's own docstring comment hand-derives).
+        below the macro steps' own worst-case sequential-run sum (the
+        635-second figure this field's own docstring comment hand-derives,
+        plus ``walkthrough_step_timeout_seconds``, 45 s by default for 680 s
+        in total, added only when ``walkthrough_enabled`` is true; keyed on
+        the raw flag, not on the step being effective).
 
         The steps run strictly sequentially, so that sum — not any single
         step's timeout — is the true worst-case healthy-run duration; a
@@ -438,6 +451,8 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
             + self.verification_step_timeout_seconds
             + self.output_step_timeout_seconds
             + self.fix_generation_step_timeout_seconds
+            # Keyed on the raw flag (a superset of "effective"), so flag-off sums are unchanged.
+            + (self.walkthrough_step_timeout_seconds if self.walkthrough_enabled else 0)
         )
         if self.stuck_job_warning_threshold_seconds < worst_case_chain_seconds:
             raise ValueError(
@@ -561,6 +576,37 @@ class WorkerSettings(OtelSettingsMixin, ProductKnowledgeSettingsMixin):
                 f"least fix_generation_max_range_lines + 2 "
                 f"({self.fix_generation_max_range_lines + 2}) so the window can contain the "
                 "longest allowed range with context"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _walkthrough_settings_are_valid(self) -> WorkerSettings:
+        """Skipped entirely when ``walkthrough_enabled`` is false (a stale value must never
+        block a rollback). Keyed on the raw flag, not step effectiveness. The step timeout
+        must leave room for the LLM call (``llm_timeout_seconds``) plus 15 s to redact and publish.
+        """
+        if not self.walkthrough_enabled:
+            return self
+        suffix = "; fix it or set walkthrough_enabled=false"
+        if self.walkthrough_min_files < 1:
+            raise ValueError(
+                f"walkthrough_min_files ({self.walkthrough_min_files}) must be at least 1{suffix}"
+            )
+        if not 1 <= self.walkthrough_max_files <= 200:
+            raise ValueError(
+                f"walkthrough_max_files ({self.walkthrough_max_files}) must be between 1 and "
+                f"200{suffix}"
+            )
+        if not 500 <= self.walkthrough_max_chars <= 60000:
+            raise ValueError(
+                f"walkthrough_max_chars ({self.walkthrough_max_chars}) must be between 500 and "
+                f"60000{suffix}"
+            )
+        if self.walkthrough_step_timeout_seconds < self.llm_timeout_seconds + 15:
+            raise ValueError(
+                f"walkthrough_step_timeout_seconds ({self.walkthrough_step_timeout_seconds}) "
+                f"must be at least llm_timeout_seconds + 15 ({self.llm_timeout_seconds + 15})"
+                f"{suffix}"
             )
         return self
 

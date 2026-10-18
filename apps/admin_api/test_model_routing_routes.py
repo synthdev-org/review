@@ -121,6 +121,7 @@ def test_get_model_routing_with_no_rows_returns_static_default_for_every_stage(
         "review_generation",
         "verification",
         "fix_generation",
+        "walkthrough",
     }
     for stage_view in stages.values():
         assert stage_view["model_name"] == "local-model"
@@ -327,3 +328,24 @@ def test_setting_model_routing_writes_audit_log(
     rows = asyncio.run(_read_audit_rows())
     assert len(rows) == 1
     assert rows[0].resource_type == "model_routing_config"
+
+
+def test_walkthrough_stage_row_resolves_and_falls_back_to_default(
+    migrated_engine: AsyncEngine,
+) -> None:
+    """US-W10: the `walkthrough` stage accepts a platform row, then reads back as
+    `platform`, while an untouched sibling stage still falls back to the default."""
+    with TestClient(create_app(_settings(dsn=_dsn(migrated_engine)))) as client:
+        csrf_token = _login_as_bootstrap_admin(client)
+
+        put = client.put(
+            "/api/v1/model-routing/walkthrough",
+            json={"org_id": None, "model_name": "walkthrough-model"},
+            headers={CSRF_HEADER_NAME: csrf_token},
+        )
+        stages = {s["stage"]: s for s in client.get("/api/v1/model-routing").json()["stages"]}
+
+    assert put.status_code == 200
+    assert stages["walkthrough"]["source"] == "platform"
+    assert stages["walkthrough"]["model_name"] == "walkthrough-model"
+    assert stages["verification"]["source"] == "static_default"

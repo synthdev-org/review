@@ -278,6 +278,8 @@ class ReviewGenerationOutput(JobIdentity):
     findings: list[Finding]
     head_sha: str
     context_bundle: ContextBundle | None = None
+    # Phase 12: carried forward unchanged for the walkthrough step.
+    intent_summary: str | None = None
 
 
 def _render_static_findings_context(findings: list[Finding]) -> str:
@@ -496,6 +498,7 @@ class ReviewGenerationStep:
             diff=parsed.diff,
             findings=[*parsed.findings, *redacted_llm_findings],
             context_bundle=parsed.context_bundle,
+            intent_summary=parsed.intent_summary,
             **job_identity_fields(parsed),
         )
 

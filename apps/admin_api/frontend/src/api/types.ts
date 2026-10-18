@@ -159,6 +159,7 @@ export const MODEL_ROUTING_STAGES = [
   "review_generation",
   "verification",
   "fix_generation",
+  "walkthrough",
 ] as const;
 export type ModelRoutingStage = (typeof MODEL_ROUTING_STAGES)[number];
 

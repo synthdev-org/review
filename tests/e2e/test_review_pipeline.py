@@ -79,6 +79,7 @@ from typing import Any
 import pytest
 
 from review.fix_generation import GENERATION_MARKER, RUBRIC_MARKER
+from review.walkthrough import MARKER_LINE as WALKTHROUGH_MARKER_LINE
 from tests.e2e.conftest import (
     base_compose_env,
     compose,
@@ -118,6 +119,92 @@ class _CallLog:
     calls: list[str] = field(default_factory=list)
     review_bodies: list[dict[str, object]] = field(default_factory=list)
     check_run_bodies: list[dict[str, object]] = field(default_factory=list)
+
+
+_APP_ID = 123456  # REVIEW_WORKER_GITHUB_APP_ID in tests/e2e/conftest.py
+_COMMENT_LIMIT_TOTAL = 501  # one more than the adapter's 5 pages of 100
+
+
+@dataclass
+class _IssueComments:
+    """PR issue-comment state for the walkthrough routes (plan-phase-12 Phase 5).
+
+    `mode`: `normal`; `write_error` (POST and PATCH answer 500); `limit` (the list
+    serves 501 foreign comments over six pages, so the adapter hits its page cap).
+    `writes` records every non-GET call, as `METHOD path`."""
+
+    items: list[dict[str, object]] = field(default_factory=list)
+    mode: str = "normal"
+    next_id: int = 1000
+    writes: list[str] = field(default_factory=list)
+
+    def platform_bodies(self) -> list[str]:
+        return [str(c["body"]) for c in self.items]
+
+
+def serve_issue_comments(
+    handler: BaseHTTPRequestHandler, method: str, path: str, query: str, owner_repo: str
+) -> bool:
+    """Answers the issue-comment list/create/edit/delete routes on `handler`
+    (which needs `_send_json`/`_read_json_body` and `server.issue_comments`).
+    Returns False when `path` is not one of them. Shared by every E2E stub GitHub."""
+    store = handler.server.issue_comments  # type: ignore[attr-defined]
+    assert isinstance(store, _IssueComments)
+    send = handler._send_json  # type: ignore[attr-defined]
+    owner = re.escape(owner_repo)
+    listing = re.fullmatch(rf"/repos/{owner}/issues/\d+/comments", path)
+    single = re.fullmatch(rf"/repos/{owner}/issues/comments/(\d+)", path)
+    if not (listing or single):
+        return False
+    if method != "GET":
+        store.writes.append(f"{method} {path}")
+
+    if listing and method == "GET":
+        if store.mode == "limit":
+            page = int(next(iter(re.findall(r"(?:^|&)page=(\d+)", query)), "1"))
+            lo, hi = (page - 1) * 100, min(page * 100, _COMMENT_LIMIT_TOTAL)
+            foreign = [{"id": i + 1, "body": f"human comment {i}"} for i in range(lo, hi)]
+            data = json.dumps(foreign).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            if hi < _COMMENT_LIMIT_TOTAL:
+                host = handler.headers.get("Host", "")
+                nxt = f"http://{host}{path}?per_page=100&page={page + 1}"
+                handler.send_header("Link", f'<{nxt}>; rel="next"')
+            handler.end_headers()
+            handler.wfile.write(data)
+            return True
+        send(200, store.items)
+        return True
+    if store.mode == "write_error" and method in ("POST", "PATCH"):
+        send(500, {"message": "simulated comment write failure (stub)"})
+        return True
+    body = str(handler._read_json_body().get("body", ""))  # type: ignore[attr-defined]
+    if listing and method == "POST":
+        store.next_id += 1
+        comment: dict[str, object] = {
+            "id": store.next_id,
+            "body": body,
+            "performed_via_github_app": {"id": _APP_ID},
+        }
+        store.items.append(comment)
+        send(201, comment)
+        return True
+    assert single is not None
+    cid = int(single.group(1))
+    target = next((c for c in store.items if c["id"] == cid), None)
+    if target is None:
+        send(404, {"message": "not found (stub)"})
+    elif method == "PATCH":
+        target["body"] = body
+        send(200, target)
+    elif method == "DELETE":
+        store.items.remove(target)
+        handler.send_response(204)
+        handler.end_headers()
+    else:
+        send(405, {"message": "method not allowed (stub)"})
+    return True
 
 
 def _single_file_scenario(
@@ -185,12 +272,29 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
             self._send_json(201, {"id": 1})
             return
 
+        if serve_issue_comments(self, "POST", path, "", _OWNER_REPO):
+            return
+
         self._send_json(404, {"message": "not found (stub)"})
+
+    def do_PATCH(self) -> None:
+        self._calls().calls.append(f"PATCH {self.path}")
+        if not serve_issue_comments(self, "PATCH", self.path, "", _OWNER_REPO):
+            self._send_json(404, {"message": "not found (stub)"})
+
+    def do_DELETE(self) -> None:
+        self._calls().calls.append(f"DELETE {self.path}")
+        if not serve_issue_comments(self, "DELETE", self.path, "", _OWNER_REPO):
+            self._send_json(404, {"message": "not found (stub)"})
 
     def do_GET(self) -> None:
         path_only = self.path.split("?", 1)[0]
         self._calls().calls.append(f"GET {self.path}")
         scenario = self._scenario()
+
+        query = self.path.partition("?")[2]
+        if serve_issue_comments(self, "GET", path_only, query, _OWNER_REPO):
+            return
 
         if re.fullmatch(rf"/repos/{re.escape(_OWNER_REPO)}/pulls/\d+", path_only):
             count = (
@@ -224,6 +328,7 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
 def stub_github_server() -> Iterator[HTTPServer]:
     server = HTTPServer(("0.0.0.0", STUB_GITHUB_PORT), _StubGitHubHandler)
     server.scenario = _single_file_scenario()  # type: ignore[attr-defined]
+    server.issue_comments = _IssueComments()  # type: ignore[attr-defined]
     server.calls = _CallLog()  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -377,6 +482,29 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
             return str(scenario.get(path, {}).get(key, "not json"))
         return None
 
+    def _walkthrough_content(self, request: dict[str, Any]) -> str | None:
+        """The walkthrough call (plan-phase-12 Phase 5) is recognized by its fixed
+        marker line, not call position, and never advances `call_count`. Scenario
+        `self.server.walkthrough_scenario`: `ok` (one group over every path sent),
+        `garbage` (not JSON) or `delay` (sleeps past the Worker's LLM timeout, then
+        answers `ok`)."""
+        messages = request.get("messages", [])
+        system = " ".join(str(m["content"]) for m in messages if m.get("role") == "system")
+        if WALKTHROUGH_MARKER_LINE not in system:
+            return None
+        user = "".join(str(m["content"]) for m in messages if m.get("role") == "user")
+        self.server.walkthrough_calls += 1  # type: ignore[attr-defined]
+        scenario = getattr(self.server, "walkthrough_scenario", "ok")
+        if scenario == "garbage":
+            return "not json"
+        if scenario == "delay":
+            time.sleep(float(getattr(self.server, "walkthrough_delay_seconds", 15.0)))
+        paths = re.findall(r"^--- (.+) \(\w+, \+\d+ -\d+\)$", user, re.MULTILINE)
+        files = [{"path": p, "note": "Changes " + p} for p in paths]
+        return json.dumps(
+            {"groups": [{"name": "Core changes", "description": "The change.", "files": files}]}
+        )
+
     def do_POST(self) -> None:
         mode = getattr(self.server, "mode", "success")
         if mode == "llm_failure":
@@ -392,6 +520,8 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             request = {}
         fix_content = self._fix_content(request) if isinstance(request, dict) else None
+        if fix_content is None and isinstance(request, dict):
+            fix_content = self._walkthrough_content(request)
         if fix_content is not None:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -417,6 +547,8 @@ def stub_llm_review_server() -> Iterator[HTTPServer]:
     server.verification_scenario = "verified"  # type: ignore[attr-defined]
     server.review_generation_content = None  # type: ignore[attr-defined]
     server.fix_scenario = {}  # type: ignore[attr-defined]
+    server.walkthrough_scenario = "ok"  # type: ignore[attr-defined]
+    server.walkthrough_calls = 0  # type: ignore[attr-defined]
     server.fix_calls = []  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -435,6 +567,7 @@ def _reset_llm_scenario(
     verification: str = "verified",
     review_generation_content: str | None = None,
     fix_scenario: dict[str, dict[str, str]] | None = None,
+    walkthrough: str = "ok",
 ) -> None:
     """Resets the stub LLM Gateway server's per-test scenario state —
     mirrors `_reset_github_scenario`'s own shape. Called at the start of
@@ -454,6 +587,8 @@ def _reset_llm_scenario(
     server.review_generation_content = review_generation_content  # type: ignore[attr-defined]
     server.fix_scenario = fix_scenario or {}  # type: ignore[attr-defined]
     server.fix_calls = []  # type: ignore[attr-defined]
+    server.walkthrough_scenario = walkthrough  # type: ignore[attr-defined]
+    server.walkthrough_calls = 0  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------

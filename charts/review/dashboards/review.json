@@ -1819,6 +1819,425 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 61,
+      "type": "row",
+      "title": "PR walkthrough",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 152
+      },
+      "panels": []
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: posted",
+      "description": "review.walkthrough.outcome_total{outcome=\"posted\"}. First walkthrough comment created on a PR. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 153
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"posted\"}[1h]))",
+          "legendFormat": "posted"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 63,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: updated",
+      "description": "review.walkthrough.outcome_total{outcome=\"updated\"}. Existing walkthrough comment edited in place on a later push. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 153
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"updated\"}[1h]))",
+          "legendFormat": "updated"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 64,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: skipped_small_pr",
+      "description": "review.walkthrough.outcome_total{outcome=\"skipped_small_pr\"}. PR below walkthrough_min_files reviewable files: no LLM call, no write. Expected traffic, not a failure. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 153
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"skipped_small_pr\"}[1h]))",
+          "legendFormat": "skipped_small_pr"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 65,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: skipped_comment_limit",
+      "description": "review.walkthrough.outcome_total{outcome=\"skipped_comment_limit\"}. PR with more than 500 comments: the walkthrough could not be found or created. Documented and accepted, not alerted; watch during the pilot. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 161
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"skipped_comment_limit\"}[1h]))",
+          "legendFormat": "skipped_comment_limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 66,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: llm_timeout",
+      "description": "review.walkthrough.outcome_total{outcome=\"llm_timeout\"}. The walkthrough LLM call timed out or was unreachable. A comment from an earlier push may be stale. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 161
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"llm_timeout\"}[1h]))",
+          "legendFormat": "llm_timeout"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 67,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: parse_failure",
+      "description": "review.walkthrough.outcome_total{outcome=\"parse_failure\"}. The LLM reply was not the expected shape. A comment from an earlier push may be stale. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 161
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"parse_failure\"}[1h]))",
+          "legendFormat": "parse_failure"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 68,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: github_error",
+      "description": "review.walkthrough.outcome_total{outcome=\"github_error\"}. A GitHub comment call failed or the publish deadline passed. A comment from an earlier push may be stale. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 169
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"github_error\"}[1h]))",
+          "legendFormat": "github_error"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 69,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: dedupe_failed",
+      "description": "review.walkthrough.outcome_total{outcome=\"dedupe_failed\"}. A create race could not be converged: a duplicate walkthrough comment may remain (runbook: cleanup). See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 169
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"dedupe_failed\"}[1h]))",
+          "legendFormat": "dedupe_failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 70,
+      "type": "timeseries",
+      "title": "Walkthrough outcome: internal_error",
+      "description": "review.walkthrough.outcome_total{outcome=\"internal_error\"}. Unexpected failure, including redactor or Gitleaks outage (fails closed). Tell causes apart by the stage field in the worker log. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 169
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(review_walkthrough_outcome_total{outcome=\"internal_error\"}[1h]))",
+          "legendFormat": "internal_error"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 71,
+      "type": "timeseries",
+      "title": "Walkthrough phase duration (p95)",
+      "description": "review.walkthrough.duration_ms by phase: llm, redact and publish. Recorded even for a phase that raised or timed out, so a step timeout can be traced to its slow phase.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 177
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_walkthrough_duration_ms_milliseconds_bucket[1h])) by (le, phase))",
+          "legendFormat": "{{phase}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 72,
+      "type": "timeseries",
+      "title": "Walkthrough rendered size (p95 chars)",
+      "description": "review.walkthrough.rendered_chars: length of the rendered comment body, capped by walkthrough_max_chars. A p95 pinned at the cap means walkthroughs are being cut at a group boundary.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 177
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(review_walkthrough_rendered_chars_bucket[1h])) by (le))",
+          "legendFormat": "p95 chars"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 73,
+      "type": "timeseries",
+      "title": "Walkthrough files not shown, by reason",
+      "description": "review.walkthrough.files_not_shown_total{reason}. max_files: files past walkthrough_max_files never sent to the model; max_chars: files dropped to fit walkthrough_max_chars. Sustained max_chars means raise the cap. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 177
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(review_walkthrough_files_not_shown_total[1h]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 74,
+      "type": "timeseries",
+      "title": "Walkthrough model path corrections, by kind",
+      "description": "review.walkthrough.reconciled_total{kind}. unknown_path and duplicate_path: paths the model invented or repeated; omitted: files it left out (placed under Other files). A jump after a model-routing change means the new model follows the prompt worse. See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 185
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(review_walkthrough_reconciled_total[1h]))",
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 75,
+      "type": "timeseries",
+      "title": "Walkthrough internal_error, by stage",
+      "description": "review.walkthrough.outcome_total{outcome=\"internal_error\"} split by stage. sentinel is a redaction failure (hostile input or redactor fault); validate is input plumbing (e.g. no diff carried). See docs/reference/operations.md, Walkthrough.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 185
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (stage) (rate(review_walkthrough_outcome_total{outcome=\"internal_error\"}[1h]))",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      }
     }
   ]
 }

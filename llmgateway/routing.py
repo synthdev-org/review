@@ -80,8 +80,9 @@ DEFAULT_MODEL_ROUTING_TIMEOUT_SECONDS = 2.0
 
 ModelRoutingSource = Literal["org", "platform", "static_default", "fallback_on_error"]
 
-# The four LLM-calling pipeline stages (per spec-admin-gui.md's US-A14,
-# which named three; fix_generation was added by Phase 11) — a closed set, not an open string, so
+# The five LLM-calling pipeline stages (per spec-admin-gui.md's US-A14,
+# which named three; fix_generation was added by Phase 11, walkthrough by Phase 12) — a
+# closed set, not an open string, so
 # ``apps/admin_api/model_routing_routes.py`` can reject an unknown stage
 # with a 422 (US-A15's write path) rather than silently accepting a typo
 # that can never match a real step's own ``name``.
@@ -90,6 +91,7 @@ KNOWN_MODEL_ROUTING_STAGES: tuple[str, ...] = (
     "review_generation",
     "verification",
     "fix_generation",
+    "walkthrough",
 )
 
 

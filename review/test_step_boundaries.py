@@ -110,6 +110,9 @@ _FRAMEWORK_MODULES = frozenset(
         "fix_validation",
         "fix_candidates",
         "analyzer_rerun",
+        # Pure model/sanitizer/renderer of the walkthrough step (plan-phase-12);
+        # no `Step` of its own.
+        "walkthrough_render",
     }
 )
 

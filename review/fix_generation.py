@@ -188,6 +188,10 @@ class _FixGenerationInput(JobIdentity):
     findings: list[Finding] = Field(default_factory=list)
     diff: Diff | None = None
     context_bundle: ContextBundle | None = None
+    # Phase 12: carried for the walkthrough step. Separate from `diff` so the
+    # `diff is None` fetch below keeps its meaning.
+    intent_summary: str | None = None
+    reviewed_diff: Diff | None = None
 
 
 class FixGenerationOutput(JobIdentity):
@@ -198,6 +202,8 @@ class FixGenerationOutput(JobIdentity):
 
     findings: list[Finding]
     context_bundle: ContextBundle | None = None
+    intent_summary: str | None = None
+    reviewed_diff: Diff | None = None
 
 
 @dataclass
@@ -340,6 +346,9 @@ class FixGenerationStep:
         return FixGenerationOutput(
             findings=findings,
             context_bundle=parsed.context_bundle,
+            intent_summary=parsed.intent_summary,
+            # Never the diff this step fetched itself.
+            reviewed_diff=parsed.reviewed_diff or parsed.diff,
             **job_identity_fields(parsed),
         )
 

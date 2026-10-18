@@ -149,6 +149,7 @@ from adapter.github.posting import GitHubFindingsPublisher
 from adapter.github.reactions import GitHubReactionFetcher
 from adapter.github.repo_config import GitHubRepoConfigFetcher
 from adapter.github.tree import GitHubTreeFetcher
+from adapter.github.walkthrough import GitHubWalkthroughPublisher
 from adapter.llm.litellm_client import LiteLLMClient
 from adapter.product_knowledge.client import ClientTimeouts
 from adapter.product_knowledge.factory import ProviderClientFactory
@@ -189,6 +190,7 @@ from review.config import (
     context_builder_can_produce_value,
     intent_summary_can_produce_value,
     resolve_review_pipeline_depends_on,
+    walkthrough_can_produce_value,
 )
 from review.context_builder import ContextBuilderStep
 from review.file_matchers import match_go, match_iac, match_javascript, match_php, match_python
@@ -205,6 +207,8 @@ from review.static_analysis import (
     gitleaks_semgrep_registrations,
 )
 from review.verification import VerificationStep
+from review.walkthrough import WalkthroughStep
+from review.walkthrough_render import WalkthroughPublisher
 
 
 def _build_llm_client(settings: WorkerSettings) -> LLMClient:
@@ -393,6 +397,23 @@ def _build_findings_publisher(
     return GitHubFindingsPublisher(
         token_provider=token_provider,
         provenance_recorder=provenance_recorder,
+        github_api_base_url=settings.github_api_base_url,
+        timeout=settings.github_api_timeout_seconds,
+        max_retry_attempts=settings.github_retry_max_attempts,
+        client=http_client,
+    )
+
+
+def _build_walkthrough_publisher(
+    settings: WorkerSettings,
+    token_provider: GitHubInstallationTokenProvider,
+    http_client: httpx.AsyncClient,
+) -> GitHubWalkthroughPublisher:
+    """The Phase 12 walkthrough comment publisher; the App id is what identifies the
+    platform's own comment (fail closed), so it comes straight from settings."""
+    return GitHubWalkthroughPublisher(
+        token_provider=token_provider,
+        app_id=settings.github_app_id,
         github_api_base_url=settings.github_api_base_url,
         timeout=settings.github_api_timeout_seconds,
         max_retry_attempts=settings.github_retry_max_attempts,
@@ -747,6 +768,8 @@ def _build_step_enablement(settings: WorkerSettings) -> StepEnablement:
         static_analysis_enabled=settings.static_analysis_enabled,
         clone_detection_enabled=settings.clone_detection_enabled,
         fix_generation_enabled=settings.fix_generation_enabled,
+        walkthrough_enabled=settings.walkthrough_enabled,
+        secret_redaction_enabled=settings.secret_redaction_enabled,
         context_builder_enabled=settings.context_builder_enabled,
         intent_summary_enabled=settings.intent_summary_enabled,
         review_generation_enabled=settings.review_generation_enabled,
@@ -770,6 +793,7 @@ def _build_step_timeouts(settings: WorkerSettings) -> StepTimeouts:
         static_analysis_analyzer_timeout_seconds=settings.static_analysis_analyzer_timeout_seconds,
         clone_detection_step_timeout_seconds=settings.clone_detection_step_timeout_seconds,
         fix_generation_step_timeout_seconds=settings.fix_generation_step_timeout_seconds,
+        walkthrough_step_timeout_seconds=settings.walkthrough_step_timeout_seconds,
         static_analysis_ruff_timeout_seconds=settings.static_analysis_ruff_timeout_seconds,
         static_analysis_eslint_timeout_seconds=settings.static_analysis_eslint_timeout_seconds,
         static_analysis_trivy_timeout_seconds=settings.static_analysis_trivy_timeout_seconds,
@@ -806,10 +830,19 @@ def _check_step_configuration(
         )
         raise SystemExit(1) from exc
 
+    if settings.walkthrough_enabled and not walkthrough_can_produce_value(enablement):
+        logger.warning(
+            "walkthrough_enabled is true but the walkthrough step is ineffective and will not "
+            "run: it requires review_generation_enabled and secret_redaction_enabled"
+        )
+
     logger.info(
         "step configuration valid",
         extra={
-            "enabled_steps": enablement.as_mapping(),
+            "enabled_steps": {
+                **enablement.as_mapping(),
+                "walkthrough": walkthrough_can_produce_value(enablement),
+            },
             "step_timeouts": timeouts.as_mapping(),
             # Phase 5 of docs/plans/plan-deliver-verification-pipeline.md —
             # so an operator can confirm from Worker startup logs alone
@@ -852,6 +885,7 @@ def _build_review_registry(
     memory_matcher: PostgresMemoryRepository,
     model_resolver: FallbackModelRoutingResolver | None,
     product_knowledge: ProductKnowledgeWiring | None = None,
+    walkthrough_publisher: WalkthroughPublisher | None = None,
 ) -> StepRegistry:
     """Construct the macro-step registry `REVIEW` jobs dispatch to.
 
@@ -948,6 +982,7 @@ def _build_review_registry(
         **enabled_mapping,
         "context_builder": context_builder_can_produce_value(enablement),
         "intent_summary": intent_summary_can_produce_value(enablement),
+        "walkthrough": walkthrough_can_produce_value(enablement),
     }
 
     # The one shared chain-resolution function (Assumption 6 of
@@ -1029,6 +1064,30 @@ def _build_review_registry(
     analyzer_rerunner = AnalyzerRerunner(
         analyzer_registrations, analyzer_slots, timeouts_mapping, config_fetcher
     )
+
+    # Phase 12: registered only when effective, so with the flag off the registry is
+    # exactly the pre-Phase-12 one (US-W9). `walkthrough_publisher` is required then.
+    walkthrough_steps: list[WalkthroughStep] = []
+    if enabled_mapping["walkthrough"]:
+        if walkthrough_publisher is None:
+            raise ValueError("walkthrough is effective but no walkthrough_publisher was given")
+        walkthrough_steps.append(
+            WalkthroughStep(
+                llm_client,
+                redactor,
+                walkthrough_publisher,
+                model=settings.llm_model,
+                timeout=settings.llm_timeout_seconds,
+                # Fail open on timeout (US-W8): the step wraps its own work in a shorter
+                # wait_for (settings validate the step timeout >= llm_timeout + 15).
+                internal_timeout_seconds=float(settings.walkthrough_step_timeout_seconds - 5),
+                min_files=settings.walkthrough_min_files,
+                max_files=settings.walkthrough_max_files,
+                max_chars=settings.walkthrough_max_chars,
+                model_resolver=model_resolver,
+                depends_on=resolved["walkthrough"],
+            )
+        )
 
     return StepRegistry(
         steps=[
@@ -1118,6 +1177,7 @@ def _build_review_registry(
                 model_resolver=model_resolver,
                 depends_on=resolved["fix_generation"],
             ),
+            *walkthrough_steps,
             FindingsOutputStep(
                 publisher,
                 depends_on=resolved["output"],
@@ -1304,6 +1364,7 @@ async def _run(
         memory_repository,
         model_routing_resolver,
         product_knowledge,
+        _build_walkthrough_publisher(settings, token_provider, github_http_client),
     )
     index_repository = IndexingRepository(session_factory)
     indexing_deps = _build_indexing_deps(tree_fetcher, embedding_client, index_repository)

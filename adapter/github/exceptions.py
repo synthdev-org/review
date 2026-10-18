@@ -303,7 +303,10 @@ class GitHubPostingError(GitHubAdapterError):
     way by the pipeline: a typed exception that fails the job (Phase 3's
     ``FAILED`` transition; posting is the findings-merge-and-output macro
     step's own I/O, so a failure here is fatal per US-F6) — never a
-    silently swallowed or partial post.
+    silently swallowed or partial post. The exception is the walkthrough
+    errors (and ``GitHubPostingUnreachableError`` as raised by
+    ``adapter.github.walkthrough``): the fail-open walkthrough step catches
+    them and they are not job-fatal.
     """
 
     def __init__(self, *, detail: str) -> None:
@@ -326,3 +329,15 @@ class GitHubPostingMalformedRequestError(GitHubPostingError):
     ``ValueError``, even (especially) when raised from the terminal-step
     failure-signal call this platform relies on to guarantee GitHub-visible
     output for every job."""
+
+
+class GitHubWalkthroughCommentLimitError(GitHubPostingError):
+    """Raised when the PR's comment list ran past the page cap without finding
+    the platform's walkthrough comment; nothing was created, edited or deleted
+    (``skipped_comment_limit``). Carries no request or response body."""
+
+
+class GitHubWalkthroughDedupeError(GitHubPostingError):
+    """Raised when the walkthrough comment was created but converging a
+    concurrent duplicate failed (``dedupe_failed``); the first comment is left
+    in place. Carries status and URL path only, never a body."""

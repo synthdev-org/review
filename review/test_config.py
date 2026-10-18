@@ -27,11 +27,13 @@ import review.config as config_module
 from review.config import (
     NoViableStepConfigurationError,
     StepEnablement,
+    StepTimeouts,
     check_step_configuration_viable,
     clone_detection_can_produce_value,
     fix_generation_can_produce_value,
     intent_summary_can_produce_value,
     resolve_review_pipeline_depends_on,
+    walkthrough_can_produce_value,
 )
 
 # --- resolve_review_pipeline_depends_on ------------------------------------
@@ -47,6 +49,7 @@ def test_all_steps_enabled_resolves_the_ordinary_six_step_chain() -> None:
         "review_generation": "intent_summary",
         "verification": "review_generation",
         "fix_generation": "verification",
+        "walkthrough": "verification",
         "output": "verification",  # fix_generation is off by default
     }
 
@@ -493,3 +496,88 @@ def test_fix_generation_on_with_no_producer_leaves_output_wired_as_today() -> No
 def test_fix_generation_flags_reach_the_registry_mappings() -> None:
     assert StepEnablement(fix_generation_enabled=True).as_mapping()["fix_generation"] is True
     assert StepEnablement().as_mapping()["fix_generation"] is False
+
+
+# --- walkthrough (plan-phase-12 Phase 3) -------------------------------------
+
+
+def test_walkthrough_after_fix_generation() -> None:
+    resolved = resolve_review_pipeline_depends_on(
+        StepEnablement(walkthrough_enabled=True, fix_generation_enabled=True)
+    )
+
+    assert resolved["walkthrough"] == "fix_generation"
+    assert resolved["output"] == "walkthrough"
+
+
+def test_walkthrough_after_verification_when_fix_generation_is_off() -> None:
+    resolved = resolve_review_pipeline_depends_on(StepEnablement(walkthrough_enabled=True))
+
+    assert resolved["walkthrough"] == "verification"
+    assert resolved["output"] == "walkthrough"
+
+
+def test_walkthrough_after_verification_with_static_analysis_off() -> None:
+    enablement = StepEnablement(walkthrough_enabled=True, static_analysis_enabled=False)
+    resolved = resolve_review_pipeline_depends_on(enablement)
+
+    assert resolved["walkthrough"] == "verification"
+    assert resolved["output"] == "walkthrough"
+    check_step_configuration_viable(enablement)
+
+
+def test_walkthrough_after_review_generation_with_verification_and_fix_generation_off() -> None:
+    enablement = StepEnablement(walkthrough_enabled=True, verification_enabled=False)
+    resolved = resolve_review_pipeline_depends_on(enablement)
+
+    assert resolved["walkthrough"] == "review_generation"
+    assert resolved["output"] == "walkthrough"
+    check_step_configuration_viable(enablement)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"review_generation_enabled": False, "walkthrough_enabled": True},
+        {"secret_redaction_enabled": False, "walkthrough_enabled": True},
+    ],
+)
+def test_ineffective_walkthrough_leaves_output_dependency_unchanged(
+    overrides: dict[str, bool],
+) -> None:
+    enablement = StepEnablement(**overrides)
+    baseline = StepEnablement(review_generation_enabled=enablement.review_generation_enabled)
+
+    resolved = resolve_review_pipeline_depends_on(enablement)
+
+    assert walkthrough_can_produce_value(enablement) is False
+    assert resolved["output"] == resolve_review_pipeline_depends_on(baseline)["output"]
+    assert resolved["output"] == resolved["walkthrough"]
+    if enablement.static_analysis_enabled:
+        check_step_configuration_viable(enablement)
+
+
+def test_walkthrough_with_prefilter_disabled_is_rejected_like_its_siblings() -> None:
+    enablement = StepEnablement(
+        walkthrough_enabled=True, prefilter_enabled=False, static_analysis_enabled=False
+    )
+
+    with pytest.raises(NoViableStepConfigurationError):
+        check_step_configuration_viable(enablement)
+
+
+def test_walkthrough_mappings_and_secret_redaction_exclusion() -> None:
+    enablement = StepEnablement(walkthrough_enabled=True)
+    assert enablement.as_mapping()["walkthrough"] is True
+    assert StepEnablement().as_mapping()["walkthrough"] is False
+    assert "secret_redaction_enabled" not in enablement.as_mapping()
+    assert StepTimeouts().as_mapping()["walkthrough"] == 45
+    assert StepTimeouts(walkthrough_step_timeout_seconds=50).as_mapping()["walkthrough"] == 50
+
+
+def test_enablement_and_timeout_mappings_name_the_same_steps() -> None:
+    enabled = set(StepEnablement().as_mapping())
+    timed = set(StepTimeouts().as_mapping()) - {"static_analysis_analyzer"}
+
+    assert enabled == timed

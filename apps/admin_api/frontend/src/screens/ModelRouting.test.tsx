@@ -30,6 +30,7 @@ const view: ModelRoutingView = {
     { stage: "review_generation", model_name: "local-model", source: "static_default" },
     { stage: "verification", model_name: "local-model", source: "static_default" },
     { stage: "fix_generation", model_name: "local-model", source: "static_default" },
+    { stage: "walkthrough", model_name: "local-model", source: "static_default" },
   ],
 };
 
