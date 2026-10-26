@@ -55,15 +55,9 @@ from adapter.github.exceptions import (
     GitHubRetryExhaustedError,
 )
 from adapter.github.http import request_with_retry
+from ingestion.diff import BLOB_SIZE_CEILING_BYTES, SUBMODULE_MODE, SYMLINK_MODE
 
 logger = logging.getLogger(__name__)
-
-# The Git Blobs API's documented ceiling is ~100MB; a blob at or beyond
-# this is treated as fatal (never fetched) rather than fetched and found to
-# fail.
-BLOB_SIZE_CEILING_BYTES = 100_000_000
-SYMLINK_MODE = "120000"
-SUBMODULE_MODE = "160000"
 
 
 def _parse_json(response: httpx.Response) -> Any:

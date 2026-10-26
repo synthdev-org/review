@@ -25,6 +25,13 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+# Git object-model facts both diff sources (GitHub, local git) apply when reading content: a blob at
+# or beyond the ceiling is never fetched (the Git Blobs API documents ~100MB), and a symlink or
+# submodule entry is listed but never read.
+BLOB_SIZE_CEILING_BYTES = 100_000_000
+SYMLINK_MODE = "120000"
+SUBMODULE_MODE = "160000"
+
 
 class DiffFile(BaseModel):
     """One changed file from a PR's diff, per the plan's Phase 4 section.

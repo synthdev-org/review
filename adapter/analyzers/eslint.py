@@ -44,6 +44,7 @@ from typing import Any
 
 import yaml
 
+from adapter.analyzers.environment import ChildEnvironmentMixin
 from adapter.analyzers.exceptions import AnalyzerInvocationError, AnalyzerOutputParseError
 from adapter.analyzers.subprocess_runner import (
     cleanup_temp_directory,
@@ -357,7 +358,7 @@ def _to_findings(
     return findings
 
 
-class EslintAnalyzer:
+class EslintAnalyzer(ChildEnvironmentMixin):
     """``review.static_analysis.StaticAnalyzer`` backed by ``review-eslint``.
     See this module's docstring."""
 
@@ -403,7 +404,10 @@ class EslintAnalyzer:
 
             try:
                 output = await run_analyzer_subprocess(
-                    _argv(choice.config_name or default_name, paths), cwd=directory, timeout=timeout
+                    _argv(choice.config_name or default_name, paths),
+                    cwd=directory,
+                    timeout=timeout,
+                    env=self._environ,
                 )
             except AnalyzerInvocationError as exc:
                 remaining = timeout - (time.monotonic() - started)
@@ -424,7 +428,10 @@ class EslintAnalyzer:
                 )
                 ConfigOutcome("default", "rejected_by_tool").record(self.name)
                 output = await run_analyzer_subprocess(
-                    _argv(default_name, paths), cwd=directory, timeout=remaining
+                    _argv(default_name, paths),
+                    cwd=directory,
+                    timeout=remaining,
+                    env=self._environ,
                 )
             return [
                 finding

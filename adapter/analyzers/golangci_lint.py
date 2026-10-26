@@ -56,6 +56,7 @@ from typing import Any
 
 import yaml
 
+from adapter.analyzers.environment import ChildEnvironmentMixin
 from adapter.analyzers.exceptions import AnalyzerInvocationError, AnalyzerOutputParseError
 from adapter.analyzers.subprocess_runner import (
     cleanup_temp_directory,
@@ -370,7 +371,7 @@ def _to_findings(
     return findings
 
 
-class GolangciLintAnalyzer:
+class GolangciLintAnalyzer(ChildEnvironmentMixin):
     """``review.static_analysis.StaticAnalyzer`` backed by ``golangci-lint``.
     See this module's docstring."""
 
@@ -424,7 +425,11 @@ class GolangciLintAnalyzer:
             async def scan(config: str, budget: float) -> bytes:
                 report = f".review-golangci/report-{uuid.uuid4().hex}.json"
                 await run_analyzer_subprocess(
-                    _argv(config, report), cwd=directory, timeout=budget, env_overrides=env
+                    _argv(config, report),
+                    cwd=directory,
+                    timeout=budget,
+                    env_overrides=env,
+                    env=self._environ,
                 )
                 return await asyncio.to_thread((directory / report).read_bytes)
 

@@ -8,6 +8,8 @@ and ``llmgateway/exceptions.py``'s ``LLMError`` pattern.
 
 from __future__ import annotations
 
+from typing import Literal
+
 
 class GitHubAdapterError(Exception):
     """Base class for every error this adapter raises."""
@@ -341,3 +343,20 @@ class GitHubWalkthroughDedupeError(GitHubPostingError):
     """Raised when the walkthrough comment was created but converging a
     concurrent duplicate failed (``dedupe_failed``); the first comment is left
     in place. Carries status and URL path only, never a body."""
+
+
+# ---------------------------------------------------------------------------
+# Local mode in CI (adapter.github.ci_review)
+# ---------------------------------------------------------------------------
+
+
+class GitHubCiError(GitHubAdapterError):
+    """A GitHub call made by ``adapter.github.ci_review`` failed. ``kind`` is ``"permission"``
+    when GitHub refused the token (401/403/404: the usual fork pull request or missing
+    ``pull-requests: write``) and ``"unavailable"`` for a rate limit, a 5xx or no response.
+    ``detail`` is a fixed phrase plus a status code: never a response body, never a header."""
+
+    def __init__(self, *, kind: Literal["permission", "unavailable"], detail: str) -> None:
+        super().__init__(f"GitHub CI review call failed ({kind}): {detail}")
+        self.kind = kind
+        self.detail = detail

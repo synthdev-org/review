@@ -44,7 +44,6 @@ from collections.abc import Sequence
 
 import httpx
 
-from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.http import (
     DEFAULT_FAN_OUT_CONCURRENCY,
     auth_headers,
@@ -52,6 +51,7 @@ from adapter.github.http import (
     request_with_retry,
     split_owner_repo,
 )
+from adapter.github.token_provider import InstallationTokenProvider
 from memory.models import ReactionRecord
 from memory.store import ReactionFetcher
 
@@ -76,7 +76,7 @@ class GitHubReactionFetcher:
     def __init__(
         self,
         *,
-        token_provider: GitHubInstallationTokenProvider,
+        token_provider: InstallationTokenProvider,
         github_api_base_url: str = _DEFAULT_GITHUB_API_BASE_URL,
         timeout: float = 10.0,
         max_retry_attempts: int = 3,

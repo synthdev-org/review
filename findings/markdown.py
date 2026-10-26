@@ -157,3 +157,21 @@ def neutralize_prose(text: str) -> str:
     out = out.replace("&", "&amp;")
     # ``~`` stays out of escape_markdown (finding text like ``~/x`` must not change).
     return escape_markdown(out).replace("~", "\\~")
+
+
+def break_autolinks(text: str) -> str:
+    """Stop GitHub auto-linking bare URLs and ``www.`` hosts in ``text`` by inserting a zero-width
+    space. For text that ``escape_markdown`` runs on later, which does not cover bare URLs; unlike
+    ``neutralize_prose`` it leaves newlines, issue references and hex runs alone."""
+    out = _URL_SCHEME_RE.sub(f":{_ZERO_WIDTH_SPACE}//", text)
+    return _WWW_RE.sub(lambda m: m.group(0) + _ZERO_WIDTH_SPACE, out)
+
+
+MESSAGE_CAP = 2000
+
+
+def sanitize_message(text: str) -> str:
+    """A finding message as a posted CI comment shows it (also how a memory-file entry is written):
+    control characters stripped, bare URLs broken, length-capped."""
+    message = break_autolinks(strip_display_text(text))
+    return message[: MESSAGE_CAP - 1] + "…" if len(message) > MESSAGE_CAP else message

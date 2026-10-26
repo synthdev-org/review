@@ -65,6 +65,8 @@ logger = logging.getLogger(__name__)
 # Worker pod. Mirrors ``adapter/github/diff.py``'s own ``Semaphore(10)``
 # bound on its concurrent blob-fetch fan-out, for the same reason.
 _MAX_CONCURRENT_REDACTIONS = 10
+# A path whose name held a secret is shown as ``REDACTED_PATH_PREFIX + n + "]"``.
+REDACTED_PATH_PREFIX = "[REDACTED-PATH-"
 
 
 def apply_redaction_ceiling(findings: list[Finding], ceiling: int) -> tuple[list[Finding], int]:

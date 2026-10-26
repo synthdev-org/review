@@ -266,7 +266,7 @@ def test_under_ceiling_mixed_severity_list_is_completely_unaffected_by_the_sort(
 
 
 @pytest.mark.parametrize("source", ["ruff", "eslint", "golangci_lint", "phpstan", "trivy"])
-def test_new_static_sources_need_no_special_casing_in_merge(source: str) -> None:
+def test_new_static_sources_need_no_special_casing_in_merge(source: Source) -> None:
     """US-A2: dedupe and ceiling ordering treat every non-llm source alike."""
     static = _finding(line=1, message=f"{source} finding", source=source)
     llm = _finding(line=2, message="entirely different llm finding", source="llm")

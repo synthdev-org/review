@@ -128,7 +128,6 @@ import os
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TypedDict
 
 import dotenv
 import httpx
@@ -180,34 +179,23 @@ from llmgateway.exceptions import LLMError
 from llmgateway.routing import FallbackModelRoutingResolver
 from llmgateway.startup_check import check_llm_reachable
 from memory.reaction_poll import MemoryReactionPollJobDependencies
-from review.analyzer_rerun import AnalyzerRerunner
-from review.clone_detection import CloneDetectionStep
 from review.config import (
     NoViableStepConfigurationError,
+    ReviewPipelineConfig,
     StepEnablement,
     StepTimeouts,
     check_step_configuration_viable,
     context_builder_can_produce_value,
-    intent_summary_can_produce_value,
     resolve_review_pipeline_depends_on,
     walkthrough_can_produce_value,
 )
-from review.context_builder import ContextBuilderStep
 from review.file_matchers import match_go, match_iac, match_javascript, match_php, match_python
-from review.fix_generation import FixGenerationStep
-from review.intent_summary import IntentSummaryStep
-from review.memory_suppression import MemorySuppressionConfig
-from review.output import FindingsOutputStep
-from review.pipeline import FailurePolicy, StepRegistry
-from review.prefilter import PrefilterStep
-from review.review_generation import ReviewGenerationStep
+from review.pipeline import StepRegistry
+from review.registry import build_review_registry
 from review.static_analysis import (
     AnalyzerRegistration,
-    StaticAnalysisStep,
     gitleaks_semgrep_registrations,
 )
-from review.verification import VerificationStep
-from review.walkthrough import WalkthroughStep
 from review.walkthrough_render import WalkthroughPublisher
 
 
@@ -855,20 +843,6 @@ def _check_step_configuration(
     return enablement, timeouts
 
 
-class _LLMStepKwargs(TypedDict):
-    """The shared keyword-argument shape ``IntentSummaryStep``,
-    ``ReviewGenerationStep``, and ``VerificationStep`` all accept for their
-    LLM Gateway call (``model``/``timeout``/``max_diff_bytes``) — typed
-    explicitly so mypy can check the ``**llm_step_kwargs`` splat below
-    against each constructor's actual parameter types, instead of widening
-    to ``dict[str, object]``.
-    """
-
-    model: str
-    timeout: float
-    max_diff_bytes: int
-
-
 def _build_review_registry(
     enablement: StepEnablement,
     timeouts: StepTimeouts,
@@ -887,138 +861,11 @@ def _build_review_registry(
     product_knowledge: ProductKnowledgeWiring | None = None,
     walkthrough_publisher: WalkthroughPublisher | None = None,
 ) -> StepRegistry:
-    """Construct the macro-step registry `REVIEW` jobs dispatch to.
-
-    Phase 4 registered the first real step, `PrefilterStep` — proving
-    Phase 2's own Acceptance criterion (registering a real macro step
-    requires zero changes to `review/pipeline.py`/`review/step.py`
-    themselves, per US-F3). Phase 5 adds the second, `StaticAnalysisStep` —
-    the same zero-framework-change property, now exercised by a second real
-    step. Phase 6 adds the third (renamed `ReviewGenerationStep` by
-    docs/plans/plan-deliver-verification-pipeline.md's Phase 2 section),
-    reusing the same already-built `llm_client` this composition root
-    already constructed for the startup connectivity check
-    (`_build_llm_client`, Phase 3) and the same `redactor` instance
-    `StaticAnalysisStep` already receives (Phase 5's
-    `secret_redaction_enabled` flag gates both steps' redaction uniformly).
-    Phase 7 adds the fourth and final step, `FindingsOutputStep`, registered
-    as this registry's own `terminal_step` (`review/pipeline.py`'s
-    "Terminal step" docstring note) — a genuinely new capability the
-    framework's own extension point provides, not something
-    `review/pipeline.py`/`review/step.py` needed changing for the
-    *registration* of, matching every prior macro step's own
-    zero-framework-change property.
-
-    The Context Builder delivery plan's Phase 5 section adds a fifth step,
-    `ContextBuilderStep`, inserted between `static_analysis`/`prefilter` and
-    `review_generation` — reusing the same `diff_fetcher` every other step
-    here already shares, plus `tree_fetcher`/`graph_query`/
-    `similarity_query`/`embedding_client` (the same `EmbeddingClient`
-    instance `_build_indexing_deps` already constructs — no second one).
-    **`ContextBuilderStep` is unconditionally constructed and placed in
-    `steps=[...]` below, exactly like every other step, regardless of
-    `context_builder_enabled`** — enablement is controlled purely via the
-    `enabled` mapping `StepRegistry` itself reads, never via a step's
-    presence or absence in this list (see that class's own module
-    docstring's "ContextBuilderStep is unconditionally constructed" note
-    for the full reasoning that phase's plan section gives).
-
-    The verification pipeline delivery plan's Phase 5 section (this phase)
-    adds the sixth and seventh steps, `IntentSummaryStep` (between
-    `context_builder` and `review_generation`) and `VerificationStep`
-    (between `review_generation` and `output`) — the same
-    unconditionally-constructed, `enabled`-mapping-gated pattern
-    `ContextBuilderStep` already established, extended from two
-    dynamically-wired steps to five. `review.config.resolve_review_pipeline_depends_on`
-    (Assumption 6 of that plan) is the one shared computation for every one
-    of the five steps' own `depends_on` value — this function no longer
-    hand-derives that chain itself, so it can't drift from
-    `review.config.check_step_configuration_viable`'s own use of the same
-    function to validate the configuration at startup.
-
-    `enablement.as_mapping()`/`timeouts.as_mapping()` are each built once
-    here and passed unchanged into `StaticAnalysisStep`, which reads the
-    same two mappings' own `"gitleaks"`/`"semgrep"` entries for its own
-    inner registry — see `review.config.StepEnablement`'s own docstring for
-    why this is one shared mapping, not two built separately.
-
-    `docs/plans/plan-deliver-memory.md`'s Phase 6 section (Unit F,
-    Assumption 6) adds `memory_matcher` — `VerificationStep` gets a new
-    `memory_suppression=MemorySuppressionConfig(...)` keyword argument built
-    from it plus the already-built `embedding_client` and three plain
-    `WorkerSettings` fields (`memory_suppression_enabled`/
-    `memory_similarity_threshold`/`memory_decay_half_life_days`) — never
-    `None` when `memory_suppression_enabled` is `True` (else `None`
-    entirely, restoring byte-for-byte the prior `VerificationStep`
-    construction, per US-M12). Unlike the five dynamically-wired steps
-    above, this isn't gated through `enabled_mapping`/`resolved` — it's an
-    internal behavior toggle inside the already-registered `verification`
-    step, not a separate pipeline stage of its own.
-
-    `docs/plans/plan-deliver-admin-gui.md`'s Phase 5 section (Unit F,
-    Assumption 3) adds `model_resolver` — passed as a new
-    `model_resolver=` keyword argument to all three LLM-calling steps
-    (`IntentSummaryStep`/`ReviewGenerationStep`/`VerificationStep`),
-    alongside their existing `llm_step_kwargs` (which still includes
-    `model`, now each step's own fallback/default when `model_resolver` is
-    `None`). `None` when `model_routing_config_enabled` is `False`,
-    restoring byte-for-byte each step's pre-Phase-5 construction (every
-    call uses `settings.llm_model` directly). When set, each step resolves
-    its own model at dispatch time inside its own `run()` — this function
-    never overwrites an already-built step's `model` field from the
-    outside, per architecture.md's "no stage reaching into another stage's
-    internals" rule.
+    """Thin Worker wrapper over `review.registry.build_review_registry` (A2 of
+    docs/plans/plan-local-mode.md): supplies the concrete analyzers and repo-config fetcher
+    and maps `WorkerSettings` into `ReviewPipelineConfig`. Step wiring lives in the shared
+    builder, so this root and the local CLI cannot drift.
     """
-    enabled_mapping = enablement.as_mapping()
-    timeouts_mapping = timeouts.as_mapping()
-
-    # Override the raw `context_builder_enabled`/`intent_summary_enabled`
-    # flags with their own shared `*_can_produce_value` predicates: each
-    # step's only consumer is `review_generation`, so if that's disabled,
-    # running either step at all only pays its own real cost (diff/tree/
-    # graph/embedding fetch for context_builder; a full LLM call for
-    # intent_summary) for a field nothing will read.
-    enabled_mapping = {
-        **enabled_mapping,
-        "context_builder": context_builder_can_produce_value(enablement),
-        "intent_summary": intent_summary_can_produce_value(enablement),
-        "walkthrough": walkthrough_can_produce_value(enablement),
-    }
-
-    # The one shared chain-resolution function (Assumption 6 of
-    # docs/plans/plan-deliver-verification-pipeline.md's Phase 5 section) —
-    # also used by `review.config.check_step_configuration_viable`'s own
-    # additive check, so the two can't drift.
-    resolved = resolve_review_pipeline_depends_on(enablement)
-
-    # The three LLM-calling review-generation-stage steps (intent_summary,
-    # review_generation, verification) all read the same three fields off
-    # `settings` for their LLM Gateway call — per the "no per-stage model
-    # routing yet" scope decision (docs/specs/spec-verification-pipeline.md).
-    # Built once here rather than repeated verbatim at each constructor call
-    # below, so a future per-stage override only needs one call site changed
-    # per step, not the shared-args tuple re-typed from scratch each time.
-    llm_step_kwargs: _LLMStepKwargs = {
-        "model": settings.llm_model,
-        "timeout": settings.llm_timeout_seconds,
-        "max_diff_bytes": settings.llm_max_diff_bytes,
-    }
-
-    # docs/plans/plan-deliver-memory.md's Phase 6 section (Unit F,
-    # Assumption 6) — `None` when `memory_suppression_enabled` is `False`,
-    # restoring exactly this step's pre-Phase-6 construction (US-M12).
-    memory_suppression = (
-        MemorySuppressionConfig(
-            memory_matcher=memory_matcher,
-            embedding_client=embedding_client,
-            similarity_threshold=settings.memory_similarity_threshold,
-            decay_half_life_days=settings.memory_decay_half_life_days,
-            enabled=True,
-        )
-        if settings.memory_suppression_enabled
-        else None
-    )
-
     analyzer_registrations = [
         *gitleaks_semgrep_registrations(GitleaksAnalyzer(), SemgrepAnalyzer()),
         AnalyzerRegistration(
@@ -1059,134 +906,28 @@ def _build_review_registry(
             config_filenames=TRIVY_CONFIG_FILENAMES,
         ),
     ]
-    analyzer_slots = asyncio.Semaphore(settings.static_analysis_max_concurrent_analyzers)
-    config_fetcher = GitHubRepoConfigFetcher(tree_fetcher)
-    analyzer_rerunner = AnalyzerRerunner(
-        analyzer_registrations, analyzer_slots, timeouts_mapping, config_fetcher
-    )
-
-    # Phase 12: registered only when effective, so with the flag off the registry is
-    # exactly the pre-Phase-12 one (US-W9). `walkthrough_publisher` is required then.
-    walkthrough_steps: list[WalkthroughStep] = []
-    if enabled_mapping["walkthrough"]:
-        if walkthrough_publisher is None:
-            raise ValueError("walkthrough is effective but no walkthrough_publisher was given")
-        walkthrough_steps.append(
-            WalkthroughStep(
-                llm_client,
-                redactor,
-                walkthrough_publisher,
-                model=settings.llm_model,
-                timeout=settings.llm_timeout_seconds,
-                # Fail open on timeout (US-W8): the step wraps its own work in a shorter
-                # wait_for (settings validate the step timeout >= llm_timeout + 15).
-                internal_timeout_seconds=float(settings.walkthrough_step_timeout_seconds - 5),
-                min_files=settings.walkthrough_min_files,
-                max_files=settings.walkthrough_max_files,
-                max_chars=settings.walkthrough_max_chars,
-                model_resolver=model_resolver,
-                depends_on=resolved["walkthrough"],
-            )
-        )
-
-    return StepRegistry(
-        steps=[
-            PrefilterStep(diff_fetcher),
-            StaticAnalysisStep(
-                diff_fetcher,
-                registrations=analyzer_registrations,
-                redactor=redactor,
-                enabled=enabled_mapping,
-                timeouts=timeouts_mapping,
-                # One semaphore per Worker process (US-A8), shared by every job
-                # because the registry is built once at startup.
-                analyzer_slots=analyzer_slots,
-                config_fetcher=config_fetcher,
-            ),
-            CloneDetectionStep(
-                diff_fetcher,
-                clone_query,
-                # A macro step's registry timeout is fatal but US-C14 requires a timeout to
-                # fail open, so the step wraps its own work in a shorter wait_for (plan
-                # Assumption 9; settings validate the step timeout exceeds 5 s).
-                internal_timeout_seconds=float(settings.clone_detection_step_timeout_seconds - 5),
-                min_tokens=settings.clone_detection_min_tokens,
-                min_lines=settings.clone_detection_min_lines,
-                max_findings=settings.clone_detection_max_findings,
-                memory_suppression=memory_suppression,
-                depends_on=resolved["clone_detection"],
-            ),
-            ContextBuilderStep(
-                diff_fetcher,
-                tree_fetcher,
-                graph_query,
-                similarity_query,
-                embedding_client,
-                internal_timeout_seconds=settings.context_builder_internal_timeout_seconds,
-                max_total_bytes=settings.llm_max_diff_bytes,
-                # When context_builder_enabled is False, `enabled["context_builder"]`
-                # skips it at run time regardless of this value — this only
-                # needs to name *some* valid, registered step so
-                # StepRegistry.__init__'s dependency validation doesn't
-                # reject it as pointing at an absent step.
-                depends_on=resolved["context_builder"],
-                # Plan Phase 7: `None` wiring => no provider code path at all
-                # (byte-for-byte the prior step). The redactor is the same
-                # instance the other steps use; a NoOp one disables the
-                # branch (A5).
-                provider_resolver=product_knowledge.resolver if product_knowledge else None,
-                provider_opener=product_knowledge.opener if product_knowledge else None,
-                provider_redactor=redactor,
-                provider_deadline_seconds=float(settings.product_knowledge_deadline_seconds),
-            ),
-            IntentSummaryStep(
-                llm_client,
-                **llm_step_kwargs,
-                model_resolver=model_resolver,
-                depends_on=resolved["intent_summary"],
-            ),
-            ReviewGenerationStep(
-                llm_client,
-                redactor=redactor,
-                **llm_step_kwargs,
-                model_resolver=model_resolver,
-                depends_on=resolved["review_generation"],
-            ),
-            VerificationStep(
-                llm_client,
-                **llm_step_kwargs,
-                model_resolver=model_resolver,
-                depends_on=resolved["verification"],
-                memory_suppression=memory_suppression,
-            ),
-            FixGenerationStep(
-                diff_fetcher,
-                llm_client,
-                analyzer_rerunner,
-                redactor,
-                model=settings.llm_model,
-                timeout=settings.llm_timeout_seconds,
-                # Fail open on timeout (US-AF12): the step wraps its own work in a
-                # shorter wait_for, as CloneDetectionStep does (settings validate > 5 s).
-                internal_timeout_seconds=float(settings.fix_generation_step_timeout_seconds - 5),
-                max_fixes_per_job=settings.fix_generation_max_fixes_per_job,
-                max_range_lines=settings.fix_generation_max_range_lines,
-                max_replacement_lines=settings.fix_generation_max_replacement_lines,
-                window_lines=settings.fix_generation_window_lines,
-                verification_enabled=enablement.verification_enabled,
-                model_resolver=model_resolver,
-                depends_on=resolved["fix_generation"],
-            ),
-            *walkthrough_steps,
-            FindingsOutputStep(
-                publisher,
-                depends_on=resolved["output"],
-            ),
-        ],
-        enabled=enabled_mapping,
-        timeouts=timeouts_mapping,
-        on_failure=FailurePolicy.FATAL,
-        terminal_step="output",
+    return build_review_registry(
+        enablement=enablement,
+        timeouts=timeouts,
+        config=ReviewPipelineConfig.model_validate(
+            settings.model_dump(include=set(ReviewPipelineConfig.model_fields))
+        ),
+        diff_fetcher=diff_fetcher,
+        tree_fetcher=tree_fetcher,
+        graph_query=graph_query,
+        similarity_query=similarity_query,
+        clone_query=clone_query,
+        embedding_client=embedding_client,
+        redactor=redactor,
+        llm_client=llm_client,
+        publisher=publisher,
+        memory_matcher=memory_matcher,
+        model_resolver=model_resolver,
+        analyzer_registrations=analyzer_registrations,
+        config_fetcher=GitHubRepoConfigFetcher(tree_fetcher),
+        provider_resolver=product_knowledge.resolver if product_knowledge else None,
+        provider_opener=product_knowledge.opener if product_knowledge else None,
+        walkthrough_publisher=walkthrough_publisher,
     )
 
 

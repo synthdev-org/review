@@ -19,11 +19,33 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 
 from findings.models import Finding
 from indexing.embedding import EmbeddingClient
 from memory.fingerprint import build_finding_fingerprint
 from memory.store import DismissedFindingMatcher
+
+
+class FingerprintMatcher(Protocol):
+    """Exact-match dismissal lookup keyed by the finding's fingerprint text, with no embedding.
+
+    Defined here, at its consumer, so a store that holds dismissals as exact fingerprints (the
+    local-mode repository memory file, ADR-0016 decision 4) needs neither an embedder nor a fake
+    one. ``fingerprint`` is ``build_finding_fingerprint``'s text; hashing it, if the store wants
+    that, is the store's business.
+    """
+
+    async def is_dismissed(self, *, repo_id: str, fingerprint: str) -> bool: ...
+
+
+@dataclass(frozen=True)
+class FingerprintSuppressionConfig:
+    """The exact-fingerprint alternative to ``MemorySuppressionConfig``: nothing to embed, so no
+    embedder, threshold or decay half-life."""
+
+    fingerprint_matcher: FingerprintMatcher
+    enabled: bool
 
 
 @dataclass(frozen=True)
@@ -42,8 +64,11 @@ class MemorySuppressionConfig:
     enabled: bool
 
 
+SuppressionConfig = MemorySuppressionConfig | FingerprintSuppressionConfig
+
+
 async def suppress_via_memory(
-    findings: list[Finding], *, config: MemorySuppressionConfig, repo_id: str
+    findings: list[Finding], *, config: SuppressionConfig, repo_id: str
 ) -> tuple[list[Finding], int]:
     """US-M6/US-M7/US-M9's pre-check. Returns ``(kept_findings, suppressed_count)``.
     Takes ``config`` explicitly: the caller has already checked it is present and
@@ -57,6 +82,15 @@ async def suppress_via_memory(
         )
         for finding in findings
     ]
+    if isinstance(config, FingerprintSuppressionConfig):
+        dismissed = await asyncio.gather(
+            *(
+                config.fingerprint_matcher.is_dismissed(repo_id=repo_id, fingerprint=fingerprint)
+                for fingerprint in fingerprints
+            )
+        )
+        kept_exact = [f for f, gone in zip(findings, dismissed, strict=True) if not gone]
+        return kept_exact, len(findings) - len(kept_exact)
     # `embed` is synchronous and CPU-bound (per `EmbeddingClient`'s docstring), so it runs
     # in a thread to keep the step's event loop free.
     vectors = await asyncio.to_thread(config.embedding_client.embed, fingerprints)

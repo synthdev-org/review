@@ -9,6 +9,13 @@ customers: the platform ships as container images the customer deploys inside
 their own infrastructure, so their code and review history never leave their
 control.
 
+> **Amended by [ADR-0016](../adr/0016-local-mode-composition-root.md)
+> (PROPOSED).** The stateless CLI is back as a *separate, additional* mode for
+> one developer or one CI run (`apps/local_cli`, a fourth composition root
+> shipped as a pip/pipx distribution, not a deployable). It has no index and no
+> shared memory, so the limits described below still hold for it; server mode
+> remains the product for teams and is unchanged.
+
 This document replaces an earlier "zero infrastructure" design (a CLI invoked as a
 git hook / CI step, with no database and no server). That design was abandoned once
 it became clear it couldn't deliver two of the highest-leverage techniques the

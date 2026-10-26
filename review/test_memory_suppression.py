@@ -12,7 +12,12 @@ import pytest
 
 from findings.models import Finding
 from indexing.embedding import EmbeddingVector
-from review.memory_suppression import MemorySuppressionConfig, suppress_via_memory
+from memory.fingerprint import build_finding_fingerprint
+from review.memory_suppression import (
+    FingerprintSuppressionConfig,
+    MemorySuppressionConfig,
+    suppress_via_memory,
+)
 
 
 @dataclass
@@ -93,3 +98,49 @@ async def test_empty_input_makes_no_embedding_or_matcher_call() -> None:
 
     assert await suppress_via_memory([], config=_config(matcher, embedder), repo_id="r") == ([], 0)
     assert embedder.calls == [] and matcher.repo_ids == []
+
+
+@dataclass
+class _ExactMatcher:
+    """A FingerprintMatcher fake: dismisses exactly the fingerprint texts it was given."""
+
+    dismissed: set[str]
+    asked: list[tuple[str, str]] = field(default_factory=list)
+
+    async def is_dismissed(self, *, repo_id: str, fingerprint: str) -> bool:
+        self.asked.append((repo_id, fingerprint))
+        return fingerprint in self.dismissed
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_config_drops_exactly_the_dismissed_findings_without_an_embedder() -> (
+    None
+):
+    gone, kept_finding = _finding("same issue"), _finding("other issue")
+    matcher = _ExactMatcher(
+        {build_finding_fingerprint(file="a.py", rule_id="duplication", message="same issue")}
+    )
+
+    kept, suppressed = await suppress_via_memory(
+        [gone, kept_finding],
+        config=FingerprintSuppressionConfig(fingerprint_matcher=matcher, enabled=True),
+        repo_id="repo-1",
+    )
+
+    assert kept == [kept_finding]
+    assert suppressed == 1
+    assert [repo for repo, _ in matcher.asked] == ["repo-1", "repo-1"]
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_config_with_no_findings_asks_nothing() -> None:
+    matcher = _ExactMatcher(set())
+
+    result = await suppress_via_memory(
+        [],
+        config=FingerprintSuppressionConfig(fingerprint_matcher=matcher, enabled=True),
+        repo_id="r",
+    )
+
+    assert result == ([], 0)
+    assert matcher.asked == []

@@ -47,12 +47,12 @@ line-attributed findings are.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import httpx
 from opentelemetry import metrics
 
-from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.exceptions import (
     GitHubPermanentAPIError,
     GitHubPostingMalformedRequestError,
@@ -60,7 +60,8 @@ from adapter.github.exceptions import (
     GitHubRetryExhaustedError,
 )
 from adapter.github.http import auth_headers, client_context, request_with_retry, split_owner_repo
-from findings.markdown import escape_markdown, suggestion_block
+from adapter.github.token_provider import InstallationTokenProvider
+from findings.markdown import break_autolinks, escape_markdown, strip_display_text, suggestion_block
 from findings.models import Finding
 from memory.models import PostedComment
 from memory.store import MemorySignalRecorder, MemoryStoreError
@@ -121,11 +122,18 @@ def _comment_line(finding: Finding) -> int | None:
     return finding.line
 
 
-def _review_comment(finding: Finding) -> dict[str, Any]:
+def comment_body(finding: Finding, marker: str = "") -> str:
+    """The inline comment text for ``finding``; a non-empty ``marker`` (a hidden HTML comment)
+    is appended so a later run can recognise the comment as its own."""
+    body = _finding_body(finding)
+    return f"{body}\n\n{marker}" if marker else body
+
+
+def _review_comment(finding: Finding, marker: str = "") -> dict[str, Any]:
     comment: dict[str, Any] = {
         "path": finding.file,
         "line": _comment_line(finding),
-        "body": _finding_body(finding),
+        "body": comment_body(finding, marker),
     }
     suggestion = finding.suggestion
     if suggestion is not None and suggestion.start_line < suggestion.end_line:
@@ -135,21 +143,46 @@ def _review_comment(finding: Finding) -> dict[str, Any]:
     return comment
 
 
-def _review_comments(line_findings: list[Finding]) -> list[dict[str, Any]]:
+def _review_comments(line_findings: list[Finding], marker: str = "") -> list[dict[str, Any]]:
     """GitHub's create-review API requires a ``line`` (or ``position``) per
     inline comment — only findings with a real ``line`` can be posted this
     way; a file-level finding (``line is None``) is folded into the
     review's own top-level ``body`` instead (see ``_review_body`` below)."""
-    return [_review_comment(finding) for finding in line_findings]
+    return [_review_comment(finding, marker) for finding in line_findings]
 
 
-def _review_body(file_level_findings: list[Finding], total_count: int) -> str:
+_MAX_LISTED_SUPPRESSED = 20
+_MAX_SUPPRESSED_LINE_CHARS = 300
+
+
+def _suppressed_section(suppressed: Sequence[str]) -> list[str]:
+    """Findings the repository memory file dismissed (local-mode CI only): a count and the first few
+    by name, so a dismissal is visible in the pull request, not only in the job log."""
+    if not suppressed:
+        return []
+    lines = ["", escape_markdown(f"Suppressed by the repository memory file: {len(suppressed)}.")]
+    for item in suppressed[:_MAX_LISTED_SUPPRESSED]:
+        text = break_autolinks(strip_display_text(item))[:_MAX_SUPPRESSED_LINE_CHARS]
+        lines.append(f"- {escape_markdown(text)}")
+    if len(suppressed) > _MAX_LISTED_SUPPRESSED:
+        lines.append(f"- and {len(suppressed) - _MAX_LISTED_SUPPRESSED} more")
+    return lines
+
+
+def file_level_line(finding: Finding) -> str:
+    return f"- **{escape_markdown(finding.file)}**: {_finding_body(finding)}"
+
+
+def _review_body(
+    file_level_findings: list[Finding], total_count: int, suppressed: Sequence[str] = ()
+) -> str:
     summary = escape_markdown(f"Automated review found {total_count} finding(s).")
-    if not file_level_findings:
-        return summary
-    lines = [summary, "", "Findings not attributable to a specific line:"]
-    for finding in file_level_findings:
-        lines.append(f"- **{escape_markdown(finding.file)}**: {_finding_body(finding)}")
+    lines = [summary]
+    if file_level_findings:
+        lines += ["", "Findings not attributable to a specific line:"]
+        for finding in file_level_findings:
+            lines.append(file_level_line(finding))
+    lines += _suppressed_section(suppressed)
     return "\n".join(lines)
 
 
@@ -179,15 +212,23 @@ class GitHubFindingsPublisher:
     def __init__(
         self,
         *,
-        token_provider: GitHubInstallationTokenProvider,
-        provenance_recorder: MemorySignalRecorder,
+        token_provider: InstallationTokenProvider,
+        provenance_recorder: MemorySignalRecorder | None = None,
         github_api_base_url: str = _DEFAULT_GITHUB_API_BASE_URL,
         timeout: float = 10.0,
         max_retry_attempts: int = 3,
         client: httpx.AsyncClient | None = None,
+        comment_marker: str = "",
+        suppressed_lines: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         self._token_provider = token_provider
+        # None when nothing stores provenance (local-mode CI): skips the follow-up comments GET.
         self._provenance_recorder = provenance_recorder
+        # Hidden text appended to every inline comment (local-mode CI only; "" in server mode).
+        self._comment_marker = comment_marker
+        # Local-mode CI only: what the repository memory file suppressed, read when the review
+        # body is built (None in server mode, which leaves the body exactly as before).
+        self._suppressed_lines = suppressed_lines
         self._github_api_base_url = github_api_base_url
         self._timeout = timeout
         self._max_retry_attempts = max_retry_attempts
@@ -213,8 +254,12 @@ class GitHubFindingsPublisher:
         file_level_findings = [finding for finding in findings if finding.line is None]
         body = {
             "event": _REVIEW_EVENT,
-            "body": _review_body(file_level_findings, len(findings)),
-            "comments": _review_comments(line_findings),
+            "body": _review_body(
+                file_level_findings,
+                len(findings),
+                () if self._suppressed_lines is None else self._suppressed_lines(),
+            ),
+            "comments": _review_comments(line_findings, self._comment_marker),
         }
         owner, repo = _split_owner_repo(repo_full_name)
         response = await self._post(
@@ -232,7 +277,7 @@ class GitHubFindingsPublisher:
         # File-level-only findings never posted a line comment in the first
         # place (see `_review_comments` above) — nothing to correlate, and
         # no reason to spend a second GitHub API call finding that out.
-        if not line_findings:
+        if not line_findings or self._provenance_recorder is None:
             return
 
         try:
@@ -335,7 +380,11 @@ class GitHubFindingsPublisher:
         # correctly disambiguated.
         submitted: dict[tuple[str, int | None, str], list[Finding]] = {}
         for finding in line_findings:
-            key = (finding.file, _comment_line(finding), _finding_body(finding))
+            key = (
+                finding.file,
+                _comment_line(finding),
+                comment_body(finding, self._comment_marker),
+            )
             submitted.setdefault(key, []).append(finding)
 
         matched: list[PostedComment] = []
@@ -378,7 +427,7 @@ class GitHubFindingsPublisher:
         else:
             logger.info("posting: provenance capture correlation summary", extra=summary_extra)
 
-        if not matched:
+        if not matched or self._provenance_recorder is None:
             return
 
         try:

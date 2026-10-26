@@ -95,7 +95,7 @@ from review.llm_telemetry import record_llm_token_usage
 from review.memory_suppression import (
     MemorySuppressionConfig as MemorySuppressionConfig,  # re-export
 )
-from review.memory_suppression import suppress_via_memory
+from review.memory_suppression import SuppressionConfig, suppress_via_memory
 from review.step import JobIdentity, Step, StepContext, job_identity_fields
 
 logger = logging.getLogger(__name__)
@@ -361,7 +361,7 @@ class VerificationStep:
         timeout: float,
         max_diff_bytes: int,
         depends_on: str = "review_generation",
-        memory_suppression: MemorySuppressionConfig | None = None,
+        memory_suppression: SuppressionConfig | None = None,
         model_resolver: FallbackModelRoutingResolver | None = None,
     ) -> None:
         """``depends_on`` names this step's single upstream dependency —

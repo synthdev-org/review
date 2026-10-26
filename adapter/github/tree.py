@@ -62,10 +62,10 @@ from typing import Any
 
 import httpx
 
-from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.exceptions import GitHubGitDataFetchError, GitHubGitDataMalformedResponseError
 from adapter.github.git_data import BlobFetchEntry, fetch_blobs, fetch_tree_listing
 from adapter.github.http import auth_headers, client_context, split_owner_repo
+from adapter.github.token_provider import InstallationTokenProvider
 from indexing.tree import (
     RepoTreeContentFetchError,
     RepoTreeEntry,
@@ -126,7 +126,7 @@ class GitHubTreeFetcher:
     def __init__(
         self,
         *,
-        token_provider: GitHubInstallationTokenProvider,
+        token_provider: InstallationTokenProvider,
         github_api_base_url: str = _DEFAULT_GITHUB_API_BASE_URL,
         timeout: float = 10.0,
         max_retry_attempts: int = 3,

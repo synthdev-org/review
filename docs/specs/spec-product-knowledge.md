@@ -1146,6 +1146,10 @@ the task brief; each is now decided, with the reason. None is pending.
    (a few hundred tokens plus latency) per review for an unmeasured gain and
    would add a new place PR-author text steers an LLM; deferred until the
    pilot metric argues for it.
+   **Scope note (local mode).** This rule governs server mode only. [`spec-local-mode.md`](spec-local-mode.md)
+   decision D5 lets local mode (US-L9) send code-derived terms to the developer's own nominated MCP
+   servers, justified by dry-run visibility. That departure is **local-only**, applies to nothing in
+   this spec, and is not implemented yet (US-L9 is deferred).
 6. **Fusion and budget.** A separate, labeled `product_knowledge` section
    with its own fixed 12 KiB ceiling, 5 items, fetched content for the top 2;
    never reranked into the code list. Not a share of the diff-proportional

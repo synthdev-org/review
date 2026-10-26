@@ -82,13 +82,17 @@ are this module's only callers):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import posixpath
 import shutil
+import signal
+import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from adapter.analyzers.exceptions import (
@@ -316,16 +320,94 @@ async def _read_capped(process: asyncio.subprocess.Process, max_output_bytes: in
             raise _OutputCapExceeded()
 
 
-async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
+_STDERR_CAP_BYTES = 65536  # separate-stderr mode only: enough to say why a child failed
+
+
+async def _feed_stdin(process: asyncio.subprocess.Process, data: bytes) -> None:
+    assert process.stdin is not None  # guaranteed by stdin=PIPE at spawn time
+    try:
+        process.stdin.write(data)
+        await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # the child exited without reading it all; its exit status reports why
+    finally:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            process.stdin.close()
+
+
+async def _drain_capped(stream: asyncio.StreamReader, cap: int) -> bytes:
+    """Read ``stream`` to EOF, keeping only the first ``cap`` bytes, so an undrained pipe can
+    never block the child."""
+    kept = bytearray()
+    while chunk := await stream.read(_READ_CHUNK_SIZE):
+        kept.extend(chunk[: max(0, cap - len(kept))])
+    return bytes(kept)
+
+
+async def _collect(
+    process: asyncio.subprocess.Process, max_output_bytes: int, stdin: bytes | None
+) -> tuple[bytes, bytes]:
+    """``(stdout, stderr)``; stderr is empty unless it was piped separately. Feeds ``stdin`` and
+    drains stderr concurrently with the capped stdout read, so none of the three pipes can
+    deadlock another; both helper tasks are cancelled however this exits."""
+    helpers: list[asyncio.Task[object]] = []
+    stderr_task: asyncio.Task[bytes] | None = None
+    if process.stderr is not None:
+        stderr_task = asyncio.create_task(_drain_capped(process.stderr, _STDERR_CAP_BYTES))
+        helpers.append(stderr_task)
+    if stdin is not None:
+        helpers.append(asyncio.create_task(_feed_stdin(process, stdin)))
+    try:
+        stdout = await _read_capped(process, max_output_bytes)
+        return stdout, (b"" if stderr_task is None else await stderr_task)
+    finally:
+        for task in helpers:
+            task.cancel()
+        await asyncio.gather(*helpers, return_exceptions=True)
+
+
+async def _discard(stream: asyncio.StreamReader) -> None:
+    while await stream.read(_READ_CHUNK_SIZE):
+        pass
+
+
+def _kill(process: asyncio.subprocess.Process, *, new_session: bool) -> None:
+    if not new_session or sys.platform == "win32":
+        with contextlib.suppress(ProcessLookupError):  # the leader may already have exited
+            process.kill()
+        return
+    # The child leads its own session (``start_new_session``), so its pid is the group id.
+    with contextlib.suppress(ProcessLookupError, PermissionError):  # group gone or pid recycled
+        os.killpg(process.pid, signal.SIGKILL)
+
+
+async def _kill_and_reap(process: asyncio.subprocess.Process, *, new_session: bool = False) -> None:
     """The one kill-and-reap mechanism every subprocess spawn site in this
     plan shares (see the module docstring's "Subprocess lifecycle" note).
     ``process.kill()`` alone does not reap the child — without the
     following ``await process.wait()``, the now-dead process stays a
-    zombie until something else reaps it.
+    zombie until something else reaps it. ``new_session`` kills the child's whole
+    process group, so a grandchild (a git hook, a filter) cannot keep a pipe open.
     """
-    if process.returncode is None:
-        process.kill()
-    await process.wait()
+    # A leader that already exited can leave a grandchild holding a pipe open; the group kill
+    # must still run or the reap below waits for that grandchild. Once both pipes hit EOF no
+    # group member can remain, so the pid may be reused and must not be signalled.
+    pipes_open = any(s is not None and not s.at_eof() for s in (process.stdout, process.stderr))
+    if process.returncode is None or (new_session and pipes_open):
+        _kill(process, new_session=new_session)
+    # ``wait()`` only returns once the transport has seen EOF on every pipe; a killed child's
+    # unread output (the output-cap case) would otherwise sit in a paused StreamReader forever.
+    sinks = [
+        asyncio.create_task(_discard(stream))
+        for stream in (process.stdout, process.stderr)
+        if stream is not None
+    ]
+    try:
+        await process.wait()
+    finally:
+        for sink in sinks:
+            sink.cancel()
+        await asyncio.gather(*sinks, return_exceptions=True)
 
 
 # Every Worker setting (GitHub App key, DB DSN, LLM and product-knowledge
@@ -345,6 +427,16 @@ def analyzer_env(environ: Mapping[str, str]) -> dict[str, str]:
     return {k: v for k, v in environ.items() if not k.startswith(_SECRET_ENV_PREFIXES)}
 
 
+@dataclass(frozen=True)
+class SubprocessResult:
+    """A child that ran to completion: its exit status and what it wrote (``stderr`` is empty
+    unless it was piped separately)."""
+
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
 async def run_analyzer_subprocess(
     argv: Sequence[str],
     *,
@@ -352,47 +444,111 @@ async def run_analyzer_subprocess(
     timeout: float,
     max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
     env_overrides: Mapping[str, str] | None = None,
+    stdin: bytes | None = None,
+    merge_stderr: bool = True,
+    env: Mapping[str, str] | None = None,
+    isolated: bool = False,
 ) -> bytes:
+    """``run_bounded_subprocess`` for a tool that must succeed: stdout (merged with stderr
+    unless ``merge_stderr=False``) on a zero exit, ``AnalyzerInvocationError`` otherwise."""
+    result = await run_bounded_subprocess(
+        argv,
+        cwd=cwd,
+        timeout=timeout,
+        max_output_bytes=max_output_bytes,
+        env_overrides=env_overrides,
+        stdin=stdin,
+        merge_stderr=merge_stderr,
+        env=env,
+        isolated=isolated,
+    )
+    if result.returncode != 0:
+        raise AnalyzerInvocationError(
+            argv=list(argv), returncode=result.returncode, output=result.stdout + result.stderr
+        )
+    return result.stdout
+
+
+async def run_bounded_subprocess(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+    env_overrides: Mapping[str, str] | None = None,
+    stdin: bytes | None = None,
+    merge_stderr: bool = True,
+    env: Mapping[str, str] | None = None,
+    isolated: bool = False,
+) -> SubprocessResult:
     """Runs ``argv`` (an analyzer tool invocation, or a
     ``findings.redact.TextRedactor`` redaction call) via
     ``asyncio.create_subprocess_exec``, bounded by both ``timeout`` and
     ``max_output_bytes`` — see the module docstring for the full
-    kill-and-reap/bounded-read design. Returns the captured, merged
-    stdout+stderr bytes on a zero exit; raises ``AnalyzerInvocationError``
-    (non-zero exit), ``AnalyzerTimeoutError`` (killed for exceeding
-    ``timeout``), or ``AnalyzerOutputTooLargeError`` (killed for exceeding
+    kill-and-reap/bounded-read design. Returns a ``SubprocessResult`` for any child that ran
+    to completion, whatever its exit status; raises
+    ``AnalyzerTimeoutError`` (killed for exceeding
+    ``timeout``) or ``AnalyzerOutputTooLargeError`` (killed for exceeding
     ``max_output_bytes``) otherwise. A genuine outer cancellation (e.g. the
     caller's own coroutine being cancelled by something *other* than this
     function's own ``timeout``) is not swallowed — the process is still
     killed and reaped, then ``asyncio.CancelledError`` is re-raised
     unchanged, per this codebase's own "never swallow or log-and-continue
     silently" rule.
+
+    Additive options for the Claude CLI backend (``adapter/llm/claude_cli.py``); the defaults
+    keep every existing caller's behaviour, except that a child never inherits the parent's
+    stdin (it gets /dev/null). ``stdin``: bytes written to the
+    child's stdin (then closed) concurrently with the read, under the same timeout; ``None``
+    gives it no stdin (/dev/null). ``merge_stderr=False``: stderr is drained separately
+    (first 64KB kept) instead of being merged into the returned bytes, so it cannot corrupt a
+    JSON stdout; it is appended to ``AnalyzerInvocationError.output`` on a non-zero exit.
+    ``env``: the complete child environment (an allow-list), replacing the credential-stripped
+    ``os.environ`` copy; ``env_overrides`` still applies on top. ``isolated``: the child gets no
+    stdin unless ``stdin`` is given, its stderr is discarded (never merged; kept only with
+    ``merge_stderr=False``), and it leads its own
+    session, so a timeout kills it and everything it spawned (a git hook, a filter) together;
+    otherwise an orphan keeps the pipe open and the reap waits for it.
     """
     argv_list = list(argv)
+    # Never inherit the parent's stdin: an interactive `review run` would otherwise let a tool read
+    # (or block on) the developer's terminal.
+    spawn_kwargs: dict[str, object] = {
+        "stdin": asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE
+    }
+    if isolated:
+        spawn_kwargs["start_new_session"] = True
+        # Merged stderr would corrupt a parsed stdout, so it is dropped unless asked for separately.
+        stderr_target = asyncio.subprocess.DEVNULL if merge_stderr else asyncio.subprocess.PIPE
+    else:
+        stderr_target = asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE
     process = await asyncio.create_subprocess_exec(
         *argv_list,
         cwd=cwd,
         # ``env_overrides`` lets an engine pin offline-hardening variables (Trivy's
         # dead-proxy) on top of the credential-stripped environment.
-        env={**analyzer_env(os.environ), **(env_overrides or {})},
+        env={**(analyzer_env(os.environ) if env is None else env), **(env_overrides or {})},
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        stderr=stderr_target,
+        **spawn_kwargs,  # type: ignore[arg-type]
     )
     read_started = time.monotonic()
     try:
-        output = await asyncio.wait_for(_read_capped(process, max_output_bytes), timeout=timeout)
+        output, stderr_output = await asyncio.wait_for(
+            _collect(process, max_output_bytes, stdin), timeout=timeout
+        )
     except TimeoutError as exc:
-        await _kill_and_reap(process)
+        await _kill_and_reap(process, new_session=isolated)
         logger.error(
             "analyzer step killed after exceeding its timeout",
             extra={"argv": argv_list, "timeout_seconds": timeout},
         )
         raise AnalyzerTimeoutError(argv=argv_list, timeout_seconds=timeout) from exc
     except asyncio.CancelledError:
-        await _kill_and_reap(process)
+        await _kill_and_reap(process, new_session=isolated)
         raise
     except _OutputCapExceeded as exc:
-        await _kill_and_reap(process)
+        await _kill_and_reap(process, new_session=isolated)
         logger.error(
             "analyzer output exceeded the size cap",
             extra={"argv": argv_list, "max_output_bytes": max_output_bytes},
@@ -431,16 +587,14 @@ async def run_analyzer_subprocess(
             remaining = max(0.0, timeout - (time.monotonic() - read_started))
             returncode = await asyncio.wait_for(process.wait(), timeout=remaining)
     except TimeoutError as exc:
-        await _kill_and_reap(process)
+        await _kill_and_reap(process, new_session=isolated)
         logger.error(
             "analyzer step killed after exceeding its timeout",
             extra={"argv": argv_list, "timeout_seconds": timeout},
         )
         raise AnalyzerTimeoutError(argv=argv_list, timeout_seconds=timeout) from exc
     except asyncio.CancelledError:
-        await _kill_and_reap(process)
+        await _kill_and_reap(process, new_session=isolated)
         raise
 
-    if returncode != 0:
-        raise AnalyzerInvocationError(argv=argv_list, returncode=returncode, output=output)
-    return output
+    return SubprocessResult(returncode=returncode, stdout=output, stderr=stderr_output)

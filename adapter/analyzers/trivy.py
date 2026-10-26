@@ -59,6 +59,7 @@ from typing import Any
 
 import yaml
 
+from adapter.analyzers.environment import ChildEnvironmentMixin
 from adapter.analyzers.exceptions import AnalyzerInvocationError, AnalyzerOutputParseError
 from adapter.analyzers.subprocess_runner import (
     cleanup_temp_directory,
@@ -415,7 +416,7 @@ def _to_findings(
     return findings, filtered
 
 
-class TrivyAnalyzer:
+class TrivyAnalyzer(ChildEnvironmentMixin):
     """``review.static_analysis.StaticAnalyzer`` backed by the ``trivy`` binary.
     See this module's docstring."""
 
@@ -464,6 +465,7 @@ class TrivyAnalyzer:
                     cwd=directory,
                     timeout=budget,
                     env_overrides=_OFFLINE_ENV,
+                    env=self._environ,
                 )
 
             try:

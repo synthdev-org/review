@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from adapter.analyzers.environment import ChildEnvironmentMixin
 from adapter.analyzers.exceptions import AnalyzerInvocationError, AnalyzerOutputParseError
 from adapter.analyzers.subprocess_runner import (
     cleanup_temp_directory,
@@ -211,7 +212,7 @@ def _to_finding(
     )
 
 
-class RuffAnalyzer:
+class RuffAnalyzer(ChildEnvironmentMixin):
     """``review.static_analysis.StaticAnalyzer`` backed by the ``ruff`` binary.
     See this module's docstring."""
 
@@ -250,7 +251,10 @@ class RuffAnalyzer:
 
             try:
                 output = await run_analyzer_subprocess(
-                    _argv(choice.config_name or default_name, paths), cwd=directory, timeout=timeout
+                    _argv(choice.config_name or default_name, paths),
+                    cwd=directory,
+                    timeout=timeout,
+                    env=self._environ,
                 )
             except AnalyzerInvocationError as exc:
                 remaining = timeout - (time.monotonic() - started)
@@ -271,7 +275,10 @@ class RuffAnalyzer:
                 )
                 ConfigOutcome("default", "rejected_by_tool").record(self.name)
                 output = await run_analyzer_subprocess(
-                    _argv(default_name, paths), cwd=directory, timeout=remaining
+                    _argv(default_name, paths),
+                    cwd=directory,
+                    timeout=remaining,
+                    env=self._environ,
                 )
             return [
                 _to_finding(entry, directory, original_by_normalized)

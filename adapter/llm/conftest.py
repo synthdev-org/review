@@ -17,7 +17,9 @@ import json
 import socket
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 
 import pytest
 
@@ -25,10 +27,40 @@ ResponseFactory = Callable[[], tuple[int, bytes]]
 StartStub = Callable[[ResponseFactory], str]
 
 
-def _make_handler(respond: ResponseFactory) -> type[BaseHTTPRequestHandler]:
+@dataclass(frozen=True)
+class CapturedRequest:
+    """One request the stub received: enough for a test to assert on what was (or was not) sent."""
+
+    path: str
+    headers: dict[str, str]
+    body: bytes
+
+    def json(self) -> Any:
+        return json.loads(self.body)
+
+    def prompt_text(self) -> str:
+        """Every chat message's content joined, for substring assertions on what the model saw."""
+        messages = self.json().get("messages", [])
+        return "\n".join(str(m.get("content", "")) for m in messages)
+
+
+RequestResponder = Callable[[CapturedRequest], tuple[int, bytes]]
+StartCapturingStub = Callable[[RequestResponder], str]
+
+
+def _make_handler(
+    respond: RequestResponder, requests: list[CapturedRequest]
+) -> type[BaseHTTPRequestHandler]:
     class _StubHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
-            status, body = respond()
+            length = int(self.headers.get("Content-Length", 0))
+            request = CapturedRequest(
+                path=self.path,
+                headers={k.lower(): v for k, v in self.headers.items()},
+                body=self.rfile.read(length),
+            )
+            requests.append(request)
+            status, body = respond(request)
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -41,16 +73,24 @@ def _make_handler(respond: ResponseFactory) -> type[BaseHTTPRequestHandler]:
 
 
 @pytest.fixture
-def stub_llm_server() -> Iterator[StartStub]:
-    """Yields a `start(respond)` function: give it a zero-arg callable
-    returning `(status_code, body_bytes)`, get back the base URL
-    (`http://127.0.0.1:<port>/v1`) a `LiteLLMClient` can be pointed at.
+def llm_requests() -> list[CapturedRequest]:
+    """Every request any stub server of this test received, in arrival order. Assert on it for
+    "the model was never called" (`== []`) and for what a prompt did or did not contain; without
+    capture such assertions pass vacuously."""
+    return []
+
+
+@pytest.fixture
+def stub_llm_capture(llm_requests: list[CapturedRequest]) -> Iterator[StartCapturingStub]:
+    """Yields a `start(respond)` function: give it a callable taking the `CapturedRequest` and
+    returning `(status_code, body_bytes)`, get back the base URL (`http://127.0.0.1:<port>/v1`)
+    a `LiteLLMClient` can be pointed at. Every request is also appended to `llm_requests`.
     Every server started this way is shut down at the end of the test.
     """
     servers: list[HTTPServer] = []
 
-    def start(respond: ResponseFactory) -> str:
-        server = HTTPServer(("127.0.0.1", 0), _make_handler(respond))
+    def start(respond: RequestResponder) -> str:
+        server = HTTPServer(("127.0.0.1", 0), _make_handler(respond, llm_requests))
         servers.append(server)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -62,6 +102,17 @@ def stub_llm_server() -> Iterator[StartStub]:
     for server in servers:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture
+def stub_llm_server(stub_llm_capture: StartCapturingStub) -> StartStub:
+    """Like `stub_llm_capture`, but `respond` is a zero-arg callable that never sees the request
+    (a fixed "cassette"). Requests are still recorded in `llm_requests`."""
+
+    def start(respond: ResponseFactory) -> str:
+        return stub_llm_capture(lambda _request: respond())
+
+    return start
 
 
 def unused_port_endpoint() -> str:

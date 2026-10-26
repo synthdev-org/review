@@ -1,0 +1,564 @@
+{
+  "$defs": {
+    "AnalyzerOutcome": {
+      "description": "``skipped`` means review chose not to run it (not installed, disabled, no matching files);\n``errored`` means it was present and failed or timed out.",
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "used",
+            "skipped",
+            "errored"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ],
+      "title": "AnalyzerOutcome",
+      "type": "object"
+    },
+    "BackendSummary": {
+      "properties": {
+        "kind": {
+          "default": "openai_compatible",
+          "enum": [
+            "openai_compatible",
+            "claude_cli"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "ci_guard_overridden": {
+          "default": false,
+          "title": "Ci Guard Overridden",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "title": "BackendSummary",
+      "type": "object"
+    },
+    "CiCommentsSummary": {
+      "properties": {
+        "posted": {
+          "default": 0,
+          "title": "Posted",
+          "type": "integer"
+        },
+        "updated": {
+          "default": 0,
+          "title": "Updated",
+          "type": "integer"
+        },
+        "outdated": {
+          "default": 0,
+          "title": "Outdated",
+          "type": "integer"
+        },
+        "skipped": {
+          "default": 0,
+          "title": "Skipped",
+          "type": "integer"
+        },
+        "rejected": {
+          "default": 0,
+          "title": "Rejected",
+          "type": "integer"
+        },
+        "dedupe_failure": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dedupe Failure"
+        }
+      },
+      "title": "CiCommentsSummary",
+      "type": "object"
+    },
+    "Finding": {
+      "description": "One normalized finding from any producer, per the PRD's US4/US5\nstructured schema (\"file, line, severity, message\").\n\n``line`` is nullable: not every finding is attributable to a single\nline (a file-level match, or a producer that doesn't report line\nnumbers) \u2014 a producer that always has one still sets it. ``rule_id`` is\nthe producing tool's own rule/check identifier where it has one (both\nGitleaks and Semgrep do; the LLM path, Phase 6, leaves it ``None``) \u2014\nmetadata useful to an operator and to Phase 7's dedupe logic, not part\nof the PRD's own minimal four-field schema.\n\n``message`` is the one field ``findings.redact.TextRedactor`` operates\non (per the plan's Phase 5 \"Static-analysis-wide secret redaction\"\nsection) \u2014 every producer is expected to put any free-text content that\ncould quote source/secret material (a Semgrep match's own quoted source\nline, an LLM's own prose) into this field, not a field this model\ndoesn't define, so the redaction pass's \"every ``Finding``'s free-text\nfields\" guarantee has exactly one field to cover.\n\n``context_ref_ids`` \u2014 added by\ndocs/plans/plan-deliver-context-builder.md's Phase 6 section (US6) \u2014\nnames which ``review.context_bundle.ContextBundleItem.id``(s) an\nLLM-sourced finding drew on, so ``review.citation.render_citation`` can\nlook them up against the same job's ``ContextBundle`` and append a\nplatform-rendered citation. **A tuple, not a list**: ``Finding`` is\n``frozen=True``, and pydantic derives ``__hash__`` from field values on\na frozen model \u2014 a ``list``-typed field would raise ``TypeError`` the\nmoment anything hashes a ``Finding`` with a non-``None`` value here\n(``findings/merge.py``'s own docstring already flags future set/dedupe\nlogic over ``Finding`` as a concern), the same reasoning\n``indexing.chunk.Chunk.line_range`` already applied. Defaults to\n``None`` so every existing (static-analysis-sourced) ``Finding``\nconstruction site is unaffected \u2014 only\n``review.review_generation._parse_llm_findings`` ever sets it, converting the\nLLM's own JSON ``list[int]`` to a tuple at construction time.\n\n``citation_markdown`` \u2014 set by ``review.output.FindingsOutputStep``'s\nown ``_apply_citations`` step, never by a finding producer directly \u2014\nthe already-rendered ``review.citation.render_citation`` output for\nthis finding's own ``context_ref_ids``, or ``None`` when there was\nnothing to cite. **Deliberately a field separate from ``message``, not\nappended into it:** ``message`` is producer-controlled free text that\n``adapter/github/posting.py``'s own ``escape_markdown`` call\nneutralizes for safe Markdown inclusion; ``citation_markdown`` is\nplatform-rendered Markdown *syntax* (bold/code-span markers) built by\n``render_citation`` around its own already-escaped file-path/symbol\nvalues \u2014 passing it through ``escape_markdown`` a second time would\nbackslash-escape its own backticks/asterisks and render the citation as\nliteral, unformatted text instead of the intended bold/code styling.\nNot covered by ``findings.redact.TextRedactor`` for the same reason\n``review.citation.render_citation``'s own docstring gives for never\nexposing a bundle item's real ``content``: this field only ever holds\nfile path/symbol/line-range metadata, never raw source text that could\ncarry a secret.\n\n``verification_status`` \u2014 set by ``review.verification.VerificationStep``\n(docs/plans/plan-deliver-verification-pipeline.md's Phase 3/4), never by\na finding producer directly. A plain scalar field, not a tuple like\n``context_ref_ids``: ``Finding`` stays ``frozen=True``/hashable\nregardless, since a single ``Literal``-or-``None`` value hashes exactly\nlike any other scalar field already on this model. Defaults to ``None``\nfor every existing (static-analysis, and any pre-verification LLM)\n``Finding`` construction site \u2014 only ``VerificationStep.run`` ever sets\nit, to ``\"verified\"`` for an ``source == \"llm\"`` finding that passed\nevery rubric criterion. A rejected finding is excluded from that step's\noutput entirely rather than ever being constructed with\n``verification_status=\"rejected\"`` in this codebase's own pipeline\ntoday; the ``\"rejected\"`` literal exists in the schema because it's part\nof the field's own documented vocabulary (per the spec), not because any\ncurrent producer sets it.\n\n``suggestion`` \u2014 set by ``review.fix_generation.FixGenerationStep``\n(docs/plans/plan-phase-11.md), never by a finding producer directly: a\nvalidated single-range fix rendered as a GitHub suggestion block. A\nfrozen ``Suggestion`` (not a mutable value), so ``Finding`` stays\nhashable; defaults to ``None`` so every existing construction site is\nunaffected.",
+      "properties": {
+        "file": {
+          "title": "File",
+          "type": "string"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        },
+        "severity": {
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "info"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "gitleaks",
+            "semgrep",
+            "ruff",
+            "eslint",
+            "golangci_lint",
+            "phpstan",
+            "trivy",
+            "llm",
+            "clone_detection"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "rule_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rule Id"
+        },
+        "context_ref_ids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Context Ref Ids"
+        },
+        "citation_markdown": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Citation Markdown"
+        },
+        "verification_status": {
+          "anyOf": [
+            {
+              "enum": [
+                "verified",
+                "rejected"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verification Status"
+        },
+        "suggestion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Suggestion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "file",
+        "severity",
+        "message",
+        "source"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "McpServerOutcome": {
+      "description": "One nominated MCP server. ``not_consulted`` is a dry run, or a review that stopped before it\nreached the server. ``reason`` is a closed phrase (timeout, protocol error, ...), never server\ntext; ``supplied_findings`` are ``path:line`` of the findings that cited its context.",
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "used",
+            "empty",
+            "timed_out",
+            "errored",
+            "not_consulted"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "truncated_items": {
+          "default": 0,
+          "title": "Truncated Items",
+          "type": "integer"
+        },
+        "supplied_findings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Supplied Findings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ],
+      "title": "McpServerOutcome",
+      "type": "object"
+    },
+    "MemoryFileSummary": {
+      "properties": {
+        "status": {
+          "default": "disabled",
+          "enum": [
+            "loaded",
+            "not_found",
+            "disabled"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "entries": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Entries"
+        }
+      },
+      "title": "MemoryFileSummary",
+      "type": "object"
+    },
+    "RedactionSummary": {
+      "properties": {
+        "status": {
+          "default": "not_reported",
+          "enum": [
+            "not_reported",
+            "applied",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Count"
+        },
+        "denied_paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Denied Paths",
+          "type": "array"
+        }
+      },
+      "title": "RedactionSummary",
+      "type": "object"
+    },
+    "RunSummary": {
+      "properties": {
+        "stages": {
+          "items": {
+            "$ref": "#/$defs/StageOutcome"
+          },
+          "title": "Stages",
+          "type": "array"
+        },
+        "analyzers": {
+          "items": {
+            "$ref": "#/$defs/AnalyzerOutcome"
+          },
+          "title": "Analyzers",
+          "type": "array"
+        },
+        "backend": {
+          "$ref": "#/$defs/BackendSummary"
+        },
+        "token_usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenUsageSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "suppressed_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Suppressed Count"
+        },
+        "redaction": {
+          "$ref": "#/$defs/RedactionSummary"
+        },
+        "truncation": {
+          "$ref": "#/$defs/TruncationSummary"
+        },
+        "mcp_servers": {
+          "items": {
+            "$ref": "#/$defs/McpServerOutcome"
+          },
+          "title": "Mcp Servers",
+          "type": "array"
+        },
+        "memory_file": {
+          "$ref": "#/$defs/MemoryFileSummary"
+        },
+        "ci_comments": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CiCommentsSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "backend"
+      ],
+      "title": "RunSummary",
+      "type": "object"
+    },
+    "StageOutcome": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "success",
+            "failed",
+            "timeout",
+            "disabled"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "duration_ms": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Duration Ms"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ],
+      "title": "StageOutcome",
+      "type": "object"
+    },
+    "Suggestion": {
+      "description": "A validated single-range fix (docs/specs/spec-auto-fix.md): replace the\n1-based inclusive new-file lines ``start_line..end_line`` with\n``replacement`` (empty means delete the range). Frozen so ``Finding``\nstays hashable.",
+      "properties": {
+        "start_line": {
+          "title": "Start Line",
+          "type": "integer"
+        },
+        "end_line": {
+          "title": "End Line",
+          "type": "integer"
+        },
+        "replacement": {
+          "title": "Replacement",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_line",
+        "end_line",
+        "replacement"
+      ],
+      "title": "Suggestion",
+      "type": "object"
+    },
+    "TokenUsageSummary": {
+      "properties": {
+        "requests": {
+          "title": "Requests",
+          "type": "integer"
+        },
+        "prompt_tokens": {
+          "title": "Prompt Tokens",
+          "type": "integer"
+        },
+        "completion_tokens": {
+          "title": "Completion Tokens",
+          "type": "integer"
+        },
+        "total_tokens": {
+          "title": "Total Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requests",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens"
+      ],
+      "title": "TokenUsageSummary",
+      "type": "object"
+    },
+    "TruncationSummary": {
+      "properties": {
+        "status": {
+          "default": "not_reported",
+          "enum": [
+            "not_reported",
+            "none",
+            "truncated"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        }
+      },
+      "title": "TruncationSummary",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "title": "Findings",
+      "type": "array"
+    },
+    "summary": {
+      "$ref": "#/$defs/RunSummary"
+    }
+  },
+  "required": [
+    "findings",
+    "summary"
+  ],
+  "title": "Report",
+  "type": "object"
+}

@@ -130,3 +130,10 @@ async def test_semgrep_analyzer_routes_through_the_shared_retry_helper(
 
     assert len(calls) == 1
     assert calls[0][0] == "semgrep"
+
+
+def test_nosem_comments_are_only_disabled_when_asked() -> None:
+    from adapter.analyzers.semgrep import _argv
+
+    assert "--disable-nosem" not in _argv("rules.yaml", ["a.py"])
+    assert "--disable-nosem" in _argv("rules.yaml", ["a.py"], disable_nosem=True)

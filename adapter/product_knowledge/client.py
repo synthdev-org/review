@@ -87,6 +87,9 @@ __all__ = [
     "FactoryTuning",
     "McpProductKnowledgeClient",
     "NegotiationCache",
+    "exception_leaves",
+    "is_malformed",
+    "network_outcome",
 ]
 
 logger = logging.getLogger(__name__)
@@ -285,14 +288,14 @@ def _silence_sdk_logging() -> None:
     logging.getLogger("mcp").setLevel(logging.CRITICAL)
 
 
-def _leaves(exc: BaseException) -> Iterator[BaseException]:
+def exception_leaves(exc: BaseException) -> Iterator[BaseException]:
     if isinstance(exc, BaseExceptionGroup):
         for inner in exc.exceptions:
-            yield from _leaves(inner)
+            yield from exception_leaves(inner)
     else:
         yield exc
         if exc.__cause__ is not None and exc.__cause__ is not exc:
-            yield from _leaves(exc.__cause__)
+            yield from exception_leaves(exc.__cause__)
 
 
 def _typed_leaf_outcome(leaves: list[BaseException]) -> ProviderOutcome | None:
@@ -308,7 +311,7 @@ def _typed_leaf_outcome(leaves: list[BaseException]) -> ProviderOutcome | None:
     return None
 
 
-def _network_outcome(leaves: list[BaseException]) -> ProviderOutcome | None:
+def network_outcome(leaves: list[BaseException]) -> ProviderOutcome | None:
     if any(isinstance(e, TimeoutError | httpx2.TimeoutException) for e in leaves):
         return ProviderOutcome.TIMEOUT
     if any(isinstance(e, httpx2.TransportError) for e in leaves):
@@ -316,7 +319,7 @@ def _network_outcome(leaves: list[BaseException]) -> ProviderOutcome | None:
     return None
 
 
-def _is_malformed(leaves: list[BaseException]) -> bool:
+def is_malformed(leaves: list[BaseException]) -> bool:
     return any(
         isinstance(e, RecursionError | json.JSONDecodeError | ValidationError)
         or (isinstance(e, MCPError) and e.code == types.PARSE_ERROR)
@@ -635,16 +638,14 @@ class McpProductKnowledgeClient:
     ) -> ProviderOutcome:
         if transport.outcome is not None:
             return transport.outcome
-        leaves = list(_leaves(exc))
+        leaves = list(exception_leaves(exc))
         # Order is the precedence: typed errors, then timeout, then transport
         # failure, then the HTTP status, then malformed bodies.
         found = _typed_leaf_outcome(leaves)
         if found is None:
-            found = _network_outcome(leaves)
+            found = network_outcome(leaves)
         if found is None:
             found = self._status_outcome(transport, endpoint)
         if found is not None:
             return found
-        return (
-            ProviderOutcome.MALFORMED if _is_malformed(leaves) else ProviderOutcome.PROVIDER_ERROR
-        )
+        return ProviderOutcome.MALFORMED if is_malformed(leaves) else ProviderOutcome.PROVIDER_ERROR

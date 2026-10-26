@@ -969,7 +969,7 @@ def _counter_points(
                 if metric.name == name:
                     assert isinstance(metric.data, Sum)
                     for point in metric.data.data_points:
-                        points[tuple(sorted((point.attributes or {}).items()))] = point.value
+                        points[tuple(sorted((point.attributes or {}).items()))] = int(point.value)
     return points
 
 

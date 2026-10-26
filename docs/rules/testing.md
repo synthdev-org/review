@@ -25,6 +25,13 @@ Deviating requires a new ADR, not a one-off exception.
   failure modes that matter (analyzer crash, LLM timeout, no findings,
   malformed webhook signature).
 
+- **Local-distribution E2E** (one, per
+  [ADR-0016](../adr/0016-local-mode-composition-root.md)): the built local-mode
+  distribution installed and run in a clean container with no services and a
+  recorded model. Lives in `tests/e2e/` beside the Compose E2E and is gated
+  identically (on merge to main or nightly). The Compose E2E also proves
+  server mode is unchanged by local-mode work.
+
 ## PRD/spec → user story → integration test
 
 - Every PRD/spec states user stories as `As a / I want / so that` with

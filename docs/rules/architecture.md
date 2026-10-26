@@ -17,8 +17,12 @@ requires a new ADR, not a one-off exception.
   depend inward on domain-defined `typing.Protocol` interfaces only.
   Entrypoints (`apps/webhook_api`, `apps/worker`, `apps/admin_api`) depend
   on the domain and wire adapters in; the domain never imports entrypoint
-  or adapter code.
-- Three deployable entrypoints share every package below `apps/`: the
+  or adapter code. The local CLI (`apps/local_cli`, adapters in
+  `adapter/local`) is a fourth composition root per
+  [ADR-0016](../adr/0016-local-mode-composition-root.md).
+- Three deployable entrypoints (plus the local CLI, a pip/pipx distribution
+  rather than a deployable, per
+  [ADR-0016](../adr/0016-local-mode-composition-root.md)) share every package below `apps/`: the
   Webhook API, the Worker (which itself dispatches both indexing and
   review jobs), and the Admin API (`apps/admin_api`, per
   [ADR-0001](../adr/0001-self-hosted-kubernetes-deployment.md)'s
@@ -39,11 +43,16 @@ requires a new ADR, not a one-off exception.
   to domain or consumer code. If it requires one, the interface boundary is
   wrong — fix the boundary, don't special-case the new adapter.
 - Wire concrete implementations only at the composition root
-  (`apps/webhook_api/main.py`, `apps/worker/main.py`) via constructor
+  (`apps/webhook_api/main.py`, `apps/worker/main.py`, `apps/admin_api`, and
+  `apps/local_cli` per
+  [ADR-0016](../adr/0016-local-mode-composition-root.md)) via constructor
   injection. No module-level singletons or global mutable state.
 - Parse config once at each entrypoint via `pydantic-settings`, pass it down
   explicitly; never read env vars, Kubernetes Secrets, or files from domain or
-  adapter code.
+  adapter code. Pending owner acceptance of
+  [ADR-0017](../adr/0017-local-mode-mcp-knowledge.md) ("Architecture-rule exception"), the one
+  exception is `adapter/local` reading the local-mode files it names (MCP configuration, the
+  memory file, the `--output` file); until that ADR is accepted those reads are a known deviation.
 
 ## Idiomatic Python
 
@@ -73,7 +82,9 @@ requires a new ADR, not a one-off exception.
   already in view — YAGNI over speculative flexibility.
 - No separate message broker, no fourth deployable component beyond the
   three named above until a real requirement forces one — see the C4
-  doc's "three deployable components, not five" note. The Admin UI
+  doc's "three deployable components, not five" note. The local CLI
+  ([ADR-0016](../adr/0016-local-mode-composition-root.md)) is a distribution,
+  not a deployable, and sets no precedent for other CLIs. The Admin UI
   (`apps/admin_api`) is the one exception already forced: an enterprise
   standalone-deployment requirement, per
   [ADR-0001](../adr/0001-self-hosted-kubernetes-deployment.md)'s

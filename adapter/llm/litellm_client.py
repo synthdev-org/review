@@ -66,9 +66,12 @@ class LiteLLMClient:
     here).
     """
 
-    def __init__(self, *, endpoint: str, api_key: str) -> None:
+    def __init__(self, *, endpoint: str, api_key: str, max_retries: int | None = None) -> None:
         self._endpoint = endpoint
         self._api_key = api_key
+        # None keeps the OpenAI client's own retries (server mode). A caller whose timeout is a
+        # promise to a person (the local CLI) passes 0 so one call cannot take several timeouts.
+        self._extra: dict[str, int] = {} if max_retries is None else {"max_retries": max_retries}
 
     async def complete(self, request: CompletionRequest, *, timeout: float) -> CompletionResponse:
         started = time.monotonic()
@@ -85,6 +88,7 @@ class LiteLLMClient:
                 max_tokens=request.max_tokens,
                 temperature=request.temperature,
                 timeout=timeout,
+                **self._extra,
             )
         except litellm.exceptions.Timeout as exc:
             self._log_failure(started, request.model, "LLMUnreachableError")

@@ -84,6 +84,8 @@ _FRAMEWORK_MODULES = frozenset(
         "step",
         "pipeline",
         "config",
+        # Pipeline assembly (local-mode plan 1a): imports every step by design, defines none.
+        "registry",
         "context_symbols",
         "context_bundle",
         "citation",

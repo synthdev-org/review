@@ -6,6 +6,10 @@ docs
 # The operator runbook: apps/test_product_knowledge_runbook.py asserts the
 # egress-disclosure literal and per-outcome entries against it in `dev`.
 !docs/reference/operations.md
+# Local-mode report JSON Schema (US-L3 tests, apps/local_cli): read in `dev`.
+!docs/reference/review-report.schema.json
+# Quickstart stand-in model: apps/local_cli/test_guide_stub_model.py runs it in `dev`.
+!docs/guides/stub_model.py
 # ADR scope-sync guard (adapter/product_knowledge/test_adr_scope_sync.py).
 !docs/adr
 .venv

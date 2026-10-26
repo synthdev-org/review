@@ -153,6 +153,12 @@ _WT_TIMEOUT_PR_NUMBER, _WT_TIMEOUT_HEAD_SHA = 104, "a3" * 20
 _WT_GARBAGE_PR_NUMBER, _WT_GARBAGE_HEAD_SHA = 105, "a4" * 20
 _WT_GITHUB_ERROR_PR_NUMBER, _WT_GITHUB_ERROR_HEAD_SHA = 106, "a5" * 20
 _WT_LIMIT_PR_NUMBER, _WT_LIMIT_HEAD_SHA = 107, "a6" * 20
+# Phase 11 re-run: a one-file PR whose only file has a real Ruff F401 (one file, so no walkthrough
+# comment is created). The stub accepts the stub fix, so the analyzer re-run gate really executes.
+_ANALYZER_PR_NUMBER, _ANALYZER_HEAD_SHA = 108, "a7" * 20
+_ANALYZER_BLOB_SHA = "5" * 40
+_ANALYZER_PY = b"import os\nx = 1\n"
+_ANALYZER_PATCH = "@@ -0,0 +1,2 @@\n+import os\n+x = 1"
 _WT_SHAS = (
     _WT_HEAD_SHA,
     _WT_SECOND_HEAD_SHA,
@@ -248,12 +254,14 @@ _TREES_BY_SHA: dict[str, list[dict[str, object]]] = {
 }
 for _sha in _WT_SHAS:
     _TREES_BY_SHA[_sha] = _TREES_BY_SHA[_HEAD_SHA]
+_TREES_BY_SHA[_ANALYZER_HEAD_SHA] = [_tree_entry("app.py", _ANALYZER_BLOB_SHA, _ANALYZER_PY)]
 
 _BLOBS: dict[str, bytes] = {
     _HELPER_BASE_BLOB_SHA: _HELPER_TS_BASE,
     _HELPER_HEAD_BLOB_SHA: _HELPER_TS_HEAD,
     _CALLER_BLOB_SHA: _CALLER_TS,
     _SECOND_FILE_BLOB_SHA: _SECOND_FILE_TS,
+    _ANALYZER_BLOB_SHA: _ANALYZER_PY,
 }
 
 
@@ -340,6 +348,11 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
             status = getattr(self.server, "files_endpoint_status", 200)
             if status != 200:
                 self._send_json(status, {"message": "simulated files-endpoint failure (stub)"})
+                return
+            if getattr(self.server, "analyzer_only", False):
+                self._send_json(
+                    200, [{"filename": "app.py", "status": "added", "patch": _ANALYZER_PATCH}]
+                )
                 return
             files = [{"filename": "helper.ts", "status": "modified", "patch": _HELPER_PATCH}]
             if getattr(self.server, "two_files", False):
@@ -428,7 +441,14 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
     # Phase 12: the walkthrough call is recognized by its marker, not call position, and its
     # scenario (ok | garbage | delay) is `server.walkthrough_scenario`.
     def _walkthrough_content(self, request: dict[str, Any]) -> str | None:
-        return _PipelineLLMHandler._walkthrough_content(self, request)  # type: ignore[arg-type]
+        content = _PipelineLLMHandler._walkthrough_content(self, request)  # type: ignore[arg-type]
+        if content is None or getattr(self.server, "walkthrough_scenario", "ok") != "sloppy":
+            return content
+        # "sloppy": the model invents a path and drops the real one(s), so the reconcile
+        # counters (unknown_path, omitted) get a real sample.
+        groups = json.loads(content)["groups"]
+        groups[0]["files"] = [{"path": "ghost.ts", "note": "Invented by the model"}]
+        return json.dumps({"groups": groups})
 
     def _fix_content(self, request: dict[str, Any]) -> str | None:
         """Auto-fix calls are recognized by their prompt marker, not call
@@ -441,6 +461,11 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
         if GENERATION_MARKER in system:
             if getattr(self.server, "fix_reply_unparseable", False):
                 return "not json"
+            user = " ".join(
+                str(m["content"]) for m in request.get("messages", []) if m.get("role") == "user"
+            )
+            if "File app.py, numbered lines" in user:  # delete the unused import (Ruff F401)
+                return json.dumps({"start_line": 1, "end_line": 1, "replacement": ""})
             return json.dumps({"start_line": 9, "end_line": 9, "replacement": "  return 3;"})
         if RUBRIC_MARKER in system:
             return json.dumps(
@@ -525,6 +550,8 @@ def _e2e_env() -> dict[str, str]:
         # smallest legal step timeout (LLM timeout 10 s + 15) keeps the timeout case quick.
         REVIEW_WORKER_WALKTHROUGH_ENABLED="true",
         REVIEW_WORKER_WALKTHROUGH_STEP_TIMEOUT_SECONDS="25",
+        # One file per walkthrough prompt, so the two-file PRs cut a file (`max_files`).
+        REVIEW_WORKER_WALKTHROUGH_MAX_FILES="1",
         # The default 5/min index limit would roll back the whole delivery (review job included)
         # once the walkthrough PRs push past it.
         REVIEW_WEBHOOK_API_INDEX_ENQUEUE_RATE_LIMIT_PER_MINUTE="1000",
@@ -892,6 +919,8 @@ _PANELS_WITHOUT_E2E_TRAFFIC = frozenset(
         # cover both.
         "Walkthrough outcome: dedupe_failed",
         "Walkthrough outcome: internal_error",
+        # Same series as the panel above, split by stage: it needs an internal_error too.
+        "Walkthrough internal_error, by stage",
     }
 )
 
@@ -1028,6 +1057,20 @@ def test_dashboard_panels_resolve_real_data_within_two_minutes(
     _wait_until_check_run_count_at_least(calls, 4)
     stub_llm_review_server.fix_reply_unparseable = False  # type: ignore[attr-defined]
 
+    # 3c2. Phase 11: the analyzer re-run panel needs an analyzer-sourced fix. A one-file PR
+    #      with a real Ruff F401 and the stub's valid fix runs the re-run gate for real.
+    stub_llm_review_server.call_count = 0  # type: ignore[attr-defined]  # fresh 3-call sequence
+    stub_github_server.analyzer_only = True  # type: ignore[attr-defined]
+    analyzer_body = _pull_request_payload(
+        pr_number=_ANALYZER_PR_NUMBER, head_sha=_ANALYZER_HEAD_SHA
+    )
+    analyzer_status = _post_webhook(
+        env, body=analyzer_body, signature=_sign(analyzer_body), event_type="pull_request"
+    )
+    assert analyzer_status == 200
+    _wait_until_check_run_count_at_least(calls, 5)
+    stub_github_server.analyzer_only = False  # type: ignore[attr-defined]
+
     # 3d. Phase 12: the walkthrough panels. The main PR above is one file, so it already gave
     #     `skipped_small_pr` its sample; the PRs below serve a two-file diff. A push creates the
     #     comment (`posted`), the next push edits it (`updated`), and one PR per failure mode
@@ -1039,7 +1082,7 @@ def test_dashboard_panels_resolve_real_data_within_two_minutes(
     store: _IssueComments = stub_github_server.issue_comments  # type: ignore[attr-defined]
     for number, sha, action, scenario, mode in (
         (_WT_PR_NUMBER, _WT_HEAD_SHA, "opened", "ok", "normal"),
-        (_WT_PR_NUMBER, _WT_SECOND_HEAD_SHA, "synchronize", "ok", "normal"),
+        (_WT_PR_NUMBER, _WT_SECOND_HEAD_SHA, "synchronize", "sloppy", "normal"),
         (_WT_TIMEOUT_PR_NUMBER, _WT_TIMEOUT_HEAD_SHA, "opened", "delay", "normal"),
         (_WT_GARBAGE_PR_NUMBER, _WT_GARBAGE_HEAD_SHA, "opened", "garbage", "normal"),
         (_WT_GITHUB_ERROR_PR_NUMBER, _WT_GITHUB_ERROR_HEAD_SHA, "opened", "ok", "write_error"),

@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from adapter.analyzers.environment import ChildEnvironmentMixin
 from adapter.analyzers.exceptions import AnalyzerInvocationError, AnalyzerOutputParseError
 from adapter.analyzers.subprocess_runner import (
     cleanup_temp_directory,
@@ -310,7 +311,7 @@ def _segments(path: str) -> list[str]:
     return path.replace("\\", "/").lower().split("/")
 
 
-class PhpstanAnalyzer:
+class PhpstanAnalyzer(ChildEnvironmentMixin):
     """``review.static_analysis.StaticAnalyzer`` backed by ``review-phpstan``.
     See this module's docstring."""
 
@@ -364,7 +365,7 @@ class PhpstanAnalyzer:
             try:
                 config = await wrapper(choice.config_name or default_name, choice.sets_level)
                 output = await run_analyzer_subprocess(
-                    _argv(config, paths), cwd=directory, timeout=timeout
+                    _argv(config, paths), cwd=directory, timeout=timeout, env=self._environ
                 )
             except AnalyzerInvocationError as exc:
                 remaining = timeout - (time.monotonic() - started)
@@ -388,6 +389,7 @@ class PhpstanAnalyzer:
                     _argv(await wrapper(default_name, False), paths),
                     cwd=directory,
                     timeout=remaining,
+                    env=self._environ,
                 )
             report = _parse_output(output)
             return [

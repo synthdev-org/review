@@ -50,16 +50,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+import posixpath
+import re
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from adapter.analyzers.environment import ChildEnvironmentMixin
 from adapter.analyzers.exceptions import AnalyzerOutputParseError
 from adapter.analyzers.subprocess_runner import (
     cleanup_temp_directory,
     materialize_into_temp_directory,
     original_path_mapping,
     run_analyzer_subprocess,
+    validate_relative_path,
 )
 from findings.models import Finding, Severity
 from findings.redact import TextRedactor
@@ -69,6 +73,18 @@ from review.static_analysis import StaticAnalyzer
 logger = logging.getLogger(__name__)
 
 _REPORT_FILENAME = ".review-gitleaks-report.json"
+_SELF_CONFIG_FILES = frozenset({".gitleaks.toml", ".gitleaksignore"})
+_SCANNED_PREFIX = "pr-config-"
+# An inline ``gitleaks:allow`` makes gitleaks skip its line; in the diff under review that is
+# attacker-controlled, so local mode defuses it in the scanned copy (``ignore_pr_config=True``; the
+# server-mode default honours a repo's own allowlists), same length so lines hold.
+_ALLOW_MARKER = re.compile(rb"gitleaks:allow", re.IGNORECASE)
+
+
+def _defuse_allow_markers(data: bytes) -> bytes:
+    return _ALLOW_MARKER.sub(lambda m: b"x" * len(m.group(0)), data)
+
+
 _REDACTION_SCRATCH_FILENAME = "candidate.txt"
 _REDACTION_MARKER = "[REDACTED]"
 # Gitleaks has no severity concept of its own — a matched secret is
@@ -184,34 +200,70 @@ def _redact_matched_lines(text: str, entries: list[dict[str, Any]]) -> str:
     )
 
 
-async def _run_gitleaks(content: dict[str, bytes], *, timeout: float) -> list[dict[str, Any]]:
+async def _run_gitleaks(
+    content: dict[str, bytes],
+    *,
+    timeout: float,
+    ignore_pr_config: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Shared materialize -> invoke -> read-report -> cleanup sequence used
     by both ``GitleaksAnalyzer.run`` and ``GitleaksTextRedactor.redact`` —
     the only difference between the two call sites is what's materialized
     (the diff's real files vs. one scratch file holding candidate text) and
     what each does with the returned entries.
     """
+    # Gitleaks auto-loads these from the source root; a PR must not be able to switch the scan off.
+    # They are still scanned (a PR can add a real secret to one), under a name it does not load.
+    # Off by default (server mode honours a repo's own config); local mode passes True.
+    renamed: dict[str, str] = {}
+    if ignore_pr_config:
+        content = {path: _defuse_allow_markers(data) for path, data in content.items()}
+        for path in list(content):
+            # Lower-cased: on a case-insensitive filesystem (macOS, Windows) ``.Gitleaks.toml`` is
+            # the file gitleaks opens as ``.gitleaks.toml``.
+            if posixpath.normpath(path.replace("\\", "/")).lower() in _SELF_CONFIG_FILES:
+                # Not a substring of the name: gitleaks' default allowlist skips ``gitleaks.toml``.
+                alias = f"{_SCANNED_PREFIX}{len(renamed)}.txt"
+                # A PR file may already use this name: overwriting it would drop it from the scan.
+                while alias in content or alias in renamed:
+                    alias = f"{_SCANNED_PREFIX}x{alias}"
+                # Gitleaks reports the normalized path; callers map that back to the original.
+                renamed[alias] = validate_relative_path(path)
+                content[alias] = content.pop(path)
     directory = await materialize_into_temp_directory(content)
     try:
         report_path = directory / _REPORT_FILENAME
-        await run_analyzer_subprocess(_argv(report_path), cwd=directory, timeout=timeout)
+        await run_analyzer_subprocess(
+            _argv(report_path), cwd=directory, timeout=timeout, env=environ
+        )
         # Off the event loop, same as materialize_into_temp_directory/
         # cleanup_temp_directory above — _read_report does synchronous
         # Path.stat()/read_text() and would otherwise block the loop for
         # its duration on every gitleaks invocation (including every
         # per-finding redaction call in GitleaksTextRedactor.redact).
-        return await asyncio.to_thread(_read_report, report_path)
+        entries = await asyncio.to_thread(_read_report, report_path)
+        for entry in entries:
+            if entry.get("File") in renamed:
+                entry["File"] = renamed[entry["File"]]
+        return entries
     finally:
         await cleanup_temp_directory(directory)
 
 
-class GitleaksAnalyzer:
+class GitleaksAnalyzer(ChildEnvironmentMixin):
     """``review.static_analysis.StaticAnalyzer`` implementation backed by
     the vendored Gitleaks binary. See this module's own docstring for the
     full design.
     """
 
     name = "gitleaks"
+
+    def __init__(
+        self, *, ignore_pr_config: bool = False, environ: Mapping[str, str] | None = None
+    ) -> None:
+        self._ignore_pr_config = ignore_pr_config
+        super().__init__(environ=environ)
 
     async def run(
         self,
@@ -225,24 +277,38 @@ class GitleaksAnalyzer:
         # normalized) path it scanned, which only differs from `content`'s
         # own key when a path contains a backslash.
         original_by_normalized = original_path_mapping(content)
-        entries = await _run_gitleaks(content, timeout=timeout)
+        entries = await _run_gitleaks(
+            content, timeout=timeout, ignore_pr_config=self._ignore_pr_config, environ=self._environ
+        )
         return [_to_finding(entry, original_by_normalized) for entry in entries]
 
 
-class GitleaksTextRedactor:
+class GitleaksTextRedactor(ChildEnvironmentMixin):
     """``findings.redact.TextRedactor`` implementation backed by the same
     vendored Gitleaks binary. See this module's own docstring for the full
     design and ``_redact_matched_lines``'s own docstring for why redaction
     is whole-line, not column-precise.
     """
 
-    def __init__(self, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 10.0,
+        ignore_pr_config: bool = False,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
         self._timeout_seconds = timeout_seconds
+        self._ignore_pr_config = ignore_pr_config
+        super().__init__(environ=environ)
 
     async def redact(self, text: str) -> str:
         entries = await _run_gitleaks(
+            # Finding text can quote attacker-controlled source; with `ignore_pr_config`
+            # `_run_gitleaks` defuses any inline allow marker.
             {_REDACTION_SCRATCH_FILENAME: text.encode("utf-8")},
             timeout=self._timeout_seconds,
+            ignore_pr_config=self._ignore_pr_config,
+            environ=self._environ,
         )
         if not entries:
             return text
@@ -253,3 +319,53 @@ class GitleaksTextRedactor:
 # actually satisfy the Protocols they're built to implement.
 _: type[StaticAnalyzer] = GitleaksAnalyzer
 _2: type[TextRedactor] = GitleaksTextRedactor
+
+
+class GitleaksSecretLineFinder(ChildEnvironmentMixin):
+    """One batched Gitleaks invocation over many texts, answering which lines of each hold a secret.
+
+    Used by local mode's input-side redaction (``adapter/local/redaction.py`` defines the Protocol
+    this satisfies). Every text becomes one scratch file in a single mode-0700 temp directory
+    (``mkdtemp``) that ``_run_gitleaks`` removes in its own ``finally``, so a diff of any size costs
+    one subprocess, never one per file or hunk. Caps on file count and bytes are the caller's job
+    and are enforced before this runs; ``timeout_seconds`` is the overall deadline for the call
+    (materialize, scan and read the report). Any failure raises: the caller fails closed.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float,
+        ignore_pr_config: bool = False,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        self._timeout_seconds = timeout_seconds
+        self._ignore_pr_config = ignore_pr_config
+        super().__init__(environ=environ)
+
+    async def secret_lines(self, texts: Sequence[str]) -> list[frozenset[int]]:
+        """Per text, the 1-based line numbers (multi-line matches included) Gitleaks flagged."""
+        if not texts:
+            return []
+        names = {f"t{index}.txt": index for index in range(len(texts))}
+        # With `ignore_pr_config`, `_run_gitleaks` defuses inline allow markers.
+        content = {name: texts[index].encode("utf-8") for name, index in names.items()}
+        async with asyncio.timeout(self._timeout_seconds):
+            entries = await _run_gitleaks(
+                content,
+                timeout=self._timeout_seconds,
+                ignore_pr_config=self._ignore_pr_config,
+                environ=self._environ,
+            )
+        lines: list[set[int]] = [set() for _ in texts]
+        for entry in entries:
+            index = names.get(entry.get("File", ""))
+            start = entry.get("StartLine")
+            end = entry.get("EndLine", start)
+            # An entry that cannot be placed would be a secret left in: fail rather than skip it.
+            if index is None or not isinstance(start, int) or not isinstance(end, int):
+                raise AnalyzerOutputParseError(
+                    tool="gitleaks", detail="a report entry could not be matched to its input"
+                )
+            lines[index].update(range(start, end + 1))
+        return [frozenset(found) for found in lines]

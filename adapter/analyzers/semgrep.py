@@ -45,6 +45,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from adapter.analyzers.environment import ChildEnvironmentMixin
 from adapter.analyzers.exceptions import AnalyzerOutputParseError
 from adapter.analyzers.subprocess_runner import (
     cleanup_temp_directory,
@@ -68,7 +69,14 @@ _SEVERITY_MAP: dict[str, Severity] = {
 _DEFAULT_SEVERITY: Severity = "medium"
 
 
-def _argv(ruleset_filename: str, paths: list[str]) -> list[str]:
+def _argv(ruleset_filename: str, paths: list[str], *, disable_nosem: bool = False) -> list[str]:
+    argv = _base_argv(ruleset_filename, paths)
+    if disable_nosem:
+        argv.insert(argv.index("--no-git-ignore") + 1, "--disable-nosem")
+    return argv
+
+
+def _base_argv(ruleset_filename: str, paths: list[str]) -> list[str]:
     return [
         "semgrep",
         "--config",
@@ -191,13 +199,21 @@ def _to_finding(
     )
 
 
-class SemgrepAnalyzer:
+class SemgrepAnalyzer(ChildEnvironmentMixin):
     """``review.static_analysis.StaticAnalyzer`` implementation backed by
     the ``semgrep`` package, run against the vendored, pinned ruleset. See
     this module's own docstring for the full design.
     """
 
     name = "semgrep"
+
+    def __init__(
+        self, *, ignore_pr_config: bool = False, environ: Mapping[str, str] | None = None
+    ) -> None:
+        # Local mode sets it: a `# nosemgrep` in the reviewed (attacker-controlled) source must not
+        # silence a rule. Server mode keeps honouring a repository's own suppressions.
+        self._ignore_pr_config = ignore_pr_config
+        super().__init__(environ=environ)
 
     async def run(
         self,
@@ -242,7 +258,10 @@ class SemgrepAnalyzer:
             original_by_normalized = original_path_mapping(content)
             paths = sorted(original_by_normalized.keys())
             output = await run_analyzer_subprocess(
-                _argv(ruleset_copy_name, paths), cwd=directory, timeout=timeout
+                _argv(ruleset_copy_name, paths, disable_nosem=self._ignore_pr_config),
+                cwd=directory,
+                timeout=timeout,
+                env=self._environ,
             )
             results = _parse_output(output)
             return [_to_finding(entry, content, original_by_normalized) for entry in results]

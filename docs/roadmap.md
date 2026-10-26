@@ -515,6 +515,31 @@ posts it, and there is no Mermaid/diagram code.
 
 ---
 
+## Phase 13 — Local mode (developer-machine and CI review)
+
+Ordered after Phase 12 because it reuses the finished pipeline steps in a
+fourth composition root rather than adding new ones. Gated on
+[ADR-0016](adr/0016-local-mode-composition-root.md) being ACCEPTED.
+
+- `apps/local_cli` runs the review pipeline in-process (no queue, database or
+  server), shipped as a pip/pipx console script.
+- Model backends (OpenAI-compatible, guarded Claude CLI), input redaction and
+  `--dry-run` egress preview, a GitHub CI comment, the developer's own MCP
+  servers for context, and a repo-tracked memory file.
+- Sequenced in [`plans/plan-local-mode.md`](plans/plan-local-mode.md); PRD in
+  [`specs/spec-local-mode.md`](specs/spec-local-mode.md).
+
+**Status (2026-10-25): Implemented; MCP relevance unproven.** The local CLI, complete run,
+OpenAI-compatible backend, input redaction and `--dry-run`, the GitHub CI comment and gate, the
+repository memory file, server-mode parity (US-P1, US-P2), and pip/pipx packaging with a
+clean-container E2E are built, and so is the opt-in Claude CLI backend with its CI guard (US-L7, US-L8; Anthropic's terms for it are unverified). MCP
+knowledge (US-L9 to US-L11) is built as an explicit per-server opt-in and tested against real MCP
+servers, but [ADR-0017](adr/0017-local-mode-mcp-knowledge.md) is PROPOSED and relevance (Q2) is
+**unproven**: the live-run evidence (`apps/local_cli/test_mcp_live.py`) has not been produced, and
+the owner's go/no-go (ADR-0017, decision 11) is outstanding. ADR-0016 and ADR-0017 are still PROPOSED.
+
+---
+
 ## Deferred, not scheduled
 
 Real, deliberate scope — not forgotten, not designed away — but not on this

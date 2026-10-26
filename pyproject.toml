@@ -104,6 +104,27 @@ dependencies = [
     "argon2-cffi>=23.1,<24",
 ]
 
+[project.scripts]
+# Local mode (ADR-0016): the one distribution channel is a pip/pipx console script, built by the
+# [build-system] table below (docs/reference/operations.md, "Installing").
+review = "apps.local_cli.main:console_main"
+
+[build-system]
+# Declared only so `pip/pipx install` can build the local-mode CLI (ADR-0016). The server images
+# never build it: [tool.uv] package = false keeps `uv sync` from installing the project.
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["adapter*", "apps*", "findings*", "iam*", "indexing*", "ingestion*", "llmgateway*", "memory*", "observability*", "review*", "tenancy*"]
+# Server-only entrypoints stay out of the wheel: local mode never imports them, and the generic
+# top-level names (`apps`, `review`, ...) should carry as little as possible into a shared site-packages.
+exclude = ["apps.admin_api*", "apps.webhook_api*", "apps.worker*", "*.testing*"]
+
+[tool.setuptools.package-data]
+# Analyzer default profiles are read next to the module at run time.
+"adapter.analyzers" = ["*.yaml", "*.yml", "*.neon", "*.json", "*.toml"]
+
 [dependency-groups]
 dev = [
     "ruff>=0.7,<1",
@@ -124,10 +145,8 @@ dev = [
 ]
 
 [tool.uv]
-# Phase 0 ships no installable distribution package yet — this repo is run
-# in place (via the Dockerfile / `uv run`), not published, so there is no
-# build backend to declare. Later phases can add [build-system] if this
-# project is ever published as an installable wheel.
+# The server is run in place (Dockerfile / `uv run`), never installed as a package, so uv must not
+# build the project even though [build-system] exists for the local-mode CLI (ADR-0016).
 package = false
 
 [tool.ruff]
@@ -320,7 +339,9 @@ also_copy = [
     "docker-compose.yml",
     "charts",
     "docs/adr",
+    "docs/guides/stub_model.py",
     "docs/reference/operations.md",
+    "docs/reference/review-report.schema.json",
     "docs/reference/product-knowledge-contract",
     "apps/admin_api/frontend/src",
     "tools/phpstan",

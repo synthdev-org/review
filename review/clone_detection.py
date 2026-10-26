@@ -37,7 +37,7 @@ from ingestion.diff import Diff, DiffContentMalformedError, DiffContentUnavailab
 from review._telemetry import suppress_telemetry_errors
 from review.changed_lines import changed_lines
 from review.clone_regions import RegionMatch, is_new_code, plan_findings
-from review.memory_suppression import MemorySuppressionConfig, suppress_via_memory
+from review.memory_suppression import SuppressionConfig, suppress_via_memory
 from review.step import JobIdentity, Step, StepContext, job_identity_fields
 
 logger = logging.getLogger(__name__)
@@ -336,7 +336,7 @@ class CloneDetectionStep:
         max_findings: int,
         depends_on: str = "static_analysis",
         # None (or disabled) skips the Memory similarity pre-check entirely (US-M12).
-        memory_suppression: MemorySuppressionConfig | None = None,
+        memory_suppression: SuppressionConfig | None = None,
     ) -> None:
         self._diff_fetcher = diff_fetcher
         self._clone_query = clone_query

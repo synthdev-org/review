@@ -963,3 +963,361 @@ required before the flag is recommended to any customer, and both must be re-run
 | --- | --- | --- |
 | 1 | The App's existing permissions allow creating, editing and deleting its own PR comments, and the real `performed_via_github_app` shape matches the recorded Phase 2 cassette. | **Not run. Required.** |
 | 2 | The hostile-fixture PR from Phase 1 renders with no active link, image, notification or cross-reference. | **Not run. Required.** |
+
+## Local mode (`review run`): exit codes, the run summary and the findings file
+
+For a developer or a CI job running the local CLI
+([ADR-0016](../adr/0016-local-mode-composition-root.md)), not for a deployed instance. Nothing here
+applies to the Worker or the Webhook API.
+
+### Command line
+
+- `review run --base <ref>` reviews the branch against `<ref>` (the merge base to `HEAD`, which is
+  what a pull request shows).
+- `review run --staged` reviews only what is staged for commit: unstaged edits are never read, and
+  findings are anchored to the staged line numbers.
+- `--output <file>` also writes the findings, as markdown for `.md`/`.markdown` or JSON for `.json`.
+  It is a command-line flag only, never read from repository files. The path is checked **before
+  any model call**: it must end in a known extension, must not be a symbolic link, must not be a
+  file git tracks (including a staged one), and its directory or file must be writable. Violations
+  exit 2 with `error: --output: ...` and nothing is sent to the model. An untracked previous output
+  is replaced. A run that fails writes no file.
+- Findings go to stdout; progress, the run summary and errors go to stderr. Output is plain text:
+  no colour and no terminal control sequences, whether piped or not.
+
+### Exit codes
+
+| Code | Meaning | Where it comes from |
+| --- | --- | --- |
+| 0 | Success, including "Nothing to review" (no model call is made) | |
+| 1 | Runtime failure; always printed as `error: <reason>: <detail>` with one of the reasons below | |
+| 2 | Usage or configuration error; nothing was sent to the model | bad or missing arguments, `invalid configuration`, no model configured, a `--base` ref that does not exist (in a shallow clone the message says to fetch it), not a git repository, an unusable `--output` path, an unusable or malformed memory file (the message names the line), `gitleaks` missing from `PATH`, the Claude CLI backend selected in CI without `--allow-claude-cli-in-ci`, a nominated MCP server that is not in your MCP configuration or whose entry is unusable, a nomination file that says how to reach a server, no workflow-provided MCP configuration in CI, a server defined and nominated only by repository files (see "MCP servers as context"), a step configuration that cannot produce a review |
+| 3 | The severity gate tripped (US-C2): a finding is at or above `REVIEW_LOCAL_FAIL_ON_SEVERITY`. Off unless that is set, so by default findings never fail a run. A tool error is always 1, never 3 | the review itself completed |
+
+Runtime failure reasons (exit 1). A failed run never exits 0 and never prints findings as if the
+review were complete:
+
+| Reason string | Meaning and what to do |
+| --- | --- |
+| `git could not read the repository` | git failed, timed out or produced more output than the cap while reading the diff, the base-commit memory file or checking the output path. The detail names the git subcommand. |
+| `a review stage failed` | A pipeline stage failed or timed out; the detail names the stage and, for the model call, the endpoint (an unreachable endpoint fails within `REVIEW_LOCAL_LLM_TIMEOUT_SECONDS`). The run summary above the error shows which stages finished. |
+| `redaction failed, nothing sent` | Input-side redaction could not screen the diff (the scanner failed or timed out, or the diff is over the file-count or byte cap), so nothing was sent to the model. The detail says which. Re-run; for an over-cap diff review a smaller range or raise `REVIEW_LOCAL_REDACTION_MAX_FILES` / `REVIEW_LOCAL_REDACTION_MAX_BYTES`. |
+| `no permission to comment` | CI only. GitHub refused the token (401, 403 or 404) when listing, posting or updating review comments: the workflow lacks `pull-requests: write`, or the pull request is from a fork, whose token is read-only. The findings are in the job log. See [`ci-github-actions.md`](ci-github-actions.md). |
+| `the pull-request review could not be posted or refreshed` | CI only. A GitHub call failed with a rate limit (429), a 5xx or no response while listing, posting, updating or minimising comments. The detail names the call and the status; the summary's `ci_comments` line shows the counts and the dedupe failure. A failed listing posts nothing (it would duplicate the earlier review). The findings are in the job log. |
+| `the output file could not be written` | The review completed but the `--output` file could not be written (for example the disk filled up or the path was swapped for a symbolic link after the check). The findings were still printed. |
+| `the model backend is unavailable` | Claude CLI backend only (opt-in). The CLI is not installed, not logged in, hung, crashed or printed output that is not the expected result. The detail names the Claude CLI and which. See "Claude CLI backend" below. |
+
+### The run summary
+
+Every run that reviews something ends with a `Run summary` on stderr, and `--output` JSON carries
+the same data as `summary`. It holds names, statuses and counts only (never code, queries or finding
+text), because CI logs of public repositories are public. A value that has not been measured says so
+(`not reported`, `not available`, `not applicable`, `disabled`) instead of showing zero, so a gap is
+never mistaken for a clean result.
+
+| Field | Meaning |
+| --- | --- |
+| `stages` | Each pipeline stage with `success`, `failed`, `timeout` or `disabled` and its duration. |
+| `analyzers` | `used`; `skipped` with a reason (`not installed`: the executable is not on `PATH`; `static analysis disabled`; `no matching files`; `not run`); or `errored` (present but `failed` or `timed out`, which is isolated: the review continues). |
+| `backend` | The kind (`openai_compatible` or `claude_cli`), the model, and, only for `claude_cli` in a detected CI environment, that the CI guard was overridden. |
+| `token_usage` | Totals over all requests, or `not available` when the endpoint reported none. |
+| `suppressed_count` | Findings suppressed by the repository memory file, or `not applicable` when no file was loaded. See "The repository memory file" below. |
+| `redaction` | `not reported`, `applied` with a count of redacted lines and the deny-listed paths whose content was not sent, or `failed, nothing sent`. See "Input-side redaction" below. |
+| `truncation` | `none`, or `truncated` with how many bytes of the diff were cut to fit `llm_max_diff_bytes`. |
+| `mcp_servers` | Per nominated server (none are listed unless one was nominated): `used`, `empty`, `timed_out`, `errored` or `not_consulted` (a dry run, or the review stopped before reaching it), a closed `reason` for the last three (`timeout`, `protocol error`, `not valid MCP output`, `no usable tool`, `output over the size cap`, `refused by the egress policy`, `could not be started`, `query withheld: it held a secret`, `redaction failed, nothing sent`, `over the call cap`), how many items were truncated to the size limits, and which findings (`path:line`) cited that server's context. See "MCP servers as context". |
+| `memory_file` | `loaded` with a count, `not found` or `disabled`. |
+| `ci_comments` | CI only (`not applicable` otherwise): comments `posted`, `updated` (same lines, new text), `outdated` (minimised because the finding is gone) and `skipped` (still present, not posted again), and the first dedupe failure, if any. |
+
+### Claude CLI backend (opt-in): Anthropic terms compliance is UNVERIFIED
+
+> **Whether Anthropic's terms permit driving a Claude subscription through the `claude` CLI this
+> way has NOT been verified (plan blocker B4).** The backend is built, is **off by default**, and
+> must be selected explicitly. Nothing in this product claims it is compliant. The owner must check
+> Anthropic's current terms before anyone relies on it; if they forbid it, remove Phase 3b as a
+> unit (nothing else depends on it).
+
+- **Opt-in:** `REVIEW_LOCAL_BACKEND=claude_cli` (default `openai_compatible`). No endpoint is
+  needed; `REVIEW_LOCAL_LLM_MODEL` is optional and, if set, is passed as the CLI's `--model` alias
+  (otherwise the CLI's own default model is used). `REVIEW_LOCAL_CLAUDE_CLI_EXECUTABLE` names the
+  executable (default `claude`). `max_tokens` and `temperature` have no CLI equivalent and are ignored.
+- **Uses only the CLI's own stored login.** No API key is read or passed: the child gets an
+  allow-listed environment (PATH, HOME, locale, proxy and CA settings, `XDG_*`, `CLAUDE_CONFIG_DIR`)
+  without `GITHUB_TOKEN`, `ANTHROPIC_API_KEY` or any other `*_TOKEN`/`*_API_KEY`. A login supplied
+  as `CLAUDE_CODE_OAUTH_TOKEN` is therefore **not** used; sign in with `claude` interactively.
+- **Missing or logged-out CLI:** exit 1 with `error: the model backend is unavailable: ... (Claude CLI): ...`
+  saying `not found on PATH` or `not logged in`, **before any content is sent** (a `claude auth
+  status` check whose output is discarded). A login that lapses mid-run fails the same way. A CLI
+  that does not answer within `REVIEW_LOCAL_LLM_TIMEOUT_SECONDS` is killed and reaped and reported
+  as a failed stage naming the Claude CLI.
+- **Usage:** the run summary says `token usage: not available`; a subscription run is not billed
+  per token and the CLI's counters are not API token counts.
+- **US-L8, CI guard:** when `CI` or `GITHUB_ACTIONS` is set the backend is **refused** (exit 2,
+  nothing started) so a personal login does not end up on a shared runner. `--allow-claude-cli-in-ci`
+  overrides it; the run summary then states `CI guard overridden by --allow-claude-cli-in-ci`. This
+  is a **best-effort guard, not a security control**: a self-hosted runner can unset `CI`, and
+  a login present on the machine is usable by anything running there.
+- **How the CLI is invoked** (every flag read from `claude --help`, Claude Code 2.1.308; a live
+  test fails if the installed CLI stops listing one): `claude -p --output-format json --input-format
+  text --tools "" --permission-mode dontAsk --permission-prompts none --safe-mode
+  --strict-mcp-config --no-session-persistence --disable-slash-commands --system-prompt <fixed
+  text> [--model <alias>]`. `--tools ""` disables every tool; no flag that skips permissions is
+  ever passed; `--bare` is not used because it never reads the subscription login. The prompt (the
+  diff, which an attacker may control) goes on **stdin**, never argv. The working directory is a
+  fresh empty temporary directory, removed afterwards, never the repository.
+- **Checking the recording has not drifted:** `pytest -m integration adapter/llm/test_claude_cli_live.py`
+  checks every flag against the installed CLI's help (no model call). With
+  `REVIEW_LIVE_CLAUDE_CLI=1` it also makes one real, tiny call on your own login (counts against
+  your subscription). It is manual or nightly only, never the default gate.
+
+### CI: `GITHUB_ACTIONS=true`
+
+Inside GitHub Actions the run also posts one pull-request review and refreshes it on each push
+(US-C1, US-C3); the full behaviour, the example workflow and the security constraints are in
+[`ci-github-actions.md`](ci-github-actions.md). The settings, besides the runner's own
+`GITHUB_ACTIONS`, `GITHUB_API_URL` (https only; GitHub Enterprise), `GITHUB_REPOSITORY`,
+`GITHUB_EVENT_PATH` and the `GITHUB_TOKEN` the workflow
+passes:
+
+| Variable | Meaning |
+| --- | --- |
+| `REVIEW_LOCAL_FAIL_ON_SEVERITY` | `critical`, `high`, `medium`, `low` or `info`: exit 3 when a finding is at or above it. Unset (the default) means findings never fail the job. Works outside CI too. |
+| `REVIEW_LOCAL_CI_BOT_LOGIN` | The author login of the comments this tool posted, default `github-actions[bot]`. Only a comment by this login that also carries the hidden marker is ever updated or minimised. |
+| `REVIEW_LOCAL_GITHUB_TIMEOUT_SECONDS`, `REVIEW_LOCAL_GITHUB_MAX_RETRY_ATTEMPTS` | Per-call timeout (default 10) and retries (default 3) for GitHub calls. |
+
+Usage errors (exit 2, nothing sent to the model): Actions without `GITHUB_TOKEN`, a bad
+`GITHUB_REPOSITORY`, an event whose `GITHUB_EVENT_NAME` is not `pull_request` (`pull_request_target`
+included), `--staged` inside Actions, or `CI=true` outside Actions while the memory file is enabled
+(it would be read from the pull-request head: set `REVIEW_LOCAL_MEMORY_FILE_ENABLED=false`, or
+`REVIEW_LOCAL_MEMORY_FROM_WORKING_TREE=true` for a trusted checkout).
+
+### The repository memory file
+
+A finding you have dismissed stays dismissed when the repository says so (US-L12). The file is
+`.review/memory.jsonl` (change it only with `REVIEW_LOCAL_MEMORY_FILE`, a relative path inside the
+repository; `REVIEW_LOCAL_MEMORY_FILE_ENABLED=false` turns the feature off). It is JSON Lines: one
+JSON object per line, blank lines and `#` comment lines ignored.
+
+```
+# false positive: the accumulator is always an int here
+{"file": "app.py", "rule_id": null, "message": "result starts as an int, so a list of floats mixes types"}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `file` | The path as review prints it, or `*` to dismiss the rule id and message in any file. |
+| `rule_id` | The rule id review prints in parentheses, or `null` when it prints none. |
+| `message` | The message exactly as review printed it (after secret redaction). Matching is exact: a reworded finding is a new finding. |
+| `note` | Optional, for people. |
+
+Other fields are rejected. Copy `file`, `rule_id` and `message` from the finding as printed; the
+match is on their SHA-256 fingerprint (the same fingerprint server mode embeds). As in server mode,
+only model-sourced and clone-detection findings are suppressed, not static-analysis findings.
+
+- Every dismissal is visible: stdout lists `Suppressed by <file> (N):` with each finding, and the
+  summary's `suppressed_count` counts them. In CI the pull-request review also carries the count and
+  the first 20 items (it is posted only when a new finding is posted; otherwise see the job log).
+- `memory_file` in the summary is `loaded` with N entries, `not found` (no file; the run continues)
+  or `disabled`. `suppressed_count` is `not applicable` unless the file was loaded, so "no memory"
+  is never shown as "0 suppressed".
+- A file that cannot be used stops the run before any model call, with exit 2 and a message that
+  names the line and the reason, never the content: `error: memory file .review/memory.jsonl:3: not
+  valid JSON (...)`. Limits: 262,144 bytes, 2,000 lines, 5,000 characters per line, a 2 s parse
+  deadline, no symbolic links, regular files only.
+- **In CI the file is read from the base commit, never from the pull request.** A pull request that
+  adds, edits or deletes the memory file changes nothing about its own review.
+- Proposals (US-L13): when the same rule id and message is dismissed for at least
+  `PROPOSAL_MIN_DISMISSALS` (3) distinct files and no `*` entry exists, stdout ends with
+  `Suggested change to <file> (not applied ...)` and a unified diff that appends one `*` entry. It is
+  only printed: review never writes to the repository. Apply it with `git apply` and commit it, or
+  ignore it.
+
+### MCP servers as context (opt-in per server): relevance is UNPROVEN
+
+> **Whether context from your MCP servers improves a review has NOT been shown** (PRD Q2,
+> [ADR-0017](../adr/0017-local-mode-mcp-knowledge.md)). The plumbing is tested against real MCP
+> servers on the official SDK, and a request-sensitive stand-in model proves a retrieved fact
+> reaches the prompt. A recorded model cannot show that it helps a real review: that is the manual
+> run in `apps/local_cli/test_mcp_live.py` (`REVIEW_LIVE_MCP=1`), whose go/no-go bar is in the ADR.
+> Until it passes, treat this as an experiment, and expect US-L9 to US-L11 to be withdrawn if it
+> fails. ADR-0017 is PROPOSED, not accepted.
+
+Local mode has no code index; it can instead ask MCP servers you already run (a docs server, a wiki,
+an internal knowledge base) for background on what changed. **Nothing is started or contacted unless
+you name the server.**
+
+- **Nominate by name**: `review run --base main --mcp docs --mcp kb:search_kb` (`NAME` or
+  `NAME:TOOL`), or commit a names-only file `.review/mcp.json`:
+  `{"mcp": {"servers": ["docs", {"name": "kb", "tool": "search_kb"}]}}` (at most 3 servers). A file
+  that has any of `command`, `args`, `env`, `url`, `headers` or `cwd` anywhere in it is rejected
+  (exit 2, naming the key and line, never the value): a repository file must not choose a command
+  to run on your machine. **In CI the file is read from the base commit**, so a pull request cannot
+  nominate a server. **With `--staged` the base commit is HEAD,
+  which a pull request controls, so in CI a nomination file is refused (exit 2); use `--base` in CI
+  or name servers with `--mcp`.**
+- **CI detection is best-effort.** "In CI" means `CI` or `GITHUB_ACTIONS` is set. GitHub Actions
+  sets both; **a runner on any other system (GitLab, Jenkins, self-hosted, ...) must set `CI=true`
+  itself**, or the CI protections described here (nominations from the base commit, no personal MCP
+  configuration, the Claude CLI guard) do not apply. A self-hosted runner can also unset it; this is
+  a guard, not a security control.
+- **Where a server is defined** is only your own MCP configuration: `~/.claude.json` (this
+  project's scope, then your user scope), the Claude Desktop file, and last the repository's
+  `.mcp.json`, or the single file in `REVIEW_LOCAL_MCP_CONFIG` if set (which replaces all of them).
+  Names, transports, commands, arguments, environment values and headers are read into memory only
+  and never printed, logged or put in an error. An unknown name exits 2 naming it. **Hardening beyond
+  the ADR text:** a server that only the repository's `.mcp.json` defines, nominated only by the
+  repository's `.review/mcp.json`, is refused (the repository would choose what runs): name it
+  yourself with `--mcp`.
+- **In CI**, none of those files is read. The only configuration is the file your workflow provides
+  in `REVIEW_LOCAL_MCP_CONFIG`, which must lie **outside the checkout** (a pull request controls
+  the checkout). A stdio server runs on the runner only because the workflow defined it; giving CI a
+  stdio command is the workflow author's decision. Without that variable a nomination exits 2.
+- **What is asked.** The query is built, never model-written: the changed files as `parent/basename`
+  and up to 10 symbol names (declared on added, removed or nearby context lines, or in hunk
+  headers), at most 500 characters, from the already-redacted diff, and screened again (a query
+  that changes is withheld). The server's one search-like tool is used (a name containing
+  `search`, `query` or `lookup`; none or several is `no usable tool`, never a guess), **but only
+  if the server declares it read-only** (`readOnlyHint` true, not `destructiveHint` or
+  `openWorldHint`). The query goes only into a parameter named `query`, `q`, `search`, `text`,
+  `keywords` or `prompt`; a tool that requires any other parameter (`sql`, `command`, ...) is
+  never called. Naming the tool yourself on the command line (`--mcp NAME:TOOL`) skips the
+  read-only check for that tool (your choice), but the argument is still only the sanitised query
+  in one of those parameters. A tool named only in `.review/mcp.json` must still be declared
+  read-only.
+- **What comes back** is screened by the same redaction before it can enter a prompt, cut to
+  1,000 characters (a snippet) or 4,000 (the two best items), with the cut counted in the summary,
+  and placed only in the labelled reference section the server-mode product-knowledge feature uses,
+  framed as inert reference data. At most 5 items. Nothing in it is ever acted on: each server is
+  called once, and there is no second tool call or command whatever the text says.
+- **Limits** (settings, environment only): `REVIEW_LOCAL_MCP_DEADLINE_SECONDS` (10, all servers
+  together), `REVIEW_LOCAL_MCP_MAX_CALLS` (3), `REVIEW_LOCAL_MCP_MAX_PROCESSES` (3),
+  `REVIEW_LOCAL_MCP_MAX_STDIO_BYTES` (262,144, enforced on the stream as bytes arrive; also the
+  HTTP response cap), `REVIEW_LOCAL_MCP_MAX_LIST_TOOLS_BYTES` (65,536), `REVIEW_LOCAL_MCP_MAX_TOOLS`
+  (100), `REVIEW_LOCAL_MCP_SCAN_TIMEOUT_SECONDS` (5, the secret scan of the query and of the
+  answers), `REVIEW_LOCAL_MCP_NOMINATIONS_FILE` (`.review/mcp.json`). A server that breaches a limit or
+  the deadline is killed (its whole process group) and reaped, reported in the summary, and the
+  review continues without it. There is no retry.
+- **A stdio server's environment** is `PATH`, `LANG`, `LC_ALL` (if set), `HOME` set to an empty
+  temporary directory that is also its working directory, and only the variables your own config
+  lists for that server. `GITHUB_TOKEN`, model keys and everything else are absent. POSIX only.
+- **HTTP servers** go through the same guard as server mode: no redirect is followed, the resolved
+  address is pinned, no environment proxy. Your configured headers go only to that entry's own
+  scheme, host and port and never over cleartext http to a public address. A host that is literally
+  `localhost`, `127.0.0.1` or `::1` may resolve to loopback; link-local, cloud-metadata,
+  unspecified and multicast addresses are blocked everywhere.
+- **Failure never blocks a review.** A timeout, protocol error, output that is not valid MCP, an
+  empty result or a missing usable tool leaves the review to finish without that context and the
+  summary says which server failed and how. An empty result is `empty`, and nothing implies context
+  was used.
+- **Which server supplied what**: the terminal prints `  context from MCP server NAME` under a
+  finding that cited it, the summary lists the `path:line` of each server's findings, the markdown
+  output gains a "Context from MCP servers" list, and the JSON carries it in `summary`. A pull-request
+  comment shows the cited item under "Product knowledge (MCP knowledge (NAME))".
+- **Departure from the server-mode privacy rule (PRD D5).** The product-knowledge feature sends
+  only issue keys. Here a query carries file paths and symbol names, because there is nothing else to
+  ask with. It applies only to local mode, only to servers you nominated, only after redaction, and
+  is shown in full by `--dry-run`. The server-mode path is unchanged. This is still an assumption
+  pending the owner's acceptance.
+
+### Input-side redaction and `--dry-run`
+
+Before anything is sent, every diff passes one batched Gitleaks scan (US-L15): added, removed and
+context lines, hunk-header text and file paths. A matching line is replaced by `[REDACTED]` (its diff
+marker is kept); a matching path becomes `[REDACTED-PATH-n]`. The scan covers the whole diff before
+the size ceiling cuts it, so a secret cannot be split by the cut. Files named like credential files
+(`.env*`, `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`, `*.tfvars` and similar) keep their entry,
+but their content is never sent; the summary names them. The scan has a file-count cap
+(`REVIEW_LOCAL_REDACTION_MAX_FILES`), a byte cap (`REVIEW_LOCAL_REDACTION_MAX_BYTES`) and an overall
+deadline (`REVIEW_LOCAL_REDACTION_TIMEOUT_SECONDS`); the caps are checked before the scanner starts.
+Any failure stops the run (exit 1, `redaction failed, nothing sent`). There is no setting that turns
+redaction off. **Coverage is the Gitleaks ruleset only: a bespoke secret format can pass through.**
+MCP queries and the text MCP servers return go through the same screen (the Claude CLI prompt is
+the model prompt, which is already screened).
+
+`review run --base main --dry-run` runs the real pipeline against a client that records each request
+and sends nothing, then prints on stdout the destinations (URLs with credentials and query values
+masked), the files and byte counts that would be sent, the size ceiling and what it would cut, and,
+for each nominated MCP server, its transport, host, tool and the exact query it would be asked (no
+server is started or contacted, and what a server would answer is not previewed). A
+report cannot drift from a real run because it is built from the requests the real builders make.
+A dry run answers every request as a model that reports no findings would, so requests that only
+exist because of findings (verification) are not previewed, and local analyzers still run. It cannot
+be combined with `--output`. Not the same as the pipeline's internal `dry_run` flag, which only
+suppresses posting.
+
+### The findings JSON contract
+
+The JSON file is `{"schema_version", "findings", "summary"}`, described by
+[`review-report.schema.json`](review-report.schema.json) (generated from
+`findings.models.Finding.model_json_schema()` and the summary models). Within a major version
+changes are additive: new optional fields appear and none is removed or retyped. A breaking change
+is a new major `schema_version`; a test fails if the committed schema and the code disagree.
+Rollback of a published schema is not possible, only a new version, so consumers should check
+`schema_version` before reading.
+
+### Installing
+
+Local mode ships through one channel, a Python distribution
+([ADR-0016](../adr/0016-local-mode-composition-root.md)); there is no container image and no GitHub
+Action wrapper.
+
+The distribution is **not published to PyPI** (the name `review` there is someone else's project).
+Build a wheel from a checkout and install that; the step-by-step guide is
+[`../guides/local-mode-quickstart.md`](../guides/local-mode-quickstart.md).
+
+```sh
+pip wheel --no-deps . -w dist          # from a checkout; produces dist/review-<version>-py3-none-any.whl
+pipx install --python python3.12 dist/review-*.whl      # or: pip install dist/review-*.whl
+review run --base main
+```
+
+Requirements on the machine or CI runner:
+- Linux or macOS. Windows is not supported: a stdio MCP server is refused there (its process-group
+  supervision is POSIX-only), and the wheel is only exercised on POSIX.
+- Python 3.12 exactly (the package declares `>=3.12,<3.13`; pipx on a system whose default Python
+  is 3.13 fails with pipx's "needs a Python matching" error unless you pass `--python python3.12`) and `git`
+  (the review reads the repository with it).
+- The `gitleaks` binary on `PATH`. Input redaction needs it and is not optional, so without it the
+  run exits 2 before any model call. Other analyzers are optional and reported as `skipped (not
+  installed)`.
+- A model: set `REVIEW_LOCAL_LLM_ENDPOINT` and `REVIEW_LOCAL_LLM_MODEL` (any OpenAI-compatible
+  endpoint).
+
+The distribution installs the same dependency set as the server (the one tree is shared by design,
+so it is larger than a minimal CLI would be). The example CI workflow is in
+[`ci-github-actions.md`](ci-github-actions.md).
+
+The built-distribution check is `tests/e2e/test_local_distribution.py`: it builds a wheel, installs
+it into a clean `python:3.12-slim` container with only `git` and `gitleaks`, deletes the source and
+reviews a repository against a recorded model. It runs with the Compose E2E (on merge to main and
+nightly).
+
+### Not in this release
+
+| Capability | Stories | Why |
+| --- | --- | --- |
+| Compliance confirmation for the Claude CLI backend | US-L7, US-L8 | The backend is built and opt-in, but whether Anthropic's terms permit driving a subscription through the CLI is **unverified** (B4). See "Claude CLI backend" above. |
+| Evidence that MCP context improves a review | US-L9, US-L10, US-L11 | The MCP feature is built and opt-in per server, but PRD Q2 is **unproven** and ADR-0017 is PROPOSED. The live-run procedure and go/no-go bar are in the ADR and `apps/local_cli/test_mcp_live.py`. See "MCP servers as context". |
+
+The product-knowledge rule that no code-derived text leaves in a query
+([`spec-product-knowledge.md`](../specs/spec-product-knowledge.md), decision 5) is unchanged for
+server mode. Local mode's departure from it (PRD D5) applies only to MCP servers you nominate, after
+redaction, and is shown by `--dry-run`.
+
+### Same pipeline as the server
+
+The CLI and the Worker build their step chain with the same function
+(`review.registry.build_review_registry`). `apps/test_parity_local_server.py` runs one fixture diff
+and one recorded model through both and requires identical file, line, severity and message; only
+delivery (terminal or GitHub comment) differs. The Worker's registry shape is pinned by
+`apps/worker/test_registry_snapshot.py`. Local mode adds no setting to the Worker or the Helm chart.
+
+### Rolling back a published release
+
+The CLI keeps no state outside the repository, so rollback is a version choice:
+- Reinstall the previous wheel (`pipx install --force --python python3.12 review-<previous>-py3-none-any.whl`); there is no PyPI release to pin.
+- If a release is harmful, yank it from the index so new installs skip it; existing pins keep working.
+- The only things a run leaves behind are a findings file you asked for with `--output`, a memory
+  file you chose to commit, and any pull-request review already posted (minimised or replaced by the
+  next run). Nothing needs cleaning up in a deployment, because there is none.
+- A breaking change to the findings JSON is a new major `schema_version`, so downgrading is safe for
+  consumers that check it.

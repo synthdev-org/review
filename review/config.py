@@ -202,6 +202,37 @@ class StepTimeouts(BaseModel):
         }
 
 
+class ReviewPipelineConfig(BaseModel):
+    """The non-enablement, non-timeout-mapping values ``review.registry.build_review_registry``
+    reads, so every composition root (the Worker's ``WorkerSettings``, later the local CLI) maps
+    its own settings into one explicit model instead of the builder reading a settings class.
+    Required fields, no defaults: each root states every value, so none can drift silently.
+    """
+
+    llm_model: str
+    llm_timeout_seconds: float
+    llm_max_diff_bytes: int
+    static_analysis_max_concurrent_analyzers: int
+    clone_detection_step_timeout_seconds: int
+    clone_detection_min_tokens: int
+    clone_detection_min_lines: int
+    clone_detection_max_findings: int
+    context_builder_internal_timeout_seconds: int
+    product_knowledge_deadline_seconds: int
+    memory_suppression_enabled: bool
+    memory_similarity_threshold: float
+    memory_decay_half_life_days: float
+    fix_generation_step_timeout_seconds: int
+    fix_generation_max_fixes_per_job: int
+    fix_generation_max_range_lines: int
+    fix_generation_max_replacement_lines: int
+    fix_generation_window_lines: int
+    walkthrough_step_timeout_seconds: int
+    walkthrough_min_files: int
+    walkthrough_max_files: int
+    walkthrough_max_chars: int
+
+
 def static_analysis_can_produce_findings(enablement: StepEnablement) -> bool:
     """Whether ``StaticAnalysisStep`` can produce any findings at all under
     ``enablement`` — true only when the macro step itself is enabled *and*

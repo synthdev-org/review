@@ -97,7 +97,6 @@ from typing import Any
 
 import httpx
 
-from adapter.github.auth import GitHubInstallationTokenProvider
 from adapter.github.exceptions import (
     GitHubBlobTooLargeError,
     GitHubDiffFetchMalformedResponseError,
@@ -117,6 +116,7 @@ from adapter.github.http import (
     request_with_retry,
     split_owner_repo,
 )
+from adapter.github.token_provider import InstallationTokenProvider
 from ingestion.diff import (
     Diff,
     DiffContentMalformedError,
@@ -170,7 +170,7 @@ class GitHubDiffFetcher:
     def __init__(
         self,
         *,
-        token_provider: GitHubInstallationTokenProvider,
+        token_provider: InstallationTokenProvider,
         github_api_base_url: str = _DEFAULT_GITHUB_API_BASE_URL,
         timeout: float = 10.0,
         max_retry_attempts: int = 3,
