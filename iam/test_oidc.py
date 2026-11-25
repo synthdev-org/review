@@ -19,7 +19,8 @@ def test_login_cookie_round_trips() -> None:
 
 
 def test_each_login_request_is_unique() -> None:
-    assert new_login_request() != new_login_request()
+    first, second = new_login_request(), new_login_request()
+    assert first != second
 
 
 def test_malformed_login_cookie_decodes_to_none() -> None:

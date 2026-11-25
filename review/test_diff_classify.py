@@ -99,7 +99,8 @@ def test_risk_large_config_json_is_data() -> None:
 
 def test_risk_by_path_is_deterministic() -> None:
     d = Diff(files=(_f("a.py"), _f("b.md")))
-    assert risk_by_path(d) == risk_by_path(d)
+    first, second = risk_by_path(d), risk_by_path(d)
+    assert first == second
     assert list(risk_by_path(d)) == ["a.py", "b.md"]
 
 

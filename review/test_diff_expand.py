@@ -139,9 +139,9 @@ def test_trailing_newline_and_no_newline_marker_preserved() -> None:
 
 
 def test_deterministic() -> None:
-    assert expand_patch("m.py", _fixture_patch(), HEAD_B) == expand_patch(
-        "m.py", _fixture_patch(), HEAD_B
-    )
+    first = expand_patch("m.py", _fixture_patch(), HEAD_B)
+    second = expand_patch("m.py", _fixture_patch(), HEAD_B)
+    assert first == second
 
 
 def _diff(*files: DiffFile) -> Diff:
