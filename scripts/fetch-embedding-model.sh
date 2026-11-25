@@ -11,6 +11,6 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$dest"
 cd "$dest"
 for f in config.json model.onnx special_tokens_map.json tokenizer.json tokenizer_config.json vocab.txt; do
-    curl -fsSL -o "$f" "https://huggingface.co/${repo}/resolve/${revision}/${f}"
+    curl --proto "=https" -fsSL -o "$f" "https://huggingface.co/${repo}/resolve/${revision}/${f}"
 done
 sha256sum -c "$root/adapter/embedding/model.sha256"

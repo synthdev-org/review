@@ -53,7 +53,7 @@ services:
     image: review-app:compose-local
     environment:
       REVIEW_DATABASE_URL: >-
-        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-review}:${POSTGRES_PASSWORD:-review}@postgres:5432/${POSTGRES_DB:-review}}
     # `alembic upgrade head` (Phase 2's baseline migration, which also runs
     # `CREATE EXTENSION IF NOT EXISTS vector`) followed by the standalone
     # pgvector-presence check CLI (adapter/storage/startup_check_cli.py).
@@ -79,7 +79,7 @@ services:
       # without a database. Same variable name migrate's block already
       # injects (adapter/storage/migrations/env.py reads it directly).
       REVIEW_DATABASE_URL: >-
-        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-review}:${POSTGRES_PASSWORD:-review}@postgres:5432/${POSTGRES_DB:-review}}
       # Required, no default — the webhook receiver's HMAC trust boundary
       # (docs/plans's Security review) cannot function without one.
       REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET: >-
@@ -183,7 +183,7 @@ services:
       # entrypoint uses. Same variable name migrate's/webhook_api's/worker's
       # blocks already inject.
       REVIEW_DATABASE_URL: >-
-        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-review}:${POSTGRES_PASSWORD:-review}@postgres:5432/${POSTGRES_DB:-review}}
       REVIEW_ADMIN_API_SESSION_COOKIE_SECURE: >-
         ${REVIEW_ADMIN_API_SESSION_COOKIE_SECURE:-false}
       REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES: >-
@@ -281,7 +281,7 @@ services:
       # database. Same variable name migrate's/webhook_api's blocks already
       # inject.
       REVIEW_DATABASE_URL: >-
-        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://review:review@postgres:5432/review}
+        ${REVIEW_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-review}:${POSTGRES_PASSWORD:-review}@postgres:5432/${POSTGRES_DB:-review}}
       # LM Studio's OpenAI-compatible endpoint on the Docker host, per the
       # plan's Phase 5 instruction and the C4 doc's Level 3 diagram.
       REVIEW_WORKER_LLM_ENDPOINT: >-

@@ -16,6 +16,7 @@ spec:
         {{- include "review.labels" . | nindent 8 }}
         {{- include "review.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: worker
           image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag | default .Chart.AppVersion }}"

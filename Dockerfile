@@ -22,12 +22,12 @@ WORKDIR /app
 FROM base AS deps
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-install-project --no-dev
+    uv sync --locked --no-install-project --no-dev --no-build
 
 # --- dev-deps: adds the dev dependency group (ruff, mypy, pytest, ...) ---
 FROM deps AS dev-deps
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-install-project
+    uv sync --locked --no-install-project --no-build
 
 # --- semgrep-tool: Semgrep in its own locked environment (tools/semgrep).
 # Semgrep hard-pins mcp 1.x, which conflicts with the main project's
@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM base AS semgrep-tool
 COPY tools/semgrep/pyproject.toml tools/semgrep/uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    UV_PROJECT_ENVIRONMENT=/opt/semgrep uv sync --locked --no-install-project
+    UV_PROJECT_ENVIRONMENT=/opt/semgrep uv sync --locked --no-install-project --no-build
 
 # Gitleaks — vendored, not a PyPI dependency (a Go binary with no
 # first-party Python packaging), pinned to an explicit tag, per the plan's
@@ -73,7 +73,7 @@ RUN set -eu; \
     repo="Qdrant/all-MiniLM-L6-v2-onnx"; \
     revision="5f1b8cd78bc4fb444dd171e59b18f3a3af89a079"; \
     for f in config.json model.onnx special_tokens_map.json tokenizer.json tokenizer_config.json vocab.txt; do \
-        curl -fsSL -o "$f" "https://huggingface.co/${repo}/resolve/${revision}/${f}"; \
+        curl --proto "=https" -fsSL -o "$f" "https://huggingface.co/${repo}/resolve/${revision}/${f}"; \
     done; \
     sha256sum -c model.sha256; \
     rm model.sha256
@@ -90,7 +90,7 @@ RUN set -eu; \
 FROM node:20-slim AS frontend-build
 WORKDIR /frontend
 COPY apps/admin_api/frontend/package.json apps/admin_api/frontend/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY apps/admin_api/frontend/ ./
 RUN npm run build
 

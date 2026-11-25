@@ -21,16 +21,16 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --no-build
 
       - name: ruff check
-        run: uv run ruff check .
+        run: uv run --locked --no-build ruff check .
 
       - name: ruff format --check
-        run: uv run ruff format --check .
+        run: uv run --locked --no-build ruff format --check .
 
       - name: mypy --strict
-        run: uv run mypy --strict .
+        run: uv run --locked --no-build mypy --strict .
 
       # US13 (docs/specs/spec-observability.md): fails the build if the
       # shipped Grafana dashboard (charts/review/dashboards/review.json)
@@ -40,7 +40,7 @@ jobs:
       # this job doesn't need the Docker-only local/agent execution rule,
       # per that spec's Unit E deliverable #4.
       - name: Dashboard/metric drift guard
-        run: uv run python scripts/check-dashboard-metrics.py
+        run: uv run --locked --no-build python scripts/check-dashboard-metrics.py
 
   test:
     name: Unit tests
@@ -55,7 +55,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --no-build
 
       # The Docker image bakes this model in; host-run tests import apps
       # that exit at startup without it (the embedding startup check).
@@ -70,7 +70,7 @@ jobs:
       - name: Install Semgrep (isolated environment)
         run: |
           set -euo pipefail
-          uv sync --project tools/semgrep --locked
+          uv sync --project tools/semgrep --locked --no-build
           mkdir -p "$HOME/.local/semgrep-bin"
           ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
           echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
@@ -83,7 +83,7 @@ jobs:
       # Coverage feeds the SonarCloud and Codacy jobs below. pytest-cov is added for
       # this run only (`--with`), so it is not a project dependency.
       - name: pytest (unit only, with coverage)
-        run: uv run --with pytest-cov pytest --cov=. --cov-report=xml
+        run: uv run --locked --no-build --with pytest-cov pytest --cov=. --cov-report=xml
 
       - name: Upload coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -113,7 +113,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --no-build
 
       # The Docker image bakes this model in; host-run tests import apps
       # that exit at startup without it (the embedding startup check).
@@ -129,7 +129,7 @@ jobs:
       - name: Install Semgrep (isolated environment)
         run: |
           set -euo pipefail
-          uv sync --project tools/semgrep --locked
+          uv sync --project tools/semgrep --locked --no-build
           mkdir -p "$HOME/.local/semgrep-bin"
           ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
           echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
@@ -150,9 +150,9 @@ jobs:
           set -euo pipefail
           GITLEAKS_VERSION=8.21.2
           ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -sSL -o "$ARCHIVE" \
+          curl --proto "=https" -sSL -o "$ARCHIVE" \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${ARCHIVE}"
-          curl -sSL -o checksums.txt \
+          curl --proto "=https" -sSL -o checksums.txt \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
           grep " ${ARCHIVE}\$" checksums.txt | sha256sum -c -
           tar xzf "$ARCHIVE" gitleaks
@@ -167,7 +167,7 @@ jobs:
         run: scripts/scan-fixtures.sh
 
       - name: pytest -m integration
-        run: uv run pytest -m integration
+        run: uv run --locked --no-build pytest -m integration
 
   frontend:
     name: Frontend (typecheck, build, vitest)
@@ -193,7 +193,7 @@ jobs:
           cache-dependency-path: apps/admin_api/frontend/package-lock.json
 
       - name: npm ci
-        run: npm ci --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Type check + build
         run: npm run build
@@ -256,9 +256,9 @@ jobs:
       - name: Export locked Python dependencies
         run: |
           uv export --locked --no-hashes --no-emit-project --output-file requirements.txt
-          uv sync --locked
+          uv sync --locked --no-build
           # uv environments have no pip, and the Snyk pip resolver needs it.
-          uv pip install --python .venv/bin/python pip
+          uv pip install --no-build --python .venv/bin/python pip
 
       - name: Snyk test (Python dependencies)
         run: snyk test --file=requirements.txt --package-manager=pip --command=.venv/bin/python --severity-threshold=high

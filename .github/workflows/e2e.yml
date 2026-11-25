@@ -30,7 +30,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --no-build
 
       # Live product-knowledge conformance (plan Phase 5b, US-PK17): points
       # the contract suite at a real provider (e.g. knowhow). Informational
@@ -44,7 +44,7 @@ jobs:
         env:
           PK_URL: ${{ vars.PK_LIVE_URL }}
           PK_TOKEN: ${{ secrets.PK_LIVE_TOKEN }}
-        run: uv run python -m adapter.product_knowledge.conformance
+        run: uv run --locked --no-build python -m adapter.product_knowledge.conformance
 
       # GitHub-hosted ubuntu-latest runners ship Docker Engine + the Compose
       # v2 plugin out of the box — no extra setup step needed. This test
@@ -52,7 +52,7 @@ jobs:
       # runs locally, building the real container images and asserting over
       # HTTP/Docker state, per testing.md's E2E tier.
       - name: Run Docker Compose E2E tests
-        run: uv run pytest tests/e2e -v
+        run: uv run --locked --no-build pytest tests/e2e -v
 
       - name: Show compose logs on failure
         if: failure()
