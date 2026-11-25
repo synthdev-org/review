@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 # `litellm` is imported.
 litellm.suppress_debug_info = True
 
+# litellm's own INFO log lines ("LiteLLM:INFO: utils.py ...") also go to stdout
+# and would break the JSON-lines log stream, so keep only warnings and errors.
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
 # litellm normalizes many distinct failure modes for a custom OpenAI-
 # compatible `api_base` down to the same exception *type*
 # (`litellm.exceptions.InternalServerError`) — confirmed empirically
