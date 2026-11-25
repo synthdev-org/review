@@ -48,7 +48,6 @@ from tests.e2e.conftest import (
     base_compose_env,
     compose,
     compose_down,
-    stub_llm_server,
     wait_for_healthy,
     wait_for_log_line,
 )
@@ -59,11 +58,6 @@ _INSTALLATION_ID = 654321
 _WEBHOOK_URL_PATH = "/webhooks/github"
 _WEBHOOK_SECRET = "e2e-test-webhook-secret"
 _WAIT_TIMEOUT_SECONDS = 120.0
-
-# Re-imported so this module's own `stub_llm_server` reference (needed for
-# the Worker's startup LLM-reachability check, even though indexing itself
-# never calls the LLM Gateway, per ADR-0007) isn't flagged unused.
-_ = stub_llm_server
 
 # A real, small TypeScript file — one exported function calling another —
 # so US3 (chunking), US4 (embedding), and US5 (graph extraction, including

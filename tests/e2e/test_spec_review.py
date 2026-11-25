@@ -52,7 +52,7 @@ _OWNER_REPO = "acme/spec-review-e2e"
 _INSTALLATION_ID = 987656
 _WEBHOOK_SECRET = "e2e-test-webhook-secret"
 _WAIT_TIMEOUT_SECONDS = 120.0
-_SPEC_STALL_SECONDS = 6.0  # longer than the 2 s internal deadline below
+_SPEC_STALL_SECONDS = 6.0  # longer than the 1 s LLM and 2 s internal timeouts below
 
 _BILLING_SPEC_PATH = "docs/specs/spec-billing-retry.md"
 _BILLING_SPEC = b"# Billing retry\n\nEvery retry must carry an idempotency key.\n"
@@ -256,6 +256,9 @@ def running_stack(
         REVIEW_WORKER_GITHUB_API_BASE_URL=f"http://host.docker.internal:{STUB_GITHUB_PORT}",
         REVIEW_WORKER_POLL_INTERVAL_SECONDS="0.2",
         REVIEW_WORKER_SPEC_REVIEW_STEP_TIMEOUT_SECONDS="10",
+        # The settings validator requires internal timeout > LLM timeout, so the LLM
+        # timeout is lowered below the 2 s internal deadline (base env uses 10 s).
+        REVIEW_WORKER_LLM_TIMEOUT_SECONDS="1",
         REVIEW_WORKER_SPEC_REVIEW_INTERNAL_TIMEOUT_SECONDS="2",
     )
     compose_down(env)
