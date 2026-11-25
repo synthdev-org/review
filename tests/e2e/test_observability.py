@@ -737,11 +737,32 @@ def _dashboard_panel_targets() -> list[tuple[str, list[str]]]:
     return targets
 
 
+# Panels that legitimately have no series in this stack: the "Product knowledge" row only
+# emits when a provider is configured (spec-product-knowledge US-PK14 covers it with the
+# static metric-name drift guard, not live data; tests/e2e/test_product_knowledge.py drives
+# the real provider path), and "Admin config write rejections" only has a series after a
+# rejected admin write. Exempting by exact title, and asserting each title still exists,
+# keeps every other panel (and any new panel) under the real-data requirement.
+_PANELS_WITHOUT_TRAFFIC_IN_THIS_STACK = frozenset(
+    {
+        "Provider job outcomes (non-ok, by outcome)",
+        "Provider call rate by operation and outcome",
+        "Provider call duration (p95)",
+        "Citation refs unresolved (ratio)",
+        "Product knowledge config resolution failures",
+        "Admin config write rejections",
+    }
+)
+
+
 def _wait_for_all_panels_to_resolve_data(
     env: dict[str, str], *, timeout: float = _DASHBOARD_DATA_TIMEOUT_SECONDS
 ) -> None:
-    panel_targets = _dashboard_panel_targets()
-    assert panel_targets, "dashboard JSON yielded no queryable panels — parsing regression"
+    all_targets = _dashboard_panel_targets()
+    assert all_targets, "dashboard JSON yielded no queryable panels — parsing regression"
+    titles = {title for title, _ in all_targets}
+    assert titles >= _PANELS_WITHOUT_TRAFFIC_IN_THIS_STACK, "stale panel exemption"
+    panel_targets = [t for t in all_targets if t[0] not in _PANELS_WITHOUT_TRAFFIC_IN_THIS_STACK]
 
     deadline = time.monotonic() + timeout
     pending: dict[str, list[str]] = {}
