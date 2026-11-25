@@ -21,16 +21,16 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --no-build
+        run: uv sync --locked --no-install-project --no-build
 
       - name: ruff check
-        run: uv run --locked --no-build ruff check .
+        run: uv run --no-sync ruff check .
 
       - name: ruff format --check
-        run: uv run --locked --no-build ruff format --check .
+        run: uv run --no-sync ruff format --check .
 
       - name: mypy --strict
-        run: uv run --locked --no-build mypy --strict .
+        run: uv run --no-sync mypy --strict .
 
       # US13 (docs/specs/spec-observability.md): fails the build if the
       # shipped Grafana dashboard (charts/review/dashboards/review.json)
@@ -40,7 +40,7 @@ jobs:
       # this job doesn't need the Docker-only local/agent execution rule,
       # per that spec's Unit E deliverable #4.
       - name: Dashboard/metric drift guard
-        run: uv run --locked --no-build python scripts/check-dashboard-metrics.py
+        run: uv run --no-sync python scripts/check-dashboard-metrics.py
 
   test:
     name: Unit tests
@@ -55,7 +55,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --no-build
+        run: uv sync --locked --no-install-project --no-build
 
       # The Docker image bakes this model in; host-run tests import apps
       # that exit at startup without it (the embedding startup check).
@@ -70,7 +70,7 @@ jobs:
       - name: Install Semgrep (isolated environment)
         run: |
           set -euo pipefail
-          uv sync --project tools/semgrep --locked --no-build
+          uv sync --project tools/semgrep --locked --no-install-project --no-build
           mkdir -p "$HOME/.local/semgrep-bin"
           ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
           echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
@@ -83,7 +83,7 @@ jobs:
       # Coverage feeds the SonarCloud and Codacy jobs below. pytest-cov is added for
       # this run only (`--with`), so it is not a project dependency.
       - name: pytest (unit only, with coverage)
-        run: uv run --locked --no-build --with pytest-cov pytest --cov=. --cov-report=xml
+        run: uv run --no-sync --with pytest-cov pytest --cov=. --cov-report=xml
 
       - name: Upload coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -113,7 +113,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --no-build
+        run: uv sync --locked --no-install-project --no-build
 
       # The Docker image bakes this model in; host-run tests import apps
       # that exit at startup without it (the embedding startup check).
@@ -129,7 +129,7 @@ jobs:
       - name: Install Semgrep (isolated environment)
         run: |
           set -euo pipefail
-          uv sync --project tools/semgrep --locked --no-build
+          uv sync --project tools/semgrep --locked --no-install-project --no-build
           mkdir -p "$HOME/.local/semgrep-bin"
           ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
           echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
@@ -167,7 +167,7 @@ jobs:
         run: scripts/scan-fixtures.sh
 
       - name: pytest -m integration
-        run: uv run --locked --no-build pytest -m integration
+        run: uv run --no-sync pytest -m integration
 
   frontend:
     name: Frontend (typecheck, build, vitest)
@@ -256,7 +256,7 @@ jobs:
       - name: Export locked Python dependencies
         run: |
           uv export --locked --no-hashes --no-emit-project --output-file requirements.txt
-          uv sync --locked --no-build
+          uv sync --locked --no-install-project --no-build
           # uv environments have no pip, and the Snyk pip resolver needs it.
           uv pip install --no-build --python .venv/bin/python pip
 
