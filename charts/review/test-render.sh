@@ -272,6 +272,7 @@ echo "=== 6. docker compose config: admin_api service (Phase 9, US-A20) ==="
 COMPOSE_ROOT="$(cd "$CHART_DIR/../.." && pwd)"
 COMPOSE_OUT=$(
     cd "$COMPOSE_ROOT" && \
+    POSTGRES_PASSWORD=test-postgres-password \
     REVIEW_WEBHOOK_API_GITHUB_WEBHOOK_SECRET=test-webhook-secret \
     REVIEW_WEBHOOK_API_GITHUB_APP_ID=1 \
     REVIEW_WEBHOOK_API_GITHUB_APP_PRIVATE_KEY=test-private-key \
