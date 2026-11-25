@@ -297,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Constrain the CLI path to the repository: no traversal outside it.
     args.dashboard = args.dashboard.resolve()
-    if not args.dashboard.is_relative_to(REPO_ROOT) or args.dashboard.suffix != ".json":
+    if not args.dashboard.is_relative_to(REPO_ROOT.resolve()) or args.dashboard.suffix != ".json":
         parser.error(f"--dashboard must be a .json file inside {REPO_ROOT}")
 
     try:

@@ -299,6 +299,19 @@ class TestMainCLI:
         assert exit_code == 1
         assert "review_totally_unregistered_total" in captured.err
 
+    @pytest.mark.parametrize("name", ["../outside.json", "dashboard.txt"])
+    def test_main_rejects_dashboard_path_outside_repo_or_not_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        monkeypatch.setattr(check_dashboard_metrics, "REPO_ROOT", repo)
+
+        with pytest.raises(SystemExit) as excinfo:
+            check_dashboard_metrics.main(["--dashboard", str(repo / name)])
+
+        assert excinfo.value.code == 2
+
 
 class TestShippedDashboardCoversProductKnowledge:
     """
