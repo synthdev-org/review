@@ -17,6 +17,7 @@ spec:
         {{- include "review.labels" . | nindent 8 }}
         {{- include "review.selectorLabels" (dict "root" . "component" "admin-api") | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: admin-api
           image: "{{ .Values.adminApi.image.repository }}:{{ .Values.adminApi.image.tag | default .Chart.AppVersion }}"

@@ -76,7 +76,9 @@ def test_no_patch_and_empty_diff() -> None:
 
 def test_build_is_deterministic() -> None:
     diff = Diff(files=(DiffFile(path="m.py", status="modified", patch=PATCH_ALPHA),))
-    assert build_pr_map(diff, {"m.py": HEAD}) == build_pr_map(diff, {"m.py": HEAD})
+    first = build_pr_map(diff, {"m.py": HEAD})
+    second = build_pr_map(diff, {"m.py": HEAD})
+    assert first == second
 
 
 def test_render_empty_is_empty_string() -> None:

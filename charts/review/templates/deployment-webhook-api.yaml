@@ -19,6 +19,7 @@ spec:
         {{- include "review.labels" . | nindent 8 }}
         {{- include "review.selectorLabels" (dict "root" . "component" "webhook-api") | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: webhook-api
           image: "{{ .Values.webhookApi.image.repository }}:{{ .Values.webhookApi.image.tag | default .Chart.AppVersion }}"

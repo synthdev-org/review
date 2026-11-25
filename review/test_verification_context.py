@@ -156,7 +156,9 @@ def test_deterministic() -> None:
     fs = [_f("m.py", 13), _f("a.py", 1)]
     files = {"m.py": PY, "a.py": b"x\n"}
     cfg = FileContextConfig(max_bytes_per_file=100, surrounding_lines=1)
-    assert build_file_contexts(fs, files, cfg) == build_file_contexts(fs, files, cfg)
+    first = build_file_contexts(fs, files, cfg)
+    second = build_file_contexts(fs, files, cfg)
+    assert first == second
 
 
 def test_section_empty_and_framed() -> None:

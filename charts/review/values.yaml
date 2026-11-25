@@ -69,7 +69,15 @@ webhookApi:
     appId: ""
     retryMaxAttempts: 3
   memoryReactionPollMaxCommentsPerPoll: 50
-  resources: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+      ephemeral-storage: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+      ephemeral-storage: 1Gi
 
 worker:
   replicaCount: 1
@@ -107,9 +115,11 @@ worker:
     requests:
       cpu: 500m
       memory: 512Mi
+      ephemeral-storage: 1Gi
     limits:
       cpu: "2"
       memory: 2Gi
+      ephemeral-storage: 4Gi
 
 # --- Credential fields (see the file header for the shared shape) ---
 
@@ -208,7 +218,15 @@ adminApi:
     baseUrl: http://prometheus:9090
     timeoutSeconds: 5
     retryMaxAttempts: 2
-  resources: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+      ephemeral-storage: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+      ephemeral-storage: 1Gi
   # --- Credential fields (see this file's header for the shared shape) ---
   # Bootstrap admin (Assumption 11) — required, no default; the bootstrap
   # routine (apps/admin_api/bootstrap.py) cannot create the first admin

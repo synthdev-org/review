@@ -107,7 +107,7 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
         self._calls().calls.append(f"POST {path}")
         if re.fullmatch(r"/app/installations/\d+/access_tokens", path):
             self._send_json(
-                201, {"token": "ghs_e2e_indexing_token", "expires_at": "2999-01-01T00:00:00Z"}
+                201, {"token": f"ghs_idx_{uuid.uuid4().hex}", "expires_at": "2999-01-01T00:00:00Z"}
             )
             return
         self._send_json(404, {"message": "not found (stub)"})

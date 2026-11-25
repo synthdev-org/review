@@ -74,9 +74,9 @@ def test_zero_slices_and_empty_input() -> None:
 def test_planning_is_deterministic() -> None:
     commits = _chain("a", "b", "c")
     sizes = {"a": 5, "b": 90, "c": 5}
-    assert plan_commit_slices(commits, sizes, max_bytes=50, max_slices=5) == plan_commit_slices(
-        commits, sizes, max_bytes=50, max_slices=5
-    )
+    first = plan_commit_slices(commits, sizes, max_bytes=50, max_slices=5)
+    second = plan_commit_slices(commits, sizes, max_bytes=50, max_slices=5)
+    assert first == second
 
 
 _PATCH = (

@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root_testdata="${SCAN_FIXTURES_ROOT_TESTDATA:-./review/testdata}"
 
-if [ "$#" -gt 0 ]; then
+if [[ "$#" -gt 0 ]]; then
     dirs=("$@")
 else
     mapfile -t dirs < <(
@@ -27,7 +27,7 @@ else
 fi
 
 status=0
-if [ "$#" -eq 0 ]; then
+if [[ "$#" -eq 0 ]]; then
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
     find "$root_testdata" -maxdepth 1 -type f -not -name 'planted_*' -exec cp {} "$scratch"/ \;
