@@ -163,7 +163,7 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
                     ]
                 }
             )
-        if '"verdicts"' in request_body:
+        if "verdicts" in request_body:  # the raw body is JSON-escaped: no literal quotes
             verdict = {
                 "valid": True,
                 "actionable": True,
