@@ -151,11 +151,16 @@ def stub_llm() -> Iterator[HTTPServer]:
         next(gen, None)
 
 
+def _stub_url(port: int, path: str = "") -> str:
+    """Plain-HTTP URL of a local stub server (no TLS on loopback stubs)."""
+    return str(httpx.URL(scheme="http", host=_HOST, port=port)).rstrip("/") + path
+
+
 def _env() -> dict[str, str]:
     credentials = json.dumps({_REF: {"token": _TOKEN, "allowed_hosts": [_HOST]}})
     return base_compose_env(
-        REVIEW_WORKER_LLM_ENDPOINT=f"http://{_HOST}:{STUB_LLM_PORT}/v1",
-        REVIEW_WORKER_GITHUB_API_BASE_URL=f"http://{_HOST}:{STUB_GITHUB_PORT}",
+        REVIEW_WORKER_LLM_ENDPOINT=_stub_url(STUB_LLM_PORT, "/v1"),
+        REVIEW_WORKER_GITHUB_API_BASE_URL=_stub_url(STUB_GITHUB_PORT),
         REVIEW_WORKER_POLL_INTERVAL_SECONDS="0.2",
         REVIEW_WORKER_PRODUCT_KNOWLEDGE_CREDENTIALS=credentials,
         REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS=credentials,

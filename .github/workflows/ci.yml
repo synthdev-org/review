@@ -248,7 +248,7 @@ jobs:
           node-version: "20"
 
       - name: Install Snyk CLI
-        run: npm install --global snyk@1
+        run: npm install --global --ignore-scripts snyk@1.1309.0
 
       # Snyk reads a requirements file, so export the locked Python
       # dependencies from uv.lock. Snyk also needs the packages installed,

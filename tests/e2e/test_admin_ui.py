@@ -406,7 +406,7 @@ def _assert_unsafe_provider_writes_refused(
     unlisted = client.put(
         "/api/v1/config/platform/product_knowledge_provider",
         json={
-            "value": {**value, "endpoint_url": "http://other.invalid/mcp", "credential_ref": None}
+            "value": {**value, "endpoint_url": "https://other.invalid/mcp", "credential_ref": None}
         },
         headers=csrf,
     )
@@ -437,7 +437,7 @@ def test_product_knowledge_panel_round_trip_and_disclosure_in_built_bundle(
         value = {
             "enabled": True,
             "display_name": "E2E Wiki",
-            "endpoint_url": "http://wiki.invalid/mcp",
+            "endpoint_url": "https://wiki.invalid/mcp",
             "credential_ref": "e2e",
             "allow_public_repos": False,
             "issue_key_prefixes": ["HR"],
@@ -451,7 +451,7 @@ def test_product_knowledge_panel_round_trip_and_disclosure_in_built_bundle(
 
         probe = client.post(
             "/api/v1/product-knowledge/test-connection",
-            json={"endpoint_url": "http://other.invalid/mcp", "credential_ref": None},
+            json={"endpoint_url": "https://other.invalid/mcp", "credential_ref": None},
             headers=csrf,
         )
         assert probe.status_code == 200, probe.text
