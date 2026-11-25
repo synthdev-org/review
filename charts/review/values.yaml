@@ -1,0 +1,363 @@
+# charts/review/values.yaml — DEFAULT profile: postgresql.enabled: true,
+# the fast-eval/trial path (per the C4 doc and this plan's Phase 6
+# section). Production installs layer values-production.yaml on top of
+# this file (`helm install -f values.yaml -f values-production.yaml`),
+# which flips postgresql.enabled to false and expects externally-managed
+# connection details.
+#
+# PRE-1.0 / UNSTABLE — see the note at the top of Chart.yaml. This shape
+# may still change before Phase 8 ("Production hardening").
+#
+# Credential fields (github.webhookSecret, github.setupStateSecret,
+# llm.apiKey, database.url) all share one shape:
+#
+#   <field>:
+#     value: "<literal, used when existingSecret.name is empty>"
+#     existingSecret:
+#       name: ""   # name of a Secret the operator/secret-backend already
+#                  # populated (Vault, External Secrets Operator, Sealed
+#                  # Secrets, a cloud Secrets Manager, ...) — see the C4
+#                  # doc's "Configuration & Secrets" / secret-backend-
+#                  # agnostic design goal.
+#       key: ""    # key within that Secret holding the value.
+#
+# When existingSecret.name is set, this chart's own Secret omits that
+# field entirely (no literal value rendered anywhere) and every Deployment
+# that needs it reads straight from the referenced Secret/key instead —
+# `value` is then ignored.
+
+webhookApi:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/mystery-digital/review
+    # Empty string defaults to .Chart.AppVersion (see _helpers.tpl).
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8000
+  # Mirrors apps/webhook_api/settings.py's WebhookAPISettings fields
+  # one-for-one (REVIEW_WEBHOOK_API_* env prefix).
+  environment: development
+  logLevel: INFO
+  webhook:
+    # Quoted as a string, not a bare int: Helm decodes values.yaml numbers
+    # as float64, and Go's default float64->string formatting renders
+    # values >= 1e6 in scientific notation (e.g. "1e+06") — a real, easy-to-
+    # miss bug caught while rendering this chart. Every other numeric field
+    # below stays under that threshold and is safe as a bare int.
+    maxBodyBytes: "1000000"
+    rateLimit:
+      maxRequests: 30
+      windowSeconds: 60
+  # Off by default per the plan's Security review ("Manifest-flow
+  # gating") — only enable for the duration of a one-time GitHub App
+  # creation flow, same as docker-compose.yml's default.
+  setupMode: false
+  setupStateTtlSeconds: 600
+  githubApi:
+    baseUrl: https://api.github.com
+    timeoutSeconds: 10
+  # GitHub App auth for the synchronous reaction-fetch path
+  # (docs/plans/plan-deliver-memory.md's Phase 4, Unit D, US-M3's second
+  # `Given/When/Then` branch) — the same App identity as `worker.github`
+  # below (`appId` is public-ish, not sensitive, same reasoning as
+  # `worker.github.appId`'s own comment; the private key is the shared
+  # top-level `github.appPrivateKey` credential field both Deployments
+  # reference).
+  github:
+    appId: ""
+    retryMaxAttempts: 3
+  memoryReactionPollMaxCommentsPerPoll: 50
+  resources: {}
+
+worker:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/mystery-digital/review
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Mirrors apps/worker/settings.py's WorkerSettings fields one-for-one
+  # (REVIEW_WORKER_* env prefix).
+  environment: development
+  logLevel: INFO
+  llm:
+    endpoint: http://host.docker.internal:1234/v1
+    model: local-model
+    timeoutSeconds: 30
+  # GitHub App server-to-server auth / diff fetch (Phase 4). `appId` is
+  # public-ish, not sensitive (see the Security review — "github_app_id is
+  # a public-ish identifier, not sensitive, so it belongs in the
+  # ConfigMap, not the Secret"), unlike `github.appPrivateKey` below, which
+  # follows the shared credential-field shape (see this file's own header
+  # comment).
+  github:
+    appId: ""
+    apiBaseUrl: https://api.github.com
+    apiTimeoutSeconds: 10
+    retryMaxAttempts: 3
+  # Phase 5: non-empty defaults, closing the gap between the pipeline's own
+  # per-step timeout (Phase 2) and actual container enforcement — a
+  # pathological diff or a misbehaving analyzer subprocess (Gitleaks,
+  # Semgrep) is bounded by both, not the timeout alone. Mirrors
+  # docker-compose.yml's own worker service `mem_limit`/`cpus` figures;
+  # tunable per-deployment via a values override, not hardcoded by the
+  # chart itself.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+# --- Credential fields (see the file header for the shared shape) ---
+
+github:
+  webhookSecret:
+    value: "replace-with-a-real-webhook-secret"
+    existingSecret:
+      name: ""
+      key: ""
+  # Only required when webhookApi.setupMode is true (see Chart.yaml's
+  # helper validation) — mirrors WebhookAPISettings' own
+  # model_validator that requires it exactly when setup_mode is enabled.
+  setupStateSecret:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+  # Required (Phase 4) — adapter/github/auth.py's JWT signing cannot
+  # function without the App's own private key. Left blank here (no safe
+  # default, like database.url.value below): the Worker's own fail-fast
+  # startup check (validate_private_key) refuses to boot with an unset or
+  # unusable value rather than posting nothing and failing silently
+  # mid-review. Shared by both Deployments (worker and, as of
+  # plan-deliver-memory.md's Phase 4, webhook-api's own synchronous
+  # reaction-fetch path) — the same GitHub App identity, one Secret key.
+  appPrivateKey:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+
+llm:
+  apiKey:
+    value: "not-needed"
+    existingSecret:
+      name: ""
+      key: ""
+
+# `adminApi:` (docs/plans/plan-deliver-memory.md's Phase 5, Unit E,
+# Assumption 7) previously held the static `admin_api_key` credential the
+# Memory admin API's shared-token auth used. docs/plans/
+# plan-deliver-admin-gui.md's Phase 3 (Unit D, US-A7) fully retired that
+# credential — the Memory admin API now authenticates via real per-user
+# sessions instead. This is Phase 9's fresh block for the real
+# `apps/admin_api` Deployment (US-A20) — mirrors `webhookApi:`'s own
+# replicaCount/image/service/resources shape one-for-one, plus its own
+# non-secret settings (mirroring apps/admin_api/settings.py's
+# AdminAPISettings fields one-for-one, REVIEW_ADMIN_API_ env prefix) and
+# its own credential fields (the shared value/existingSecret shape this
+# file's header documents, same as the credential fields below — unlike
+# those, these live inside this block rather than at the top level since
+# only apps/admin_api ever consumes them, per this chart's own
+# single-consumer-vs-shared placement convention).
+adminApi:
+  # Independently toggleable from `ingress.enabled` below (Observability &
+  # rollback) — an operator not ready to run the Admin UI at all can
+  # disable the Deployment/Service themselves, not just external exposure
+  # to them. No equivalent flag exists for `webhookApi:`/`worker:` today
+  # (both render unconditionally) — this is a new, Admin-UI-specific
+  # toggle, not a retrofit of that same convention onto the other two.
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/mystery-digital/review
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    # Matches docker-compose.yml's own admin_api service port (Phase 1) —
+    # also the port apps/admin_api/main.py's uvicorn command below binds.
+    port: 8001
+  environment: development
+  logLevel: INFO
+  # Session cookie (Assumption 7). `false` only ever makes sense for a
+  # plain-HTTP local loopback — every real cluster deployment sits behind
+  # a TLS-terminating Ingress (see the `ingress:` block below).
+  sessionCookieSecure: true
+  sessionIdleTimeoutMinutes: 30
+  # Login rate limiting (Assumption 5) — Postgres-backed, correct across
+  # this Deployment's multiple stateless replicas.
+  loginRateLimit:
+    attempts: 5
+    windowMinutes: 15
+  # Password policy (Assumption 14).
+  minPasswordLength: 12
+  # Model routing's static-default tier (Phase 5, Unit F) — keep in sync
+  # with worker.llm.model above, same reasoning as
+  # apps/admin_api/settings.py's own field-level comment.
+  llmModel: local-model
+  # Memory admin API's embedding client (Phase 3, Unit D) — same
+  # Dockerfile-baked on-disk path every other entrypoint's copy of this
+  # setting uses.
+  embeddingModelPath: /app/models/all-MiniLM-L6-v2
+  # Admin-stats dashboard's Prometheus-reading adapter (Phase 6, Unit G).
+  prometheus:
+    baseUrl: http://prometheus:9090
+    timeoutSeconds: 5
+    retryMaxAttempts: 2
+  resources: {}
+  # --- Credential fields (see this file's header for the shared shape) ---
+  # Bootstrap admin (Assumption 11) — required, no default; the bootstrap
+  # routine (apps/admin_api/bootstrap.py) cannot create the first admin
+  # user without these.
+  bootstrapUsername:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+  bootstrapPassword:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+  # Session-bound CSRF HMAC key (Assumption 13) — required, no default;
+  # without it, admin_api fails to boot.
+  csrfSecret:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+  # Optional OIDC single sign-on (US-A24). `provider` is none | generic |
+  # authentik; local login always works. `redirectUri` must be the public
+  # URL of /api/v1/auth/oidc/callback. `clientSecret` may stay empty for a
+  # public (PKCE-only) client.
+  oidc:
+    provider: none
+    clientId: ""
+    redirectUri: ""
+    issuer: ""
+    authentik:
+      baseUrl: ""
+      appSlug: ""
+    scopes: "openid profile email"
+    usernameClaim: preferred_username
+    clientSecret:
+      value: ""
+      existingSecret:
+        name: ""
+        key: ""
+
+# Optional external product-knowledge provider (docs/plans/
+# plan-deliver-product-knowledge.md, Phase 6). The provider itself
+# (endpoint, display name, credential reference) is day-two config set in
+# the Admin UI; only the bearer *tokens* and the network policy are
+# bootstrap config here. `credentials.value` is a JSON object
+#   {"<ref>": {"token": "...", "allowed_hosts": ["host", ...]}}
+# and follows the shared credential-field shape above. It is rendered into
+# BOTH the Worker and the Admin API Deployments (the Admin API validates a
+# provider's `credential_ref` and host binding against it), and **only when
+# `value` or `existingSecret.name` is set** — an unset map renders no env
+# var and no secretKeyRef, so an existing install upgrades with nothing to
+# configure. NOTE: the chart adds no checksum annotation for this
+# credential map, so rotating it (the chart-managed Secret OR the Secret an
+# `existingSecret` points at) does NOT roll pods. Restart the Worker and the
+# Admin API (`kubectl rollout restart`) after a rotation, or add a checksum
+# annotation to your own pod template via your secret-backend's reloader.
+productKnowledge:
+  # Kill switch (needs a pod restart to flip): false => no provider is
+  # ever queried, even with provider settings present.
+  enabled: true
+  callTimeoutSeconds: 5
+  # Worker only: whole provider branch, must stay below the Context
+  # Builder's internal timeout when the feature is in use.
+  deadlineSeconds: 10
+  # RFC1918/ULA ranges are allowed by default so an in-cluster provider
+  # works; loopback/link-local/cloud-metadata are always refused.
+  allowPrivateNetworks: true
+  # Comma-separated `host` / `*.suffix` entries; empty = no allow-list.
+  endpointAllowlist: ""
+  credentials:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+
+# Chart-managed Ingress (US-A21) — new as of Phase 9; the chart had no
+# Ingress template before this phase. Routes to both the Admin UI
+# (`adminApi.service`) and Webhook API (`webhookApi.service`) Services.
+# Independently toggleable from the Deployments/Services themselves: an
+# operator not ready to expose the Admin UI externally can set
+# `ingress.enabled: false` alone, leaving both Services running and
+# reachable in-cluster.
+#
+# TLS: set `tls` using the standard Kubernetes Ingress shape
+# (`[{secretName, hosts}]`) either way —
+#   - existingSecret: point `tls[].secretName` at a Secret your own
+#     secret-backend (Vault, External Secrets Operator, Sealed Secrets, a
+#     cloud Secrets Manager, ...) already populated, mirroring this
+#     chart's other `existingSecret` fields.
+#   - cert-manager: add the issuer annotation via `ingress.annotations`
+#     (e.g. `cert-manager.io/cluster-issuer: letsencrypt-prod`) and
+#     `tls[].secretName` names the Secret cert-manager creates itself.
+# Left empty by default (no TLS) — an operator enabling Ingress for a real
+# deployment is expected to set this explicitly, the same "no unsafe
+# default" posture the credential fields above take.
+ingress:
+  enabled: true
+  className: nginx
+  # Example: an operator can set a rate-limit annotation here as a
+  # network-layer complement to the Admin API's own per-username/
+  # aggregate application-layer login throttling (Assumption 5) — e.g.
+  #   annotations:
+  #     nginx.ingress.kubernetes.io/limit-rps: "5"
+  # Documented as an available option, not a default this chart imposes.
+  annotations: {}
+  hosts:
+    - host: review.example.com
+      paths:
+        # More specific paths first — matches
+        # apps/webhook_api/webhook_routes.py's/manifest_routes.py's actual
+        # route prefixes (`/webhooks/github`, `/setup/*`); everything else
+        # (including `/api/*` and the built frontend's static assets) goes
+        # to the Admin UI, per apps/admin_api/main.py's own catch-all
+        # frontend route.
+        - path: /webhooks
+          pathType: Prefix
+          service: webhook-api
+        - path: /setup
+          pathType: Prefix
+          service: webhook-api
+        - path: /
+          pathType: Prefix
+          service: admin-api
+  tls: []
+
+database:
+  # Full REVIEW_DATABASE_URL DSN (postgresql+asyncpg://user:pass@host:port/db).
+  # Left blank here: when postgresql.enabled is true, the chart derives it
+  # automatically from the bundled subchart's postgresql.auth.* values
+  # (see templates/_helpers.tpl's "review.databaseUrl" helper) so the
+  # fast-eval path works with zero extra configuration. When
+  # postgresql.enabled is false, either set this value explicitly or use
+  # existingSecret — templates fail closed with a clear error if neither
+  # is provided (see the same helper).
+  url:
+    value: ""
+    existingSecret:
+      name: ""
+      key: ""
+
+# `true` bundles the Postgres+pgvector subchart (charts/postgresql/) for a
+# fast-eval/trial path — no external database needed. `false` takes
+# externally-managed connection details via `database.url` above. See
+# docs/reference/c4-architecture.md's "Postgres is bring-your-own-or-
+# bundled" note. values-production.yaml sets this to false.
+postgresql:
+  enabled: true
+  auth:
+    username: review
+    password: review
+    database: review

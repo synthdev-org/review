@@ -1,0 +1,63 @@
+name: E2E
+
+# Per docs/rules/testing.md's CI-gating rule ("E2E: on merge to main (or
+# nightly)") and the plan's Phase 5 section — this is the one test tier not
+# already wired into CI by an earlier phase (.github/workflows/ci.yml
+# covers unit-on-every-push and integration-on-every-PR).
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Nightly, in addition to on-merge, per testing.md's "(or nightly)"
+    # allowance — catches drift even on a quiet main branch.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: Docker Compose E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # Live product-knowledge conformance (plan Phase 5b, US-PK17): points
+      # the contract suite at a real provider (e.g. knowhow). Informational
+      # only, never a gate (testing.md): this file also triggers on push to
+      # main, so the event guard is what keeps it off merges; PK_LIVE_URL
+      # (a repository variable) opts a repo in; continue-on-error keeps a
+      # red result from failing the workflow. Deliberately absent from ci.yml.
+      - name: Live product-knowledge conformance (nightly/manual, non-gating)
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.PK_LIVE_URL != ''
+        continue-on-error: true
+        env:
+          PK_URL: ${{ vars.PK_LIVE_URL }}
+          PK_TOKEN: ${{ secrets.PK_LIVE_TOKEN }}
+        run: uv run python -m adapter.product_knowledge.conformance
+
+      # GitHub-hosted ubuntu-latest runners ship Docker Engine + the Compose
+      # v2 plugin out of the box — no extra setup step needed. This test
+      # suite (tests/e2e/) drives the same docker-compose.yml a developer
+      # runs locally, building the real container images and asserting over
+      # HTTP/Docker state, per testing.md's E2E tier.
+      - name: Run Docker Compose E2E tests
+        run: uv run pytest tests/e2e -v
+
+      - name: Show compose logs on failure
+        if: failure()
+        run: docker compose -p review_e2e -f docker-compose.yml logs --no-color || true
+
+      - name: Tear down compose stack
+        if: always()
+        run: docker compose -p review_e2e -f docker-compose.yml down --volumes --remove-orphans || true

@@ -1,0 +1,50 @@
+# values-production.yaml — layered on top of values.yaml for production
+# installs: `helm install review charts/review -f charts/review/values.yaml
+# -f charts/review/values-production.yaml`. Per the plan's Phase 6 section
+# and the C4 doc's "default[s] off in the production values profile" note,
+# the one thing this profile *must* do is flip postgresql.enabled to
+# false — everything else here is a sensible production default, not a
+# hard requirement of this profile's existence.
+#
+# The operator still MUST supply real values for every credential/required
+# field below (github.webhookSecret, github.appPrivateKey, llm.apiKey,
+# database.url, github.setupStateSecret if setupMode is
+# ever enabled, and BOTH webhookApi.github.appId and worker.github.appId —
+# each defaults to "" in values.yaml but is parsed as a required int with
+# no default by WebhookAPISettings/WorkerSettings respectively, so leaving
+# either unset crash-loops that Deployment at startup) — either as
+# literals in a private values override file that is never committed, or
+# (preferred for production) via existingSecret references into whatever
+# secret backend already populates this cluster's Secrets. This file
+# itself carries no real credentials, per the plan's Security review
+# ("Secrets never committed").
+
+postgresql:
+  enabled: false
+
+database:
+  url:
+    value: ""
+    # Example of the preferred production shape — replace with a real
+    # Secret name/key from your own secret-management pipeline:
+    # existingSecret:
+    #   name: review-db-credentials
+    #   key: database-url
+    existingSecret:
+      name: ""
+      key: ""
+
+webhookApi:
+  environment: production
+  logLevel: INFO
+
+worker:
+  environment: production
+  logLevel: INFO
+
+# Phase 9 — keeps the Admin API's environment/log level in step with the
+# other two entrypoints above; without this override it would silently
+# stay on values.yaml's `development` default in a production install.
+adminApi:
+  environment: production
+  logLevel: INFO

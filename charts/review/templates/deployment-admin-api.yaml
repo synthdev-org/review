@@ -1,0 +1,82 @@
+{{- if .Values.adminApi.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "review.fullname" . }}-admin-api
+  labels:
+    {{- include "review.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admin-api
+spec:
+  replicas: {{ .Values.adminApi.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "review.selectorLabels" (dict "root" . "component" "admin-api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "review.labels" . | nindent 8 }}
+        {{- include "review.selectorLabels" (dict "root" . "component" "admin-api") | nindent 8 }}
+    spec:
+      containers:
+        - name: admin-api
+          image: "{{ .Values.adminApi.image.repository }}:{{ .Values.adminApi.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.adminApi.image.pullPolicy }}
+          # Same command docker-compose.yml's own admin_api service uses
+          # (Phase 1) — the runtime image's default CMD serves webhook_api
+          # instead, so this entrypoint needs an explicit override, unlike
+          # the webhook-api/worker Deployments above.
+          command:
+            [
+              "uvicorn",
+              "apps.admin_api.main:app",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "{{ .Values.adminApi.service.port }}",
+            ]
+          ports:
+            - name: http
+              containerPort: {{ .Values.adminApi.service.port }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "review.fullname" . }}-config
+          env:
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_DATABASE_URL" "field" .Values.database.url "secretName" (include "review.secretName" .) "secretKey" "database-url") | nindent 12 }}
+            {{- /* Bootstrap admin + CSRF secrets (Assumptions 11 and 13) — no safe default, admin_api fails to boot without them. */}}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_USERNAME" "field" .Values.adminApi.bootstrapUsername "secretName" (include "review.secretName" .) "secretKey" "admin-bootstrap-username") | nindent 12 }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_ADMIN_BOOTSTRAP_PASSWORD" "field" .Values.adminApi.bootstrapPassword "secretName" (include "review.secretName" .) "secretKey" "admin-bootstrap-password") | nindent 12 }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_ADMIN_CSRF_SECRET" "field" .Values.adminApi.csrfSecret "secretName" (include "review.secretName" .) "secretKey" "admin-csrf-secret") | nindent 12 }}
+            {{- /* Only when a client secret is configured; a public PKCE client has none. */}}
+            {{- if or .Values.adminApi.oidc.clientSecret.value .Values.adminApi.oidc.clientSecret.existingSecret.name }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_OIDC_CLIENT_SECRET" "field" .Values.adminApi.oidc.clientSecret "secretName" (include "review.secretName" .) "secretKey" "admin-oidc-client-secret") | nindent 12 }}
+            {{- end }}
+            {{- /* Only rendered when a credential map is configured: an
+                   unconditional secretKeyRef would break every existing
+                   install on upgrade (the key would not exist). */}}
+            {{- if or .Values.productKnowledge.credentials.value .Values.productKnowledge.credentials.existingSecret.name }}
+            {{- include "review.credentialEnvVar" (dict "envName" "REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CREDENTIALS" "field" .Values.productKnowledge.credentials "secretName" (include "review.secretName" .) "secretKey" "product-knowledge-credentials") | nindent 12 }}
+            {{- end }}
+          # Fresh probe blocks — no existing probe pattern to mirror in this
+          # chart (Assumption 10: neither deployment-webhook-api.yaml nor
+          # deployment-worker.yaml has one today, and that pre-existing gap
+          # is out of scope here). Targets the same `/healthz` convention
+          # apps/admin_api/main.py mirrors from apps/webhook_api/main.py.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.adminApi.resources | nindent 12 }}
+{{- end }}

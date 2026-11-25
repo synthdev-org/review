@@ -1,0 +1,85 @@
+# Non-secret bootstrap values for all three entrypoints, per the plan's
+# Phase 6 section ("ConfigMap ... for non-secret bootstrap values"). Keys
+# mirror apps/webhook_api/settings.py's WebhookAPISettings,
+# apps/worker/settings.py's WorkerSettings, and (Phase 9)
+# apps/admin_api/settings.py's AdminAPISettings fields one-for-one — each
+# entrypoint's own env_prefix (REVIEW_WEBHOOK_API_ / REVIEW_WORKER_ /
+# REVIEW_ADMIN_API_) keeps the three sets of keys from colliding in one
+# shared ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "review.fullname" . }}-config
+  labels:
+    {{- include "review.labels" . | nindent 4 }}
+data:
+  # Long values are deliberately kept on one line, not folded with `>-`: a
+  # folded block scalar does not interpret quotes, so `>-` + `| quote` would
+  # render literal quote characters into the value. test-render.sh asserts no
+  # ConfigMap value is a block scalar; do not "tidy" these back.
+  # --- Webhook API (apps/webhook_api/settings.py) ---
+  REVIEW_WEBHOOK_API_ENVIRONMENT: {{ .Values.webhookApi.environment | quote }}
+  REVIEW_WEBHOOK_API_LOG_LEVEL: {{ .Values.webhookApi.logLevel | quote }}
+  REVIEW_WEBHOOK_API_WEBHOOK_MAX_BODY_BYTES: {{ .Values.webhookApi.webhook.maxBodyBytes | quote }}
+  REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_MAX_REQUESTS: {{ .Values.webhookApi.webhook.rateLimit.maxRequests | quote }}
+  REVIEW_WEBHOOK_API_WEBHOOK_RATE_LIMIT_WINDOW_SECONDS: {{ .Values.webhookApi.webhook.rateLimit.windowSeconds | quote }}
+  REVIEW_WEBHOOK_API_SETUP_MODE: {{ .Values.webhookApi.setupMode | quote }}
+  REVIEW_WEBHOOK_API_SETUP_STATE_TTL_SECONDS: {{ .Values.webhookApi.setupStateTtlSeconds | quote }}
+  REVIEW_WEBHOOK_API_GITHUB_API_BASE_URL: {{ .Values.webhookApi.githubApi.baseUrl | quote }}
+  REVIEW_WEBHOOK_API_GITHUB_API_TIMEOUT_SECONDS: {{ .Values.webhookApi.githubApi.timeoutSeconds | quote }}
+  # GitHub App auth for the synchronous reaction-fetch path
+  # (docs/plans/plan-deliver-memory.md's Phase 4, Unit D, US-M3). `appId` is
+  # public-ish, not sensitive (same reasoning as REVIEW_WORKER_GITHUB_APP_ID
+  # below) — the private key is rendered via templates/secret.yaml instead
+  # (deployment-webhook-api.yaml's own credentialEnvVar entry).
+  REVIEW_WEBHOOK_API_GITHUB_APP_ID: {{ .Values.webhookApi.github.appId | quote }}
+  REVIEW_WEBHOOK_API_GITHUB_RETRY_MAX_ATTEMPTS: {{ .Values.webhookApi.github.retryMaxAttempts | quote }}
+  REVIEW_WEBHOOK_API_MEMORY_REACTION_POLL_MAX_COMMENTS_PER_POLL: {{ .Values.webhookApi.memoryReactionPollMaxCommentsPerPoll | quote }}
+
+  # --- Worker (apps/worker/settings.py) ---
+  REVIEW_WORKER_ENVIRONMENT: {{ .Values.worker.environment | quote }}
+  REVIEW_WORKER_LOG_LEVEL: {{ .Values.worker.logLevel | quote }}
+  REVIEW_WORKER_LLM_ENDPOINT: {{ .Values.worker.llm.endpoint | quote }}
+  REVIEW_WORKER_LLM_MODEL: {{ .Values.worker.llm.model | quote }}
+  REVIEW_WORKER_LLM_TIMEOUT_SECONDS: {{ .Values.worker.llm.timeoutSeconds | quote }}
+  # GitHub App auth / diff fetch (Phase 4). github_app_id is public-ish,
+  # not sensitive (see the Security review) — github_app_private_key below
+  # is the sensitive counterpart, rendered via templates/secret.yaml
+  # instead.
+  REVIEW_WORKER_GITHUB_APP_ID: {{ .Values.worker.github.appId | quote }}
+  REVIEW_WORKER_GITHUB_API_BASE_URL: {{ .Values.worker.github.apiBaseUrl | quote }}
+  REVIEW_WORKER_GITHUB_API_TIMEOUT_SECONDS: {{ .Values.worker.github.apiTimeoutSeconds | quote }}
+  REVIEW_WORKER_GITHUB_RETRY_MAX_ATTEMPTS: {{ .Values.worker.github.retryMaxAttempts | quote }}
+
+  # --- Product knowledge (non-secret; the token map is in secret.yaml) ---
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENABLED: {{ .Values.productKnowledge.enabled | quote }}
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS: {{ .Values.productKnowledge.callTimeoutSeconds | quote }}
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_DEADLINE_SECONDS: {{ .Values.productKnowledge.deadlineSeconds | quote }}
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS: {{ .Values.productKnowledge.allowPrivateNetworks | quote }}
+  REVIEW_WORKER_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST: {{ .Values.productKnowledge.endpointAllowlist | quote }}
+  REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENABLED: {{ .Values.productKnowledge.enabled | quote }}
+  REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_CALL_TIMEOUT_SECONDS: {{ .Values.productKnowledge.callTimeoutSeconds | quote }}
+  REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ALLOW_PRIVATE_NETWORKS: {{ .Values.productKnowledge.allowPrivateNetworks | quote }}
+  REVIEW_ADMIN_API_PRODUCT_KNOWLEDGE_ENDPOINT_ALLOWLIST: {{ .Values.productKnowledge.endpointAllowlist | quote }}
+
+  # --- Admin API (apps/admin_api/settings.py) — Phase 9 ---
+  REVIEW_ADMIN_API_ENVIRONMENT: {{ .Values.adminApi.environment | quote }}
+  REVIEW_ADMIN_API_LOG_LEVEL: {{ .Values.adminApi.logLevel | quote }}
+  REVIEW_ADMIN_API_SESSION_COOKIE_SECURE: {{ .Values.adminApi.sessionCookieSecure | quote }}
+  REVIEW_ADMIN_API_SESSION_IDLE_TIMEOUT_MINUTES: {{ .Values.adminApi.sessionIdleTimeoutMinutes | quote }}
+  REVIEW_ADMIN_API_OIDC_PROVIDER: {{ .Values.adminApi.oidc.provider | quote }}
+  REVIEW_ADMIN_API_OIDC_CLIENT_ID: {{ .Values.adminApi.oidc.clientId | quote }}
+  REVIEW_ADMIN_API_OIDC_REDIRECT_URI: {{ .Values.adminApi.oidc.redirectUri | quote }}
+  REVIEW_ADMIN_API_OIDC_ISSUER: {{ .Values.adminApi.oidc.issuer | quote }}
+  REVIEW_ADMIN_API_OIDC_AUTHENTIK_BASE_URL: {{ .Values.adminApi.oidc.authentik.baseUrl | quote }}
+  REVIEW_ADMIN_API_OIDC_AUTHENTIK_APP_SLUG: {{ .Values.adminApi.oidc.authentik.appSlug | quote }}
+  REVIEW_ADMIN_API_OIDC_SCOPES: {{ .Values.adminApi.oidc.scopes | quote }}
+  REVIEW_ADMIN_API_OIDC_USERNAME_CLAIM: {{ .Values.adminApi.oidc.usernameClaim | quote }}
+  REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_ATTEMPTS: {{ .Values.adminApi.loginRateLimit.attempts | quote }}
+  REVIEW_ADMIN_API_LOGIN_RATE_LIMIT_WINDOW_MINUTES: {{ .Values.adminApi.loginRateLimit.windowMinutes | quote }}
+  REVIEW_ADMIN_API_MIN_PASSWORD_LENGTH: {{ .Values.adminApi.minPasswordLength | quote }}
+  REVIEW_ADMIN_API_LLM_MODEL: {{ .Values.adminApi.llmModel | quote }}
+  REVIEW_ADMIN_API_EMBEDDING_MODEL_PATH: {{ .Values.adminApi.embeddingModelPath | quote }}
+  REVIEW_ADMIN_API_PROMETHEUS_BASE_URL: {{ .Values.adminApi.prometheus.baseUrl | quote }}
+  REVIEW_ADMIN_API_PROMETHEUS_TIMEOUT_SECONDS: {{ .Values.adminApi.prometheus.timeoutSeconds | quote }}
+  REVIEW_ADMIN_API_PROMETHEUS_RETRY_MAX_ATTEMPTS: {{ .Values.adminApi.prometheus.retryMaxAttempts | quote }}

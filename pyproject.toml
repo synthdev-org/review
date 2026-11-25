@@ -1,0 +1,326 @@
+[project]
+name = "review"
+version = "0.1.0"
+description = "Self-hosted, enterprise AI code review platform."
+requires-python = ">=3.12,<3.13"
+readme = "AGENTS.md"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.5,<3",
+    "uvicorn[standard]>=0.32,<1",
+    "sqlalchemy[asyncio]>=2.0.35,<3",
+    "asyncpg>=0.29,<1",
+    "alembic>=1.13,<2",
+    "litellm>=1.98.0,<2",
+    # Phase 4: adapter/github/manifest.py's exchange_temporary_code (Phase 0)
+    # already imports httpx, but it was only ever listed under the dev
+    # dependency group — a latent gap this phase's own dependency check
+    # surfaced (the built runtime image, which runs `uv sync --no-dev`, was
+    # already broken for that route). Moved to main dependencies here, the
+    # first phase to add a production GitHub-calling code path
+    # (adapter/github/auth.py, diff.py) that would ship the same way if left
+    # uncorrected. See the plan's Phase 4 section.
+    "httpx>=0.27,<1",
+    # Phase 4: RS256 JWT signing for the GitHub App server-to-server
+    # auth flow (adapter/github/auth.py) — no existing dependency or stdlib
+    # module covers this (manifest.py's HMAC-based setup-state signing is a
+    # different, symmetric primitive). Pulls in `cryptography` as its RS256
+    # backend.
+    "pyjwt[crypto]>=2.9,<3",
+    # Semgrep is NOT a dependency of this project: it hard-pins mcp 1.x and
+    # imports mcp.server.fastmcp, which conflicts with `mcp` below. It is
+    # run as a subprocess from its own locked environment
+    # (tools/semgrep/pyproject.toml + uv.lock; see the Dockerfile's
+    # `semgrep-tool` stage and ci.yml). Gitleaks (a Go binary) is vendored
+    # into the Dockerfile's runtime/dev stages.
+    # Product-knowledge MCP client (adapter/product_knowledge/ only), per
+    # ADR-0013. mcp 2.x brings httpx2 (not httpx) as its HTTP stack.
+    # ADR-0013 is PROPOSED: do not merge this line before it is ACCEPTED.
+    "mcp>=2.3,<3",
+    # Phase 3 (indexing plan): the AST-aware chunker (indexing/chunk.py)
+    # parses TypeScript/PHP/Go source into real syntax trees and splits at
+    # structural boundaries (per rag-techniques.md's cAST rationale) —
+    # added as ordinary PyPI-packaged grammars, the same way Semgrep was in
+    # Phase 1/5. Not covered by the existing Semgrep dependency: Semgrep is
+    # invoked as a subprocess for rule-based finding output only
+    # (adapter/analyzers/semgrep.py), exposing no API for the underlying
+    # chunk/parse-tree boundaries this phase needs. Phase 5's graph
+    # extraction (indexing/graph.py) reuses the same parse tree
+    # ``indexing/chunk.py`` produces rather than re-parsing.
+    "tree-sitter>=0.23,<1",
+    "tree-sitter-typescript>=0.23,<1",
+    "tree-sitter-php>=0.23,<1",
+    "tree-sitter-go>=0.23,<1",
+    "tree-sitter-python>=0.23,<1",
+    # Phase 4 (indexing plan): the local embedding client
+    # (adapter/embedding/local_onnx.py) — a thin ONNX wrapper that ships
+    # its own tokenizer/inference machinery, over a lower-level
+    # onnxruntime+tokenizers pairing or sentence-transformers, per the
+    # plan's Assumption 3 ("smaller dependency footprint, matching this
+    # whole PRD's keep-it-cheap direction"). At runtime this adapter always
+    # points fastembed at the Dockerfile's checksum-verified, baked-in
+    # model directory (`specific_model_path`) rather than letting it
+    # download/cache a model itself — see that module's own docstring.
+    "fastembed>=0.4,<1",
+    # Phase 6 (indexing plan): the Python-side SQLAlchemy ``Vector`` column
+    # type binding for the `index_chunk.embedding` column — the `vector`
+    # Postgres extension itself is already enabled by the baseline
+    # migration (0001), but no Python-side binding was installed until this
+    # phase actually needed to declare a vector-typed column.
+    "pgvector>=0.3,<1",
+    # Phase 3 (verification-pipeline plan): apps/worker/main.py's
+    # `_check_deprecated_settings_env_vars` calls `dotenv.dotenv_values`
+    # directly (WorkerSettings' `extra="ignore"` config means the built
+    # settings instance can never reveal a deprecated env var's presence,
+    # so raw `.env`/`os.environ` inspection is the only way to detect one).
+    # Previously only present transitively via pydantic-settings' own
+    # optional dotenv extra — pinned as a direct dependency now that a
+    # production code path imports it, so a future pydantic-settings
+    # version that drops or optionalizes that transitive pull doesn't
+    # silently break the worker at startup.
+    "python-dotenv>=1.0,<2",
+    # docs/specs/spec-observability.md's Unit A: OTel SDK/exporter wiring
+    # at both composition roots (Rollout & Release Safety, "New
+    # dependencies"). `opentelemetry-api` is the vendor-neutral,
+    # no-op-by-default interface domain code imports directly (the same
+    # precedent `logging` already sets — see that spec's "Resolved
+    # decisions"); `opentelemetry-sdk` provides the real
+    # TracerProvider/MeterProvider construction confined to
+    # apps/webhook_api/main.py and apps/worker/main.py (architecture.md's
+    # composition-root rule); `opentelemetry-exporter-otlp-proto-grpc` is
+    # the OTLP transport, chosen as OTel's own default and the transport
+    # that pairs cleanly with the standard OTel Collector's default
+    # receiver (a build-time choice between gRPC/HTTP variants, not a
+    # product decision per that spec's Rollout section).
+    "opentelemetry-api>=1.27,<2",
+    "opentelemetry-sdk>=1.27,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27,<2",
+    # Phase 1 (Admin UI delivery plan, Unit B): Argon2id password hashing
+    # for apps/admin_api's local login (adapter/auth/argon2_hasher.py), per
+    # that plan's Assumption 1/8/14. Nothing in pyproject.toml covered
+    # password hashing before this phase. `argon2-cffi` is the reference
+    # PyPI binding for the Argon2 CLI/reference implementation, the same
+    # library OWASP's own Argon2id guidance names.
+    "argon2-cffi>=23.1,<24",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.7,<1",
+    "mypy>=1.13,<2",
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<1",
+    "testcontainers[postgres]>=4.8,<5",
+    "respx>=0.21,<1",
+    "pyyaml>=6.0,<7",
+    "types-pyyaml>=6.0,<7",
+    "mutmut>=3.7,<4",
+    # Validates committed product-knowledge contract examples against the
+    # committed JSON Schemas (adapter/product_knowledge/test_contract_schemas.py);
+    # already in the lockfile transitively, listed explicitly so the test does
+    # not depend on that.
+    "jsonschema>=4.20,<5",
+    "types-jsonschema>=4.20,<5",
+]
+
+[tool.uv]
+# Phase 0 ships no installable distribution package yet — this repo is run
+# in place (via the Dockerfile / `uv run`), not published, so there is no
+# build backend to declare. Later phases can add [build-system] if this
+# project is ever published as an installable wheel.
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific rules
+]
+ignore = []
+
+[tool.ruff.lint.flake8-bugbear]
+# Phase 1 (Admin UI delivery plan, Unit B): apps/admin_api's own
+# require_session/require_admin_role dependencies (apps/admin_api/dependencies.py)
+# are the first place this codebase passes a per-parameter `Depends(...)`
+# call as an argument default — FastAPI's own documented, recommended
+# pattern for a dependency whose *return value* a route body needs (unlike
+# every prior router-level `dependencies=[Depends(...)]` gate in this repo,
+# e.g. apps/webhook_api/admin_routes.py's `_require_admin_key`, which never
+# needed its return value inside a route). B008 (no function calls in
+# argument defaults) exists to catch a mutable-default-argument footgun,
+# not this — FastAPI re-evaluates `Depends(...)` on every request, so this
+# is exempted the same way `flake8-bugbear` itself documents as the
+# standard fix for FastAPI projects, rather than a `# noqa: B008` on every
+# route this pattern recurs in across every later phase.
+extend-immutable-calls = ["fastapi.Depends"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "ingestion",
+    "indexing",
+    "review",
+    "llmgateway",
+    "findings",
+    "memory",
+    "tenancy",
+    "iam",
+    "adapter",
+    "apps",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+python_version = "3.12"
+strict = true
+files = [
+    "ingestion",
+    "indexing",
+    "review",
+    "llmgateway",
+    "findings",
+    "memory",
+    "tenancy",
+    "iam",
+    "adapter",
+    "apps",
+]
+# Third-party stubs beyond what's bundled are added as adapters/apps pull in
+# more infra libraries in later phases.
+[[tool.mypy.overrides]]
+module = "uvicorn.*"
+ignore_missing_imports = true
+
+# fastembed ships no inline type hints/py.typed marker and no third-party
+# stub package exists on PyPI as of Phase 4 (indexing plan) — the same
+# "no stubs beyond what's bundled" gap the uvicorn override above already
+# documents, now for this codebase's first ONNX-inference dependency.
+[[tool.mypy.overrides]]
+module = "fastembed.*"
+ignore_missing_imports = true
+
+# asyncpg (already a direct dependency via SQLAlchemy's async engine) ships
+# no inline type hints/py.typed marker either — the same gap as fastembed/
+# uvicorn above, now for tests/e2e/test_indexing_pipeline.py's first direct
+# (not-through-SQLAlchemy) use of it, to query Postgres straight from the
+# host for the indexing E2E scenario's own assertions.
+[[tool.mypy.overrides]]
+module = "asyncpg.*"
+ignore_missing_imports = true
+
+# Alembic version scripts are semi-generated (autogenerate produces the first
+# draft) and Alembic's own `Revision`/`op` typing is looser than the rest of
+# this codebase's strict-mypy standard; excluding just the versions directory
+# (not the rest of adapter.storage.migrations, e.g. env.py) keeps the schema
+# migration history from blocking `mypy --strict` on churn that isn't real
+# application logic.
+[[tool.mypy.overrides]]
+module = "adapter.storage.migrations.versions.*"
+ignore_errors = true
+
+# grpcio (the `grpc` package, a transitive dependency of this phase's
+# `opentelemetry-exporter-otlp-proto-grpc` — see pyproject.toml's own
+# dependency comment) ships no inline type hints/py.typed marker and no
+# third-party stub package is installed — the same "no stubs beyond what's
+# bundled" gap the uvicorn/fastembed/asyncpg overrides above already
+# document, now for `adapter/telemetry/test_telemetry_integration.py`'s
+# real local OTLP gRPC receiver (the only place in this repo that imports
+# `grpc` directly; `adapter/telemetry/sdk.py` itself only ever goes
+# through the already-typed `opentelemetry.exporter.otlp.proto.grpc.*`
+# wrapper modules).
+[[tool.mypy.overrides]]
+module = "grpc.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: real adapter against a real/high-fidelity external system (testing.md middle tier); excluded from the default run.",
+]
+addopts = "-m 'not integration' --strict-markers"
+testpaths = [
+    "ingestion",
+    "indexing",
+    "review",
+    "llmgateway",
+    "findings",
+    "memory",
+    "tenancy",
+    "iam",
+    "adapter",
+    "apps",
+]
+
+[tool.mutmut]
+# Explicit, not left to mutmut's own guesswork: with no `source_paths`,
+# mutmut falls back to guessing from the current directory name — and this
+# repo's own folder is named "review", which also happens to be one of the
+# nine package directories below. Left unset, that coincidence would make
+# mutmut silently mutate only `review/` and skip every other domain,
+# adapter, and app package. Mirrors [tool.mypy].files and
+# [tool.pytest.ini_options].testpaths above.
+source_paths = [
+    "ingestion",
+    "indexing",
+    "review",
+    "llmgateway",
+    "findings",
+    "memory",
+    "tenancy",
+    "iam",
+    "adapter",
+    "apps",
+]
+# No explicit test-selection/marker args needed here: mutmut copies
+# pyproject.toml into its mutants/ sandbox (see also_copy in mutmut's own
+# default config) and runs plain `pytest` there, which already picks up
+# [tool.pytest.ini_options].addopts above (`-m 'not integration'`) — so
+# integration tests (real Postgres/testcontainers, no LM Studio in CI) stay
+# excluded from mutation runs the same way they're excluded from a bare
+# `pytest` run, with no second place to keep in sync.
+#
+# also_copy: mutmut's own default already copies tests/, test/,
+# pyproject.toml, and the lockfiles into mutants/ — but apps/test_env_example_sync.py
+# and apps/test_github_workflows.py read .env.example and .github/workflows/
+# directly from the repo root (Path(__file__).resolve().parents[1]), which
+# are outside every source_paths package dir above, so mutmut's sandbox copy
+# needs them added explicitly or those two test files fail with a
+# FileNotFoundError against every single mutant, not just the ones that
+# actually broke something. Same for
+# adapter/product_knowledge/test_contract_schemas.py, whose drift test reads
+# the committed schemas/examples under docs/reference/product-knowledge-contract/
+# (parents[2] of the test file == the repo root, or mutants/ in the sandbox).
+# Likewise the Dockerfile and docker-compose.yml (packaging/env-sync guards),
+# charts/ (configmap + test-render.sh), docs/reference/operations.md and the
+# admin frontend's src/ (runbook-vs-disclosure-literal tests), and docs/adr
+# (test_adr_scope_sync.py checks ADR-0005 names every public pure function).
+# apps/test_product_knowledge_runbook.py asserts every repo-root path a unit
+# test reads is listed here, so a new one fails loudly instead of per-mutant.
+also_copy = [
+    ".env.example",
+    ".github",
+    "Dockerfile",
+    "docker-compose.yml",
+    "charts",
+    "docs/adr",
+    "docs/reference/operations.md",
+    "docs/reference/product-knowledge-contract",
+    "apps/admin_api/frontend/src",
+    "scripts/scan-fixtures.sh",
+]
+# The fake MCP provider is test tooling, not product code: never mutate it.
+do_not_mutate = ["adapter/product_knowledge/testing/*", "llmgateway/testing/*"]

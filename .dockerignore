@@ -1,0 +1,30 @@
+.git
+docs
+# Committed contract schemas/examples: read by adapter/product_knowledge's
+# drift and conformance tests, which run inside the `dev` image.
+!docs/reference/product-knowledge-contract
+# The operator runbook: apps/test_product_knowledge_runbook.py asserts the
+# egress-disclosure literal and per-outcome entries against it in `dev`.
+!docs/reference/operations.md
+# ADR scope-sync guard (adapter/product_knowledge/test_adr_scope_sync.py).
+!docs/adr
+.venv
+.venv-docker
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+.env.*
+!.env.example
+mutants/
+
+# Frontend (apps/admin_api/frontend, Phase 8) — the `dev`/`runtime` stages
+# never need the frontend's own node_modules/dist; the Dockerfile's
+# dedicated `frontend-build` stage installs deps and builds dist/ itself
+# from a clean COPY of the frontend source, and only that stage's own
+# dist/ output is copied into `runtime`.
+apps/admin_api/frontend/node_modules/
+apps/admin_api/frontend/dist/

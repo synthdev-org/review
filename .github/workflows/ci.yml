@@ -1,0 +1,322 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy --strict
+        run: uv run mypy --strict .
+
+      # US13 (docs/specs/spec-observability.md): fails the build if the
+      # shipped Grafana dashboard (charts/review/dashboards/review.json)
+      # references a metric name the instrumented code no longer emits, so
+      # a future metric rename can't silently break it. Runs directly
+      # (not via pytest) against this checked-out repo's own uv/Python —
+      # this job doesn't need the Docker-only local/agent execution rule,
+      # per that spec's Unit E deliverable #4.
+      - name: Dashboard/metric drift guard
+        run: uv run python scripts/check-dashboard-metrics.py
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # The Docker image bakes this model in; host-run tests import apps
+      # that exit at startup without it (the embedding startup check).
+      - name: Fetch embedding model
+        run: |
+          sudo mkdir -p /app/models
+          sudo chown "$USER" /app/models
+          scripts/fetch-embedding-model.sh
+
+      # adapter/analyzers/test_semgrep.py runs the real Semgrep CLI, which
+      # lives in its own locked environment (tools/semgrep, ADR-0013).
+      - name: Install Semgrep (isolated environment)
+        run: |
+          set -euo pipefail
+          uv sync --project tools/semgrep --locked
+          mkdir -p "$HOME/.local/semgrep-bin"
+          ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
+          echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
+          "$HOME/.local/semgrep-bin/semgrep" --version
+
+      # No `-m integration` here on purpose: integration tests (Phase 2
+      # onward, tagged @pytest.mark.integration) run on every PR, not every
+      # push, per docs/rules/testing.md's CI-gating section. Plain `pytest`
+      # already excludes them via pyproject.toml's `addopts`.
+      # Coverage feeds the SonarCloud and Codacy jobs below. pytest-cov is added for
+      # this run only (`--with`), so it is not a project dependency.
+      - name: pytest (unit only, with coverage)
+        run: uv run --with pytest-cov pytest --cov=. --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+
+  integration-test:
+    name: Integration tests (Postgres)
+    # Gated on pull requests, not every push, per docs/rules/testing.md's
+    # CI-gating section ("Integration: every PR") and the plan's Phase 2
+    # section. `testcontainers-python` (adapter/storage's migration,
+    # SKIP LOCKED, and pgvector-presence tests) manages its own real
+    # Postgres/pgvector container against the runner's Docker daemon, which
+    # ubuntu-latest GitHub-hosted runners provide out of the box — no
+    # `services:` container needed here.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # The Docker image bakes this model in; host-run tests import apps
+      # that exit at startup without it (the embedding startup check).
+      - name: Fetch embedding model
+        run: |
+          sudo mkdir -p /app/models
+          sudo chown "$USER" /app/models
+          scripts/fetch-embedding-model.sh
+
+      # Semgrep lives in its own locked environment (tools/semgrep) because
+      # it conflicts with the main project's `mcp` pin (ADR-0013); the
+      # adapter runs it as a `semgrep` subprocess found on PATH.
+      - name: Install Semgrep (isolated environment)
+        run: |
+          set -euo pipefail
+          uv sync --project tools/semgrep --locked
+          mkdir -p "$HOME/.local/semgrep-bin"
+          ln -sf "$PWD/tools/semgrep/.venv/bin/semgrep" "$HOME/.local/semgrep-bin/semgrep"
+          echo "$HOME/.local/semgrep-bin" >> "$GITHUB_PATH"
+          "$HOME/.local/semgrep-bin/semgrep" --version
+
+      # Gitleaks is not (a Go binary
+      # with no first-party Python packaging, per the plan's Assumptions
+      # section) — this job runs `pytest -m integration` directly on the
+      # runner, not inside the built Docker image (which vendors Gitleaks
+      # itself, per the Dockerfile), so the binary needs installing here
+      # too. Pinned to the same explicit tag as the Dockerfile
+      # (v8.21.2, never `:latest`), verified against a checksum published
+      # alongside that pinned GitHub release before use — a mismatch fails
+      # the build, the same fatal-not-warn action every other pinning check
+      # in this plan takes.
+      - name: Install Gitleaks (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION=8.21.2
+          ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL -o "$ARCHIVE" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${ARCHIVE}"
+          curl -sSL -o checksums.txt \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${ARCHIVE}\$" checksums.txt | sha256sum -c -
+          tar xzf "$ARCHIVE" gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          chmod +x /usr/local/bin/gitleaks
+          gitleaks version
+
+      # Eval corpus and every cassette/fixture directory must be secret-free
+      # (docs/specs/spec-review-quality.md, non-functional requirements). Needs the Gitleaks
+      # binary installed above.
+      - name: Gitleaks over eval corpus and cassettes
+        run: scripts/scan-fixtures.sh
+
+      - name: pytest -m integration
+        run: uv run pytest -m integration
+
+  frontend:
+    name: Frontend (typecheck, build, vitest)
+    # apps/admin_api's React/TypeScript/Vite frontend (Phase 8, Unit I) —
+    # its own dependency tree, separate from the Python `uv` project, so it
+    # gets its own job with Node set up rather than piggybacking on the
+    # `test` job above. Runs on every push, same as the Python unit-test
+    # job, per docs/rules/testing.md's CI-gating rule ("Unit: every push")
+    # — this is this tier's CI gate, not e2e.yml (which only builds the
+    # frontend via Docker as part of the full Compose stack and never runs
+    # `npm test`).
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/admin_api/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/admin_api/frontend/package-lock.json
+
+      - name: npm ci
+        run: npm ci --no-audit --no-fund
+
+      - name: Type check + build
+        run: npm run build
+
+      - name: vitest run
+        run: npm test
+
+  helm-lint:
+    name: Helm chart lint & template
+    # No real cluster involved — the Helm-equivalent of the pyramid's unit
+    # tier, per the plan's Phase 6 ("Helm chart skeleton") Tests section.
+    # Runs on every push, same as the plain lint/unit-test jobs above,
+    # since it's just as cheap and has no external dependency.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.4"
+
+      # charts/review/test-render.sh runs helm lint + helm template against
+      # the default values.yaml, values-production.yaml layered on top
+      # (asserting postgresql.enabled: false takes effect), and
+      # postgresql.enabled: false plus an existingSecret reference for
+      # every credential field (asserting no literal credential value
+      # renders anywhere) — see the plan's Phase 6 Tests/Acceptance
+      # sections.
+      - name: helm lint + helm template checks
+        run: ./charts/review/test-render.sh
+
+  snyk:
+    name: Snyk (dependency vulnerabilities)
+    # Needs the SNYK_TOKEN repository secret. A pull request from a fork
+    # has no access to secrets, so the job runs only for branches in this
+    # repository.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Snyk CLI
+        run: npm install --global snyk@1
+
+      # Snyk reads a requirements file, so export the locked Python
+      # dependencies from uv.lock. Snyk also needs the packages installed,
+      # so sync them into .venv, add pip, and point Snyk at that Python.
+      - name: Export locked Python dependencies
+        run: |
+          uv export --locked --no-hashes --no-emit-project --output-file requirements.txt
+          uv sync --locked
+          # uv environments have no pip, and the Snyk pip resolver needs it.
+          uv pip install --python .venv/bin/python pip
+
+      - name: Snyk test (Python dependencies)
+        run: snyk test --file=requirements.txt --package-manager=pip --command=.venv/bin/python --severity-threshold=high
+
+      - name: Snyk test (Admin UI dependencies)
+        working-directory: apps/admin_api/frontend
+        run: snyk test --file=package-lock.json --severity-threshold=high
+
+      # Records the dependency tree in Snyk so that it can alert about new
+      # vulnerabilities between builds. Runs on the main branch only.
+      - name: Snyk monitor
+        if: github.ref == 'refs/heads/main'
+        run: |
+          snyk monitor --file=requirements.txt --package-manager=pip --command=.venv/bin/python --project-name=review-python
+          snyk monitor --file=apps/admin_api/frontend/package-lock.json --project-name=review-admin-ui
+
+  sonarcloud:
+    name: SonarCloud (code quality and coverage)
+    # Needs the SONAR_TOKEN repository secret. See the Snyk job for the
+    # reason behind this condition.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # SonarCloud needs the full history to blame new code correctly.
+          fetch-depth: 0
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-xml
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  codacy-coverage:
+    name: Codacy (coverage upload)
+    # Codacy analyzes code through its GitHub App. This job only sends the
+    # coverage report. It needs the CODACY_PROJECT_TOKEN repository secret,
+    # so it skips when the secret is not set and for pull requests from forks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download coverage report
+        if: env.CODACY_PROJECT_TOKEN != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-xml
+
+      - name: Upload coverage to Codacy
+        if: env.CODACY_PROJECT_TOKEN != ''
+        uses: codacy/codacy-coverage-reporter-action@v1
+        with:
+          project-token: ${{ env.CODACY_PROJECT_TOKEN }}
+          coverage-reports: coverage.xml

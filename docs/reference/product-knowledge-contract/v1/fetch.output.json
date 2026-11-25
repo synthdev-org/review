@@ -1,0 +1,70 @@
+{
+  "properties": {
+    "content": {
+      "title": "Content",
+      "type": "string"
+    },
+    "content_format": {
+      "default": "text",
+      "enum": [
+        "text",
+        "markdown"
+      ],
+      "title": "Content Format",
+      "type": "string"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "source_type": {
+      "pattern": "^[a-z][a-z0-9_.-]{0,31}$",
+      "title": "Source Type",
+      "type": "string"
+    },
+    "title": {
+      "maxLength": 200,
+      "title": "Title",
+      "type": "string"
+    },
+    "truncated": {
+      "default": false,
+      "title": "Truncated",
+      "type": "boolean"
+    },
+    "updated_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Updated At"
+    },
+    "url": {
+      "anyOf": [
+        {
+          "maxLength": 2048,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Url"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "content",
+    "source_type"
+  ],
+  "title": "FetchResponse",
+  "type": "object"
+}

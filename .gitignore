@@ -1,0 +1,66 @@
+# Environment / secrets — never commit real values (see docs/plans Security review).
+.env
+.env.*
+!.env.example
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# uv / venvs
+.venv/
+venv/
+.uv-cache/
+
+# Test / coverage / type-checker caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Mutation testing (mutmut) working directory — mutated source copies +
+# per-mutant .meta result files, regenerable by scripts/run-mutation-tests.sh
+mutants/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Frontend build artifacts (apps/admin_api/frontend, Phase 8) — node_modules
+# is regenerable from package-lock.json; dist/ (already covered by the
+# generic `dist/` pattern above) is built fresh by the Docker image's own
+# frontend-build stage, never committed.
+apps/admin_api/frontend/node_modules/
+apps/admin_api/frontend/dist/
+
+# Helm build artifacts (charts/review, Phase 6) — `helm dependency update`
+# packages the local charts/postgresql/ subchart source into a .tgz plus a
+# Chart.lock; both are regenerable from source and neither should be
+# committed, matching how the subchart directory itself stays the
+# editable source of truth (see charts/review/Chart.yaml's dependency
+# comment).
+charts/**/charts/*.tgz
+charts/**/Chart.lock

@@ -1,0 +1,54 @@
+# Vendored, pinned Semgrep ruleset for SQL migration safety (plan
+# docs/plans/plan-deliver-prompt-improvements-and-classifier.md Phase 4, RQ8).
+# Same mechanism as semgrep_ruleset.yaml (content-pinned by the sibling
+# .sha256, checked by test_semgrep.py) but a separate file so the analyzer can
+# be switched on and off on its own (`static_analysis_sql_migrations_enabled`).
+#
+# Each rule drops matches lying inside a `--` comment, a `/* */` comment or a
+# single-line '...' string literal (pattern-not-regex removes any match
+# contained in one of those ranges).
+# shortcut: regex, not a SQL parser. Multi-line string literals and $$ bodies
+# are not recognised (the latter are still scanned on purpose); upgrade to a
+# SQL-aware parser if fixture precision shows this matters.
+rules:
+  - id: review-sql-index-not-concurrent
+    languages: [generic]
+    severity: WARNING
+    message: >-
+      CREATE INDEX without CONCURRENTLY takes a write lock on the table for
+      the whole build. Use CREATE INDEX CONCURRENTLY (outside a transaction).
+    paths:
+      include: ["*.sql"]
+    patterns:
+      - pattern-regex: '(?i)\bCREATE\s+(UNIQUE\s+)?INDEX\s+(?!\s|CONCURRENTLY\b)'
+      - pattern-not-regex: '--[^\n]*'
+      - pattern-not-regex: '(?s)/\*.*?\*/'
+      - pattern-not-regex: "'[^'\\n]*'"
+
+  - id: review-sql-drop-policy
+    languages: [generic]
+    severity: ERROR
+    message: >-
+      DROP POLICY removes a row-level-security policy. Confirm the table
+      stays protected by another policy; otherwise this exposes rows.
+    paths:
+      include: ["*.sql"]
+    patterns:
+      - pattern-regex: '(?i)\bDROP\s+POLICY\b'
+      - pattern-not-regex: '--[^\n]*'
+      - pattern-not-regex: '(?s)/\*.*?\*/'
+      - pattern-not-regex: "'[^'\\n]*'"
+
+  - id: review-sql-drop-missing-if-exists
+    languages: [generic]
+    severity: WARNING
+    message: >-
+      DROP without IF EXISTS makes the migration fail if re-run or applied to
+      a database that drifted. Add IF EXISTS.
+    paths:
+      include: ["*.sql"]
+    patterns:
+      - pattern-regex: '(?i)\bDROP\s+(TABLE|INDEX|VIEW|COLUMN|CONSTRAINT|TRIGGER|FUNCTION|SCHEMA|TYPE)\s+(?!\s|IF\s+EXISTS\b)'
+      - pattern-not-regex: '--[^\n]*'
+      - pattern-not-regex: '(?s)/\*.*?\*/'
+      - pattern-not-regex: "'[^'\\n]*'"

@@ -1,0 +1,58 @@
+# Brand-new template (verified no `Ingress` template existed in this
+# chart before this phase) — US-A21: one chart-managed Ingress routing
+# external traffic to both the Admin UI and the GitHub webhook receiver.
+# Independently toggleable from `adminApi.enabled`/`webhookApi` (there is
+# no per-Deployment enabled flag for those today, so "independently
+# toggleable" here means `ingress.enabled: false` alone, leaving both
+# Services running and reachable in-cluster without external exposure).
+#
+# TLS is configurable two ways, both expressed via the same
+# `ingress.tls` list (standard Kubernetes Ingress shape), mirroring the
+# chart's existing `existingSecret` convention (see values.yaml's header):
+#   1. existingSecret: an operator/secret-backend already-populated
+#      Secret name — set `ingress.tls[].secretName` to it directly.
+#   2. cert-manager: set a cert-manager annotation (e.g.
+#      `cert-manager.io/cluster-issuer`) via `ingress.annotations`, and
+#      `ingress.tls[].secretName` names the Secret cert-manager will
+#      create/populate itself.
+# This template doesn't need to know which case applies — either way, it
+# only ever references a Secret name, never a literal certificate value.
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "review.fullname" . }}
+  labels:
+    {{- include "review.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    {{- $hostName := .host }}
+    - host: {{ $hostName }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ include "review.fullname" $ }}-{{ .service }}
+                port:
+                  number: {{- if eq .service "admin-api" }} {{ $.Values.adminApi.service.port }}
+                  {{- else if eq .service "webhook-api" }} {{ $.Values.webhookApi.service.port }}
+                  {{- else }} {{ fail (printf "ingress: unknown backend service %q for host %q — must be \"admin-api\" or \"webhook-api\"" .service $hostName) }}
+                  {{- end }}
+          {{- end }}
+    {{- end }}
+{{- end }}
