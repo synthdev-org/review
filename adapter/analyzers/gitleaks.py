@@ -1,4 +1,4 @@
-"""adapter.analyzers.gitleaks — the concrete ``StaticAnalyzer`` and
+"""adapter.analyzers.gitleaks - the concrete ``StaticAnalyzer`` and
 ``TextRedactor`` implementations backed by the vendored Gitleaks binary, per
 the plan's Phase 5 section.
 
