@@ -85,7 +85,7 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
         path = self.path
         if re.fullmatch(r"/app/installations/\d+/access_tokens", path):
             self._send_json(
-                201, {"token": f"ghs_{uuid.uuid4().hex}", "expires_at": "2999-01-01T00:00:00Z"}
+                201, {"token": f"ghs_sa_{uuid.uuid4().hex}", "expires_at": "2999-01-01T00:00:00Z"}
             )
         elif re.fullmatch(rf"/repos/{re.escape(_OWNER_REPO)}/pulls/\d+/reviews", path):
             self._calls().review_bodies.append(self._read_json_body())

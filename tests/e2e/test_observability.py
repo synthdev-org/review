@@ -238,7 +238,7 @@ class _StubGitHubHandler(BaseHTTPRequestHandler):
 
         if re.fullmatch(r"/app/installations/\d+/access_tokens", path):
             self._send_json(
-                201, {"token": f"ghs_{uuid.uuid4().hex}", "expires_at": "2999-01-01T00:00:00Z"}
+                201, {"token": f"ghs_obs_{uuid.uuid4().hex}", "expires_at": "2999-01-01T00:00:00Z"}
             )
             return
 
