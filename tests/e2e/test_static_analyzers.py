@@ -266,5 +266,11 @@ def test_doc_and_migration_findings_are_posted_with_no_llm_call_for_them(
     assert "Broken link" in review
     assert "CREATE INDEX without CONCURRENTLY" in review
     # The LLM reported nothing, and analyzer findings skip verification: no verdict request.
-    assert not any('"verdicts"' in prompt for prompt in prompts)
-    assert not any("CREATE INDEX without CONCURRENTLY" in prompt for prompt in prompts)
+    assert not any("verdicts" in prompt for prompt in prompts)
+    # The generation prompt carries analyzer findings as "already reported — do not
+    # repeat" context (review/review_generation.py), so only that prompt may mention one.
+    assert all(
+        "already reported — do not repeat" in prompt
+        for prompt in prompts
+        if "CREATE INDEX without CONCURRENTLY" in prompt
+    )

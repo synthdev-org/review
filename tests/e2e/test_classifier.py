@@ -32,6 +32,7 @@ import httpx
 import pytest
 
 from adapter.product_knowledge.testing.loopback import self_signed_cert
+from findings.markdown import escape_markdown
 from tests.e2e.conftest import (
     COMPOSE_FILE,
     PROJECT_NAME,
@@ -58,6 +59,8 @@ _TOKEN = "e2e-classifier-token-canary"
 _REF = "e2e-classifier"
 _HOST = "host.docker.internal"
 _FINDING = "Changing this return value may break billing retries."
+# The posted comment markdown-escapes the message, and `body` below is JSON-encoded.
+_POSTED_FINDING = json.dumps(escape_markdown(_FINDING))[1:-1]
 
 
 @dataclass
@@ -244,7 +247,7 @@ def _review(env: dict[str, str], github: HTTPServer, llm: HTTPServer, number: in
     body = _review_and_wait(
         env, github, llm, number=number, title=f"Change {number}", head_ref=f"c/{number}"
     )
-    assert _FINDING in body, "the finding must be posted in every scenario"
+    assert _POSTED_FINDING in body, "the finding must be posted in every scenario"
     return int(llm.call_count)  # type: ignore[attr-defined]
 
 

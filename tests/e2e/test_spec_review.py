@@ -52,7 +52,7 @@ _OWNER_REPO = "acme/spec-review-e2e"
 _INSTALLATION_ID = 987656
 _WEBHOOK_SECRET = "e2e-test-webhook-secret"
 _WAIT_TIMEOUT_SECONDS = 120.0
-_SPEC_STALL_SECONDS = 6.0  # longer than the 2 s internal deadline below
+_SPEC_STALL_SECONDS = 6.0  # longer than the 1 s LLM and 2 s internal timeouts below
 
 _BILLING_SPEC_PATH = "docs/specs/spec-billing-retry.md"
 _BILLING_SPEC = b"# Billing retry\n\nEvery retry must carry an idempotency key.\n"
@@ -163,7 +163,7 @@ class _StubLLMHandler(BaseHTTPRequestHandler):
                     ]
                 }
             )
-        if '"verdicts"' in request_body:
+        if "verdicts" in request_body:  # the raw body is JSON-escaped: no literal quotes
             verdict = {
                 "valid": True,
                 "actionable": True,
@@ -256,6 +256,9 @@ def running_stack(
         REVIEW_WORKER_GITHUB_API_BASE_URL=f"http://host.docker.internal:{STUB_GITHUB_PORT}",
         REVIEW_WORKER_POLL_INTERVAL_SECONDS="0.2",
         REVIEW_WORKER_SPEC_REVIEW_STEP_TIMEOUT_SECONDS="10",
+        # The settings validator requires internal timeout > LLM timeout, so the LLM
+        # timeout is lowered below the 2 s internal deadline (base env uses 10 s).
+        REVIEW_WORKER_LLM_TIMEOUT_SECONDS="1",
         REVIEW_WORKER_SPEC_REVIEW_INTERNAL_TIMEOUT_SECONDS="2",
     )
     compose_down(env)
@@ -351,7 +354,10 @@ def test_spec_finding_posted_when_spec_matches_and_review_survives_no_spec_and_s
 
     # 3. The spec call stalls past the internal deadline: the step degrades, the review posts.
     degraded = _review_and_wait(env, stub_github_server, number=3, head_ref="feature/timeout-retry")
-    assert len(spec_calls) == 2
+    # The 1 s LLM timeout makes the OpenAI client retry the stalled call, so PR #3 may
+    # send several spec requests; all of them must be for that PR.
+    assert len(spec_calls) >= 2
+    assert all("Timeout retry" in call for call in spec_calls[1:])
     assert _SPEC_FINDING_MESSAGE not in degraded
     assert "Changing this return value" in degraded
     calls: _CallLog = stub_github_server.calls  # type: ignore[attr-defined]

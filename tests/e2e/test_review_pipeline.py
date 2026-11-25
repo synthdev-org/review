@@ -118,12 +118,19 @@ class _CallLog:
     check_run_bodies: list[dict[str, object]] = field(default_factory=list)
 
 
+_V2_README_LINES = ["# hello", "", "line three", "", "line five", "", "line seven"]
+_V2_README = ("\n".join(_V2_README_LINES) + "\n").encode()
+
+
 def _single_file_scenario(
-    *, path: str = "app.py", content: bytes = _SECRET_FILE_CONTENT
+    *,
+    path: str = "app.py",
+    content: bytes = _SECRET_FILE_CONTENT,
+    patch: str = "@@ -0,0 +1 @@\n+planted",
 ) -> _GitHubScenario:
     blob_sha = "f" * 40
     return _GitHubScenario(
-        files=[{"filename": path, "status": "added", "patch": "@@ -0,0 +1 @@\n+planted"}],
+        files=[{"filename": path, "status": "added", "patch": patch}],
         tree=[{"path": path, "mode": "100644", "sha": blob_sha, "size": len(content)}],
         blobs={blob_sha: content},
     )
@@ -820,7 +827,14 @@ def test_v2_review_posts_one_root_cause_hides_nits_and_keeps_the_fence_closed(
     )
     _reset_github_scenario(
         stub_github_server,
-        _single_file_scenario(path="README.md", content=b"# hello\n\nnothing interesting here.\n"),
+        # The patch must cover every line the stub LLM reports (3, 5, 7): findings outside
+        # the diff are demoted to file-level and would not be inline comments.
+        _single_file_scenario(
+            path="README.md",
+            content=_V2_README,
+            patch="@@ -0,0 +1,7 @@\n"
+            + "".join(f"+{line}\n" for line in _V2_README_LINES).rstrip("\n"),
+        ),
     )
     pr_number, head_sha = _fresh_pr()
 
