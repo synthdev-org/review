@@ -3,7 +3,7 @@
 ``shrink_diff`` stubs data/fixture patches, collapses deletion-only hunks and
 trims long prose, so the prompt carries less low-value text. The caller lists
 every ``ShrinkNote`` as not-reviewed-in-detail; nothing is silently dropped.
-Imports ``ingestion.diff`` only and never raises on odd input.
+Imports ``ingestion.diff`` only and never raises on odd input (no I/O at all).
 """
 
 from __future__ import annotations
