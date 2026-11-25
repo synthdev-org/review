@@ -354,7 +354,10 @@ def test_spec_finding_posted_when_spec_matches_and_review_survives_no_spec_and_s
 
     # 3. The spec call stalls past the internal deadline: the step degrades, the review posts.
     degraded = _review_and_wait(env, stub_github_server, number=3, head_ref="feature/timeout-retry")
-    assert len(spec_calls) == 2
+    # The 1 s LLM timeout makes the OpenAI client retry the stalled call, so PR #3 may
+    # send several spec requests; all of them must be for that PR.
+    assert len(spec_calls) >= 2
+    assert all("Timeout retry" in call for call in spec_calls[1:])
     assert _SPEC_FINDING_MESSAGE not in degraded
     assert "Changing this return value" in degraded
     calls: _CallLog = stub_github_server.calls  # type: ignore[attr-defined]
