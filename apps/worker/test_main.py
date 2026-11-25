@@ -120,6 +120,12 @@ async def _noop_dispatch_loop_forever(
     await http_client.aclose()
 
 
+def _json_log_lines(out: str) -> list[dict[str, Any]]:
+    """Our JSON log records only: a real LLM call makes LiteLLM print its own
+    plain-text lines (e.g. ``21:07:21 - LiteLLM:INFO: ...``) to stdout too."""
+    return [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+
+
 def test_main_parses_settings_and_logs_startup(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -203,7 +209,7 @@ def test_main_succeeds_when_llm_endpoint_reachable(
         server.server_close()
 
     captured = capsys.readouterr()
-    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    payloads = _json_log_lines(captured.out)
     assert any(p["message"] == "llm endpoint reachable" for p in payloads)
     assert any(p["message"] == "worker started" for p in payloads)
 
@@ -225,7 +231,7 @@ def test_main_exits_non_zero_when_llm_endpoint_unreachable(
     assert excinfo.value.code == 1
 
     captured = capsys.readouterr()
-    payloads = [json.loads(line) for line in captured.out.strip().splitlines() if line]
+    payloads = _json_log_lines(captured.out)
     assert any(
         p["message"] == "LLM endpoint unreachable at startup; exiting" and p["level"] == "ERROR"
         for p in payloads
