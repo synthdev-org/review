@@ -84,7 +84,7 @@ RUN set -eu; \
 # independently of the frontend's own source, mirroring `deps`'s own
 # `uv sync --no-install-project` split above) keeps a source-only change
 # from invalidating the `npm ci` layer.
-FROM node:20-slim AS frontend-build
+FROM node:25-slim AS frontend-build
 WORKDIR /frontend
 COPY apps/admin_api/frontend/package.json apps/admin_api/frontend/package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
