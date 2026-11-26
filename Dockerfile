@@ -44,7 +44,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # stage (so `pytest -m integration` run via `docker build --target dev`
 # locally has the same binary CI's integration-test job installs separately
 # on the bare runner — see .github/workflows/ci.yml).
-FROM zricethezav/gitleaks:v8.21.2 AS gitleaks
+FROM zricethezav/gitleaks:v8.30.1 AS gitleaks
 
 # --- embedding-model: download and checksum-verify the bundled local
 # embedding model weights (US4, adapter/embedding/local_onnx.py) at build
