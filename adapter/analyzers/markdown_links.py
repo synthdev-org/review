@@ -49,7 +49,7 @@ _SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*:", re.IGNORECASE)
 
 
 def _fence(line: str) -> tuple[str, str] | None:
-    """CommonMark fence line as ``(marker run, rest)``, else None (linear scan, no regex)."""
+    """Parse a CommonMark fence line as ``(marker run, rest)``, else None."""
     body = line.lstrip(" ")
     if len(line) - len(body) > 3 or body[:1] not in ("`", "~"):
         return None
