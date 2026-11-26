@@ -16,7 +16,11 @@ from adapter.product_knowledge.testing.fake_provider import (
     FakeProvider,
 )
 from apps.admin_api.dependencies import CSRF_COOKIE_NAME, CSRF_HEADER_NAME
-from apps.admin_api.pk_routes_harness import (
+from apps.admin_api.probe_rate_limit import (
+    GLOBAL_LIMIT_PER_MINUTE,
+    SESSION_LIMIT_PER_MINUTE,
+)
+from apps.admin_api.testing.pk_routes_harness import (
     HOST,
     TOKEN,
     Harness,
@@ -25,10 +29,6 @@ from apps.admin_api.pk_routes_harness import (
     login,
     post,
     run,
-)
-from apps.admin_api.probe_rate_limit import (
-    GLOBAL_LIMIT_PER_MINUTE,
-    SESSION_LIMIT_PER_MINUTE,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]

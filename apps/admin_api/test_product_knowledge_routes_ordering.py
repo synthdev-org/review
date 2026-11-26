@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from adapter.product_knowledge.testing.fake_provider import (
     FakeProvider,
 )
-from apps.admin_api.pk_routes_harness import (
+from apps.admin_api.testing.pk_routes_harness import (
     HOST,
     TOKEN,
     Harness,

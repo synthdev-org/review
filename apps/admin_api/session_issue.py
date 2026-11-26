@@ -34,7 +34,7 @@ async def issue_session(
     response.set_cookie(
         SESSION_COOKIE_NAME, raw_token, httponly=True, secure=secure, samesite="lax"
     )
-    response.set_cookie(
+    response.set_cookie(  # NOSONAR S3330: double-submit CSRF token, the SPA must read it from JS
         CSRF_COOKIE_NAME,
         generate_csrf_token(session_id=session.id, secret=csrf_secret),
         httponly=False,

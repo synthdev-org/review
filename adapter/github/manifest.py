@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import secrets
 import time
+from urllib.parse import quote
 
 import httpx
 
@@ -123,7 +124,7 @@ async def exchange_temporary_code(
     needs — never a raw ``httpx`` exception, per architecture.md's "specific
     exception types" rule.
     """
-    url = f"{api_base_url}/app-manifests/{code}/conversions"
+    url = f"{api_base_url}/app-manifests/{quote(code, safe='')}/conversions"
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(url)

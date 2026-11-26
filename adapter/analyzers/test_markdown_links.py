@@ -10,6 +10,7 @@ import time
 
 import pytest
 
+from adapter.analyzers import markdown_links
 from adapter.analyzers.conftest import RunStep, added_file
 from adapter.analyzers.markdown_links import (
     MAX_FILE_BYTES,
@@ -277,3 +278,57 @@ async def test_a_file_without_a_patch_yields_no_findings() -> None:
     diff = Diff(files=(DiffFile(path="a.md", status="modified"),))
 
     assert await _ANALYZER.run(diff, {"a.md": b"[x](#gone)\n"}, timeout=5) == []
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("a `b` c", "a     c"),
+        ("``a`b`` `c`", " " * 11),
+        ("`unclosed and ``double`` x", "`unclosed and " + " " * 10 + " x"),
+        ("`a` `b", "    `b"),
+        ("no ticks", "no ticks"),
+    ],
+)
+def test_blank_code_spans_blanks_only_equal_length_runs_and_keeps_length(
+    line: str, expected: str
+) -> None:
+    out = markdown_links._blank_code_spans(line)
+    assert out == expected
+    assert len(out) == len(line)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("## Title ##", "Title"),
+        ("#   Spaced   ", "Spaced"),
+        ("# C#", "C"),
+        ("# #", "#"),
+        ("####### seven", None),
+        ("#nospace", None),
+        ("# ", None),
+    ],
+)
+def test_atx_text(line: str, expected: str | None) -> None:
+    assert markdown_links._atx_text(line) == expected
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "`" * 3000 + "x" * 3000,
+        "``" * 5000 + "a`" * 5000,
+        "#" + " " * 20000 + "x" + " " * 20000,
+        "# " + "{#a" * 8000,
+        " " * 3 + "`" * 20000 + "a",
+        "~" * 20000 + " x",
+    ],
+)
+def test_helpers_stay_linear_on_hostile_lines(hostile: str) -> None:
+    start = time.monotonic()
+    markdown_links._blank_code_spans(hostile)
+    markdown_links._atx_text(hostile)
+    markdown_links._FENCE.match(hostile)
+    markdown_links._CUSTOM_ID.search(hostile)
+    assert time.monotonic() - start < 1.0

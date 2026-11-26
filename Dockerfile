@@ -131,6 +131,8 @@ RUN rm -rf ./adapter/product_knowledge/testing
 # Likewise the in-memory fake Classifier.
 RUN rm -rf ./llmgateway/testing
 COPY apps ./apps
+# The Admin API test harnesses are test doubles too.
+RUN rm -rf ./apps/admin_api/testing
 COPY pyproject.toml alembic.ini ./
 
 # apps/admin_api's built frontend —

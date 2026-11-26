@@ -18,16 +18,16 @@ from adapter.product_knowledge.testing.fake_provider import (
     FakeProvider,
     Fault,
 )
-from apps.admin_api.pk_routes_harness import (
+from apps.admin_api.product_knowledge_routes import (
+    _MESSAGES,
+    ProbeStatus,
+)
+from apps.admin_api.testing.pk_routes_harness import (
     TOKEN,
     Harness,
     dsn,
     post,
     run,
-)
-from apps.admin_api.product_knowledge_routes import (
-    _MESSAGES,
-    ProbeStatus,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]

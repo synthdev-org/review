@@ -13,7 +13,8 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from apps.admin_api.classifier_harness import (
+from apps.admin_api.dependencies import CSRF_HEADER_NAME
+from apps.admin_api.testing.classifier_harness import (
     HOST,
     TOKEN,
     audit_rows,
@@ -23,7 +24,6 @@ from apps.admin_api.classifier_harness import (
     seed_orgs,
     value,
 )
-from apps.admin_api.dependencies import CSRF_HEADER_NAME
 
 pytestmark = pytest.mark.integration
 

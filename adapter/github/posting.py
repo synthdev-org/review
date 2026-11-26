@@ -256,7 +256,7 @@ def _indent_under_bullet(text: str) -> str:
     return "\n".join(f"  {line}" if line else line for line in text.split("\n"))
 
 
-_FENCE_LINE = re.compile(r"^(\s*)(`{3,})(.*)$")
+_FENCE_LINE = re.compile(r"^(\s*)(`{3,}(?!`))(.*)$")
 
 
 _DETAILS_TAG = re.compile(r"</?details\b[^>]*>", re.IGNORECASE)

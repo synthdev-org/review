@@ -822,3 +822,17 @@ def test_v2_oversize_file_level_finding_is_skipped_not_fatal_to_later_smaller_on
     assert "big2\\.py" in body  # collapsed summary line, not dropped
     assert "y" * 1_000 not in body
     assert "<details>" in body
+
+
+def test_scan_fences_is_linear_on_hostile_lines() -> None:
+    import time
+
+    start = time.monotonic()
+    for hostile in ("`" * 50000 + "x", " " * 50000 + "`", "\t" * 50000 + "``` a`b"):
+        posting_module._scan_fences(hostile)
+    assert time.monotonic() - start < 1.0
+
+
+def test_scan_fences_still_finds_an_open_fence_and_ignores_an_overlong_tick_run_info() -> None:
+    assert posting_module._scan_fences("  ```py\ncode") == (("  ", "```"), 0)
+    assert posting_module._scan_fences("```a`b\n<details>") == (None, 1)

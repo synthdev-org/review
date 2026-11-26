@@ -206,3 +206,19 @@ async def test_exchange_temporary_code_malformed_response_raises_typed_error() -
 
     with pytest.raises(GitHubCodeExchangeMalformedResponseError):
         await exchange_temporary_code("weird-code", timeout=5.0)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@respx.mock
+async def test_exchange_temporary_code_quotes_a_traversing_code() -> None:
+    route = respx.post(url__regex=r"https://api\.github\.com/.*").mock(
+        return_value=httpx.Response(404)
+    )
+
+    with pytest.raises(GitHubCodeExchangeUnreachableError):
+        await exchange_temporary_code("../../app/installations", timeout=1.0)
+
+    assert route.calls.last.request.url.raw_path == (
+        b"/app-manifests/..%2F..%2Fapp%2Finstallations/conversions"
+    )

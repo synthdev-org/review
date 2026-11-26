@@ -69,6 +69,10 @@ export interface RequestOptions {
  * `0`) — callers never need to branch on `response.ok` themselves.
  */
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  // Callers encode their own segments; refuse anything that could leave the /api/v1 prefix.
+  if (!path.startsWith("/") || path.includes("//") || path.includes("\\") || path.split(/[/?]/).includes("..")) {
+    throw new ApiError(0, "invalid request path");
+  }
   const method = options.method ?? "GET";
   const headers: Record<string, string> = {};
   if (options.body !== undefined) {

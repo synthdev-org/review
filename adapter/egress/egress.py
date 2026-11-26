@@ -56,7 +56,12 @@ class AddressClass(StrEnum):
 # 169.254.169.254 is link-local and caught by ``is_link_local``.
 _METADATA_ADDRESSES: Final = frozenset(
     ipaddress.ip_address(a)
-    for a in ("fd00:ec2::254", "100.100.100.200", "168.63.129.16", "192.0.0.192")
+    for a in (
+        "fd00:ec2::254",
+        "100.100.100.200",
+        "168.63.129.16",
+        "192.0.0.192",
+    )  # NOSONAR S1313: cloud-metadata SSRF blocklist
 )
 
 # IPv6 transition/embedding forms that can smuggle an IPv4 target past a
@@ -73,7 +78,9 @@ _DENIED_V6_NETWORKS: Final = tuple(
 # definition has shifted between Python releases): "this network" 0.0.0.0/8
 # (``0.x.x.x`` connects to localhost on Linux) and 240.0.0.0/4 (class E plus
 # the limited broadcast address).
-_DENIED_V4_NETWORKS: Final = tuple(ipaddress.ip_network(n) for n in ("0.0.0.0/8", "240.0.0.0/4"))
+_DENIED_V4_NETWORKS: Final = tuple(
+    ipaddress.ip_network(n) for n in ("0.0.0.0/8", "240.0.0.0/4")
+)  # NOSONAR S1313: reserved-range SSRF blocklist
 
 # IPv6 is allow-listed rather than deny-listed: only global unicast 2000::/3
 # and ULA fc00::/7 are connectable at all, so every unassigned/reserved block

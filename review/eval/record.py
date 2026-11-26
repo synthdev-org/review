@@ -73,8 +73,12 @@ _SYNTHETIC_TIER: dict[str, str] = {
 }
 
 
+# A closed set of file names: the CLI value only selects one, it never becomes part of a path.
+_CASSETTE_FILES = {"v1": "v1.json", "v2": "v2.json"}
+
+
 def cassette_path(version: str) -> Path:
-    return CASSETTE_DIR / f"{version}.json"
+    return CASSETTE_DIR / _CASSETTE_FILES[version]
 
 
 def baseline_dict(metrics: Metrics, *, version: str, synthetic: bool) -> dict[str, Any]:
@@ -185,6 +189,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--version",
         default="v1",
+        choices=sorted(_CASSETTE_FILES),
         help="cassette set name (v1 = baseline prompt; v2 = review_quality_v2 prompt)",
     )
     parser.add_argument("--synthetic", action="store_true", help="no network; derive responses")

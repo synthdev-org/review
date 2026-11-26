@@ -39,16 +39,48 @@ _MAX_LINE_CHARS = 1024
 _MAX_TARGET_CHARS = 200
 
 _LINK = re.compile(r"\[[^\]\n]*\]\(<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+\"[^\"]*\")?\)")
-_HEADING = re.compile(r"^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$")
+_HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*)$")
 _SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
-_CUSTOM_ID = re.compile(r"\s*\{#([^}\s]+)\}\s*$")
+_CUSTOM_ID = re.compile(r"\{#([^}\s]+)\}$")  # matched against already-stripped heading text
 _HTML_ANCHOR = re.compile(r"""<a\s[^>]*?(?:name|id)=["']([^"']+)["']""", re.IGNORECASE)
 _INLINE_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
 _NOT_SLUG = re.compile(r"[^\w\- ]", re.UNICODE)
-_CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
-_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")  # CommonMark fence line
+_BACKTICK_RUN = re.compile(r"`+")
+_FENCE = re.compile(r"^ {0,3}(`{3,}(?!`)|~{3,}(?!~))(.*)$")  # CommonMark fence line
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*:", re.IGNORECASE)
+
+
+def _atx_text(line: str) -> str | None:
+    """Heading text of an ATX heading line (closing ``#`` run removed), else None."""
+    match = _HEADING.match(line)
+    if match is None or not match.group(1):
+        return None
+    rest = match.group(1).rstrip()
+    return rest.rstrip("#").rstrip() or rest[:1]
+
+
+def _blank_code_spans(line: str) -> str:
+    """Blank (same length) every code span: a backtick run closed by a run of equal length.
+
+    Linear: one pass records, per run, the next run of the same length."""
+    runs = list(_BACKTICK_RUN.finditer(line))
+    following: list[int | None] = [None] * len(runs)
+    last_seen: dict[int, int] = {}
+    for i in range(len(runs) - 1, -1, -1):
+        size = runs[i].end() - runs[i].start()
+        following[i] = last_seen.get(size)
+        last_seen[size] = i
+    chars = list(line)
+    i = 0
+    while i < len(runs):
+        closer = following[i]
+        if closer is None:
+            i += 1
+            continue
+        chars[runs[i].start() : runs[closer].end()] = " " * (runs[closer].end() - runs[i].start())
+        i = closer + 1
+    return "".join(chars)
 
 
 def _is_markdown(path: str) -> bool:
@@ -97,10 +129,9 @@ def _anchors(lines: list[tuple[int, str, bool]]) -> set[str]:
     para = 0  # lines in the paragraph so far: only a single-line one can be underlined
     for _, line, _ in lines[_front_matter_end(lines) :]:
         anchors.update(m.lower() for m in _HTML_ANCHOR.findall(line))
-        atx = _HEADING.match(line)
-        text: str | None = None
-        if atx:
-            text, para = atx.group(1), 0
+        text = _atx_text(line)
+        if text is not None:
+            para = 0
         elif para == 1 and _SETEXT_UNDERLINE.match(line):
             text, para = prev.strip(), 0  # the underline row is consumed by its heading
         elif not line.strip():
@@ -113,7 +144,7 @@ def _anchors(lines: list[tuple[int, str, bool]]) -> set[str]:
         if custom:  # kramdown/pandoc ``{#id}``; GitHub keeps it in the text, so allow both
             anchors.add(custom.group(1).lower())
             anchors.add(_slug(text))
-            text = text[: custom.start()]
+            text = text[: custom.start()].rstrip()
         slug = _slug(text)
         count = seen.get(slug, 0)
         seen[slug] = count + 1
@@ -160,7 +191,7 @@ def _check(
             if overlong or number not in added.get(path, ()):
                 continue  # ReDoS bound: never link-scan an over-long line
             # Blanked (same length) so offsets and the `!` image check still line up.
-            line = _CODE_SPAN.sub(lambda m: " " * len(m.group()), line)
+            line = _blank_code_spans(line)
             for match in _LINK.finditer(line):
                 target = match.group(1)
                 if _SCHEME.match(target) or target.startswith(("/", "//")):
