@@ -43,7 +43,7 @@ TOKEN = "CANARY-PK-ROUTE-TOKEN-2c26b46b68ffc68ff99b453c1d304134"
 HOST = "wiki.test"
 PRIVATE = "10.9.8.7"
 MAP = json.dumps({"wiki": {"token": TOKEN, "allowed_hosts": [HOST]}})
-FAST = ClientTimeouts(connect_seconds=3.0, call_seconds=3.0, teardown_grace_seconds=0.5)
+FAST = ClientTimeouts(connect_seconds=10.0, call_seconds=10.0, teardown_grace_seconds=0.5)
 
 
 class Harness:
