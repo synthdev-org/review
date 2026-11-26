@@ -105,6 +105,8 @@ jobs:
     # `services:` container needed here.
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # A hung test must fail the job with a traceback instead of running to the 6 hour default.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -170,7 +172,12 @@ jobs:
       - name: pytest -m integration
         env:
           COVERAGE_FILE: coverage-integration.data
-        run: uv run --no-sync --no-build --with pytest-cov pytest -m integration --cov=. --cov-report=
+          # sys.monitoring tracer: far less overhead than settrace for the long Postgres tests.
+          COVERAGE_CORE: sysmon
+        # -v names the running test in the log; faulthandler dumps every thread's stack if one test stalls for 10 minutes.
+        run: >-
+          uv run --no-sync --no-build --with pytest-cov pytest -m integration -v --durations=15
+          -o faulthandler_timeout=600 --cov=. --cov-report=
 
       - name: Upload integration coverage data
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
