@@ -102,7 +102,7 @@ dependencies = [
     # (adapter/auth/argon2_hasher.py). `argon2-cffi` is the reference
     # PyPI binding for the Argon2 CLI/reference implementation, the same
     # library OWASP's own Argon2id guidance names.
-    "argon2-cffi>=23.1,<24",
+    "argon2-cffi>=25.1.0,<26",
 ]
 
 [dependency-groups]
