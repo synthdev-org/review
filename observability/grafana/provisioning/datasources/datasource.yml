@@ -1,0 +1,18 @@
+# Grafana datasource provisioning for the `observability` Compose profile
+# (US11/US12). Grafana auto-loads every YAML file under
+# /etc/grafana/provisioning/datasources on startup — no manual "Add data
+# source" click needed for the local demo to work.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Fixed, not Grafana-generated, so the dashboard JSON's `${DS_PROMETHEUS}`
+    # datasource-variable panels (and this Unit's own E2E test, which queries
+    # /api/ds/query directly against this uid) resolve to exactly this one
+    # provisioned datasource, deterministically, on every stack restart.
+    uid: review-observability-prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

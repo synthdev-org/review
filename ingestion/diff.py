@@ -1,0 +1,175 @@
+"""ingestion.diff — the ``Diff``/``DiffFile`` data model and the
+``DiffFetcher`` Protocol operating over it.
+
+**Placement — a Protocol defined alongside the data model it produces, not
+at its first consumer, per ``docs/adr/0006-protocol-defined-at-data-model.md``:**
+``ingestion/diff.py`` isn't itself one of ``DiffFetcher``'s consumers
+(``review/prefilter.py``, ``review/static_analysis.py`` and
+``review/review_generation.py`` are) — it's the package that owns
+the ``Diff`` model every consumer receives, mirroring how ``findings/models.py``
+owns ``Finding`` for every consumer that produces or reads one. See that
+ADR for the general rule this instance follows.
+
+``ingestion`` has zero infra imports (no ``httpx``/``sqlalchemy``/etc.),
+per architecture.md's domain-package rule — ``adapter/github/diff.py``
+is the one concrete implementation, wired in only at the
+composition root (``apps/worker/main.py``).
+
+Bare diff only, per the roadmap — no AST parsing, no index.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Sequence
+from typing import Protocol
+
+from pydantic import BaseModel, ConfigDict
+
+
+class DiffFile(BaseModel):
+    """One changed file from a PR's diff.
+
+    ``mode`` is the real octal git mode (``100644``/``100755``/``120000``/
+    ``160000``) sourced from the Git Trees API — not a derived value from a
+    differently-shaped field — so a symlink (``120000``) or submodule
+    (``160000``) entry can be distinguished before any content is fetched
+    for it (see ``adapter/github/diff.py``'s materialization-safety guard).
+    ``mode``/``blob_sha``/``blob_size_bytes`` are all ``None`` for a
+    ``removed`` file — it no longer exists at the head commit's tree (the
+    Trees API is fetched against the PR's *head* SHA), so there is no mode
+    to resolve, and nothing to fetch or size.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    path: str
+    status: str
+    """GitHub's own changed-file status: ``added``/``modified``/``removed``/etc."""
+    patch: str | None = None
+    """Unified-diff patch text. GitHub omits this for some files (e.g. a
+    binary file, or a diff too large to render) — never assumed present."""
+    mode: str | None = None
+    blob_sha: str | None = None
+    blob_size_bytes: int | None = None
+
+
+class Diff(BaseModel):
+    """A PR's full changed-file list at one head commit. ``review/prefilter.py`` narrows this to
+    the subset that should proceed to static-analysis/LLM review.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    files: tuple[DiffFile, ...]
+
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def commentable_lines(diff: Diff) -> dict[str, frozenset[int]]:
+    """New-side line numbers GitHub accepts an inline comment on (added and
+    context lines inside a hunk), per changed file. A comment anywhere else
+    makes GitHub reject the whole create-review call (HTTP 422), losing every
+    other finding, so callers demote unanchorable findings to file-level."""
+    result: dict[str, frozenset[int]] = {}
+    for changed in diff.files:
+        if not changed.patch:
+            result[changed.path] = frozenset()
+            continue
+        lines: set[int] = set()
+        new_line = 0
+        for raw in changed.patch.splitlines():
+            hunk = _HUNK_RE.match(raw)
+            if hunk:
+                new_line = int(hunk.group(1))
+            elif raw.startswith("-") or raw.startswith("\\"):
+                continue
+            elif new_line:
+                lines.add(new_line)
+                new_line += 1
+        result[changed.path] = frozenset(lines)
+    return result
+
+
+class DiffContentUnavailableError(Exception):
+    """Raised by ``DiffFetcher.fetch_content`` when real file content could
+    not be fetched at all — the GitHub (or other host) API was unreachable,
+    its retry budget was exhausted, or a requested blob exceeded the
+    adapter's own size ceiling.
+
+    Domain-owned, defined alongside the ``DiffFetcher`` Protocol it's part
+    of the failure contract for — mirroring ``indexing/tree.py``'s existing
+    ``RepoTreeFetchError``/``RepoTreeTruncatedError`` pattern (a domain
+    package's own typed exceptions for an adapter-implemented Protocol's
+    failure modes) — so a domain-package caller (``ContextBuilderStep``) can catch this for
+    graceful degradation (US7) without importing an adapter-owned exception
+    type by name, which would
+    violate architecture.md's "domain never imports adapter code" rule. The
+    concrete GitHub-backed implementation
+    (``adapter/github/diff.py``'s ``GitHubDiffFetcher.fetch_content``)
+    translates its own adapter-level exceptions into this one at its own
+    call sites.
+    """
+
+    def __init__(self, *, repo_full_name: str, detail: str) -> None:
+        super().__init__(f"content fetch for {repo_full_name} unavailable: {detail}")
+        self.repo_full_name = repo_full_name
+        self.detail = detail
+
+
+class DiffContentMalformedError(Exception):
+    """Raised by ``DiffFetcher.fetch_content`` when the underlying API
+    responded, but its response could not be parsed into the content this
+    Protocol promises — see ``DiffContentUnavailableError``'s own docstring
+    for the placement/translation rationale, identical here.
+    """
+
+    def __init__(self, *, repo_full_name: str, detail: str) -> None:
+        super().__init__(f"content fetch for {repo_full_name} returned malformed data: {detail}")
+        self.repo_full_name = repo_full_name
+        self.detail = detail
+
+
+class DiffFetcher(Protocol):
+    """Fetches a PR's diff and, for a narrowed subset of paths, real file
+    content. Implemented by
+    ``adapter/github/diff.py``'s ``GitHubDiffFetcher``.
+
+    ``fetch`` and ``fetch_content`` are deliberately two separate calls, not
+    one: ``review/prefilter.py`` calls only ``fetch`` — the
+    changed-file list plus per-file mode/size, no content — and
+    ``review/static_analysis.py`` calls ``fetch_content`` only
+    after pre-filter has narrowed the path set, so content is never fetched
+    for a file pre-filter would have excluded anyway (lockfiles, vendored
+    paths, generated files, files beyond the materialization ceiling).
+    """
+
+    async def fetch(
+        self, *, installation_id: int, repo_full_name: str, pr_number: int, head_sha: str
+    ) -> Diff:
+        """Fetch every changed file's path/status/patch (paginated
+        Files-endpoint) plus real git mode/blob sha/blob size
+        (cross-referenced from one Git Trees API call) — no file content.
+        """
+        ...
+
+    async def fetch_content(
+        self,
+        *,
+        installation_id: int,
+        repo_full_name: str,
+        diff: Diff,
+        paths: Sequence[str],
+    ) -> dict[str, bytes]:
+        """Fetch real file content for exactly ``paths`` (a subset of
+        ``diff.files``, already narrowed by ``review/prefilter.py``) via
+        the Git Blobs API, keyed by path (a blob shared by several paths is
+        fetched once and reused). A symlink (``120000``) or submodule (``160000``) entry in
+        ``diff`` is skipped entirely (no blob fetched), even if its path is
+        present in ``paths``.
+
+        Raises ``DiffContentUnavailableError``/``DiffContentMalformedError``
+        — never an adapter-owned exception type — on failure.
+        """
+        ...

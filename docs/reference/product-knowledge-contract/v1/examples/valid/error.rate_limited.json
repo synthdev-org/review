@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "rate_limited",
+    "message": "Slow down.",
+    "retry_after_seconds": 30
+  }
+}

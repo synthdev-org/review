@@ -1,0 +1,58 @@
+# Vendored, pinned Semgrep ruleset: a live
+# `--config=auto`/registry-pack call is network-dependent and
+# non-deterministic (findings could silently change between two scans of
+# identical code as an upstream registry ruleset updates), and would fail
+# outright in an air-gapped customer deployment. This file is loaded
+# locally at scan time (`adapter/analyzers/semgrep.py`) instead — same
+# "broad default coverage" intent as a registry pack, but deterministic and
+# offline-safe.
+#
+# **Why not Semgrep's `p/ci` registry pack:** that pack is hundreds of rules across
+# many languages/ecosystems, fetched from semgrep.dev's registry — genuinely vendoring its
+# exact content requires network access to that registry at
+# ruleset-authoring time and a very large committed file, neither of which
+# is needed to get a pinned, vendored ruleset instead of a live network
+# call. This file is instead a
+# small, deliberately curated, hand-written ruleset covering a few
+# genuinely demonstrable, security-relevant Python patterns (arbitrary code
+# execution via `eval`, shell-injection via `subprocess(..., shell=True)`,
+# a hardcoded-secret-assignment heuristic) — satisfying the same
+# deterministic/offline/pinned-by-content property this file exists for,
+# without depending on a live registry fetch. Trivially extensible with
+# more rules/languages later without changing this mechanism.
+#
+# **Pinned by content, not only by fetch timing:** this file's own sha256
+# is pinned in `adapter/analyzers/semgrep_ruleset.yaml.sha256`, verified by
+# `adapter/analyzers/test_semgrep.py::test_pinned_ruleset_checksum_matches`
+# (run on every push, per ci.yml's `test` job) — an edit to this file
+# without also updating the pinned checksum fails that test, turning a
+# ruleset change into a detected, deliberate re-pin rather than a silent
+# drift.
+rules:
+  - id: review-eval-usage
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Use of eval() on untrusted input can lead to arbitrary code
+      execution.
+    patterns:
+      - pattern: eval(...)
+
+  - id: review-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      subprocess call with shell=True can lead to shell injection if any
+      argument is influenced by untrusted input.
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+
+  - id: review-hardcoded-secret-assignment
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Possible hardcoded password, API key, or other secret assigned
+      directly in source rather than sourced from configuration/secret
+      storage.
+    patterns:
+      - pattern-regex: '(?i)(password|secret|api_key|token)\s*=\s*["''][A-Za-z0-9_\-]{8,}["'']'

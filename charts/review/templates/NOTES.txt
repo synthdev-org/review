@@ -1,0 +1,15 @@
+review has been installed (release: {{ .Release.Name }}, namespace: {{ .Release.Namespace }}).
+
+Webhook API: {{ include "review.fullname" . }}-webhook-api (Service: {{ include "review.fullname" . }}-webhook-api:{{ .Values.webhookApi.service.port }})
+Worker:      {{ include "review.fullname" . }}-worker (no exposed port)
+
+{{- if .Values.postgresql.enabled }}
+Postgres+pgvector: bundled subchart ({{ .Release.Name }}-postgresql) — fast-eval/trial
+path. Set postgresql.enabled: false (see values-production.yaml) and provide
+database.url for a production install against your own instance.
+{{- else }}
+Postgres: externally-managed (postgresql.enabled: false) — using the
+database.url credential you supplied.
+{{- end }}
+
+This chart is pre-1.0 / unstable — see the note at the top of Chart.yaml.

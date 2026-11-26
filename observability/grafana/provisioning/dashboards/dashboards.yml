@@ -1,0 +1,19 @@
+# Grafana dashboard-provider provisioning for the `observability` Compose
+# profile (Unit F, US11/US12). Points at the directory docker-compose.yml
+# mounts charts/review/dashboards/review.json into — Unit E's own canonical
+# dashboard JSON, not a copy: this file is the *provider config* only, so
+# there is exactly one committed copy of the dashboard JSON in this repo
+# (see docker-compose.yml's `grafana` service volumes for the mount).
+apiVersion: 1
+
+providers:
+  - name: review
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
