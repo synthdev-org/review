@@ -1,0 +1,13 @@
+{
+  "results": [
+    {
+      "id": "HR-77",
+      "title": "Refund policy",
+      "snippet": "Refunds are issued within 14 days.",
+      "source_type": "confluence",
+      "url": "https://wiki.example.com/x",
+      "score": 0.82,
+      "updated_at": "2026-09-30T12:00:00Z"
+    }
+  ]
+}

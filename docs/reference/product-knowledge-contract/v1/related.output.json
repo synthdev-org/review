@@ -1,0 +1,95 @@
+{
+  "$defs": {
+    "SearchItem": {
+      "description": "One ranked result. ``title`` is required (F1): a citation needs it.",
+      "properties": {
+        "id": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "score": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Score"
+        },
+        "snippet": {
+          "maxLength": 1000,
+          "title": "Snippet",
+          "type": "string"
+        },
+        "source_type": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,31}$",
+          "title": "Source Type",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "url": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Url"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "snippet",
+        "source_type"
+      ],
+      "title": "SearchItem",
+      "type": "object"
+    }
+  },
+  "description": "``results`` is ordered best-first; array order is the ranking.",
+  "properties": {
+    "results": {
+      "items": {
+        "$ref": "#/$defs/SearchItem"
+      },
+      "maxItems": 20,
+      "title": "Results",
+      "type": "array"
+    }
+  },
+  "required": [
+    "results"
+  ],
+  "title": "SearchResponse",
+  "type": "object"
+}

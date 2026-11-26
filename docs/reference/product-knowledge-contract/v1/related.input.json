@@ -1,0 +1,30 @@
+{
+  "additionalProperties": false,
+  "description": "Optional tool; review v1 never calls it, but conformance tests it.",
+  "properties": {
+    "contract_version": {
+      "pattern": "^[0-9]+$",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "id": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Id",
+      "type": "string"
+    },
+    "top_k": {
+      "default": 5,
+      "maximum": 20,
+      "minimum": 1,
+      "title": "Top K",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "contract_version",
+    "id"
+  ],
+  "title": "RelatedRequest",
+  "type": "object"
+}

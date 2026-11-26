@@ -1,0 +1,14 @@
+# Minimal, self-authored Postgres+pgvector subchart bundled by the parent
+# review chart when postgresql.enabled: true (fast-eval/trial path — see
+# the parent Chart.yaml and docs/reference/c4-architecture.md). Uses the
+# same pgvector/pgvector:pg16 image as the repo's own docker-compose.yml
+# `postgres` service, so local Compose and a bundled Helm trial install
+# behave the same way. Not intended for production use (no replication, no
+# managed backups) — production deployments set postgresql.enabled: false
+# and point at an externally-managed instance instead.
+apiVersion: v2
+name: postgresql
+description: Minimal Postgres+pgvector StatefulSet for review's bundled trial/demo path.
+type: application
+version: "0.1.0"
+appVersion: "pg16"

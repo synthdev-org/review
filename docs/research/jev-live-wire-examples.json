@@ -1,0 +1,156 @@
+{
+  "_note": "Live responses from POST https://api.typesafe.ai/v1/systemone recorded 2026-11-24 with SYNTHETIC data only (no customer code). Model jev-1.14.0. 0.24s for 5 questions, 0.19s for 2.",
+  "multi_question": {
+    "request": {
+      "model": "jev-latest",
+      "state": "DIFF:\n--- a/client.py\n-    resp = httpx.get(url, timeout=10)\n+    resp = httpx.get(url)\n\nFINDING: The timeout argument was removed from httpx.get, so a hung server blocks the worker forever.",
+      "questions": {
+        "valid": {
+          "type": "noul",
+          "instructions": "Is the FINDING factually correct about the DIFF?"
+        },
+        "actionable": {
+          "type": "noul",
+          "instructions": "Could the author act on the FINDING?"
+        },
+        "has_scenario": {
+          "type": "noul",
+          "instructions": "Does the FINDING describe a concrete failing scenario?"
+        },
+        "tier": {
+          "type": "choice",
+          "instructions": "Classify the FINDING.",
+          "criteria": {
+            "blocker": "Regression or reachable security/data-loss defect",
+            "should_fix": "Real defect with limited impact",
+            "nit": "Style, naming or preference"
+          }
+        },
+        "reachability": {
+          "type": "score",
+          "instructions": "How reachable is the failure?",
+          "criteria": [
+            "Not reachable",
+            "Only in unusual conditions",
+            "Reachable in normal operation"
+          ]
+        }
+      }
+    },
+    "response": {
+      "model": "jev-1.14.0",
+      "answers": {
+        "valid": {
+          "type": "noul",
+          "noul": 0.93
+        },
+        "actionable": {
+          "type": "noul",
+          "noul": 0.89
+        },
+        "has_scenario": {
+          "type": "noul",
+          "noul": 0.76
+        },
+        "tier": {
+          "type": "choice",
+          "choice": "blocker",
+          "confidence": 0.76,
+          "probabilities": {
+            "blocker": 0.84,
+            "should_fix": 0.16,
+            "nit": 0.0
+          }
+        },
+        "reachability": {
+          "type": "score",
+          "score": 1.59,
+          "confidence": 0.37,
+          "legend": {
+            "0": "Not reachable",
+            "1": "Only in unusual conditions",
+            "2": "Reachable in normal operation"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.4,
+            "2": 0.59
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 489,
+        "output_tokens": 111
+      }
+    },
+    "http": 200
+  },
+  "nit_finding": {
+    "request": {
+      "model": "jev-latest",
+      "state": "FINDING: This function has 11 parameters; consider grouping them into an object for readability.",
+      "questions": {
+        "has_scenario": {
+          "type": "noul",
+          "instructions": "Does the FINDING describe a concrete failing scenario?"
+        },
+        "tier": {
+          "type": "choice",
+          "criteria": {
+            "blocker": "Regression or reachable security/data-loss defect",
+            "should_fix": "Real defect with limited impact",
+            "nit": "Style, naming or preference"
+          }
+        }
+      }
+    },
+    "response": {
+      "model": "jev-1.14.0",
+      "answers": {
+        "has_scenario": {
+          "type": "noul",
+          "noul": 0.09
+        },
+        "tier": {
+          "type": "choice",
+          "choice": "nit",
+          "confidence": 0.94,
+          "probabilities": {
+            "blocker": 0.0,
+            "should_fix": 0.04,
+            "nit": 0.96
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 361,
+        "output_tokens": 59
+      }
+    },
+    "http": 200
+  },
+  "empty_questions": {
+    "http": 422,
+    "response": {
+      "detail": [
+        {
+          "type": "too_short",
+          "loc": [
+            "body",
+            "questions"
+          ],
+          "msg": "Dictionary should have at least 1 item after validation, not 0",
+          "input": "{}",
+          "ctx": {
+            "field_type": "Dictionary",
+            "min_length": 1,
+            "actual_length": 0
+          }
+        }
+      ]
+    }
+  },
+  "invalid_key": {
+    "http": 401
+  }
+}
