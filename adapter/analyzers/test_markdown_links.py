@@ -330,5 +330,20 @@ def test_helpers_stay_linear_on_hostile_lines(hostile: str) -> None:
     markdown_links._blank_code_spans(hostile)
     markdown_links._atx_text(hostile)
     markdown_links._FENCE.match(hostile)
-    markdown_links._CUSTOM_ID.search(hostile)
+    markdown_links._custom_id(hostile)
     assert time.monotonic() - start < 1.0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Title {#my-id}", ("my-id", 6)),
+        ("{#a} {#b}", ("b", 5)),
+        ("Title {#}", None),
+        ("Title {#a b}", None),
+        ("Title {#a}x", None),
+        ("Title", None),
+    ],
+)
+def test_custom_id(text: str, expected: tuple[str, int] | None) -> None:
+    assert markdown_links._custom_id(text) == expected

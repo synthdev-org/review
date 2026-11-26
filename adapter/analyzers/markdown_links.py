@@ -41,7 +41,6 @@ _MAX_TARGET_CHARS = 200
 _LINK = re.compile(r"\[[^\]\n]*\]\(<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+\"[^\"]*\")?\)")
 _HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*)$")
 _SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
-_CUSTOM_ID = re.compile(r"\{#([^}\s]+)\}$")  # matched against already-stripped heading text
 _HTML_ANCHOR = re.compile(r"""<a\s[^>]*?(?:name|id)=["']([^"']+)["']""", re.IGNORECASE)
 _INLINE_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
 _NOT_SLUG = re.compile(r"[^\w\- ]", re.UNICODE)
@@ -140,16 +139,31 @@ def _anchors(lines: list[tuple[int, str, bool]]) -> set[str]:
             prev, para = line, para + 1
         if text is None:
             continue
-        custom = _CUSTOM_ID.search(text)
+        custom = _custom_id(text)
         if custom:  # kramdown/pandoc ``{#id}``; GitHub keeps it in the text, so allow both
-            anchors.add(custom.group(1).lower())
+            anchors.add(custom[0].lower())
             anchors.add(_slug(text))
-            text = text[: custom.start()].rstrip()
+            text = text[: custom[1]].rstrip()
         slug = _slug(text)
         count = seen.get(slug, 0)
         seen[slug] = count + 1
         anchors.add(slug if count == 0 else f"{slug}-{count}")
     return anchors
+
+
+def _custom_id(text: str) -> tuple[str, int] | None:
+    """Return ``(id, start)`` of a trailing ``{#id}`` in stripped heading text (linear scan)."""
+    start = text.rfind("{#")
+    ident = text[start + 2 : -1]
+    if (
+        start < 0
+        or not text.endswith("}")
+        or not ident
+        or "}" in ident
+        or any(c.isspace() for c in ident)
+    ):
+        return None
+    return ident, start
 
 
 def _slug(text: str) -> str:
