@@ -1,0 +1,19 @@
+{
+  "description": "Output of ``product_knowledge_contract``: the majors a provider speaks.",
+  "properties": {
+    "supported_versions": {
+      "items": {
+        "pattern": "^[0-9]+$",
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Supported Versions",
+      "type": "array"
+    }
+  },
+  "required": [
+    "supported_versions"
+  ],
+  "title": "ContractDeclaration",
+  "type": "object"
+}

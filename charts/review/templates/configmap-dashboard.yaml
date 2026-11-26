@@ -1,0 +1,24 @@
+# US11 (docs/specs/spec-observability.md): ships the canonical dashboard
+# JSON (charts/review/dashboards/review.json) as a ConfigMap, loaded via
+# Helm's `.Files.Get` — not a copy-pasted duplicate of the JSON — so there
+# is exactly one place the dashboard's panel definitions live.
+#
+# The "grafana_dashboard": "1" label is the well-known auto-discovery
+# convention the Grafana sidecar container ships by
+# kube-prometheus-stack and the standalone `grafana/grafana` Helm chart
+# both use by default (`sidecar.dashboards.enabled: true`, default label
+# key `grafana_dashboard`, default label value `"1"`) to pick up
+# ConfigMaps across the cluster without any Grafana-side provisioning
+# config. This is opt-in on the customer's side, per the spec's own
+# "if they use that convention" scoping — this ConfigMap is inert extra
+# cluster state otherwise, never a hard dependency of this chart.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "review.fullname" . }}-dashboard
+  labels:
+    {{- include "review.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+data:
+  review.json: |-
+    {{- .Files.Get "dashboards/review.json" | nindent 4 }}

@@ -1,0 +1,7 @@
+{
+  "additionalProperties": false,
+  "description": "``product_knowledge_contract`` takes no arguments.",
+  "properties": {},
+  "title": "ContractRequest",
+  "type": "object"
+}

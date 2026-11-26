@@ -1,0 +1,10 @@
+---
+# Codacy analyzes pull requests through its GitHub App. This file lists the
+# paths that Codacy skips. Tools and patterns are set in the Codacy app.
+exclude_paths:
+  - "uv.lock"
+  - "**/package-lock.json"
+  - "**/node_modules/**"
+  - "**/dist/**"
+  - "**/testdata/**"
+  - "**/__pycache__/**"

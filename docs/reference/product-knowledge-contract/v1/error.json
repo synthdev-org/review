@@ -1,0 +1,57 @@
+{
+  "$defs": {
+    "ProviderErrorDetail": {
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_argument",
+            "not_found",
+            "unauthorized",
+            "forbidden",
+            "rate_limited",
+            "unsupported_version",
+            "unavailable",
+            "internal"
+          ],
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 500,
+          "title": "Message",
+          "type": "string"
+        },
+        "retry_after_seconds": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retry After Seconds"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "ProviderErrorDetail",
+      "type": "object"
+    }
+  },
+  "description": "``structuredContent`` of a tool result with ``isError: true``.\n\nUnknown ``code`` values fail validation here (the set is closed for\nproviders); a consumer classifies an unparseable error as\n``provider_error`` itself.",
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/ProviderErrorDetail"
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "title": "ProviderError",
+  "type": "object"
+}

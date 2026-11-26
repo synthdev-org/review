@@ -1,0 +1,39 @@
+# charts/review — production deployment target (Kubernetes/Helm), per
+# ADR-0001 and docs/reference/c4-architecture.md. Docker Compose
+# (docker-compose.yml, repo root) runs the same images for local dev.
+#
+# PRE-1.0 / UNSTABLE: this chart's values.yaml shape has no stability
+# guarantee yet. Phase 8 of the roadmap ("Production hardening") is where
+# chart maturity/versioning discipline lands — until then, a values-schema
+# field may be renamed or restructured without a deprecation cycle. Don't
+# build automation against this chart's values shape expecting SemVer-style
+# compatibility before that phase ships.
+apiVersion: v2
+name: review
+description: >-
+  Self-hosted AI code review platform — Webhook API, Worker, and Admin API
+  and UI, with an optional bundled Postgres+pgvector subchart for quick
+  trials.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - code-review
+  - ai
+  - github-app
+home: https://github.com/synthdev-org/review
+sources:
+  - https://github.com/synthdev-org/review
+dependencies:
+  # Bundled Postgres+pgvector subchart, gated by postgresql.enabled — per
+  # the C4 doc's "postgresql.enabled: true bundles a subchart for quick
+  # trials/demos ... false plus connection details for production" split.
+  # This is a small, self-authored subchart (charts/postgresql/) using the
+  # same pgvector/pgvector:pg16 image as docker-compose.yml, not a
+  # third-party chart-repo dependency — no network fetch is needed to
+  # resolve it (it already lives in this chart's own charts/ directory), so
+  # `helm dependency update` never has to reach an external registry.
+  - name: postgresql
+    version: "0.1.0"
+    repository: "file://charts/postgresql"
+    condition: postgresql.enabled
