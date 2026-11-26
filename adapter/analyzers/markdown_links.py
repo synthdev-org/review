@@ -39,23 +39,36 @@ _MAX_LINE_CHARS = 1024
 _MAX_TARGET_CHARS = 200
 
 _LINK = re.compile(r"\[[^\]\n]*\]\(<?((?:[^()\s>]|\([^()\s>]*\))+)>?(?:\s+\"[^\"]*\")?\)")
-_HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+(.*)$")
 _SETEXT_UNDERLINE = re.compile(r"^ {0,3}(?:=+|-+)\s*$")
 _HTML_ANCHOR = re.compile(r"""<a\s[^>]*?(?:name|id)=["']([^"']+)["']""", re.IGNORECASE)
 _INLINE_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
 _NOT_SLUG = re.compile(r"[^\w\- ]", re.UNICODE)
 _BACKTICK_RUN = re.compile(r"`+")
-_FENCE = re.compile(r"^ {0,3}(`{3,}(?!`)|~{3,}(?!~))(.*)$")  # CommonMark fence line
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*:", re.IGNORECASE)
 
 
+def _fence(line: str) -> tuple[str, str] | None:
+    """CommonMark fence line as ``(marker run, rest)``, else None (linear scan, no regex)."""
+    body = line.lstrip(" ")
+    if len(line) - len(body) > 3 or body[:1] not in ("`", "~"):
+        return None
+    run = len(body) - len(body.lstrip(body[0]))
+    return (body[:run], body[run:]) if run >= 3 else None
+
+
 def _atx_text(line: str) -> str | None:
     """Heading text of an ATX heading line (closing ``#`` run removed), else None."""
-    match = _HEADING.match(line)
-    if match is None or not match.group(1):
+    body = line.lstrip(" ")
+    if len(line) - len(body) > 3:
         return None
-    rest = match.group(1).rstrip()
+    after = body.lstrip("#")
+    if not 1 <= len(body) - len(after) <= 6:
+        return None
+    text = after.lstrip(" \t")
+    if len(text) == len(after) or not text:
+        return None
+    rest = text.rstrip()
     return rest.rstrip("#").rstrip() or rest[:1]
 
 
@@ -96,18 +109,18 @@ def _scannable_lines(text: str) -> list[tuple[int, str, bool]]:
     fence: tuple[str, int] | None = None  # (fence char, opener length)
     for number, line in enumerate(text.split("\n"), start=1):
         if fence is not None:
-            closer = _FENCE.match(line)
+            closer = _fence(line)
             if (
                 closer
-                and closer.group(1)[0] == fence[0]
-                and len(closer.group(1)) >= fence[1]
-                and not closer.group(2).strip()
+                and closer[0][0] == fence[0]
+                and len(closer[0]) >= fence[1]
+                and not closer[1].strip()
             ):
                 fence = None
             continue
-        opener = _FENCE.match(line)
-        if opener and not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
-            fence = (opener.group(1)[0], len(opener.group(1)))
+        opener = _fence(line)
+        if opener and not (opener[0][0] == "`" and "`" in opener[1]):
+            fence = (opener[0][0], len(opener[0]))
             continue
         if fence is None:
             out.append((number, line[:_MAX_LINE_CHARS], len(line) > _MAX_LINE_CHARS))

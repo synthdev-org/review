@@ -323,13 +323,16 @@ def test_atx_text(line: str, expected: str | None) -> None:
         "# " + "{#a" * 8000,
         " " * 3 + "`" * 20000 + "a",
         "~" * 20000 + " x",
+        "#" * 50000,
+        "# " * 30000 + "\t" * 30000,
+        " " * 50000 + "```",
     ],
 )
 def test_helpers_stay_linear_on_hostile_lines(hostile: str) -> None:
     start = time.monotonic()
     markdown_links._blank_code_spans(hostile)
     markdown_links._atx_text(hostile)
-    markdown_links._FENCE.match(hostile)
+    markdown_links._fence(hostile)
     markdown_links._custom_id(hostile)
     assert time.monotonic() - start < 1.0
 

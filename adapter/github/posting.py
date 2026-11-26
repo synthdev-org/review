@@ -256,7 +256,11 @@ def _indent_under_bullet(text: str) -> str:
     return "\n".join(f"  {line}" if line else line for line in text.split("\n"))
 
 
-_FENCE_LINE = re.compile(r"^(\s*)(`{3,}(?!`))(.*)$")
+def _fence_line(line: str) -> tuple[str, str, str] | None:
+    """``(indent, backtick run, rest)`` of a backtick fence line, else None (linear scan)."""
+    body = line.lstrip()
+    run = len(body) - len(body.lstrip("`"))
+    return (line[: len(line) - len(body)], body[:run], body[run:]) if run >= 3 else None
 
 
 _DETAILS_TAG = re.compile(r"</?details\b[^>]*>", re.IGNORECASE)
@@ -267,18 +271,18 @@ def _scan_fences(text: str) -> tuple[tuple[str, str] | None, int]:
     opened: tuple[str, str] | None = None
     details = 0
     for line in text.split("\n"):
-        match = _FENCE_LINE.match(line)
+        match = _fence_line(line)
         # CommonMark: a backtick fence's info string may not contain a backtick, so
         # "```a`b" is not an opener (mirrors adapter/analyzers/markdown_links.py;
         # duplicated, not imported, to keep adapters independent).
-        if match is not None and opened is None and "`" in match.group(3):
+        if match is not None and opened is None and "`" in match[2]:
             match = None
         if match is None:
             if opened is None:
                 for tag in _DETAILS_TAG.findall(line):
                     details += -1 if tag.startswith("</") else 1
             continue
-        indent, ticks, rest = match.groups()
+        indent, ticks, rest = match
         if opened is None:
             opened = (indent, ticks)
         elif not rest.strip() and len(ticks) >= len(opened[1]):

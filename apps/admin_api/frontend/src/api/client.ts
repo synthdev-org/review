@@ -73,6 +73,11 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   if (!path.startsWith("/") || path.includes("//") || path.includes("\\") || path.split(/[/?]/).includes("..")) {
     throw new ApiError(0, "invalid request path");
   }
+  // Second, structural guard: the resolved URL must be same-origin under /api/v1/.
+  const url = new URL(`/api/v1${path}`, window.location.origin);
+  if (url.origin !== window.location.origin || !url.pathname.startsWith("/api/v1/")) {
+    throw new ApiError(0, "invalid request path");
+  }
   const method = options.method ?? "GET";
   const headers: Record<string, string> = {};
   if (options.body !== undefined) {
@@ -87,7 +92,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
 
   let response: Response;
   try {
-    response = await fetch(`/api/v1${path}`, {
+    response = await fetch(url.pathname + url.search, {
       method,
       headers,
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
