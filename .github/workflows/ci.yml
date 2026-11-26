@@ -212,9 +212,9 @@ jobs:
       # Both runs used the same checkout layout, so the source paths match.
       - name: Combine coverage data into coverage.xml
         run: |
-          uvx --from coverage coverage combine --keep coverage-data/*.data
-          uvx --from coverage coverage xml -o coverage.xml
-          uvx --from coverage coverage report --omit='*/test_*,*/conftest.py,tests/*,*/__init__.py,apps/admin_api/frontend/*,*/migrations/*,*/testing/*' | tail -n 3
+          uvx --no-build --from coverage==7.16.0 coverage combine --keep coverage-data/*.data
+          uvx --no-build --from coverage==7.16.0 coverage xml -o coverage.xml
+          uvx --no-build --from coverage==7.16.0 coverage report --omit='*/test_*,*/conftest.py,tests/*,*/__init__.py,apps/admin_api/frontend/*,*/migrations/*,*/testing/*' | tail -n 3
 
       - name: Upload coverage report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
