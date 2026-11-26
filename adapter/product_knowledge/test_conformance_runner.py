@@ -1,6 +1,8 @@
-"""Unit tests for the conformance tool's runner, CLI and byte counter, with the
-check list and the MCP session replaced by fakes. The checks themselves are
-proven against a real local server in ``test_conformance.py``."""
+"""Unit tests for the conformance tool's runner, CLI and byte counter."""
+
+# The check list and the MCP session are replaced by fakes. The checks
+# themselves are proven against a real local server in
+# ``test_conformance.py``.
 
 from __future__ import annotations
 

@@ -1,6 +1,8 @@
-"""Unit tests for VerificationStep's memory-suppression pre-check, head-file
-context loading and per-batch judging. Fakes sit at the EmbeddingClient,
-DismissedFindingMatcher, DiffFetcher and FindingJudge Protocol boundaries."""
+"""Unit tests for the VerificationStep helpers."""
+
+# Covers the memory-suppression pre-check, head-file context loading and
+# per-batch judging. Fakes sit at the EmbeddingClient,
+# DismissedFindingMatcher, DiffFetcher and FindingJudge Protocol boundaries.
 
 from __future__ import annotations
 

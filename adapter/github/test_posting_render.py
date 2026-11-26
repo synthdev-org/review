@@ -1,6 +1,7 @@
-"""Unit tests for the pure review-body/comment rendering helpers in
-``adapter.github.posting`` — no HTTP, no GitHub; the publisher's wire
-behavior is covered by the respx integration tests alongside."""
+"""Unit tests for the pure rendering helpers in ``adapter.github.posting``."""
+
+# No HTTP and no GitHub. The publisher's wire behavior is covered by the
+# respx integration tests alongside.
 
 from __future__ import annotations
 

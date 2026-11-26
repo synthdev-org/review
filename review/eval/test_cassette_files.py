@@ -1,6 +1,7 @@
-"""Unit tests for the cassette file helpers and the recorder's small pure
-functions (no network: the respx replay path is covered by
-``test_eval_cassettes.py``)."""
+"""Unit tests for the cassette file helpers and the recorder's pure functions."""
+
+# There is no network here. The respx replay path is covered by
+# ``test_eval_cassettes.py``.
 
 from __future__ import annotations
 

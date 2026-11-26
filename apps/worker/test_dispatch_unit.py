@@ -1,6 +1,8 @@
-"""Unit tests for the Worker dispatch loop with fakes at its seams (the job
-queue, the review StepRegistry, and the INDEX/MEMORY_REACTION_POLL job
-runners). The real-Postgres coverage lives in ``test_dispatch.py``."""
+"""Unit tests for the Worker dispatch loop."""
+
+# Fakes sit at the job queue, the review StepRegistry and the INDEX and
+# MEMORY_REACTION_POLL job runners. The real-Postgres coverage lives in
+# ``test_dispatch.py``.
 
 from __future__ import annotations
 

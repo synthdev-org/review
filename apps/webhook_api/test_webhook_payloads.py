@@ -1,5 +1,7 @@
-"""Unit tests for the pure payload/event builders and the bounded body reader
-in ``apps.webhook_api.webhook_routes`` — no database, no HTTP server."""
+"""Unit tests for the pure payload and event builders in ``webhook_routes``."""
+
+# Also covers the bounded body reader in ``apps.webhook_api.webhook_routes``.
+# There is no database and no HTTP server.
 
 from __future__ import annotations
 

@@ -1,6 +1,8 @@
-"""Unit tests for ReviewGenerationStep's commit-by-commit review mode
-(spec-review-context.md US-X9). Fakes sit at the LLMClient, DiffFetcher,
-CommitSource and TextRedactor Protocol boundaries; no real I/O."""
+"""Unit tests for ReviewGenerationStep's commit-by-commit review mode."""
+
+# See spec-review-context.md US-X9. Fakes sit at the LLMClient,
+# DiffFetcher, CommitSource and TextRedactor Protocol boundaries; there is
+# no real I/O.
 
 from __future__ import annotations
 
