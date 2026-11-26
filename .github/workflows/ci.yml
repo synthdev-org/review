@@ -81,25 +81,29 @@ jobs:
       # Coverage feeds the SonarCloud and Codacy jobs below. pytest-cov is added for
       # this run only (`--with`), so it is not a project dependency.
       - name: pytest (unit only, with coverage)
-        run: uv run --no-sync --no-build --with pytest-cov pytest --cov=. --cov-report=xml
+        env:
+          COVERAGE_FILE: coverage-unit.data
+        run: uv run --no-sync --no-build --with pytest-cov pytest --cov=. --cov-report=
 
-      - name: Upload coverage report
+      - name: Upload unit coverage data
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: coverage-xml
-          path: coverage.xml
+          name: coverage-data-unit
+          path: coverage-unit.data
           if-no-files-found: error
 
   integration-test:
     name: Integration tests (Postgres)
-    # Gated on pull requests, not every push, per docs/rules/testing.md's
-    # CI-gating section ("Integration: every PR").
+    # Runs on pull requests and on pushes to main, not on every branch push
+    # (docs/rules/testing.md: "Integration: every PR"). Its coverage data is
+    # merged with the unit data in the coverage job, so SonarCloud and Codacy
+    # see the code that these real-Postgres tests exercise.
     # `testcontainers-python` (adapter/storage's migration,
     # SKIP LOCKED, and pgvector-presence tests) manages its own real
     # Postgres/pgvector container against the runner's Docker daemon, which
     # ubuntu-latest GitHub-hosted runners provide out of the box — no
     # `services:` container needed here.
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -164,7 +168,53 @@ jobs:
         run: scripts/scan-fixtures.sh
 
       - name: pytest -m integration
-        run: uv run --no-sync pytest -m integration
+        env:
+          COVERAGE_FILE: coverage-integration.data
+        run: uv run --no-sync --no-build --with pytest-cov pytest -m integration --cov=. --cov-report=
+
+      - name: Upload integration coverage data
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-data-integration
+          path: coverage-integration.data
+          if-no-files-found: error
+
+  coverage:
+    name: Merged coverage (unit + integration)
+    needs: [test, integration-test]
+    # integration-test is skipped on branch pushes that are not main; the
+    # merge then uses the unit data alone.
+    if: ${{ !cancelled() && needs.test.result == 'success' && (needs.integration-test.result == 'success' || needs.integration-test.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Download coverage data
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: coverage-data-*
+          path: coverage-data
+          merge-multiple: true
+
+      # Both runs used the same checkout layout, so the source paths match.
+      - name: Combine coverage data into coverage.xml
+        run: |
+          uvx --from coverage coverage combine --keep coverage-data/*.data
+          uvx --from coverage coverage xml -o coverage.xml
+          uvx --from coverage coverage report --omit='*/test_*,*/conftest.py,tests/*,*/__init__.py,apps/admin_api/frontend/*,*/migrations/*,*/testing/*' | tail -n 3
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
 
   frontend:
     name: Frontend (typecheck, build, vitest)
@@ -276,7 +326,7 @@ jobs:
     # Needs the SONAR_TOKEN repository secret. See the Snyk job for the
     # reason behind this condition.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    needs: test
+    needs: coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -300,7 +350,7 @@ jobs:
     # coverage report. It needs the CODACY_PROJECT_TOKEN repository secret,
     # so it skips when the secret is not set and for pull requests from forks.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    needs: test
+    needs: coverage
     runs-on: ubuntu-latest
     env:
       CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}

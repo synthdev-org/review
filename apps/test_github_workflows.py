@@ -65,13 +65,13 @@ def test_ci_unit_test_job_excludes_integration_tests() -> None:
     )
 
 
-def test_ci_integration_test_job_is_gated_on_pull_requests_only() -> None:
+def test_ci_integration_test_job_runs_on_pull_requests_and_main() -> None:
     job = _load("ci.yml")["jobs"]["integration-test"]
     runs = _job_step_runs(job)
 
-    assert job.get("if") == "github.event_name == 'pull_request'", (
-        "integration-test job must be gated to pull_request events, not every push"
-    )
+    assert job.get("if") == (
+        "github.event_name == 'pull_request' || github.ref == 'refs/heads/main'"
+    ), "integration-test job must run on pull requests and pushes to main, not every push"
     assert any("pytest -m integration" in run for run in runs), (
         "integration-test job must actually run the integration-marked tests"
     )
@@ -122,3 +122,12 @@ def test_live_product_knowledge_conformance_step_is_nightly_only_and_non_gating(
     assert "PK_LIVE_URL" not in (WORKFLOWS_DIR / "ci.yml").read_text()
     if "adapter.product_knowledge.conformance" in (WORKFLOWS_DIR / "ci.yml").read_text():
         pytest.fail("ci.yml must not run the live conformance suite")
+
+
+def test_ci_sonar_and_codacy_use_the_merged_coverage_job() -> None:
+    jobs = _load("ci.yml")["jobs"]
+
+    assert set(jobs["coverage"]["needs"]) == {"test", "integration-test"}
+    assert jobs["sonarcloud"]["needs"] == "coverage"
+    assert jobs["codacy-coverage"]["needs"] == "coverage"
+    assert any("coverage combine" in run for run in _job_step_runs(jobs["coverage"]))
