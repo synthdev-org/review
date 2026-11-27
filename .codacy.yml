@@ -1,0 +1,20 @@
+---
+# Codacy analyzes pull requests through its GitHub App. This file lists the
+# paths that Codacy skips. Tools and patterns are set in the Codacy app.
+exclude_paths:
+  # Dependencies, build output and generated files.
+  - "uv.lock"
+  - "**/package-lock.json"
+  - "**/node_modules/**"
+  - "**/dist/**"
+  - "**/__pycache__/**"
+  # Tests and test tooling: no quality or security checks on them.
+  - "tests/**"
+  - "**/test_*.py"
+  - "**/conftest.py"
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/testing/**"
+  - "**/testdata/**"
+  - "apps/admin_api/frontend/src/test/**"
+  - "charts/review/test-render.sh"

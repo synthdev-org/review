@@ -1,0 +1,20 @@
+# SHA-256 checksums for the bundled local embedding model (US4). The
+# Dockerfile's `embedding-model` build stage downloads each of these files from
+# https://huggingface.co/Qdrant/all-MiniLM-L6-v2-onnx (pinned to commit
+# 5f1b8cd78bc4fb444dd171e59b18f3a3af89a079, not a mutable branch ref — see
+# the Dockerfile) and runs `sha256sum -c` against this file, failing the
+# image build on any mismatch. Regenerate by re-downloading at a new pinned
+# commit and re-running `sha256sum *` in that directory — never hand-edit a
+# hash without re-verifying the actual bytes.
+#
+# See adapter/embedding/local_onnx.py's module docstring for why this
+# specific Hugging Face repo (fastembed's own registry source for
+# `sentence-transformers/all-MiniLM-L6-v2`, per that module's own
+# verification) is the pinned source, not a differently-structured mirror
+# such as Xenova/all-MiniLM-L6-v2.
+1b4d8e2a3988377ed8b519a31d8d31025a25f1c5f8606998e8014111438efcd7  config.json
+bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5  model.onnx
+5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a  special_tokens_map.json
+bd2e06a5b20fd1b13ca988bedc8763d332d242381b4fbc98f8fead4524158f79  tokenizer_config.json
+da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0  tokenizer.json
+07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3  vocab.txt

@@ -1,0 +1,43 @@
+# Snyk policy file. Snyk reads it for the CLI and for imported projects.
+version: v1.25.0
+ignore:
+  # Debian 13 packages in the python:3.12-slim base image. Debian has no fixed
+  # version yet, and coreutils and adduser depend on these libraries, so we
+  # cannot remove them. Review this entry when it expires or when Debian
+  # ships a fix.
+  SNYK-DEBIAN13-ACL-17677866:
+    - '*':
+        reason: No fixed Debian package exists yet. The library cannot be removed from the base image.
+        expires: 2027-02-23T00:00:00.000Z
+        created: 2026-11-25T00:00:00.000Z
+  SNYK-DEBIAN13-ACL-17677882:
+    - '*':
+        reason: No fixed Debian package exists yet. The library cannot be removed from the base image.
+        expires: 2027-02-23T00:00:00.000Z
+        created: 2026-11-25T00:00:00.000Z
+  SNYK-DEBIAN13-ATTR-17678182:
+    - '*':
+        reason: No fixed Debian package exists yet. The library cannot be removed from the base image.
+        expires: 2027-02-23T00:00:00.000Z
+        created: 2026-11-25T00:00:00.000Z
+  # litellm is used here only as a library (`import litellm` in
+  # adapter/llm/litellm_client.py and review/eval/cassette.py). These three
+  # issues are in the LiteLLM proxy server's authentication code, which this
+  # project never runs. No fixed version exists yet. Review this entry when it
+  # expires or when LiteLLM ships a fix.
+  SNYK-PYTHON-LITELLM-17391451:
+    - '*':
+        reason: Affects the LiteLLM proxy server authentication, which review does not run. No fixed version exists yet.
+        expires: 2027-02-23T00:00:00.000Z
+        created: 2026-11-25T00:00:00.000Z
+  SNYK-PYTHON-LITELLM-20257373:
+    - '*':
+        reason: Affects the LiteLLM proxy server JWT authentication, which review does not run. No fixed version exists yet.
+        expires: 2027-02-23T00:00:00.000Z
+        created: 2026-11-25T00:00:00.000Z
+  SNYK-PYTHON-LITELLM-20840174:
+    - '*':
+        reason: Affects the LiteLLM proxy server model management endpoints, which review does not run. No fixed version exists yet.
+        expires: 2027-02-23T00:00:00.000Z
+        created: 2026-11-25T00:00:00.000Z
+patch: {}
